@@ -496,11 +496,16 @@ static void handle_stream_stats(struct mg_connection *c, struct http_server *htt
 
 /* ---------- mongoose event handler ---------- */
 
-static void http_handler(struct mg_connection *c, int ev, void *ev_data, void *fn_data)
+/* Mongoose 7.x: mg_http_listen stores fn_data on the listening connection.
+ * For accepted HTTP connections, we use a static pointer set at startup. */
+static http_server_t *g_http_server = NULL;
+
+static void http_handler(struct mg_connection *c, int ev, void *ev_data)
 {
+    (void)c;
     if (ev != MG_EV_HTTP_MSG) return;
 
-    struct http_server *http = (struct http_server *)fn_data;
+    struct http_server *http = g_http_server;
     struct mg_http_message *hm = (struct mg_http_message *)ev_data;
     struct mg_str uri = hm->uri;
 
@@ -586,7 +591,8 @@ int http_server_start(http_server_t *http)
 {
     snprintf(http->listen_addr, sizeof(http->listen_addr), "http://%s", http->config.http_bind);
     mg_mgr_init(&http->mgr);
-    if (!mg_http_listen(&http->mgr, http->listen_addr, http_handler, http)) {
+    g_http_server = http;
+    if (!mg_http_listen(&http->mgr, http->listen_addr, http_handler, NULL)) {
         log_error("Failed to start HTTP on %s", http->config.http_bind);
         return -1;
     }
