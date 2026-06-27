@@ -377,23 +377,26 @@ static void handle_streams_list(struct mg_connection *c, struct http_server *htt
     db_stream_t *streams = NULL; int count = 0;
     db_stream_list(http->db, &streams, &count);
 
-    size_t cap = 65536;
+    size_t cap = 4096 + (size_t)count * 256;
     char *buf = malloc(cap);
+    if (!buf) { db_stream_free_list(streams); err_json(c, 500, "INTERNAL", "Out of memory"); return; }
     int off = snprintf(buf, cap, "[");
     for (int i = 0; i < count; i++) {
         /* Never expose keys in list view */
-        off += snprintf(buf + off, cap - (size_t)off,
+        int written = snprintf(buf + off, cap - (size_t)off,
             "%s{\"id\":\"%s\",\"name\":\"%s\",\"app\":\"%s\",\"enabled\":%s,\"created_at\":%ld}",
             i > 0 ? "," : "",
             streams[i].id, streams[i].name, streams[i].app,
             streams[i].enabled ? "true" : "false",
             (long)streams[i].created_at);
+        if (written > 0) off += written;
     }
     off += snprintf(buf + off, cap - (size_t)off, "]");
 
     db_stream_free_list(streams);
     send_json(c, 200, buf, (size_t)off);
     free(buf);
+    db_stream_free_list(streams);
 }
 
 /* POST /api/v1/streams  → creates stream, returns keys */
@@ -536,7 +539,7 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data)
         return;
     }
 
-    /* /api/v1/streams/*  (DELETE or /stats) */
+    /* /api/v1/streams/X  (DELETE or /stats) */
     if (match_uri(hm, "/api/v1/streams/*")) {
         /* Check for /stats sub-path */
         const char *after = strstr(uri.buf, "/api/v1/streams/");
