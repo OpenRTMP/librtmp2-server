@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h>
 
 struct db_context {
     sqlite3 *conn;

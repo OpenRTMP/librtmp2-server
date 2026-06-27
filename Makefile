@@ -3,6 +3,7 @@
 
 CC ?= gcc
 CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes
+CFLAGS += -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 CFLAGS += -Iinclude -I../librtmp2/include -I../librtmp2/src
 
 # Mongoose
@@ -13,6 +14,14 @@ CFLAGS += -I$(MONGOOSE_DIR)
 SQLITE_CFLAGS := $(shell pkg-config --cflags sqlite3 2>/dev/null)
 SQLITE_LIBS := $(shell pkg-config --libs sqlite3 2>/dev/null)
 CFLAGS += $(SQLITE_CFLAGS)
+
+# Linuxbrew fallback for sqlite3
+ifeq ($(SQLITE_CFLAGS),)
+  ifneq ($(wildcard /home/linuxbrew/.linuxbrew/include/sqlite3.h),)
+    CFLAGS += -I/home/linuxbrew/.linuxbrew/include
+    SQLITE_LIBS = -L/home/linuxbrew/.linuxbrew/lib -lsqlite3
+  endif
+endif
 
 # librtmp2 (sibling checkout, matches the include paths above)
 LRTMP2_DIR = ../librtmp2
