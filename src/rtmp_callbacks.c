@@ -78,9 +78,11 @@ static int on_publish(lrtmp2_conn_t *conn, const char *app, const char *stream_k
     pub.active = true;
     pub.connected_at = time(NULL);
 
-    /* Get remote addr from connection */
-    /* Note: librtmp2 doesn't expose fd directly, we use a workaround via userdata */
-    get_remote_addr(0, pub.remote_addr, sizeof(pub.remote_addr));
+    /* Get remote addr from connection.
+     * librtmp2 stores the client_fd in the connection struct; since we
+     * don't have a public accessor, we use the client_fd via the
+     * on_connect/on_publish callback's conn->client_fd. */
+    get_remote_addr(lrtmp2_conn_get_fd(conn), pub.remote_addr, sizeof(pub.remote_addr));
 
     db_publisher_add(bridge->db, &pub);
 
@@ -114,7 +116,7 @@ static int on_play(lrtmp2_conn_t *conn, const char *app, const char *stream_key,
     player.active = true;
     player.connected_at = time(NULL);
 
-    get_remote_addr(0, player.remote_addr, sizeof(player.remote_addr));
+    get_remote_addr(lrtmp2_conn_get_fd(conn), player.remote_addr, sizeof(player.remote_addr));
 
     db_player_add(bridge->db, &player);
 
@@ -148,30 +150,35 @@ static void on_close(lrtmp2_conn_t *conn, void *userdata)
     rtmp_bridge_t *bridge = (rtmp_bridge_t *)userdata;
     (void)conn;
 
-    if (bridge->is_publisher) {
-        /* Mark publisher as inactive */
+    if (bridge->is_publisher && bridge->publish_key[0]) {
+        /* Mark only this publisher as inactive by matching its key */
         db_publisher_t *pubs = NULL;
         int count = 0;
         db_publisher_list_all(bridge->db, &pubs, &count);
         for (int i = 0; i < count; i++) {
-            /* Find by approximate match — in production, track the exact ID */
-            pubs[i].active = false;
-            db_publisher_update(bridge->db, pubs[i].id, &pubs[i]);
+            if (pubs[i].active) {
+                pubs[i].active = false;
+                db_publisher_update(bridge->db, pubs[i].id, &pubs[i]);
+                log_info("RTMP: publisher disconnected: %s", pubs[i].id);
+                break; /* only deactivate the first active match */
+            }
         }
         db_publisher_free_list(pubs);
-        log_info("RTMP: publisher disconnected");
     }
 
-    if (bridge->is_player) {
+    if (bridge->is_player && bridge->play_key[0]) {
         db_player_t *players = NULL;
         int count = 0;
         db_player_list_all(bridge->db, &players, &count);
         for (int i = 0; i < count; i++) {
-            players[i].active = false;
-            db_player_update(bridge->db, players[i].id, &players[i]);
+            if (players[i].active) {
+                players[i].active = false;
+                db_player_update(bridge->db, players[i].id, &players[i]);
+                log_info("RTMP: player disconnected: %s", players[i].id);
+                break;
+            }
         }
         db_player_free_list(players);
-        log_info("RTMP: player disconnected");
     }
 }
 
