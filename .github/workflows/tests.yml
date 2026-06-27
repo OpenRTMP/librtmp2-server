@@ -61,7 +61,7 @@ jobs:
     - name: Clone librtmp2
       uses: actions/checkout@v7
       with:
-        repository: AlexanderWagnerDev/librtmp2
+        repository: OpenRTMP/librtmp2
         path: librtmp2
         token: ${{ secrets.GITHUB_TOKEN }}
 
