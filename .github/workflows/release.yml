@@ -92,7 +92,7 @@ jobs:
             > "librtmp2-server-${{ steps.ver.outputs.version }}-src.tar.gz.sha256"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: librtmp2-server-${{ steps.ver.outputs.version }}
           path: |
