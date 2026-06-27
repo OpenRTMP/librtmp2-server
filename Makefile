@@ -15,7 +15,7 @@ SQLITE_LIBS := $(shell pkg-config --libs sqlite3 2>/dev/null)
 CFLAGS += $(SQLITE_CFLAGS)
 
 # librtmp2
-LRTMP2_DIR = ../librtmp2
+LRTMP2_DIR = librtmp2
 LRTMP2_A = $(LRTMP2_DIR)/liblibrtmp2.a
 
 ifdef DEBUG

@@ -27,10 +27,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev
 
       - name: Clone librtmp2
-        run: git clone --depth 1 https://github.com/AlexanderWagnerDev/librtmp2.git ../librtmp2
+        uses: actions/checkout@v7
+        with:
+          repository: AlexanderWagnerDev/librtmp2
+          path: librtmp2
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build librtmp2
-        run: make -C ../librtmp2 release
+        run: make -C librtmp2 release
 
       - name: Build (release)
         run: make release
@@ -52,10 +56,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev
 
       - name: Clone librtmp2
-        run: git clone --depth 1 https://github.com/AlexanderWagnerDev/librtmp2.git ../librtmp2
+        uses: actions/checkout@v7
+        with:
+          repository: AlexanderWagnerDev/librtmp2
+          path: librtmp2
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build librtmp2
-        run: make -C ../librtmp2 release
+        run: make -C librtmp2 release
 
       - name: Resolve version
         id: ver

@@ -8,7 +8,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(ENABLE_TESTS "Build tests" ON)
 
 # --- librtmp2 (from workspace sibling) ---
-set(LRTMP2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../librtmp2" CACHE PATH "librtmp2 source dir")
+set(LRTMP2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/librtmp2" CACHE PATH "librtmp2 source dir")
 
 if(NOT EXISTS "${LRTMP2_DIR}/include/librtmp2/librtmp2.h")
     message(FATAL_ERROR "librtmp2 not found at ${LRTMP2_DIR}. "
