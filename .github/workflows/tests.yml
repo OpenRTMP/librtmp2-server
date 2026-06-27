@@ -1,0 +1,70 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  unit-tests-make:
+    name: unit tests (make, ${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+    - name: Clone librtmp2
+      run: git clone --depth 1 https://github.com/AlexanderWagnerDev/librtmp2.git ../librtmp2
+
+    - name: Build librtmp2
+      run: make -C ../librtmp2 release
+
+    - name: Compile (release, sanity)
+      run: make release
+      env:
+        CC: ${{ matrix.cc }}
+
+    - name: Run unit tests
+      run: make test
+      env:
+        CC: ${{ matrix.cc }}
+
+    - name: Run unit tests (ASan)
+      run: make clean && make asan
+      env:
+        CC: ${{ matrix.cc }}
+
+    - name: Run unit tests (UBSan)
+      run: make clean && make ubsan
+      env:
+        CC: ${{ matrix.cc }}
+
+  unit-tests-cmake:
+    name: unit tests (cmake)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev
+
+    - name: Clone librtmp2
+      run: git clone --depth 1 https://github.com/AlexanderWagnerDev/librtmp2.git ../librtmp2
+
+    - name: Build librtmp2
+      run: make -C ../librtmp2 release
+
+    - name: CMake configure
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLRTMP2_DIR=../librtmp2 -DENABLE_TESTS=ON
+
+    - name: CMake build
+      run: cmake --build build -j$(nproc)
+
+    - name: Run tests
+      run: ctest --test-dir build --output-on-failure
