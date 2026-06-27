@@ -14,14 +14,14 @@ SQLITE_CFLAGS := $(shell pkg-config --cflags sqlite3 2>/dev/null)
 SQLITE_LIBS := $(shell pkg-config --libs sqlite3 2>/dev/null)
 CFLAGS += $(SQLITE_CFLAGS)
 
-# librtmp2
-LRTMP2_DIR = librtmp2
+# librtmp2 (sibling checkout, matches the include paths above)
+LRTMP2_DIR = ../librtmp2
 LRTMP2_A = $(LRTMP2_DIR)/liblibrtmp2.a
 
 ifdef DEBUG
   CFLAGS += -g -O0 -DDEBUG
 else
-  CFLAGS += -O2 -NDEBUG
+  CFLAGS += -O2 -DNDEBUG
 endif
 
 ifdef ASAN
@@ -40,7 +40,9 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # Mongoose object
 MONGOOSE_SRC = $(MONGOOSE_DIR)/mongoose.c
+MONGOOSE_HDR = $(MONGOOSE_DIR)/mongoose.h
 MONGOOSE_OBJ = $(MONGOOSE_DIR)/mongoose.o
+MONGOOSE_BASE = https://raw.githubusercontent.com/cesanta/mongoose/7.14
 
 STATIC_LIB = liblibrtmp2-server.a
 SERVER_BIN = librtmp2-server
@@ -65,28 +67,33 @@ release:
 $(LRTMP2_A):
 	$(MAKE) -C $(LRTMP2_DIR) release
 
-# Mongoose
-$(MONGOOSE_SRC):
+# Mongoose — fetch both the amalgamated source and its header.
+$(MONGOOSE_HDR):
 	mkdir -p $(MONGOOSE_DIR)
-	curl -fsSL https://raw.githubusercontent.com/cesanta/mongoose/7.14/mongoose.c -o $(MONGOOSE_SRC)
+	curl -fsSL $(MONGOOSE_BASE)/mongoose.h -o $(MONGOOSE_HDR)
+
+$(MONGOOSE_SRC): $(MONGOOSE_HDR)
+	curl -fsSL $(MONGOOSE_BASE)/mongoose.c -o $(MONGOOSE_SRC)
 
 $(MONGOOSE_OBJ): $(MONGOOSE_SRC)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Library objects
-src/%.o: src/%.c
+# Library objects — the server sources #include "mongoose.h", so make sure the
+# header is fetched (order-only) before any of them compile.
+src/%.o: src/%.c | $(MONGOOSE_HDR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Static library
+# Static library — server objects + mongoose. librtmp2 is a separate archive
+# that consumers link alongside this one (see SERVER_BIN below).
 $(STATIC_LIB): $(LIB_OBJS) $(MONGOOSE_OBJ)
-	ar rcs $@ $(LIB_OBJS) $(MONGOOSE_OBJ) $(LRTMP2_A)
+	ar rcs $@ $(LIB_OBJS) $(MONGOOSE_OBJ)
 
 # Server binary
-src/cli.o: src/cli.c
+src/cli.o: src/cli.c | $(MONGOOSE_HDR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(SERVER_BIN): src/cli.o $(LIB_OBJS) $(MONGOOSE_OBJ) $(LRTMP2_A)
-	$(CC) $(LDFLAGS) -o $@ src/cli.o $(LIB_OBJS) $(MONGOOSE_OBJ) -L$(LRTMP2_DIR) -llibrtmp2 $(SQLITE_LIBS) -lpthread -lm
+	$(CC) $(LDFLAGS) -o $@ src/cli.o $(LIB_OBJS) $(MONGOOSE_OBJ) $(LRTMP2_A) $(SQLITE_LIBS) -lpthread -lm
 
 # Tests
 tests/unit/%.o: tests/unit/%.c

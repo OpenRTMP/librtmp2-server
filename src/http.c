@@ -30,22 +30,27 @@ struct http_server {
 
 /* ---------- helpers ---------- */
 
+/* mongoose 7.14 dropped mg_http_match_uri(); mg_match() is the replacement. */
+static bool match_uri(const struct mg_http_message *hm, const char *glob)
+{
+    return mg_match(hm->uri, mg_str(glob), NULL);
+}
+
 static void send_json(struct mg_connection *c, int status, const char *body, size_t len)
 {
-    mg_http_printf_head(c, status,
+    /* mg_http_reply() emits the status line and Content-Length automatically. */
+    mg_http_reply(c, status,
         "Content-Type: application/json; charset=utf-8\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n", len);
-    mg_write(c, body, len);
+        "Connection: close\r\n",
+        "%.*s", (int)len, body);
 }
 
 static void send_xml(struct mg_connection *c, int status, const char *body, size_t len)
 {
-    mg_http_printf_head(c, status,
+    mg_http_reply(c, status,
         "Content-Type: application/xml; charset=utf-8\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n", len);
-    mg_write(c, body, len);
+        "Connection: close\r\n",
+        "%.*s", (int)len, body);
 }
 
 static void err_json(struct mg_connection *c, int status, const char *code, const char *msg)
@@ -84,13 +89,13 @@ static int query_var(const struct mg_http_message *hm, const char *name, char *o
 static bool bearer_ok(struct http_server *http, const struct mg_http_message *hm)
 {
     if (!http->config.api_token[0]) return true;
-    const struct mg_str *hdr = mg_http_get_header(hm, "Authorization");
-    if (!hdr || hdr->len < 8 || strncmp(hdr->ptr, "Bearer ", 7) != 0)
+    const struct mg_str *hdr = mg_http_get_header((struct mg_http_message *)hm, "Authorization");
+    if (!hdr || hdr->len < 8 || strncmp(hdr->buf, "Bearer ", 7) != 0)
         return false;
     char tok[256];
     size_t tlen = hdr->len - 7;
     if (tlen >= sizeof(tok)) tlen = sizeof(tok) - 1;
-    memcpy(tok, hdr->ptr + 7, tlen);
+    memcpy(tok, hdr->buf + 7, tlen);
     tok[tlen] = '\0';
     for (int i = (int)tlen - 1; i >= 0; i--) {
         if (tok[i] == '\r' || tok[i] == '\n' || tok[i] == ' ') tok[i] = '\0';
@@ -399,7 +404,7 @@ static void handle_stream_create(struct mg_connection *c, struct http_server *ht
 
     char body[4096];
     size_t blen = hm->body.len < sizeof(body) - 1 ? hm->body.len : sizeof(body) - 1;
-    memcpy(body, hm->body.ptr, blen);
+    memcpy(body, hm->body.buf, blen);
     body[blen] = '\0';
 
     db_stream_t s;
@@ -500,25 +505,25 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data, void *f
     struct mg_str uri = hm->uri;
 
     /* Health — no auth */
-    if (mg_http_match_uri(hm, "/api/v1/health")) {
+    if (match_uri(hm, "/api/v1/health")) {
         handle_health(c, http);
         return;
     }
 
     /* /stats?key=*** → JSON */
-    if (mg_http_match_uri(hm, "/stats")) {
+    if (match_uri(hm, "/stats")) {
         handle_stats_json(c, http, hm);
         return;
     }
 
     /* /stats-nginx?key=*** → XML */
-    if (mg_http_match_uri(hm, "/stats-nginx")) {
+    if (match_uri(hm, "/stats-nginx")) {
         handle_stats_nginx(c, http, hm);
         return;
     }
 
     /* /api/v1/streams */
-    if (mg_http_match_uri(hm, "/api/v1/streams")) {
+    if (match_uri(hm, "/api/v1/streams")) {
         if (hm->body.len == 0)
             handle_streams_list(c, http, hm);
         else
@@ -527,9 +532,9 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data, void *f
     }
 
     /* /api/v1/streams/*  (DELETE or /stats) */
-    if (mg_http_match_uri(hm, "/api/v1/streams/*")) {
+    if (match_uri(hm, "/api/v1/streams/*")) {
         /* Check for /stats sub-path */
-        const char *after = strstr(uri.ptr, "/api/v1/streams/");
+        const char *after = strstr(uri.buf, "/api/v1/streams/");
         if (after) {
             after += strlen("/api/v1/streams/");
             const char *slash = strchr(after, '/');
