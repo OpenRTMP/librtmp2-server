@@ -1,12 +1,15 @@
 /**
  * server.c — Main server application context
+ *
+ * Wires together:
+ * - librtmp2 (RTMP protocol)
+ * - SQLite (persistence)
+ * - Mongoose (HTTP API + nginx-compatible stats)
  */
 #include "librtmp2-server/server.h"
 #include "librtmp2-server/config.h"
-#include "librtmp2-server/stream_registry.h"
-#include "librtmp2-server/session_manager.h"
-#include "librtmp2-server/stats_collector.h"
-#include "librtmp2-server/http_api.h"
+#include "librtmp2-server/db.h"
+#include "librtmp2-server/http.h"
 #include "librtmp2-server/logger.h"
 #include "librtmp2/librtmp2.h"
 
@@ -15,27 +18,33 @@
 #include <signal.h>
 #include <stdlib.h>
 
-/* Include mongoose for polling */
-#include "mongoose.h"
+/* Defined in rtmp_callbacks.c */
+typedef struct {
+    db_context_t *db;
+    char publish_key[128];
+    char play_key[128];
+    int  is_publisher;
+    int  is_player;
+} rtmp_bridge_t;
+
+extern void rtmp_bridge_setup(lrtmp2_server_config_t *config, rtmp_bridge_t *bridge,
+                               db_context_t *db);
 
 struct lrtmp2_server_app {
     server_config_t     config;
     lrtmp2_server_t    *rtmp_server;
-    stream_registry_t  *registry;
-    session_manager_t  *sessions;
-    stats_collector_t  *stats;
+    db_context_t       *db;
     http_server_t      *http;
+    rtmp_bridge_t       bridge;
     int                 running;
 };
 
-static lrtmp2_server_app_t *g_app = NULL;  /* for signal handler */
+static lrtmp2_server_app_t *g_app = NULL;
 
 static void signal_handler(int sig)
 {
     (void)sig;
-    if (g_app) {
-        g_app->running = 0;
-    }
+    if (g_app) g_app->running = 0;
 }
 
 lrtmp2_server_app_t *server_app_create(const server_config_t *config)
@@ -45,14 +54,14 @@ lrtmp2_server_app_t *server_app_create(const server_config_t *config)
 
     memcpy(&app->config, config, sizeof(*config));
 
-    /* Create subsystems */
-    app->registry = stream_registry_create();
-    app->sessions = session_manager_create();
-    app->stats    = stats_collector_create();
+    /* Open SQLite database */
+    const char *db_path = getenv("LRTMP2_DB");
+    if (!db_path || !db_path[0]) db_path = "/tmp/librtmp2-server.db";
 
-    if (!app->registry || !app->sessions || !app->stats) {
-        log_error("Failed to create server subsystems");
-        server_app_destroy(app);
+    app->db = db_open(db_path);
+    if (!app->db) {
+        log_error("Failed to open database: %s", db_path);
+        free(app);
         return NULL;
     }
 
@@ -60,12 +69,11 @@ lrtmp2_server_app_t *server_app_create(const server_config_t *config)
     app->http = http_server_create(config);
     if (!app->http) {
         log_error("Failed to create HTTP server");
-        server_app_destroy(app);
+        db_close(app->db);
+        free(app);
         return NULL;
     }
-    http_server_set_stream_registry(app->http, app->registry);
-    http_server_set_session_manager(app->http, app->sessions);
-    http_server_set_stats_collector(app->http, app->stats);
+    http_server_set_db(app->http, app->db);
 
     g_app = app;
     signal(SIGINT, signal_handler);
@@ -82,10 +90,8 @@ void server_app_destroy(lrtmp2_server_app_t *app)
         lrtmp2_server_stop(app->rtmp_server);
         lrtmp2_server_destroy(app->rtmp_server);
     }
-    if (app->http)      http_server_destroy(app->http);
-    if (app->stats)     stats_collector_destroy(app->stats);
-    if (app->sessions)  session_manager_destroy(app->sessions);
-    if (app->registry)  stream_registry_destroy(app->registry);
+    if (app->http)  http_server_destroy(app->http);
+    if (app->db)    db_close(app->db);
 
     if (g_app == app) g_app = NULL;
     free(app);
@@ -102,17 +108,9 @@ int server_app_run(lrtmp2_server_app_t *app)
     rc = http_server_start(app->http);
     if (rc != 0) return rc;
 
-    /* Create and start RTMP server */
-    /* Note: rtmp_bridge setup will be called from rtmp bridge */
-    /* For now, we create directly here with a minimal config */
+    /* Create RTMP server with bridge to DB */
     lrtmp2_server_config_t rtmp_config;
-    memset(&rtmp_config, 0, sizeof(rtmp_config));
-    rtmp_config.max_connections = app->config.rtmp_max_conn;
-    rtmp_config.chunk_size      = app->config.rtmp_chunk_size;
-    rtmp_config.userdata        = app; /* will be passed to bridge */
-
-    /* TODO: set callbacks via bridge setup */
-    /* rtmp_bridge_setup(&rtmp_config, &bridge, app->registry, app->sessions, app->stats); */
+    rtmp_bridge_setup(&rtmp_config, &app->bridge, app->db);
 
     app->rtmp_server = lrtmp2_server_create(&rtmp_config);
     if (!app->rtmp_server) {
@@ -132,9 +130,7 @@ int server_app_run(lrtmp2_server_app_t *app)
     /* Main loop */
     app->running = 1;
     while (app->running) {
-        /* Pump Mongoose HTTP events */
         http_server_poll(app->http, 10);
-        /* Pump RTMP events */
         lrtmp2_server_poll(app->rtmp_server, 10);
     }
 

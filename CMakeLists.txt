@@ -34,16 +34,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(mongoose)
 
+# --- SQLite (system library) ---
+find_package(SQLite3 REQUIRED)
+
 # --- Server library ---
 add_library(lrtmp2server_lib STATIC
-    src/cli.c
     src/server.c
     src/config.c
-    src/stream_registry.c
-    src/session_manager.c
-    src/stats_collector.c
-    src/http_api.c
-    src/http_static.c
+    src/db.c
+    src/http.c
     src/rtmp_callbacks.c
     src/logger.c
 )
@@ -61,6 +60,7 @@ target_link_libraries(lrtmp2server_lib
     PUBLIC
         pthread
         m
+        SQLite::SQLite3
     PRIVATE
         ${LRTMP2_A}
 )

@@ -8,10 +8,8 @@
     "bind": "0.0.0.0:8080"
   },
   "auth": {
-    "api_token": "change-me-to-a-secure-token",
-    "require_stream_key": true
+    "api_token": "change-me-to-a-secure-token"
   },
   "log_level": 2,
-  "log_file": "",
-  "web_root": "./web"
+  "log_file": ""
 }

@@ -2,7 +2,7 @@
 
 RTMP / E-RTMP media server built on [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2).
 
-Ingest, stream registry, HTTP API, and a modern stats UI — focused on RTMP/E-RTMP only.
+Focused on RTMP/E-RTMP only. SQLite-backed. Nginx-RTMP-compatible stats.
 
 [![License](https://img.shields.io/github/license/AlexanderWagnerDev/librtmp2-server)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange)]()
@@ -13,12 +13,12 @@ Ingest, stream registry, HTTP API, and a modern stats UI — focused on RTMP/E-R
 ## Features
 
 - **RTMP / E-RTMP ingest** — Legacy RTMP + Enhanced RTMP v1/v2 (HEVC, AV1, VP9)
-- **Stream registry** — Create and manage streams via API or config
-- **HTTP API** — RESTful control plane (`/api/v1/streams`, `/api/v1/sessions`, `/api/v1/stats`)
-- **Stats UI** — Modern dashboard with live stream status, bitrate, codec info
-- **Session management** — Track publishers and players, disconnect control
-- **Config file** — JSON-based configuration
-- **Docker-ready** — Lightweight Alpine container image
+- **SQLite persistence** — Streams, publishers, players, stats all in a DB
+- **Unique keys per stream** — Each stream gets a unique `publish_key`, `play_key`, and `stats_key`
+- **Privacy by design** — No one can see your streams/stats without knowing the exact key
+- **Nginx-RTMP-compatible `/stats`** — Drop-in replacement for nginx-rtmp stat XML
+- **REST API** — Create/manage streams, query sessions
+- **Docker-ready** — Lightweight Alpine container
 
 ---
 
@@ -30,10 +30,12 @@ OBS / FFmpeg / App
         ▼
   librtmp2-server
   ├── RTMP Listener (port 1935)
-  ├── Stream Registry
-  ├── HTTP API       (port 8080)
-  ├── Stats Collector
-  ├── Web UI
+  ├── SQLite (streams, publishers, players, stats)
+  ├── HTTP API     (port 8080)
+  │   ├── /api/v1/streams     CRUD
+  │   ├── /api/v1/streams/:id/stats
+  │   ├── /stats              Nginx-RTMP XML (key-protected)
+  │   └── /stats-nginx        Alias (identical)
   └── Config
         │
         ▼
@@ -55,7 +57,8 @@ OBS / FFmpeg / App
 - C11 compiler (gcc / clang)
 - CMake >= 3.16
 - pthread
-- [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2) (workspace sibling or clone)
+- SQLite3 dev
+- [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2) (workspace sibling)
 
 ### Compile
 
@@ -88,52 +91,115 @@ Or with CLI flags:
 
 ---
 
-## Configuration
+## Stream Keys & Privacy
 
-```json
-{
-  "rtmp": {
-    "bind": "0.0.0.0:1935",
-    "max_connections": 100,
-    "chunk_size": 4096
-  },
-  "http": {
-    "bind": "0.0.0.0:8080"
-  },
-  "auth": {
-    "api_token": "change-me",
-    "require_stream_key": true
-  },
-  "log_level": 2,
-  "log_file": "",
-  "web_root": "./web"
-}
-```
+Each stream has **three unique, auto-generated keys**:
+
+| Key | Purpose | Used by |
+|-----|---------|---------|
+| `publish_key` | OBS/FFmpeg publishes with this | Publisher |
+| `play_key` | Players connect with this | Player |
+| `stats_key` | Access stats for this stream | Monitoring |
+
+**No one can see your streams or stats without the exact key.** There is no public list of active streams.
 
 ---
 
 ## HTTP API
 
+### Public
+
+| Method | Endpoint | Auth |
+|--------|----------|------|
+| GET | `/api/v1/health` | None |
+
+### API (Bearer token required)
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/v1/health` | Health check (no auth) |
-| GET | `/api/v1/stats/overview` | Server stats |
-| GET | `/api/v1/streams` | List streams |
-| POST | `/api/v1/streams` | Create stream |
-| GET | `/api/v1/streams/:id` | Get stream |
-| PATCH | `/api/v1/streams/:id` | Update stream |
+| GET | `/api/v1/streams` | List streams (keys hidden) |
+| POST | `/api/v1/streams` | Create stream (returns keys) |
 | DELETE | `/api/v1/streams/:id` | Delete stream |
-| GET | `/api/v1/sessions` | List sessions |
-| GET | `/api/v1/sessions/:id` | Get session |
-| POST | `/api/v1/sessions/:id/disconnect` | Disconnect session |
+| GET | `/api/v1/streams/:id/stats?key=<stats_key>` | Per-stream stats |
 
-All endpoints except `/health` require `Authorization: Bearer <token>`.
+### Stats (key-protected via query param)
+
+| Endpoint | Description |
+|----------|-------------|
+| `/stats?key=<stats_key>` | Nginx-RTMP-compatible XML |
+| `/stats-nginx?key=<stats_key>` | Identical alias |
 
 ---
 
-## Stats UI
+## Example: Create a stream
 
-Open `http://localhost:8080/` in your browser for the live dashboard.
+```bash
+curl -X POST http://localhost:8080/api/v1/streams \
+  -H "Authorization: Bearer change-me-to-a-secure-token" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"mystream","name":"My Live Stream","app":"live"}'
+```
+
+Response:
+```json
+{
+  "id": "mystream",
+  "name": "My Live Stream",
+  "app": "live",
+  "publish_key": "pub_mystream_1719480000",
+  "play_key": "pl_mystream_1719480001",
+  "stats_key": "st_mystream_1719480002",
+  "enabled": true
+}
+```
+
+### Publish with OBS
+
+- Server: `rtmp://your-server/live`
+- Stream Key: `pub_mystream_1719480000`
+
+### View stats (nginx-compatible)
+
+```bash
+curl "http://localhost:8080/stats?key=st_mystream_1719480002"
+```
+
+Returns XML identical to nginx-rtmp:
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<rtmp>
+  <server>
+    <application>
+      <name>live</name>
+      <live>
+        <stream>
+          <name>My Live Stream</name>
+          <time>12345</time>
+          <bw_in>123456</bw_in>
+          <bytes_in>1234567</bytes_in>
+          <video>
+            <width>1920</width>
+            <height>1080</height>
+            <frame_rate>30</frame_rate>
+            <codec>h264</codec>
+          </video>
+          <audio>
+            <codec>aac</codec>
+            <sample_rate>44100</sample_rate>
+            <channels>2</channels>
+          </audio>
+          <client>
+            <address>1.2.3.4:56789</address>
+            <active>1</active>
+            <publisher>1</publisher>
+          </client>
+        </stream>
+        <nclients>1</nclients>
+      </live>
+    </application>
+  </server>
+</rtmp>
+```
 
 ---
 
@@ -141,17 +207,6 @@ Open `http://localhost:8080/` in your browser for the live dashboard.
 
 ```bash
 docker compose up -d
-```
-
-Or manually:
-
-```bash
-docker build -t librtmp2-server .
-docker run -d \
-  --name rtmp-server \
-  -p 1935:1935 \
-  -p 8080:8080 \
-  librtmp2-server
 ```
 
 ---
@@ -162,17 +217,13 @@ docker run -d \
 librtmp2-server/
 ├── include/librtmp2-server/   Public headers
 ├── src/                       Source files
-│   ├── cli.c                  Entry point
+│   ├── cli.c                  Entry point & arg parsing
 │   ├── server.c               Main app context
-│   ├── config.c               JSON config parser
-│   ├── stream_registry.c      Stream CRUD
-│   ├── session_manager.c      Active session tracking
-│   ├── stats_collector.c      Aggregated stats
-│   ├── http_api.c             HTTP server (Mongoose)
-│   ├── http_static.c          Static file helpers
-│   ├── rtmp_callbacks.c      librtmp2 → server bridge
+│   ├── config.c               JSON config loader
+│   ├── db.c                   SQLite persistence
+│   ├── http.c                 HTTP server (Mongoose)
+│   ├── rtmp_callbacks.c      librtmp2 → DB bridge
 │   └── logger.c               Logging
-├── web/                       Static web UI
 ├── tests/                     Unit tests
 ├── CMakeLists.txt
 ├── Dockerfile
@@ -187,11 +238,12 @@ librtmp2-server/
 | Feature | Status |
 |---------|--------|
 | RTMP/E-RTMP ingest | Planned |
-| Stream registry | Planned |
-| HTTP API | Planned |
-| Stats UI | Planned |
-| Session management | Planned |
-| Persistent stats | Planned |
+| SQLite persistence | Planned |
+| Unique keys per stream | Planned |
+| Nginx-RTMP-compatible /stats | Planned |
+| REST API | Planned |
+| Per-stream stats | Planned |
+| Persistent stats history | Planned |
 | Multi-node | Future |
 
 ---
