@@ -16,7 +16,8 @@ Focused on RTMP/E-RTMP only. SQLite-backed. Nginx-RTMP-compatible stats.
 - **SQLite persistence** — Streams, publishers, players, stats all in a DB
 - **Unique keys per stream** — Each stream gets a unique `publish_key`, `play_key`, and `stats_key`
 - **Privacy by design** — No one can see your streams/stats without knowing the exact key
-- **Nginx-RTMP-compatible `/stats`** — Drop-in replacement for nginx-rtmp stat XML
+- **JSON stats** — `/stats?key=***` returns clean modern JSON
+- **Nginx-RTMP-compatible XML** — `/stats-nginx?key=***` for existing tools
 - **REST API** — Create/manage streams, query sessions
 - **Docker-ready** — Lightweight Alpine container
 
@@ -126,8 +127,8 @@ Each stream has **three unique, auto-generated keys**:
 
 | Endpoint | Description |
 |----------|-------------|
-| `/stats?key=<stats_key>` | Nginx-RTMP-compatible XML |
-| `/stats-nginx?key=<stats_key>` | Identical alias |
+| `/stats?key=<stats_key>` | JSON stats (modern) |
+| `/stats-nginx?key=<stats_key>` | XML (nginx-rtmp compatible) |
 
 ---
 
@@ -158,48 +159,36 @@ Response:
 - Server: `rtmp://your-server/live`
 - Stream Key: `pub_mystream_1719480000`
 
-### View stats (nginx-compatible)
+### View stats (JSON)
 
 ```bash
 curl "http://localhost:8080/stats?key=st_mystream_1719480002"
 ```
 
-Returns XML identical to nginx-rtmp:
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<rtmp>
-  <server>
-    <application>
-      <name>live</name>
-      <live>
-        <stream>
-          <name>My Live Stream</name>
-          <time>12345</time>
-          <bw_in>123456</bw_in>
-          <bytes_in>1234567</bytes_in>
-          <video>
-            <width>1920</width>
-            <height>1080</height>
-            <frame_rate>30</frame_rate>
-            <codec>h264</codec>
-          </video>
-          <audio>
-            <codec>aac</codec>
-            <sample_rate>44100</sample_rate>
-            <channels>2</channels>
-          </audio>
-          <client>
-            <address>1.2.3.4:56789</address>
-            <active>1</active>
-            <publisher>1</publisher>
-          </client>
-        </stream>
-        <nclients>1</nclients>
-      </live>
-    </application>
-  </server>
-</rtmp>
+```json
+{
+  "streams": [{
+    "name": "My Live Stream",
+    "app": "live",
+    "uptime": 12345,
+    "bitrate_kbps": 2450.5,
+    "bytes_in": 1234567,
+    "video": {"codec": "h264", "width": 1920, "height": 1080, "fps": 30.0},
+    "audio": {"codec": "aac"},
+    "client": {"address": "1.2.3.4:56789", "publisher": true}
+  }],
+  "players": [],
+  "summary": {"publishers": 1, "players": 0, "total_clients": 1}
+}
 ```
+
+### Stats nginx-rtmp XML (für externe Tools)
+
+```bash
+curl "http://localhost:8080/stats-nginx?key=st_mystream_1719480002"
+```
+
+Gibt das gleiche XML-Format wie `nginx-rtmp-module` zurück.
 
 ---
 
