@@ -1,10 +1,10 @@
 # librtmp2-server
 
-RTMP / E-RTMP media server built on [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2).
+RTMP / E-RTMP media server built on [librtmp2](https://github.com/OpenRTMP/librtmp2).
 
 Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
-[![License](https://img.shields.io/github/license/AlexanderWagnerDev/librtmp2-server)](LICENSE)
+[![License](https://img.shields.io/github/license/OpenRTMP/librtmp2-server)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)]()
 [![Language](https://img.shields.io/badge/language-C-blue)]()
 
@@ -57,17 +57,17 @@ OBS / FFmpeg / App
 - C11 compiler (gcc / clang)
 - CMake >= 3.16
 - pthread + SQLite3 dev
-- [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2)
+- [librtmp2](https://github.com/OpenRTMP/librtmp2)
 
 ### Compile
 
 ```bash
 # Build librtmp2 first
-git clone https://github.com/AlexanderWagnerDev/librtmp2.git
+git clone https://github.com/OpenRTMP/librtmp2.git
 cd librtmp2 && make release && cd ..
 
 # Build the server
-git clone https://github.com/AlexanderWagnerDev/librtmp2-server.git
+git clone https://github.com/OpenRTMP/librtmp2-server.git
 cd librtmp2-server
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DLRTMP2_DIR=../../librtmp2
