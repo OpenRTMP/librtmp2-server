@@ -4,3 +4,8 @@ build/
 *.so
 config.json
 .DS_Store
+
+# Build outputs
+/librtmp2-server
+/tests/run_tests
+/tests/run_tests_asan
