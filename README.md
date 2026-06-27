@@ -2,10 +2,10 @@
 
 RTMP / E-RTMP media server built on [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2).
 
-Focused on RTMP/E-RTMP only. SQLite-backed. Nginx-RTMP-compatible stats.
+Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
 [![License](https://img.shields.io/github/license/AlexanderWagnerDev/librtmp2-server)](LICENSE)
-[![Status](https://img.shields.io/badge/status-alpha-orange)]()
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)]()
 [![Language](https://img.shields.io/badge/language-C-blue)]()
 
 ---
@@ -14,11 +14,11 @@ Focused on RTMP/E-RTMP only. SQLite-backed. Nginx-RTMP-compatible stats.
 
 - **RTMP / E-RTMP ingest** — Legacy RTMP + Enhanced RTMP v1/v2 (HEVC, AV1, VP9)
 - **SQLite persistence** — Streams, publishers, players, stats all in a DB
-- **Unique keys per stream** — Each stream gets a unique `publish_key`, `play_key`, and `stats_key`
-- **Privacy by design** — No one can see your streams/stats without knowing the exact key
-- **JSON stats** — `/stats?key=***` returns clean modern JSON
-- **Nginx-RTMP-compatible XML** — `/stats-nginx?key=***` for existing tools
-- **REST API** — Create/manage streams, query sessions
+- **Unique keys per stream** — `publish_key`, `play_key`, `stats_key`
+- **Privacy by design** — No one can see streams/stats without the exact key
+- **JSON stats** — `/stats?key=***` clean modern JSON
+- **Nginx-RTMP XML** — `/stats-nginx?key=***` for existing tools
+- **REST API** — Stream CRUD, Bearer token auth
 - **Docker-ready** — Lightweight Alpine container
 
 ---
@@ -33,10 +33,9 @@ OBS / FFmpeg / App
   ├── RTMP Listener (port 1935)
   ├── SQLite (streams, publishers, players, stats)
   ├── HTTP API     (port 8080)
-  │   ├── /api/v1/streams     CRUD
-  │   ├── /api/v1/streams/:id/stats
-  │   ├── /stats              Nginx-RTMP XML (key-protected)
-  │   └── /stats-nginx        Alias (identical)
+  │   ├── /api/v1/streams    CRUD
+  │   ├── /stats             JSON stats (key-protected)
+  │   └── /stats-nginx       XML stats (nginx-compatible)
   └── Config
         │
         ▼
@@ -57,21 +56,18 @@ OBS / FFmpeg / App
 
 - C11 compiler (gcc / clang)
 - CMake >= 3.16
-- pthread
-- SQLite3 dev
-- [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2) (workspace sibling)
+- pthread + SQLite3 dev
+- [librtmp2](https://github.com/AlexanderWagnerDev/librtmp2)
 
 ### Compile
 
 ```bash
-# Clone both repos side by side
-git clone https://github.com/AlexanderWagnerDev/librtmp2.git
-git clone https://github.com/AlexanderWagnerDev/librtmp2-server.git
-
 # Build librtmp2 first
+git clone https://github.com/AlexanderWagnerDev/librtmp2.git
 cd librtmp2 && make release && cd ..
 
 # Build the server
+git clone https://github.com/AlexanderWagnerDev/librtmp2-server.git
 cd librtmp2-server
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DLRTMP2_DIR=../../librtmp2
@@ -88,6 +84,28 @@ Or with CLI flags:
 
 ```bash
 ./librtmp2-server -p 1935 -w 8080 -t my-secret-token -v
+```
+
+---
+
+## Configuration
+
+```json
+{
+  "rtmp": {
+    "bind": "0.0.0.0:1935",
+    "max_connections": 100,
+    "chunk_size": 4096
+  },
+  "http": {
+    "bind": "0.0.0.0:8080"
+  },
+  "auth": {
+    "api_token": "change-me-to-a-secure-token"
+  },
+  "log_level": 2,
+  "log_file": ""
+}
 ```
 
 ---
@@ -121,14 +139,14 @@ Each stream has **three unique, auto-generated keys**:
 | GET | `/api/v1/streams` | List streams (keys hidden) |
 | POST | `/api/v1/streams` | Create stream (returns keys) |
 | DELETE | `/api/v1/streams/:id` | Delete stream |
-| GET | `/api/v1/streams/:id/stats?key=<stats_key>` | Per-stream stats |
+| GET | `/api/v1/streams/:id/stats?key=<sk>` | Per-stream JSON stats |
 
 ### Stats (key-protected via query param)
 
-| Endpoint | Description |
-|----------|-------------|
-| `/stats?key=<stats_key>` | JSON stats (modern) |
-| `/stats-nginx?key=<stats_key>` | XML (nginx-rtmp compatible) |
+| Endpoint | Format | Description |
+|----------|--------|-------------|
+| `/stats?key=<stats_key>` | JSON | Modern stats |
+| `/stats-nginx?key=<stats_key>` | XML | Nginx-rtmp compatible |
 
 ---
 
@@ -211,7 +229,7 @@ librtmp2-server/
 │   ├── config.c               JSON config loader
 │   ├── db.c                   SQLite persistence
 │   ├── http.c                 HTTP server (Mongoose)
-│   ├── rtmp_callbacks.c      librtmp2 → DB bridge
+│   ├── rtmp_callbacks.c       librtmp2 → DB bridge
 │   └── logger.c               Logging
 ├── tests/                     Unit tests
 ├── CMakeLists.txt
@@ -219,21 +237,6 @@ librtmp2-server/
 ├── docker-compose.yml
 └── config.example.json
 ```
-
----
-
-## Roadmap
-
-| Feature | Status |
-|---------|--------|
-| RTMP/E-RTMP ingest | Planned |
-| SQLite persistence | Planned |
-| Unique keys per stream | Planned |
-| Nginx-RTMP-compatible /stats | Planned |
-| REST API | Planned |
-| Per-stream stats | Planned |
-| Persistent stats history | Planned |
-| Multi-node | Future |
 
 ---
 
