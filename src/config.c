@@ -170,15 +170,21 @@ bool config_load(const char *path, server_config_t *config, char *error, size_t 
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    char *json = malloc(len + 1);
+    if (len < 0) {
+        fclose(f);
+        snprintf(error, errlen, "Cannot determine config file size: %s", path);
+        return false;
+    }
+
+    char *json = malloc((size_t)len + 1);
     if (!json) {
         fclose(f);
         snprintf(error, errlen, "Out of memory");
         return false;
     }
 
-    fread(json, 1, len, f);
-    json[len] = '\0';
+    size_t got = fread(json, 1, (size_t)len, f);
+    json[got] = '\0';
     fclose(f);
 
     /* Top-level keys */

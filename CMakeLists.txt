@@ -12,7 +12,7 @@ set(LRTMP2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/librtmp2" CACHE PATH "librtmp2 sourc
 
 if(NOT EXISTS "${LRTMP2_DIR}/include/librtmp2/librtmp2.h")
     message(FATAL_ERROR "librtmp2 not found at ${LRTMP2_DIR}. "
-                        "Clone it as a sibling: git clone https://github.com/AlexanderWagnerDev/librtmp2.git")
+                        "Clone it as a sibling: git clone https://github.com/OpenRTMP/librtmp2.git")
 endif()
 
 # Use the pre-built .a if available, otherwise build from sources
@@ -38,6 +38,9 @@ FetchContent_MakeAvailable(mongoose)
 find_package(SQLite3 REQUIRED)
 
 # --- Server library ---
+# mongoose.c (the amalgamated HTTP engine) must be compiled into the library;
+# FetchContent only makes its sources available, it does not build a linkable
+# target here, so http.c's mongoose symbols would otherwise be undefined at link.
 add_library(lrtmp2server_lib STATIC
     src/server.c
     src/config.c
@@ -45,6 +48,7 @@ add_library(lrtmp2server_lib STATIC
     src/http.c
     src/rtmp_callbacks.c
     src/logger.c
+    ${mongoose_SOURCE_DIR}/mongoose.c
 )
 
 target_include_directories(lrtmp2server_lib

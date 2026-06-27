@@ -2,9 +2,17 @@
 # Quick build without CMake. For full builds use CMake.
 
 CC ?= gcc
+
+# librtmp2 dependency location. Local development keeps it as a sibling
+# checkout (../librtmp2); CI clones it into a subdirectory of the workspace
+# (./librtmp2). Auto-detect whichever exists (falling back to the sibling
+# path), and allow an explicit override, e.g. `make LRTMP2_DIR=/path/to/librtmp2`.
+LRTMP2_DIR ?= $(firstword $(wildcard ../librtmp2 librtmp2) ../librtmp2)
+LRTMP2_A = $(LRTMP2_DIR)/liblibrtmp2.a
+
 CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes
 CFLAGS += -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-CFLAGS += -Iinclude -I../librtmp2/include -I../librtmp2/src
+CFLAGS += -Iinclude -I$(LRTMP2_DIR)/include -I$(LRTMP2_DIR)/src
 
 # Mongoose
 MONGOOSE_DIR = build/mongoose
@@ -22,10 +30,6 @@ ifeq ($(SQLITE_CFLAGS),)
     SQLITE_LIBS = -L/home/linuxbrew/.linuxbrew/lib -lsqlite3
   endif
 endif
-
-# librtmp2 (sibling checkout, matches the include paths above)
-LRTMP2_DIR = ../librtmp2
-LRTMP2_A = $(LRTMP2_DIR)/liblibrtmp2.a
 
 ifdef DEBUG
   CFLAGS += -g -O0 -DDEBUG

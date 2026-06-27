@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <time.h>
 
 struct http_server {
@@ -70,6 +71,99 @@ static void err_xml(struct mg_connection *c, int status, const char *msg)
     send_xml(c, status, buf, (size_t)n);
 }
 
+/* ---------- dynamic string buffer (grows; never overflows) ----------
+ *
+ * The stats builders previously accumulated into a fixed 64 KB buffer with
+ * `off += snprintf(buf + off, cap - off, ...)`. Once the cumulative output
+ * exceeded the buffer, `cap - off` underflowed to a huge size_t and the next
+ * snprintf wrote out of bounds (heap overflow). This grows on demand instead. */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} dynbuf_t;
+
+static int dyn_init(dynbuf_t *d, size_t initial)
+{
+    d->buf = malloc(initial);
+    if (!d->buf) { d->len = d->cap = 0; return -1; }
+    d->len = 0;
+    d->cap = initial;
+    d->buf[0] = '\0';
+    return 0;
+}
+
+/* Append printf-style, growing as needed. On OOM the buffer is left valid and
+ * unchanged; callers detect failure via the final length / a NULL result. */
+static void dyn_appendf(dynbuf_t *d, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need < 0) return;
+
+    if (d->len + (size_t)need + 1 > d->cap) {
+        size_t ncap = d->cap ? d->cap : 1024;
+        while (ncap < d->len + (size_t)need + 1) ncap *= 2;
+        char *nb = realloc(d->buf, ncap);
+        if (!nb) return;
+        d->buf = nb;
+        d->cap = ncap;
+    }
+
+    va_start(ap, fmt);
+    vsnprintf(d->buf + d->len, d->cap - d->len, fmt, ap);
+    va_end(ap);
+    d->len += (size_t)need;
+}
+
+/* ---------- output escaping (prevents JSON/XML injection) ----------
+ *
+ * Stream/app/codec/address strings are attacker- or operator-supplied (the
+ * RTMP `app` is set by the publishing client). Emitting them raw lets a peer
+ * inject structure into the stats JSON/XML. Both helpers always NUL-terminate
+ * and truncate safely if `out` is too small. */
+static void json_escape(const char *in, char *out, size_t outcap)
+{
+    size_t o = 0;
+    if (outcap == 0) return;
+    for (size_t i = 0; in && in[i] && o + 7 < outcap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        switch (c) {
+            case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+            case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+            case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+            case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+            case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+            default:
+                if (c < 0x20) o += (size_t)snprintf(out + o, outcap - o, "\\u%04x", c);
+                else          out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+static void xml_escape(const char *in, char *out, size_t outcap)
+{
+    size_t o = 0;
+    if (outcap == 0) return;
+    for (size_t i = 0; in && in[i] && o + 7 < outcap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        switch (c) {
+            case '&':  memcpy(out + o, "&amp;", 5);  o += 5; break;
+            case '<':  memcpy(out + o, "&lt;", 4);   o += 4; break;
+            case '>':  memcpy(out + o, "&gt;", 4);   o += 4; break;
+            case '"':  memcpy(out + o, "&quot;", 6); o += 6; break;
+            case '\'': memcpy(out + o, "&apos;", 6); o += 6; break;
+            default:
+                /* Drop control chars XML 1.0 forbids; pass the rest through. */
+                if (c >= 0x20 || c == '\t' || c == '\n' || c == '\r') out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
 static int query_var(const struct mg_http_message *hm, const char *name, char *out, size_t outlen)
 {
     char tmp[512];
@@ -86,6 +180,22 @@ static int query_var(const struct mg_http_message *hm, const char *name, char *o
 
 /* ---------- auth ---------- */
 
+/* Length-padded, content-constant-time string equality, so token validation
+ * does not leak the secret one byte at a time via response timing. (Length
+ * equality may still be observable; the token's entropy is in its bytes.) */
+static bool ct_str_eq(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    size_t n = la > lb ? la : lb;
+    unsigned char diff = (unsigned char)(la ^ lb);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = i < la ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < lb ? (unsigned char)b[i] : 0;
+        diff |= (unsigned char)(ca ^ cb);
+    }
+    return diff == 0;
+}
+
 static bool bearer_ok(struct http_server *http, const struct mg_http_message *hm)
 {
     if (!http->config.api_token[0]) return true;
@@ -101,7 +211,7 @@ static bool bearer_ok(struct http_server *http, const struct mg_http_message *hm
         if (tok[i] == '\r' || tok[i] == '\n' || tok[i] == ' ') tok[i] = '\0';
         else break;
     }
-    return strcmp(tok, http->config.api_token) == 0;
+    return ct_str_eq(tok, http->config.api_token);
 }
 
 static bool stats_key_ok(struct http_server *http, const char *key, const char *stream_id)
@@ -118,9 +228,11 @@ static bool stats_key_ok(struct http_server *http, const char *key, const char *
 static void build_json_stats(struct http_server *http, const char *stream_id,
                               char **out, size_t *outlen)
 {
-    size_t cap = 65536;
-    char *buf = malloc(cap);
-    int off = 0;
+    *out = NULL;
+    *outlen = 0;
+
+    dynbuf_t d;
+    if (dyn_init(&d, 8192) != 0) return;
 
     db_publisher_t *pubs = NULL; int pub_cnt = 0;
     db_player_t *players = NULL; int player_cnt = 0;
@@ -133,14 +245,19 @@ static void build_json_stats(struct http_server *http, const char *stream_id,
         db_player_list_all(http->db, &players, &player_cnt);
     }
 
-    off += snprintf(buf + off, cap - (size_t)off, "{\"streams\":[");
+    dyn_appendf(&d, "{\"streams\":[");
 
     for (int i = 0; i < pub_cnt; i++) {
         db_publisher_t *p = &pubs[i];
-        time_t now = time(NULL);
-        int uptime_s = (int)(now - p->connected_at);
+        int uptime_s = (int)(time(NULL) - p->connected_at);
+        char e_name[1024], e_app[1024], e_vcodec[256], e_acodec[256], e_addr[512];
+        json_escape(p->stream_name, e_name, sizeof(e_name));
+        json_escape(p->app, e_app, sizeof(e_app));
+        json_escape(p->video_codec, e_vcodec, sizeof(e_vcodec));
+        json_escape(p->audio_codec, e_acodec, sizeof(e_acodec));
+        json_escape(p->remote_addr, e_addr, sizeof(e_addr));
 
-        off += snprintf(buf + off, cap - (size_t)off,
+        dyn_appendf(&d,
             "%s{"
             "\"id\":\"%s\","
             "\"name\":\"%s\","
@@ -153,22 +270,26 @@ static void build_json_stats(struct http_server *http, const char *stream_id,
             "\"client\":{\"address\":\"%s\",\"publisher\":true}"
             "}",
             i > 0 ? "," : "",
-            p->stream_name, p->stream_name, p->app,
+            e_name, e_name, e_app,
             uptime_s, p->bitrate_kbps,
             (unsigned long long)p->bytes_in,
-            p->video_codec, p->video_width, p->video_height, p->fps,
-            p->audio_codec,
-            p->remote_addr);
+            e_vcodec, p->video_width, p->video_height, p->fps,
+            e_acodec,
+            e_addr);
     }
 
     /* Players grouped by stream */
-    off += snprintf(buf + off, cap - (size_t)off, "],\"players\":[");
+    dyn_appendf(&d, "],\"players\":[");
     for (int i = 0; i < player_cnt; i++) {
         db_player_t *pl = &players[i];
-        time_t now = time(NULL);
-        int uptime_s = (int)(now - pl->connected_at);
+        int uptime_s = (int)(time(NULL) - pl->connected_at);
+        char e_id[512], e_name[1024], e_app[1024], e_addr[512];
+        json_escape(pl->id, e_id, sizeof(e_id));
+        json_escape(pl->stream_name, e_name, sizeof(e_name));
+        json_escape(pl->app, e_app, sizeof(e_app));
+        json_escape(pl->remote_addr, e_addr, sizeof(e_addr));
 
-        off += snprintf(buf + off, cap - (size_t)off,
+        dyn_appendf(&d,
             "%s{"
             "\"id\":\"%s\","
             "\"stream_name\":\"%s\","
@@ -179,21 +300,21 @@ static void build_json_stats(struct http_server *http, const char *stream_id,
             "\"client\":{\"address\":\"%s\"}"
             "}",
             i > 0 ? "," : "",
-            pl->id, pl->stream_name, pl->app,
+            e_id, e_name, e_app,
             uptime_s, pl->bitrate_kbps,
             (unsigned long long)pl->bytes_out,
-            pl->remote_addr);
+            e_addr);
     }
 
-    off += snprintf(buf + off, cap - (size_t)off,
+    dyn_appendf(&d,
         "],\"summary\":{\"publishers\":%d,\"players\":%d,\"total_clients\":%d}}",
         pub_cnt, player_cnt, pub_cnt + player_cnt);
 
     db_publisher_free_list(pubs);
     db_player_free_list(players);
 
-    *out = buf;
-    *outlen = (size_t)off;
+    *out = d.buf;
+    *outlen = d.len;
 }
 
 /* ---------- XML stats (nginx-rtmp compatible) ---------- */
@@ -201,9 +322,11 @@ static void build_json_stats(struct http_server *http, const char *stream_id,
 static void build_nginx_xml(struct http_server *http, const char *stream_id,
                              char **out, size_t *outlen)
 {
-    size_t cap = 65536;
-    char *buf = malloc(cap);
-    int off = 0;
+    *out = NULL;
+    *outlen = 0;
+
+    dynbuf_t d;
+    if (dyn_init(&d, 8192) != 0) return;
 
     db_publisher_t *pubs = NULL; int pub_cnt = 0;
     db_player_t *players = NULL; int player_cnt = 0;
@@ -216,17 +339,21 @@ static void build_nginx_xml(struct http_server *http, const char *stream_id,
         db_player_list_all(http->db, &players, &player_cnt);
     }
 
-    off += snprintf(buf + off, cap - (size_t)off,
+    dyn_appendf(&d,
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rtmp>\n  <server>\n"
         "    <application>\n      <name>live</name>\n      <live>\n");
 
     for (int i = 0; i < pub_cnt; i++) {
         db_publisher_t *p = &pubs[i];
-        time_t now = time(NULL);
-        int uptime_ms = (int)(now - p->connected_at) * 1000;
+        int uptime_ms = (int)(time(NULL) - p->connected_at) * 1000;
         int bw_in = (int)(p->bitrate_kbps * 1000);
+        char e_name[1024], e_vcodec[256], e_acodec[256], e_addr[512];
+        xml_escape(p->stream_name, e_name, sizeof(e_name));
+        xml_escape(p->video_codec, e_vcodec, sizeof(e_vcodec));
+        xml_escape(p->audio_codec, e_acodec, sizeof(e_acodec));
+        xml_escape(p->remote_addr, e_addr, sizeof(e_addr));
 
-        off += snprintf(buf + off, cap - (size_t)off,
+        dyn_appendf(&d,
             "        <stream>\n"
             "          <name>%s</name>\n"
             "          <time>%d</time>\n"
@@ -234,11 +361,11 @@ static void build_nginx_xml(struct http_server *http, const char *stream_id,
             "          <bytes_in>%llu</bytes_in>\n"
             "          <bw_out>0</bw_out>\n"
             "          <bytes_out>0</bytes_out>\n",
-            p->stream_name, uptime_ms, bw_in,
+            e_name, uptime_ms, bw_in,
             (unsigned long long)p->bytes_in);
 
         if (p->video_codec[0]) {
-            off += snprintf(buf + off, cap - (size_t)off,
+            dyn_appendf(&d,
                 "          <video>\n"
                 "            <width>%u</width>\n"
                 "            <height>%u</height>\n"
@@ -247,20 +374,20 @@ static void build_nginx_xml(struct http_server *http, const char *stream_id,
                 "            <profile>baseline</profile>\n"
                 "            <level>3.1</level>\n"
                 "          </video>\n",
-                p->video_width, p->video_height, p->fps, p->video_codec);
+                p->video_width, p->video_height, p->fps, e_vcodec);
         }
 
         if (p->audio_codec[0]) {
-            off += snprintf(buf + off, cap - (size_t)off,
+            dyn_appendf(&d,
                 "          <audio>\n"
                 "            <codec>%s</codec>\n"
                 "            <sample_rate>44100</sample_rate>\n"
                 "            <channels>2</channels>\n"
                 "          </audio>\n",
-                p->audio_codec);
+                e_acodec);
         }
 
-        off += snprintf(buf + off, cap - (size_t)off,
+        dyn_appendf(&d,
             "          <client>\n"
             "            <address>%s</address>\n"
             "            <time>%d</time>\n"
@@ -272,15 +399,17 @@ static void build_nginx_xml(struct http_server *http, const char *stream_id,
             "            <publisher>1</publisher>\n"
             "          </client>\n"
             "        </stream>\n",
-            p->remote_addr, uptime_ms, uptime_ms);
+            e_addr, uptime_ms, uptime_ms);
     }
 
     for (int i = 0; i < player_cnt; i++) {
         db_player_t *pl = &players[i];
-        time_t now = time(NULL);
-        int uptime_ms = (int)(now - pl->connected_at) * 1000;
+        int uptime_ms = (int)(time(NULL) - pl->connected_at) * 1000;
+        char e_name[1024], e_addr[512];
+        xml_escape(pl->stream_name, e_name, sizeof(e_name));
+        xml_escape(pl->remote_addr, e_addr, sizeof(e_addr));
 
-        off += snprintf(buf + off, cap - (size_t)off,
+        dyn_appendf(&d,
             "        <stream>\n"
             "          <name>%s</name>\n"
             "          <time>%d</time>\n"
@@ -299,13 +428,13 @@ static void build_nginx_xml(struct http_server *http, const char *stream_id,
             "            <publisher>0</publisher>\n"
             "          </client>\n"
             "        </stream>\n",
-            pl->stream_name, uptime_ms,
+            e_name, uptime_ms,
             (int)(pl->bitrate_kbps * 1000),
             (unsigned long long)pl->bytes_out,
-            pl->remote_addr, uptime_ms, uptime_ms);
+            e_addr, uptime_ms, uptime_ms);
     }
 
-    off += snprintf(buf + off, cap - (size_t)off,
+    dyn_appendf(&d,
         "        <nclients>%d</nclients>\n"
         "      </live>\n    </application>\n  </server>\n</rtmp>\n",
         pub_cnt + player_cnt);
@@ -313,8 +442,8 @@ static void build_nginx_xml(struct http_server *http, const char *stream_id,
     db_publisher_free_list(pubs);
     db_player_free_list(players);
 
-    *out = buf;
-    *outlen = (size_t)off;
+    *out = d.buf;
+    *outlen = d.len;
 }
 
 /* ---------- handlers ---------- */
@@ -344,6 +473,7 @@ static void handle_stats_json(struct mg_connection *c, struct http_server *http,
 
     char *json = NULL; size_t jlen = 0;
     build_json_stats(http, s.id, &json, &jlen);
+    if (!json) { err_json(c, 500, "INTERNAL", "Out of memory"); return; }
     send_json(c, 200, json, jlen);
     free(json);
 }
@@ -364,6 +494,7 @@ static void handle_stats_nginx(struct mg_connection *c, struct http_server *http
 
     char *xml = NULL; size_t xlen = 0;
     build_nginx_xml(http, s.id, &xml, &xlen);
+    if (!xml) { err_xml(c, 500, "Out of memory"); return; }
     send_xml(c, 200, xml, xlen);
     free(xml);
 }
@@ -377,26 +508,31 @@ static void handle_streams_list(struct mg_connection *c, struct http_server *htt
     db_stream_t *streams = NULL; int count = 0;
     db_stream_list(http->db, &streams, &count);
 
-    size_t cap = 4096 + (size_t)count * 256;
-    char *buf = malloc(cap);
-    if (!buf) { db_stream_free_list(streams); err_json(c, 500, "INTERNAL", "Out of memory"); return; }
-    int off = snprintf(buf, cap, "[");
+    dynbuf_t d;
+    if (dyn_init(&d, 4096) != 0) {
+        db_stream_free_list(streams);
+        err_json(c, 500, "INTERNAL", "Out of memory");
+        return;
+    }
+    dyn_appendf(&d, "[");
     for (int i = 0; i < count; i++) {
         /* Never expose keys in list view */
-        int written = snprintf(buf + off, cap - (size_t)off,
+        char e_id[1024], e_name[1024], e_app[1024];
+        json_escape(streams[i].id, e_id, sizeof(e_id));
+        json_escape(streams[i].name, e_name, sizeof(e_name));
+        json_escape(streams[i].app, e_app, sizeof(e_app));
+        dyn_appendf(&d,
             "%s{\"id\":\"%s\",\"name\":\"%s\",\"app\":\"%s\",\"enabled\":%s,\"created_at\":%ld}",
             i > 0 ? "," : "",
-            streams[i].id, streams[i].name, streams[i].app,
+            e_id, e_name, e_app,
             streams[i].enabled ? "true" : "false",
             (long)streams[i].created_at);
-        if (written > 0) off += written;
     }
-    off += snprintf(buf + off, cap - (size_t)off, "]");
+    dyn_appendf(&d, "]");
 
     db_stream_free_list(streams);
-    send_json(c, 200, buf, (size_t)off);
-    free(buf);
-    db_stream_free_list(streams);
+    send_json(c, 200, d.buf, d.len);
+    free(d.buf);
 }
 
 /* POST /api/v1/streams  → creates stream, returns keys */
@@ -493,6 +629,7 @@ static void handle_stream_stats(struct mg_connection *c, struct http_server *htt
 
     char *json = NULL; size_t jlen = 0;
     build_json_stats(http, id, &json, &jlen);
+    if (!json) { err_json(c, 500, "INTERNAL", "Out of memory"); return; }
     send_json(c, 200, json, jlen);
     free(json);
 }
