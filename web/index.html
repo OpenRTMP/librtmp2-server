@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>librtmp2-server — Dashboard</title>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --surface: #1a1d27;
+            --surface2: #242836;
+            --text: #e4e6f0;
+            --text-dim: #8b8fa8;
+            --accent: #6c5ce7;
+            --green: #00b894;
+            --red: #ff6b6b;
+            --yellow: #ffc048;
+            --blue: #74b9ff;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        .header {
+            background: var(--surface);
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--surface2);
+        }
+        .header h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+        .header h1 span { color: var(--accent); }
+        .header .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-dim);
+        }
+        .status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            background: var(--surface);
+            border-radius: 12px;
+            padding: 1.5rem;
+            border: 1px solid var(--surface2);
+        }
+        .card h3 {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-dim);
+            margin-bottom: 0.5rem;
+        }
+        .card .value {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        .card .value.green { color: var(--green); }
+        .card .value.blue { color: var(--blue); }
+        .card .value.yellow { color: var(--yellow); }
+        .section-title {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: var(--text-dim);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--surface);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--surface2);
+        }
+th {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-dim);
+        }
+        .badge {
+            display: inline-block;
+            padding: 0.2rem 0.6rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .badge.live { background: rgba(0,184,148,0.2); color: var(--green); }
+        .badge.offline { background: rgba(139,143,168,0.2); color: var(--text-dim); }
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-dim);
+            font-size: 0.75rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>librtmp2<span>-server</span></h1>
+        <div class="status">
+            <div class="status-dot"></div>
+            <span id="uptime">connecting...</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="grid">
+            <div class="card">
+                <h3>Active Sessions</h3>
+                <div class="value green" id="active-sessions">—</div>
+            </div>
+            <div class="card">
+                <h3>Publishers</h3>
+                <div class="value blue" id="active-publishers">—</div>
+            </div>
+            <div class="card">
+                <h3>Players</h3>
+                <div class="value yellow" id="active-players">—</div>
+            </div>
+            <div class="card">
+                <h3>Total Streams</h3>
+                <div class="value" id="total-streams">—</div>
+            </div>
+        </div>
+
+        <h2 class="section-title">Active Streams</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Stream</th>
+                    <th>Status</th>
+                    <th>Sessions</th>
+                    <th>Codec</th>
+                    <th>Bitrate</th>
+                </tr>
+            </thead>
+            <tbody id="streams-body">
+                <tr><td colspan="5" style="text-align:center;color:var(--text-dim)">No active streams</td></tr>
+            </tbody>
+        </table>
+
+        <h2 class="section-title" style="margin-top:2rem">Sessions</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Role</th>
+                    <th>Stream</th>
+                    <th>Remote</th>
+                    <th>Duration</th>
+                </tr>
+            </thead>
+            <tbody id="sessions-body">
+                <tr><td colspan="5" style="text-align:center;color:var(--text-dim)">No active sessions</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="footer">librtmp2-server v0.1.0 — Built on librtmp2</div>
+
+    <script>
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/v1/stats/overview');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                document.getElementById('active-sessions').textContent = data.active_sessions || 0;
+                document.getElementById('active-publishers').textContent = data.active_publishers || 0;
+                document.getElementById('active-players').textContent = data.active_players || 0;
+                document.getElementById('total-streams').textContent = data.total_streams || 0;
+
+                const uptime = data.uptime || 0;
+                const h = Math.floor(uptime / 3600);
+                const m = Math.floor((uptime % 3600) / 60);
+                const s = uptime % 60;
+                document.getElementById('uptime').textContent =
+                    `${h}h ${m}m ${s}s`;
+            } catch (e) {
+                document.getElementById('uptime').textContent = 'offline';
+            }
+        }
+
+        fetchStats();
+        setInterval(fetchStats, 5000);
+    </script>
+</body>
+</html>

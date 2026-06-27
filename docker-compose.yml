@@ -1,0 +1,11 @@
+services:
+  librtmp2-server:
+    build: .
+    image: alexanderwagnerdev/librtmp2-server:latest
+    container_name: librtmp2-server
+    ports:
+      - "1935:1935"   # RTMP
+      - "8080:8080"   # HTTP API + UI
+    volumes:
+      - ./config.json:/etc/librtmp2-server/config.json:ro
+    restart: unless-stopped
