@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     cmake \
     git \
     linux-headers \
+    sqlite3 \
     pkgconf \
     openssl-dev
 
