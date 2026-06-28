@@ -19,12 +19,19 @@ jobs:
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
 
-    - name: Clone librtmp2
-      uses: actions/checkout@v7
-      with:
-        repository: OpenRTMP/librtmp2
-        path: librtmp2
-        token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Clone librtmp2 (matching PR branch if it exists, else default)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REF: ${{ github.head_ref }}
+      run: |
+        AUTH="https://x-access-token:${GH_TOKEN}@github.com/OpenRTMP/librtmp2.git"
+        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$AUTH" "$REF" >/dev/null 2>&1; then
+          echo "Using librtmp2 branch $REF (matches this PR)"
+          git clone --depth 1 --branch "$REF" "$AUTH" librtmp2
+        else
+          echo "Using librtmp2 default branch"
+          git clone --depth 1 "$AUTH" librtmp2
+        fi
 
     - name: Build librtmp2
       run: make -C librtmp2 release
@@ -58,12 +65,19 @@ jobs:
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev libssl-dev
 
-    - name: Clone librtmp2
-      uses: actions/checkout@v7
-      with:
-        repository: OpenRTMP/librtmp2
-        path: librtmp2
-        token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Clone librtmp2 (matching PR branch if it exists, else default)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REF: ${{ github.head_ref }}
+      run: |
+        AUTH="https://x-access-token:${GH_TOKEN}@github.com/OpenRTMP/librtmp2.git"
+        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$AUTH" "$REF" >/dev/null 2>&1; then
+          echo "Using librtmp2 branch $REF (matches this PR)"
+          git clone --depth 1 --branch "$REF" "$AUTH" librtmp2
+        else
+          echo "Using librtmp2 default branch"
+          git clone --depth 1 "$AUTH" librtmp2
+        fi
 
     - name: Build librtmp2
       run: make -C librtmp2 release
