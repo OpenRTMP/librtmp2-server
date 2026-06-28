@@ -40,6 +40,5 @@ jobs:
           push: true
           tags: |
             ghcr.io/openrtmp/librtmp2-server:latest
+            ghcr.io/openrtmp/librtmp2-server:beta
             ghcr.io/openrtmp/librtmp2-server:alpha
-            ghcr.io/openrtmp/librtmp2-server:v0.1.0
-            ghcr.io/openrtmp/librtmp2-server:0.1.0
