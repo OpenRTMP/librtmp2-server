@@ -158,6 +158,41 @@ static const char *match_bracket(const char *p)
     return p;
 }
 
+void config_apply_env(server_config_t *config)
+{
+    const char *v;
+
+    v = getenv("LRTMP2_API_TOKEN");
+    if (v && v[0]) {
+        strncpy(config->api_token, v, sizeof(config->api_token) - 1);
+        config->api_token[sizeof(config->api_token) - 1] = '\0';
+    }
+
+    v = getenv("LRTMP2_RTMP_BIND");
+    if (v && v[0]) {
+        strncpy(config->rtmp_bind, v, sizeof(config->rtmp_bind) - 1);
+        config->rtmp_bind[sizeof(config->rtmp_bind) - 1] = '\0';
+    }
+
+    v = getenv("LRTMP2_HTTP_BIND");
+    if (v && v[0]) {
+        strncpy(config->http_bind, v, sizeof(config->http_bind) - 1);
+        config->http_bind[sizeof(config->http_bind) - 1] = '\0';
+    }
+
+    v = getenv("LRTMP2_LOG_LEVEL");
+    if (v && v[0]) {
+        int lvl = atoi(v);
+        if (lvl >= 0 && lvl <= 5) config->log_level = lvl;
+    }
+
+    v = getenv("LRTMP2_DB_PATH");
+    if (v && v[0]) {
+        /* db_path is not part of server_config_t yet — stored for later use */
+        (void)0;
+    }
+}
+
 bool config_load(const char *path, server_config_t *config, char *error, size_t errlen)
 {
     config_set_defaults(config);

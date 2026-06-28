@@ -13,6 +13,7 @@ extern "C" {
 
 /* Load config from JSON file. Zero-out config first as defaults. */
 bool config_load(const char *path, server_config_t *config, char *error, size_t errlen);
+void config_apply_env(server_config_t *config);
 
 /* Load default config */
 void config_set_defaults(server_config_t *config);

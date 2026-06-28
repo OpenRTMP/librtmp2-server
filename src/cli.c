@@ -67,6 +67,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "No config file at %s, using defaults\n", config_path);
     }
 
+    /* Environment variables override config file values */
+    config_apply_env(&config);
+
     if (verbose) config.log_level = 3;
 
     /* If auth.api_token is still empty after config load, the server would
