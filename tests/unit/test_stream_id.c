@@ -130,27 +130,56 @@ static int test_on_close_matches_correct_publisher(void)
     db_publisher_update(db, pubs[0].id, &pubs[0]);
     db_publisher_free_list(pubs);
 
-    /* Verify pub2 is still active */
-    db_publisher_t *all_pubs = NULL;
-    int all_count = 0;
-    db_publisher_list_all(db, &all_pubs, &all_count);
+    /* Verify pub2 is still active by fetching it directly */
+    db_publisher_t *active_pubs = NULL;
+    int active_count = 0;
+    db_publisher_list(db, "stream2", &active_pubs, &active_count);
 
-    if (all_count != 2) {
-        fprintf(stderr, "FAIL: expected 2 total publishers, got %d\n", all_count);
-        db_publisher_free_list(all_pubs);
+    if (active_count != 1) {
+        fprintf(stderr, "FAIL: expected 1 active publisher for stream2, got %d\n", active_count);
+        db_publisher_free_list(active_pubs);
         db_close(db);
         return 1;
     }
 
-    if (all_pubs[0].active == all_pubs[1].active) {
-        fprintf(stderr, "FAIL: expected one active and one inactive publisher\n");
-        db_publisher_free_list(all_pubs);
+    if (!active_pubs[0].active) {
+        fprintf(stderr, "FAIL: pub2 should still be active after on_close of pub1\n");
+        db_publisher_free_list(active_pubs);
+        db_close(db);
+        return 1;
+    }
+
+    if (strcmp(active_pubs[0].id, "pub_1000_def") != 0) {
+        fprintf(stderr, "FAIL: wrong publisher returned for stream2: %s\n", active_pubs[0].id);
+        db_publisher_free_list(active_pubs);
+        db_close(db);
+        return 1;
+    }
+
+    /* Also verify pub1 is now inactive */
+    db_publisher_t *stream1_pubs = NULL;
+    int stream1_count = 0;
+    db_publisher_list(db, "stream1", &stream1_pubs, &stream1_count);
+
+    if (stream1_count != 1) {
+        fprintf(stderr, "FAIL: expected 1 publisher for stream1, got %d\n", stream1_count);
+        db_publisher_free_list(stream1_pubs);
+        db_publisher_free_list(active_pubs);
+        db_close(db);
+        return 1;
+    }
+
+    if (stream1_pubs[0].active) {
+        fprintf(stderr, "FAIL: pub1 should be inactive after on_close\n");
+        db_publisher_free_list(stream1_pubs);
+        db_publisher_free_list(active_pubs);
         db_close(db);
         return 1;
     }
 
     printf("PASS: test_on_close_matches_correct_publisher\n");
-    db_publisher_free_list(all_pubs);
+    db_publisher_free_list(stream1_pubs);
+    db_publisher_free_list(active_pubs);
     db_close(db);
     return 0;
 }

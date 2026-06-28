@@ -41,7 +41,7 @@ int test_keygen_main(void)
             return 1;
         }
 
-        strncpy(ids[i], pub.id, sizeof(ids[i]) - 1);
+        snprintf(ids[i], sizeof(ids[i]), "%s", pub.id);
     }
 
     for (int i = 0; i < 100; i++) {
