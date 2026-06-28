@@ -6,7 +6,7 @@ RUN apk add --no-cache \
     cmake \
     git \
     linux-headers \
-    sqlite \
+    sqlite-dev \
     pkgconf \
     openssl-dev
 
@@ -30,7 +30,7 @@ RUN mkdir build && cd build && \
 # Runtime stage
 FROM alpine:latest
 
-RUN apk add --no-cache libstdc++ libgcc openssl
+RUN apk add --no-cache libstdc++ libgcc openssl sqlite
 
 COPY --from=builder /build/server/build/librtmp2-server /usr/local/bin/
 COPY --from=builder /build/server/config.example.json /etc/librtmp2-server/config.json
