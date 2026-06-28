@@ -57,6 +57,7 @@ OBS / FFmpeg / App
 - C11 compiler (gcc / clang)
 - CMake >= 3.16
 - pthread + SQLite3 dev
+- OpenSSL dev (for RTMPS; optional — see below)
 - [librtmp2](https://github.com/OpenRTMP/librtmp2)
 
 ### Compile
@@ -97,6 +98,11 @@ Or with CLI flags:
     "max_connections": 100,
     "chunk_size": 4096
   },
+  "tls": {
+    "enabled": false,
+    "cert_file": "/etc/librtmp2-server/fullchain.pem",
+    "key_file": "/etc/librtmp2-server/privkey.pem"
+  },
   "http": {
     "bind": "0.0.0.0:8080"
   },
@@ -107,6 +113,32 @@ Or with CLI flags:
   "log_file": ""
 }
 ```
+
+---
+
+## RTMPS (TLS)
+
+RTMPS termination is provided by librtmp2 (OpenSSL) and is **built in by
+default**. To enable it, set `tls.enabled` and point at a PEM certificate chain
+and private key:
+
+```json
+"tls": { "enabled": true, "cert_file": "/path/fullchain.pem", "key_file": "/path/privkey.pem" }
+```
+
+Equivalent environment variables: `LRTMP2_TLS_ENABLED=1`,
+`LRTMP2_TLS_CERT_FILE`, `LRTMP2_TLS_KEY_FILE`. When `tls.enabled` is `false`
+(the default) the listener speaks plaintext RTMP.
+
+To build **without** TLS (no OpenSSL dependency), disable it in both projects:
+
+```bash
+make TLS=0                      # Makefile build
+cmake .. -DENABLE_TLS=OFF       # CMake build
+```
+
+Enabling TLS in the config while the library was built without it is refused at
+startup with a clear error.
 
 ---
 

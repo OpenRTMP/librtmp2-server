@@ -4,6 +4,11 @@
     "max_connections": 100,
     "chunk_size": 4096
   },
+  "tls": {
+    "enabled": false,
+    "cert_file": "/etc/librtmp2-server/fullchain.pem",
+    "key_file": "/etc/librtmp2-server/privkey.pem"
+  },
   "http": {
     "bind": "0.0.0.0:8080"
   },

@@ -180,6 +180,32 @@ void config_apply_env(server_config_t *config)
         config->http_bind[sizeof(config->http_bind) - 1] = '\0';
     }
 
+    v = getenv("LRTMP2_TLS_ENABLED");
+    if (v && v[0]) {
+        /* Only recognized values flip the flag; a typo or unsupported form
+         * leaves the configured value untouched rather than silently
+         * downgrading to plaintext. */
+        if (strcmp(v, "1") == 0 || strcmp(v, "true") == 0) {
+            config->tls_enabled = true;
+        } else if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0) {
+            config->tls_enabled = false;
+        } else {
+            log_warn("Ignoring invalid LRTMP2_TLS_ENABLED value '%s' (expected 1/0/true/false)", v);
+        }
+    }
+
+    v = getenv("LRTMP2_TLS_CERT_FILE");
+    if (v && v[0]) {
+        strncpy(config->tls_cert_file, v, sizeof(config->tls_cert_file) - 1);
+        config->tls_cert_file[sizeof(config->tls_cert_file) - 1] = '\0';
+    }
+
+    v = getenv("LRTMP2_TLS_KEY_FILE");
+    if (v && v[0]) {
+        strncpy(config->tls_key_file, v, sizeof(config->tls_key_file) - 1);
+        config->tls_key_file[sizeof(config->tls_key_file) - 1] = '\0';
+    }
+
     v = getenv("LRTMP2_LOG_LEVEL");
     if (v && v[0]) {
         int lvl = atoi(v);
@@ -243,6 +269,20 @@ bool config_load(const char *path, server_config_t *config, char *error, size_t 
         get_string(buf, "bind", config->rtmp_bind, sizeof(config->rtmp_bind));
         get_int(buf, "max_connections", &config->rtmp_max_conn);
         get_int(buf, "chunk_size", &config->rtmp_chunk_size);
+    }
+
+    /* tls object (RTMPS) */
+    const char *tls = find_object(json, "tls");
+    if (tls) {
+        const char *end = match_brace(tls);
+        char buf[1024];
+        size_t blen = end - tls + 1;
+        if (blen > sizeof(buf) - 1) blen = sizeof(buf) - 1;
+        memcpy(buf, tls, blen);
+        buf[blen] = '\0';
+        get_bool(buf, "enabled", &config->tls_enabled);
+        get_string(buf, "cert_file", config->tls_cert_file, sizeof(config->tls_cert_file));
+        get_string(buf, "key_file", config->tls_key_file, sizeof(config->tls_key_file));
     }
 
     /* http object */

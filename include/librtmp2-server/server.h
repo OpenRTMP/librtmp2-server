@@ -20,6 +20,15 @@ typedef struct {
     int  rtmp_max_conn;
     int  rtmp_chunk_size;
 
+    /* RTMPS (TLS) — off by default. Enable to terminate TLS on the RTMP
+     * listener; requires a PEM certificate chain and private key. librtmp2
+     * ships with TLS built in by default, so the operator toggles it here. If
+     * the linked librtmp2 was built without TLS, enabling this is refused at
+     * startup. */
+    bool tls_enabled;
+    char tls_cert_file[256];  /* PEM certificate chain */
+    char tls_key_file[256];   /* PEM private key */
+
     /* HTTP API + UI */
     char http_bind[64];       /* e.g. "0.0.0.0:8080" */
 

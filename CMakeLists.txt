@@ -6,6 +6,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Options
 option(ENABLE_TESTS "Build tests" ON)
+# RTMPS / TLS via OpenSSL. On by default to match librtmp2's default build;
+# turn OFF (-DENABLE_TLS=OFF) for a plaintext-only, OpenSSL-free build.
+option(ENABLE_TLS "RTMPS/TLS support via OpenSSL" ON)
+
+if(ENABLE_TLS)
+    find_package(OpenSSL REQUIRED)
+endif()
 
 # --- librtmp2 (from workspace sibling) ---
 set(LRTMP2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/librtmp2" CACHE PATH "librtmp2 source dir")
@@ -22,6 +29,11 @@ if(NOT EXISTS "${LRTMP2_A}")
     file(GLOB_RECURSE LRTMP2_SRCS "${LRTMP2_DIR}/src/*.c")
     add_library(librtmp2_static STATIC ${LRTMP2_SRCS})
     target_include_directories(librtmp2_static PUBLIC "${LRTMP2_DIR}/include" "${LRTMP2_DIR}/src")
+    if(ENABLE_TLS)
+        # Match librtmp2's own default build so the from-source path also has TLS.
+        target_compile_definitions(librtmp2_static PRIVATE LRTMP2_HAVE_TLS)
+        target_link_libraries(librtmp2_static PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    endif()
     set(LRTMP2_A librtmp2_static)
 endif()
 
@@ -68,6 +80,14 @@ target_link_libraries(lrtmp2server_lib
     PRIVATE
         ${LRTMP2_A}
 )
+
+if(ENABLE_TLS)
+    # Link OpenSSL into the consumer too: when librtmp2 is a pre-built archive
+    # (the LRTMP2_A path above) it carries unresolved OpenSSL symbols that the
+    # final link must satisfy.
+    target_compile_definitions(lrtmp2server_lib PRIVATE LRTMP2_HAVE_TLS)
+    target_link_libraries(lrtmp2server_lib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # Main executable
 add_executable(librtmp2-server src/cli.c)
