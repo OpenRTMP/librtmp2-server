@@ -1,5 +1,5 @@
 # Build stage
-FROM alpine:3.20 AS builder
+FROM alpine:latest AS builder
 
 RUN apk add --no-cache \
     build-base \
@@ -27,7 +27,7 @@ RUN mkdir build && cd build && \
     make -j$(nproc)
 
 # Runtime stage
-FROM alpine:3.20
+FROM alpine:latest
 
 RUN apk add --no-cache libstdc++ libgcc openssl
 
