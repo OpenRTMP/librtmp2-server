@@ -32,6 +32,9 @@ jobs:
           echo "Using librtmp2 default branch"
           git clone --depth 1 "$AUTH" librtmp2
         fi
+        # Scrub the token out of the cloned repo's remote config so it doesn't
+        # persist on disk for the rest of the job.
+        git -C librtmp2 remote set-url origin https://github.com/OpenRTMP/librtmp2.git
 
     - name: Build librtmp2
       run: make -C librtmp2 release
@@ -78,6 +81,9 @@ jobs:
           echo "Using librtmp2 default branch"
           git clone --depth 1 "$AUTH" librtmp2
         fi
+        # Scrub the token out of the cloned repo's remote config so it doesn't
+        # persist on disk for the rest of the job.
+        git -C librtmp2 remote set-url origin https://github.com/OpenRTMP/librtmp2.git
 
     - name: Build librtmp2
       run: make -C librtmp2 release
@@ -90,6 +96,21 @@ jobs:
 
     - name: Run tests
       run: ctest --test-dir build --output-on-failure
+
+    # Also exercise the plaintext-only CMake path so -DENABLE_TLS=OFF can't
+    # regress. Rebuild librtmp2 without TLS so the archive carries no OpenSSL
+    # symbols for this build to resolve.
+    - name: Build librtmp2 without TLS
+      run: make -C librtmp2 clean && make -C librtmp2 release TLS=0
+
+    - name: CMake configure (no TLS)
+      run: cmake -B build-notls -DCMAKE_BUILD_TYPE=Release -DLRTMP2_DIR=$GITHUB_WORKSPACE/librtmp2 -DENABLE_TESTS=ON -DENABLE_TLS=OFF
+
+    - name: CMake build (no TLS)
+      run: cmake --build build-notls -j$(nproc)
+
+    - name: Run tests (no TLS)
+      run: ctest --test-dir build-notls --output-on-failure
 
   unit-tests-no-tls:
     name: unit tests (plaintext-only, no OpenSSL)
@@ -114,6 +135,9 @@ jobs:
           echo "Using librtmp2 default branch"
           git clone --depth 1 "$AUTH" librtmp2
         fi
+        # Scrub the token out of the cloned repo's remote config so it doesn't
+        # persist on disk for the rest of the job.
+        git -C librtmp2 remote set-url origin https://github.com/OpenRTMP/librtmp2.git
 
     - name: Build librtmp2 without TLS
       run: make -C librtmp2 release TLS=0
