@@ -1,5 +1,5 @@
 # Build stage
-FROM alpine:3.20 AS builder
+FROM alpine:latest AS builder
 
 RUN apk add --no-cache \
     build-base \
@@ -10,8 +10,6 @@ RUN apk add --no-cache \
 
 WORKDIR /build
 
-# Copy librtmp2 (workspace sibling — use COPY in real builds)
-# For docker build context, we clone it:
 RUN git clone https://github.com/AlexanderWagnerDev/librtmp2.git /build/librtmp2 && \
     cd /build/librtmp2 && make release
 
@@ -26,7 +24,7 @@ RUN mkdir build && cd build && \
     make -j$(nproc)
 
 # Runtime stage
-FROM alpine:3.20
+FROM alpine:latest
 
 RUN apk add --no-cache libstdc++ libgcc
 
