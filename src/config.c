@@ -17,7 +17,9 @@ void config_set_defaults(server_config_t *config)
     config->rtmp_max_conn = 100;
     config->rtmp_chunk_size = 4096;
     strncpy(config->http_bind, "0.0.0.0:8080", sizeof(config->http_bind) - 1);
-    strncpy(config->api_token, "change-me", sizeof(config->api_token) - 1);
+    /* api_token left empty by default — server will refuse to start
+     * with protected endpoints unless a token is configured. */
+    config->api_token[0] = '\0';
     config->require_stream_key = true;
     strncpy(config->web_root, "./web", sizeof(config->web_root) - 1);
     config->log_level = 2; /* info */

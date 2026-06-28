@@ -8,7 +8,7 @@
     "bind": "0.0.0.0:8080"
   },
   "auth": {
-    "api_token": "change-me-to-a-secure-token"
+    "api_token": "<replace-with-random-token>"
   },
   "log_level": 2,
   "log_file": ""

@@ -61,7 +61,7 @@ STATIC_LIB = liblibrtmp2-server.a
 SERVER_BIN = librtmp2-server
 
 # Test files
-TEST_SRCS = tests/unit/main.c tests/unit/test_db.c tests/unit/test_config.c tests/unit/test_http_stats.c
+TEST_SRCS = tests/unit/main.c tests/unit/test_db.c tests/unit/test_config.c tests/unit/test_http_stats.c tests/unit/test_stream_id.c tests/unit/test_keygen.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 TEST_BIN = tests/run_tests
 TEST_BIN_ASAN = tests/run_tests_asan

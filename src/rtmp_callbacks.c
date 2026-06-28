@@ -71,7 +71,7 @@ static int on_publish(lrtmp2_conn_t *conn, const char *app, const char *stream_k
     /* Insert publisher into DB */
     db_publisher_t pub;
     memset(&pub, 0, sizeof(pub));
-    snprintf(pub.id, sizeof(pub.id), "pub_%ld", (long)time(NULL));
+    snprintf(pub.id, sizeof(pub.id), "pub_%ld_%08x", (long)time(NULL), rand() & 0xFFFFFFFF);
     strncpy(pub.stream_id, stream.id, sizeof(pub.stream_id) - 1);
     strncpy(pub.app, app, sizeof(pub.app) - 1);
     strncpy(pub.stream_name, stream.name, sizeof(pub.stream_name) - 1);
@@ -109,7 +109,7 @@ static int on_play(lrtmp2_conn_t *conn, const char *app, const char *stream_key,
     /* Insert player into DB */
     db_player_t player;
     memset(&player, 0, sizeof(player));
-    snprintf(player.id, sizeof(player.id), "pl_%ld", (long)time(NULL));
+    snprintf(player.id, sizeof(player.id), "pl_%ld_%08x", (long)time(NULL), rand() & 0xFFFFFFFF);
     strncpy(player.stream_id, stream.id, sizeof(player.stream_id) - 1);
     strncpy(player.app, app, sizeof(player.app) - 1);
     strncpy(player.stream_name, stream.name, sizeof(player.stream_name) - 1);
@@ -151,34 +151,45 @@ static void on_close(lrtmp2_conn_t *conn, void *userdata)
     (void)conn;
 
     if (bridge->is_publisher && bridge->publish_key[0]) {
-        /* Mark only this publisher as inactive by matching its key */
-        db_publisher_t *pubs = NULL;
-        int count = 0;
-        db_publisher_list_all(bridge->db, &pubs, &count);
-        for (int i = 0; i < count; i++) {
-            if (pubs[i].active) {
-                pubs[i].active = false;
-                db_publisher_update(bridge->db, pubs[i].id, &pubs[i]);
-                log_info("RTMP: publisher disconnected: %s", pubs[i].id);
-                break; /* only deactivate the first active match */
+        /* Find the publisher by matching its stream_id, not just "first active".
+         * The bridge->publish_key is the RTMP stream key; cross-reference it via
+         * the streams table to get the stream_id, then match the publisher. */
+        db_stream_t stream;
+        if (db_stream_find_by_publish_key(bridge->db, bridge->publish_key, &stream)) {
+            db_publisher_t *pubs = NULL;
+            int count = 0;
+            db_publisher_list(bridge->db, stream.id, &pubs, &count);
+            for (int i = 0; i < count; i++) {
+                if (pubs[i].active) {
+                    pubs[i].active = false;
+                    db_publisher_update(bridge->db, pubs[i].id, &pubs[i]);
+                    log_info("RTMP: publisher disconnected: stream=%s id=%s",
+                             stream.id, pubs[i].id);
+                    break;
+                }
             }
+            db_publisher_free_list(pubs);
         }
-        db_publisher_free_list(pubs);
     }
 
     if (bridge->is_player && bridge->play_key[0]) {
-        db_player_t *players = NULL;
-        int count = 0;
-        db_player_list_all(bridge->db, &players, &count);
-        for (int i = 0; i < count; i++) {
-            if (players[i].active) {
-                players[i].active = false;
-                db_player_update(bridge->db, players[i].id, &players[i]);
-                log_info("RTMP: player disconnected: %s", players[i].id);
-                break;
+        /* Same cross-reference for players via play_key → stream_id */
+        db_stream_t stream;
+        if (db_stream_find_by_play_key(bridge->db, bridge->play_key, &stream)) {
+            db_player_t *players = NULL;
+            int count = 0;
+            db_player_list(bridge->db, stream.id, &players, &count);
+            for (int i = 0; i < count; i++) {
+                if (players[i].active) {
+                    players[i].active = false;
+                    db_player_update(bridge->db, players[i].id, &players[i]);
+                    log_info("RTMP: player disconnected: stream=%s id=%s",
+                             stream.id, players[i].id);
+                    break;
+                }
             }
+            db_player_free_list(players);
         }
-        db_player_free_list(players);
     }
 }
 

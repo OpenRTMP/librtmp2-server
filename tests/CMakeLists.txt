@@ -19,12 +19,16 @@ target_link_libraries(lrtmp2server_test_lib
         SQLite::SQLite3
 )
 
-# Unit test executable
+# Unit test executable — main.c calls each test_*_main() function.
+# New tests are added by: (1) implementing test_<name>_main() in a .c file,
+# (2) #including its declaration in main.c, (3) adding it here as a source.
 add_executable(run_tests
     unit/main.c
     unit/test_db.c
     unit/test_config.c
     unit/test_http_stats.c
+    unit/test_stream_id.c
+    unit/test_keygen.c
 )
 
 target_link_libraries(run_tests PRIVATE lrtmp2server_test_lib)

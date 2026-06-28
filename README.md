@@ -101,7 +101,7 @@ Or with CLI flags:
     "bind": "0.0.0.0:8080"
   },
   "auth": {
-    "api_token": "change-me-to-a-secure-token"
+    "api_token": "<replace-with-random-token>"
   },
   "log_level": 2,
   "log_file": ""
@@ -154,7 +154,7 @@ Each stream has **three unique, auto-generated keys**:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/streams \
-  -H "Authorization: Bearer change-me-to-a-secure-token" \
+  -H "Authorization: Bearer $(openssl rand -hex 32)" \
   -H "Content-Type: application/json" \
   -d '{"id":"mystream","name":"My Live Stream","app":"live"}'
 ```

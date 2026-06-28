@@ -250,7 +250,8 @@ static void build_json_stats(struct http_server *http, const char *stream_id,
     for (int i = 0; i < pub_cnt; i++) {
         db_publisher_t *p = &pubs[i];
         int uptime_s = (int)(time(NULL) - p->connected_at);
-        char e_name[1024], e_app[1024], e_vcodec[256], e_acodec[256], e_addr[512];
+        char e_id[1024], e_name[1024], e_app[1024], e_vcodec[256], e_acodec[256], e_addr[512];
+        json_escape(p->stream_id, e_id, sizeof(e_id));
         json_escape(p->stream_name, e_name, sizeof(e_name));
         json_escape(p->app, e_app, sizeof(e_app));
         json_escape(p->video_codec, e_vcodec, sizeof(e_vcodec));
@@ -270,7 +271,7 @@ static void build_json_stats(struct http_server *http, const char *stream_id,
             "\"client\":{\"address\":\"%s\",\"publisher\":true}"
             "}",
             i > 0 ? "," : "",
-            e_name, e_name, e_app,
+            e_id, e_name, e_app,
             uptime_s, p->bitrate_kbps,
             (unsigned long long)p->bytes_in,
             e_vcodec, p->video_width, p->video_height, p->fps,
@@ -669,10 +670,17 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data)
 
     /* /api/v1/streams */
     if (match_uri(hm, "/api/v1/streams")) {
-        if (hm->body.len == 0)
+        /* Route by HTTP method, not body length. A well-behaved GET has no
+         * body; a POST carries JSON. Routing on body length misclassifies
+         * GETs with bodies (e.g. misbehaving proxies) and fails to reject
+         * unsupported methods like PUT/PATCH. */
+        if (hm->method.len == 3 && strncmp(hm->method.buf, "GET", 3) == 0) {
             handle_streams_list(c, http, hm);
-        else
+        } else if (hm->method.len == 4 && strncmp(hm->method.buf, "POST", 4) == 0) {
             handle_stream_create(c, http, hm);
+        } else {
+            err_json(c, 405, "METHOD_NOT_ALLOWED", "Only GET and POST accepted");
+        }
         return;
     }
 
@@ -694,14 +702,23 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data)
                 }
             }
 
-            /* DELETE /api/v1/streams/:id */
-            char sid[64] = {0};
-            strncpy(sid, after, sizeof(sid) - 1);
-            for (int i = 0; sid[i]; i++) {
-                if (sid[i] == '/' || sid[i] == '?') { sid[i] = '\0'; break; }
-            }
-            if (sid[0]) {
-                handle_stream_delete(c, http, hm, sid);
+            /* DELETE /api/v1/streams/:id — only accept DELETE method */
+            if (hm->method.len == 6 && strncmp(hm->method.buf, "DELETE", 6) == 0) {
+                char sid[64] = {0};
+                strncpy(sid, after, sizeof(sid) - 1);
+                for (int i = 0; sid[i]; i++) {
+                    if (sid[i] == '/' || sid[i] == '?') { sid[i] = '\0'; break; }
+                }
+                if (sid[0]) {
+                    handle_stream_delete(c, http, hm, sid);
+                    return;
+                }
+            } else if (hm->method.len == 3 && strncmp(hm->method.buf, "GET", 3) == 0) {
+                /* GET /api/v1/streams/:id — could return single stream info later */
+                err_json(c, 404, "NOT_FOUND", "Unknown endpoint");
+                return;
+            } else {
+                err_json(c, 405, "METHOD_NOT_ALLOWED", "Only DELETE accepted");
                 return;
             }
         }

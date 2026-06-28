@@ -69,6 +69,15 @@ int main(int argc, char **argv)
 
     if (verbose) config.log_level = 3;
 
+    /* If auth.api_token is still empty after config load, the server would
+     * silently allow unauthenticated access to every Bearer-protected
+     * endpoint. Refuse to start instead of creating an open server. */
+    if (!config.api_token[0]) {
+        fprintf(stderr, "FATAL: auth.api_token is not set. "
+                        "Configure a token in %s or via -t flag.\n", config_path);
+        return 1;
+    }
+
     /* Init logger */
     logger_init(config.log_level, config.log_file);
 
