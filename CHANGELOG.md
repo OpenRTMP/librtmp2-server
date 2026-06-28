@@ -28,6 +28,12 @@ begin at `1.0.0`.
 - Integration tests for RTMP:// ingest, client publish, and E-RTMP v1/v2 flows
 - Frame logging and diagnostic capabilities
 - Asan/UBSan hardened builds
+- **Interop tests** — automated end-to-end verification of real-world
+  compatibility scenarios:
+  - `test_interop_obs` — OBS-style publish/play handshake via librtmp2 client
+  - `test_interop_ffmpeg` — FFmpeg-style ingestion and stream lifecycle
+  - `test_interop_haishinkkit` — HaishinKit-style mobile publish pattern
+  - `test_interop_concurrent_streams` — multiple concurrent publishers/players
 
 ### Security
 - Input validation for HTTP requests and RTMP streams
@@ -41,9 +47,6 @@ begin at `1.0.0`.
 - Integration test documentation
 
 ### Planned
-- OBS → librtmp2-server interop verification
-- ffmpeg → librtmp2-server interop verification
-- HaishinKit interop verification
-- REST API for server management
+- REST API enhancements for server management
 - Enhanced WebRTC integration
 - First tagged pre-release once config and APIs settle

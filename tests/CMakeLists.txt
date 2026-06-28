@@ -34,3 +34,41 @@ add_executable(run_tests
 target_link_libraries(run_tests PRIVATE lrtmp2server_test_lib)
 
 add_test(NAME unit_tests COMMAND run_tests)
+
+# ---------------------------------------------------------------------------
+# Interop tests — end-to-end tests that spawn the real server binary
+# and drive it via librtmp2 client API + HTTP/curl.
+# ---------------------------------------------------------------------------
+find_package(CURL REQUIRED)
+
+add_executable(run_interop_tests
+    integration/main.c
+    integration/test_interop_obs.c
+    integration/test_interop_ffmpeg.c
+    integration/test_interop_haishinkkit.c
+    integration/test_interop_concurrent.c
+)
+
+target_include_directories(run_interop_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${LRTMP2_DIR}/include
+)
+
+target_link_libraries(run_interop_tests
+    PRIVATE
+        ${LRTMP2_A}
+        lrtmp2server_test_lib
+        CURL::libcurl
+        pthread
+        m
+)
+
+# Interop tests need the server binary to be built first
+add_dependencies(run_interop_tests librtmp2-server)
+
+# Run via CTest with a longer timeout — these are end-to-end tests
+add_test(NAME interop_tests COMMAND run_interop_tests)
+set_tests_properties(interop_tests PROPERTIES
+    TIMEOUT 60
+    DEPENDS unit_tests  # run after unit tests pass)

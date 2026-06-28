@@ -73,6 +73,18 @@ TEST_OBJS = $(TEST_SRCS:.c=.o)
 TEST_BIN = tests/run_tests
 TEST_BIN_ASAN = tests/run_tests_asan
 
+# Interop test files — end-to-end tests that spawn the real server binary
+INTEROP_SRCS = tests/integration/main.c tests/integration/test_interop_obs.c tests/integration/test_interop_ffmpeg.c tests/integration/test_interop_haishinkkit.c tests/integration/test_interop_concurrent.c
+INTEROP_OBJS = $(INTEROP_SRCS:.c=.o)
+INTEROP_BIN = tests/run_interop_tests
+
+# Interop tests need curl
+CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+CURL_LIBS := $(shell pkg-config --libs libcurl 2>/dev/null)
+ifeq ($(CURL_LIBS),)
+  CURL_LIBS = -lcurl
+endif
+
 .PHONY: debug release test clean asan ubsan all
 
 all: $(STATIC_LIB) $(SERVER_BIN)
@@ -137,7 +149,22 @@ ubsan:
 	$(MAKE) DEBUG=1 UBSAN=1 $(TEST_BIN)
 	./$(TEST_BIN)
 
+# Interop tests — build and run (requires server binary + librtmp2)
+tests/integration/%.o: tests/integration/%.c | $(MONGOOSE_HDR)
+	$(CC) $(CFLAGS) $(CURL_CFLAGS) -c $< -o $@
+
+$(INTEROP_BIN): $(INTEROP_OBJS) src/config.o src/db.o src/logger.o $(LRTMP2_A)
+	$(CC) $(LDFLAGS) -o $@ $(INTEROP_OBJS) src/config.o src/db.o src/logger.o $(LRTMP2_A) $(SQLITE_LIBS) $(OPENSSL_LIBS) $(CURL_LIBS) -lpthread -lm
+
+# Run interop tests — server binary must be built first, then we
+# spawn it, drive it, and tear it down.
+interop: $(SERVER_BIN) $(INTEROP_BIN)
+	@echo "Running interop tests (spawns server binary)..."
+	LRTMP2_DB_PATH=$(INTEROP_DB_PATH) $(INTEROP_BIN)
+	@echo "Interop tests complete."
+
 clean:
 	rm -f $(LIB_OBJS) $(MONGOOSE_OBJ) src/cli.o $(STATIC_LIB) $(SERVER_BIN)
 	rm -f $(TEST_OBJS) $(TEST_BIN) $(TEST_BIN_ASAN)
+	rm -f $(INTEROP_OBJS) $(INTEROP_BIN)
 	rm -rf $(MONGOOSE_DIR)

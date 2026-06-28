@@ -138,3 +138,32 @@ jobs:
 
     - name: Run unit tests
       run: make test TLS=0
+
+  interop-tests:
+    name: interop tests (OBS / FFmpeg / HaishinKit / concurrent)
+    runs-on: ubuntu-latest
+    needs: [unit-tests-make, unit-tests-cmake]  # only run if unit tests pass
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libcurl4-openssl-dev
+
+    - name: Clone librtmp2 (matching PR branch if it exists, else default)
+      env:
+        REF: ${{ github.head_ref }}
+      run: |
+        REMOTE="https://github.com/OpenRTMP/librtmp2.git"
+        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$REMOTE" "$REF" >/dev/null 2>&1; then
+          echo "Using librtmp2 branch $REF (matches this PR)"
+          git clone --depth 1 --branch "$REF" "$REMOTE" librtmp2
+        else
+          echo "Using librtmp2 default branch"
+          git clone --depth 1 "$REMOTE" librtmp2
+        fi
+
+    - name: Build librtmp2
+      run: make -C librtmp2 release
+
+    - name: Build server + interop tests
+      make interop
