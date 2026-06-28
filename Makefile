@@ -31,6 +31,13 @@ ifeq ($(SQLITE_CFLAGS),)
   endif
 endif
 
+# TLS / RTMPS. librtmp2 builds TLS in by default, so the server links OpenSSL by
+# default too. `make TLS=0` builds a plaintext-only librtmp2 and drops OpenSSL.
+TLS ?= 1
+ifeq ($(TLS),1)
+  OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
+endif
+
 ifdef DEBUG
   CFLAGS += -g -O0 -DDEBUG
 else
@@ -76,9 +83,9 @@ debug:
 release:
 	$(MAKE) all
 
-# Ensure librtmp2 is built
+# Ensure librtmp2 is built (matching this build's TLS setting)
 $(LRTMP2_A):
-	$(MAKE) -C $(LRTMP2_DIR) release
+	$(MAKE) -C $(LRTMP2_DIR) release TLS=$(TLS)
 
 # Mongoose — fetch both the amalgamated source and its header.
 $(MONGOOSE_HDR):
@@ -106,14 +113,14 @@ src/cli.o: src/cli.c | $(MONGOOSE_HDR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(SERVER_BIN): src/cli.o $(LIB_OBJS) $(MONGOOSE_OBJ) $(LRTMP2_A)
-	$(CC) $(LDFLAGS) -o $@ src/cli.o $(LIB_OBJS) $(MONGOOSE_OBJ) $(LRTMP2_A) $(SQLITE_LIBS) -lpthread -lm
+	$(CC) $(LDFLAGS) -o $@ src/cli.o $(LIB_OBJS) $(MONGOOSE_OBJ) $(LRTMP2_A) $(SQLITE_LIBS) $(OPENSSL_LIBS) -lpthread -lm
 
 # Tests
 tests/unit/%.o: tests/unit/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TEST_BIN): $(TEST_OBJS) src/config.o src/db.o src/logger.o $(LRTMP2_A)
-	$(CC) $(LDFLAGS) -o $@ $(TEST_OBJS) src/config.o src/db.o src/logger.o $(SQLITE_LIBS) -lpthread -lm
+	$(CC) $(LDFLAGS) -o $@ $(TEST_OBJS) src/config.o src/db.o src/logger.o $(SQLITE_LIBS) $(OPENSSL_LIBS) -lpthread -lm
 
 $(TEST_BIN_ASAN): $(TEST_SRCS) src/config.c src/db.c src/logger.c
 	$(CC) $(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -g -O0 -DDEBUG \

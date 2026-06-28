@@ -57,6 +57,7 @@ int test_config_main(void)
         } else {
             fprintf(f, "{\n"
                 "  \"rtmp\": {\"bind\": \"127.0.0.1:1936\", \"max_connections\": 50},\n"
+                "  \"tls\": {\"enabled\": true, \"cert_file\": \"/etc/ssl/cert.pem\", \"key_file\": \"/etc/ssl/key.pem\"},\n"
                 "  \"http\": {\"bind\": \"127.0.0.1:8081\"},\n"
                 "  \"auth\": {\"api_token\": \"test-token-123\"},\n"
                 "  \"log_level\": 3\n"
@@ -94,6 +95,21 @@ int test_config_main(void)
                     errors += fail("config_load log_level", "wrong value");
                 else
                     pass("config_load log_level");
+
+                if (!config.tls_enabled)
+                    errors += fail("config_load tls_enabled", "expected true");
+                else
+                    pass("config_load tls_enabled");
+
+                if (strcmp(config.tls_cert_file, "/etc/ssl/cert.pem") != 0)
+                    errors += fail("config_load tls_cert_file", "wrong value");
+                else
+                    pass("config_load tls_cert_file");
+
+                if (strcmp(config.tls_key_file, "/etc/ssl/key.pem") != 0)
+                    errors += fail("config_load tls_key_file", "wrong value");
+                else
+                    pass("config_load tls_key_file");
             }
             unlink(tmp);
         }

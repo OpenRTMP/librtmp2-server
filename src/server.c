@@ -112,6 +112,27 @@ int server_app_run(lrtmp2_server_app_t *app)
     lrtmp2_server_config_t rtmp_config;
     rtmp_bridge_setup(&rtmp_config, &app->bridge, app->db);
 
+    /* RTMPS: enable TLS termination if the operator configured it. librtmp2
+     * builds TLS in by default but it can be compiled out, so refuse to start
+     * with a clear message rather than silently serving plaintext. */
+    if (app->config.tls_enabled) {
+        if (!lrtmp2_tls_supported()) {
+            log_error("TLS enabled in config but librtmp2 was built without TLS "
+                      "support (rebuild librtmp2 with TLS, or disable tls in config)");
+            return -1;
+        }
+        if (app->config.tls_cert_file[0] == '\0' || app->config.tls_key_file[0] == '\0') {
+            log_error("TLS enabled but tls.cert_file / tls.key_file not configured");
+            return -1;
+        }
+        rtmp_config.tls_enabled   = 1;
+        rtmp_config.tls_cert_file = app->config.tls_cert_file;
+        rtmp_config.tls_key_file  = app->config.tls_key_file;
+        log_info("RTMPS enabled (cert=%s)", app->config.tls_cert_file);
+    } else {
+        log_info("RTMPS disabled (plaintext RTMP only)");
+    }
+
     app->rtmp_server = lrtmp2_server_create(&rtmp_config);
     if (!app->rtmp_server) {
         log_error("Failed to create RTMP server");
