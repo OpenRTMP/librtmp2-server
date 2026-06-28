@@ -182,7 +182,16 @@ void config_apply_env(server_config_t *config)
 
     v = getenv("LRTMP2_TLS_ENABLED");
     if (v && v[0]) {
-        config->tls_enabled = (strcmp(v, "1") == 0 || strcmp(v, "true") == 0);
+        /* Only recognized values flip the flag; a typo or unsupported form
+         * leaves the configured value untouched rather than silently
+         * downgrading to plaintext. */
+        if (strcmp(v, "1") == 0 || strcmp(v, "true") == 0) {
+            config->tls_enabled = true;
+        } else if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0) {
+            config->tls_enabled = false;
+        } else {
+            log_warn("Ignoring invalid LRTMP2_TLS_ENABLED value '%s' (expected 1/0/true/false)", v);
+        }
     }
 
     v = getenv("LRTMP2_TLS_CERT_FILE");

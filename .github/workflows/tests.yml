@@ -90,3 +90,36 @@ jobs:
 
     - name: Run tests
       run: ctest --test-dir build --output-on-failure
+
+  unit-tests-no-tls:
+    name: unit tests (plaintext-only, no OpenSSL)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    # Deliberately omit libssl-dev to prove the TLS=0 path is OpenSSL-free.
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+    - name: Clone librtmp2 (matching PR branch if it exists, else default)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REF: ${{ github.head_ref }}
+      run: |
+        AUTH="https://x-access-token:${GH_TOKEN}@github.com/OpenRTMP/librtmp2.git"
+        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$AUTH" "$REF" >/dev/null 2>&1; then
+          echo "Using librtmp2 branch $REF (matches this PR)"
+          git clone --depth 1 --branch "$REF" "$AUTH" librtmp2
+        else
+          echo "Using librtmp2 default branch"
+          git clone --depth 1 "$AUTH" librtmp2
+        fi
+
+    - name: Build librtmp2 without TLS
+      run: make -C librtmp2 release TLS=0
+
+    - name: Compile (release, sanity)
+      run: make release TLS=0
+
+    - name: Run unit tests
+      run: make test TLS=0

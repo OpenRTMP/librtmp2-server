@@ -3,6 +3,7 @@
  */
 #include "librtmp2-server/config.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -46,6 +47,17 @@ int test_config_main(void)
             errors += fail("defaults log_level", "wrong default");
         else
             pass("defaults log_level");
+
+        /* TLS is off by default, with empty cert/key paths. */
+        if (config.tls_enabled)
+            errors += fail("defaults tls_enabled", "TLS should be off by default");
+        else
+            pass("defaults tls_enabled off");
+
+        if (config.tls_cert_file[0] != '\0' || config.tls_key_file[0] != '\0')
+            errors += fail("defaults tls cert/key", "should be empty by default");
+        else
+            pass("defaults tls cert/key empty");
     }
 
     /* Load from file */
@@ -123,6 +135,46 @@ int test_config_main(void)
             errors += fail("config_load missing", "should fail on missing file");
         else
             pass("config_load missing file returns false");
+    }
+
+    /* Environment overrides for TLS */
+    {
+        setenv("LRTMP2_TLS_ENABLED", "1", 1);
+        setenv("LRTMP2_TLS_CERT_FILE", "/env/cert.pem", 1);
+        setenv("LRTMP2_TLS_KEY_FILE", "/env/key.pem", 1);
+
+        server_config_t config;
+        config_set_defaults(&config);
+        config_apply_env(&config);
+
+        if (!config.tls_enabled)
+            errors += fail("env tls_enabled", "LRTMP2_TLS_ENABLED=1 should enable TLS");
+        else
+            pass("env tls_enabled");
+
+        if (strcmp(config.tls_cert_file, "/env/cert.pem") != 0)
+            errors += fail("env tls_cert_file", "wrong value");
+        else
+            pass("env tls_cert_file");
+
+        if (strcmp(config.tls_key_file, "/env/key.pem") != 0)
+            errors += fail("env tls_key_file", "wrong value");
+        else
+            pass("env tls_key_file");
+
+        /* An invalid value must not silently flip TLS off. */
+        setenv("LRTMP2_TLS_ENABLED", "yesplease", 1);
+        config_set_defaults(&config);
+        config.tls_enabled = true;  /* pretend the JSON enabled it */
+        config_apply_env(&config);
+        if (!config.tls_enabled)
+            errors += fail("env tls_enabled invalid", "invalid value should leave TLS unchanged");
+        else
+            pass("env tls_enabled invalid value ignored");
+
+        unsetenv("LRTMP2_TLS_ENABLED");
+        unsetenv("LRTMP2_TLS_CERT_FILE");
+        unsetenv("LRTMP2_TLS_KEY_FILE");
     }
 
     if (errors == 0)

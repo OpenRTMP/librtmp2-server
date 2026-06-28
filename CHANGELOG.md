@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cmake -DENABLE_TLS=OFF`); enabling TLS without library support is refused at
   startup with a clear error
 
+### Planned
+- OBS → librtmp2-server interop verification
+- ffmpeg → librtmp2-server interop verification
+- HaishinKit interop verification
+- REST API for server management (planned for 0.2.0)
+- Enhanced WebRTC integration (planned for 0.2.0)
+
 ## [0.1.0] - 2025-06-27
 
 ### Added
@@ -37,12 +44,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/rtmp-server-architecture.md` for architectural overview
 - Example configurations for various use cases
 - Integration test documentation
-
-## [Unreleased]
-
-### Planned
-- OBS → librtmp2-server interop verification
-- ffmpeg → librtmp2-server interop verification
-- HaishinKit interop verification
-- REST API for server management (planned for 0.2.0)
-- Enhanced WebRTC integration (planned for 0.2.0)
