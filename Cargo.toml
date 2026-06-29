@@ -2,6 +2,8 @@
 name = "librtmp2-server"
 version = "0.1.0"
 edition = "2021"
+# 1.95 because rusqlite 0.40's own source relies on cfg_select, stabilized in
+# that release; lower floors here would fail to compile rusqlite, not just warn.
 rust-version = "1.95"
 license = "Apache-2.0"
 description = "RTMP / E-RTMP media server built on librtmp2"
