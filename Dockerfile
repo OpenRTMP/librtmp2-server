@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1-alpine AS builder
+FROM rust:alpine AS builder
 
 RUN apk add --no-cache build-base
 
