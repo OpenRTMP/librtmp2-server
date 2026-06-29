@@ -190,7 +190,7 @@ int test_interop_ffmpeg_main(void)
 
     char url[256];
     snprintf(url, sizeof(url), "rtmp://127.0.0.1:%d/live/%s",
-             INTEROP_RTMP_PORT, stream_id);
+             INTEROP_RTMP_PORT, pub_key);
 
     rc = lrtmp2_client_connect(pub, url);
     interop_result_record(&result, rc == 0);

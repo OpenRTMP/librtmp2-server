@@ -225,9 +225,11 @@ int test_interop_obs_main(void)
         }
 
         char url[256];
-        /* OBS connects with: rtmp://server/live, stream name = stream_id, key = pub_key */
+        /* OBS connects with: rtmp://server/live/<pub_key> — the publish key
+         * IS the stream key on the wire; the server validates it against
+         * the random key returned by stream creation, not the stream id. */
         snprintf(url, sizeof(url), "rtmp://127.0.0.1:%d/live/%s",
-                 INTEROP_RTMP_PORT, stream_id);
+                 INTEROP_RTMP_PORT, pub_key);
 
         rc = lrtmp2_client_connect(pub, url);
         interop_result_record(&result, rc == 0);
@@ -302,7 +304,7 @@ int test_interop_obs_main(void)
 
         char player_url[256];
         snprintf(player_url, sizeof(player_url), "rtmp://127.0.0.1:%d/live/%s",
-                 INTEROP_RTMP_PORT, stream_id);
+                 INTEROP_RTMP_PORT, play_key);
 
         rc = lrtmp2_client_connect(player, player_url);
         interop_result_record(&result, rc == 0);
