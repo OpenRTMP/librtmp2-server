@@ -7,163 +7,31 @@ on:
     branches: [ main, develop ]
 
 jobs:
-  unit-tests-make:
-    name: unit tests (make, ${{ matrix.cc }})
+  test:
+    name: cargo build & test
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        cc: [gcc, clang]
+    permissions:
+      contents: read
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libcurl4-openssl-dev
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
 
-    - name: Clone librtmp2 (matching PR branch if it exists, else default)
-      env:
-        REF: ${{ github.head_ref }}
-      run: |
-        # librtmp2 is a public repo, so clone anonymously — no token needed.
-        REMOTE="https://github.com/OpenRTMP/librtmp2.git"
-        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$REMOTE" "$REF" >/dev/null 2>&1; then
-          echo "Using librtmp2 branch $REF (matches this PR)"
-          git clone --depth 1 --branch "$REF" "$REMOTE" librtmp2
-        else
-          echo "Using librtmp2 default branch"
-          git clone --depth 1 "$REMOTE" librtmp2
-        fi
+    - uses: Swatinem/rust-cache@v2
 
-    - name: Build librtmp2
-      run: make -C librtmp2 release
+    - name: Check formatting
+      run: cargo fmt --check
 
-    - name: Compile (release, sanity)
-      run: make release
-      env:
-        CC: ${{ matrix.cc }}
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
 
-    - name: Run unit tests
-      run: make test
-      env:
-        CC: ${{ matrix.cc }}
-
-    - name: Run unit tests (ASan)
-      run: make clean && make asan
-      env:
-        CC: ${{ matrix.cc }}
-
-    - name: Run unit tests (UBSan)
-      run: make clean && make ubsan
-      env:
-        CC: ${{ matrix.cc }}
-
-  unit-tests-cmake:
-    name: unit tests (cmake)
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v7
-
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev libssl-dev libcurl4-openssl-dev
-
-    - name: Clone librtmp2 (matching PR branch if it exists, else default)
-      env:
-        REF: ${{ github.head_ref }}
-      run: |
-        # librtmp2 is a public repo, so clone anonymously — no token needed.
-        REMOTE="https://github.com/OpenRTMP/librtmp2.git"
-        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$REMOTE" "$REF" >/dev/null 2>&1; then
-          echo "Using librtmp2 branch $REF (matches this PR)"
-          git clone --depth 1 --branch "$REF" "$REMOTE" librtmp2
-        else
-          echo "Using librtmp2 default branch"
-          git clone --depth 1 "$REMOTE" librtmp2
-        fi
-
-    - name: Build librtmp2
-      run: make -C librtmp2 release
-
-    - name: CMake configure
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLRTMP2_DIR=$GITHUB_WORKSPACE/librtmp2 -DENABLE_TESTS=ON
-
-    - name: CMake build
-      run: cmake --build build -j$(nproc)
+    - name: Build
+      run: cargo build --verbose
 
     - name: Run tests
-      run: ctest --test-dir build --output-on-failure
-
-    # Also exercise the plaintext-only CMake path so -DENABLE_TLS=OFF can't
-    # regress. Rebuild librtmp2 without TLS so the archive carries no OpenSSL
-    # symbols for this build to resolve.
-    - name: Build librtmp2 without TLS
-      run: make -C librtmp2 clean && make -C librtmp2 release TLS=0
-
-    - name: CMake configure (no TLS)
-      run: cmake -B build-notls -DCMAKE_BUILD_TYPE=Release -DLRTMP2_DIR=$GITHUB_WORKSPACE/librtmp2 -DENABLE_TESTS=ON -DENABLE_TLS=OFF
-
-    - name: CMake build (no TLS)
-      run: cmake --build build-notls -j$(nproc)
-
-    - name: Run tests (no TLS)
-      run: ctest --test-dir build-notls --output-on-failure
-
-  unit-tests-no-tls:
-    name: unit tests (plaintext-only, no OpenSSL)
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v7
-
-    # Deliberately omit libssl-dev to prove the TLS=0 path is OpenSSL-free.
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
-
-    - name: Clone librtmp2 (matching PR branch if it exists, else default)
-      env:
-        REF: ${{ github.head_ref }}
-      run: |
-        # librtmp2 is a public repo, so clone anonymously — no token needed.
-        REMOTE="https://github.com/OpenRTMP/librtmp2.git"
-        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$REMOTE" "$REF" >/dev/null 2>&1; then
-          echo "Using librtmp2 branch $REF (matches this PR)"
-          git clone --depth 1 --branch "$REF" "$REMOTE" librtmp2
-        else
-          echo "Using librtmp2 default branch"
-          git clone --depth 1 "$REMOTE" librtmp2
-        fi
-
-    - name: Build librtmp2 without TLS
-      run: make -C librtmp2 release TLS=0
-
-    - name: Compile (release, sanity)
-      run: make release TLS=0
-
-    - name: Run unit tests
-      run: make test TLS=0
-
-  interop-tests:
-    name: interop tests (OBS / FFmpeg / HaishinKit / concurrent)
-    runs-on: ubuntu-latest
-    needs: [unit-tests-make, unit-tests-cmake]  # only run if unit tests pass
-    steps:
-    - uses: actions/checkout@v7
-
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libcurl4-openssl-dev
-
-    - name: Clone librtmp2 (matching PR branch if it exists, else default)
-      env:
-        REF: ${{ github.head_ref }}
-      run: |
-        REMOTE="https://github.com/OpenRTMP/librtmp2.git"
-        if [ -n "$REF" ] && git ls-remote --exit-code --heads "$REMOTE" "$REF" >/dev/null 2>&1; then
-          echo "Using librtmp2 branch $REF (matches this PR)"
-          git clone --depth 1 --branch "$REF" "$REMOTE" librtmp2
-        else
-          echo "Using librtmp2 default branch"
-          git clone --depth 1 "$REMOTE" librtmp2
-        fi
-
-    - name: Build librtmp2
-      run: make -C librtmp2 release
-
-    - name: Build server + interop tests
-      run: make interop
+      run: cargo test --verbose

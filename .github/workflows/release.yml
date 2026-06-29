@@ -23,27 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Clone librtmp2
-        uses: actions/checkout@v7
-        with:
-          repository: OpenRTMP/librtmp2
-          path: librtmp2
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build librtmp2
-        run: make -C librtmp2 release
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
-        run: make release
+        run: cargo build --release
 
-      - name: Run unit tests
-        run: make test
-
-      - name: Run unit tests (ASan)
-        run: make clean && make asan
+      - name: Run tests
+        run: cargo test --release
 
   package:
     name: build & package
@@ -52,18 +41,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Clone librtmp2
-        uses: actions/checkout@v7
-        with:
-          repository: OpenRTMP/librtmp2
-          path: librtmp2
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build librtmp2
-        run: make -C librtmp2 release
+      - uses: Swatinem/rust-cache@v2
 
       - name: Resolve version
         id: ver
@@ -74,12 +55,12 @@ jobs:
           echo "tag=$REF" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
-        run: make release
+        run: cargo build --release
 
       - name: Stage install tree
         run: |
           mkdir -p dist/librtmp2-server-${{ steps.ver.outputs.version }}
-          cp librtmp2-server dist/librtmp2-server-${{ steps.ver.outputs.version }}/
+          cp target/release/librtmp2-server dist/librtmp2-server-${{ steps.ver.outputs.version }}/
           cp config.example.json dist/librtmp2-server-${{ steps.ver.outputs.version }}/config.json
 
       - name: Create binary tarball

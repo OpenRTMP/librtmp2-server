@@ -1,12 +1,3 @@
-build/
-*.o
-*.a
-*.so
+/target/
 config.json
 .DS_Store
-
-# Build outputs
-/librtmp2-server
-/tests/run_tests
-/tests/run_tests_asan
-librtmp2

@@ -3,31 +3,23 @@
 This project follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) specification for commit messages. All commits must use English language for messages.
 
 ## Code Contribution Guidelines
-- **API Compatibility**: No breaking librtmp2 API changes without coordinated updates to librtmp2 and librtmp2-server in the same session
-- **librtmp2 Dependency**: librtmp2-server depends on librtmp2 as a sibling directory. Changes to librtmp2 headers may require updates in librtmp2-server
-- **Testing**: All new features must be covered by unit/integration tests in `tests/unit` and `tests/integration`
-- **Security**: Input validation on all HTTP and RTMP entry points; sanitize all user-provided data before database operations
-- **Build**: Use CMake for production builds; Makefile for quick development builds
+- **Integration seam stability**: `librtmp2-server` does not implement the RTMP/E-RTMP protocol itself — that lives in the separate `librtmp2` crate. Changes to the [`RtmpEventHandler`](src/rtmp_bridge.rs) trait are a breaking change for that integration and should be coordinated
+- **Testing**: All new features must be covered by unit tests alongside the module they touch (`#[cfg(test)] mod tests` in the relevant `src/*.rs` file)
+- **Security**: Input validation on all HTTP entry points; sanitize all user-provided data before database operations
+- **Lints**: `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` must pass clean — this is enforced in CI
 
 ## Build Guidelines
 ```bash
-# Quick build with Makefile (pulls librtmp2 from sibling)
-make debug     # Debug build with symbols
-make release   # Release build with optimizations
-make test      # Build and run unit tests
-make asan      # AddressSanitizer build
-make ubsan     # UndefinedBehaviorSanitizer build
-
-# Production build with CMake
-cmake -B build -DENABLE_TESTS=ON
-cmake --build build
-ctest --test-dir build
+cargo build           # Debug build
+cargo build --release # Release build with optimizations
+cargo test             # Run unit tests
+cargo fmt              # Format code
+cargo clippy --all-targets -- -D warnings  # Lint (same as CI)
 ```
 
 ## Dependencies
-- **librtmp2**: Must be present as sibling directory (`../librtmp2`)
-- **Mongoose**: Fetched automatically by CMake; Makefile downloads from GitHub
-- **SQLite3**: System library (`pkg-config --libs sqlite3`)
+- **Rust** stable toolchain
+- **SQLite**: vendored via rusqlite's `bundled` feature — no system SQLite3 needed
 
 ## License
 Source code is under [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0). Additional assets have their own license information.
