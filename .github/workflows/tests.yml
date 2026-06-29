@@ -166,4 +166,4 @@ jobs:
       run: make -C librtmp2 release
 
     - name: Build server + interop tests
-      make interop
+      run: make interop
