@@ -311,34 +311,53 @@ bool db_stream_update(db_context_t *db, const char *id, const db_stream_t *s)
     return rc == SQLITE_DONE;
 }
 
-bool db_stream_delete(db_context_t *db, const char *id)
+/* Run one bound DELETE inside the already-open transaction. Returns true on
+ * SQLITE_DONE, false on a prepare or step failure so the caller can roll
+ * back instead of leaving a partially cascaded delete. */
+static bool db_exec_delete_by_stream_id(db_context_t *db, const char *sql, const char *id)
 {
-    pthread_mutex_lock(&db->lock);
     sqlite3_stmt *stmt;
-
-    /* Cascade: remove dependent rows so deleted streams cannot leave ghost
-     * active publishers/players that pollute stats after stream re-creation. */
-    sqlite3_prepare_v2(db->conn, "DELETE FROM publishers WHERE stream_id=?", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    sqlite3_prepare_v2(db->conn, "DELETE FROM players WHERE stream_id=?", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    sqlite3_prepare_v2(db->conn, "DELETE FROM stats_samples WHERE stream_id=?", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    sqlite3_prepare_v2(db->conn, "DELETE FROM streams WHERE id=?", -1, &stmt, NULL);
+    if (sqlite3_prepare_v2(db->conn, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
     sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db->lock);
     return rc == SQLITE_DONE;
+}
+
+bool db_stream_delete(db_context_t *db, const char *id)
+{
+    pthread_mutex_lock(&db->lock);
+
+    /* Cascade: remove dependent rows so deleted streams cannot leave ghost
+     * active publishers/players that pollute stats after stream re-creation.
+     * Wrapped in a transaction so a failure partway through (e.g. SQLITE_BUSY)
+     * cannot leave the cascade half-applied. */
+    char *err = NULL;
+    if (sqlite3_exec(db->conn, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
+        log_error("DB error starting cascade delete transaction: %s", err);
+        sqlite3_free(err);
+        pthread_mutex_unlock(&db->lock);
+        return false;
+    }
+
+    bool ok = db_exec_delete_by_stream_id(db, "DELETE FROM publishers WHERE stream_id=?", id) &&
+              db_exec_delete_by_stream_id(db, "DELETE FROM players WHERE stream_id=?", id) &&
+              db_exec_delete_by_stream_id(db, "DELETE FROM stats_samples WHERE stream_id=?", id) &&
+              db_exec_delete_by_stream_id(db, "DELETE FROM streams WHERE id=?", id);
+
+    if (ok) {
+        if (sqlite3_exec(db->conn, "COMMIT", NULL, NULL, &err) != SQLITE_OK) {
+            log_error("DB error committing cascade delete: %s", err);
+            sqlite3_free(err);
+            ok = false;
+        }
+    }
+    if (!ok) {
+        sqlite3_exec(db->conn, "ROLLBACK", NULL, NULL, NULL);
+    }
+
+    pthread_mutex_unlock(&db->lock);
+    return ok;
 }
 
 bool db_stream_list(db_context_t *db, db_stream_t **out_array, int *out_count)
@@ -641,6 +660,11 @@ bool db_stat_recent(db_context_t *db, const char *stream_id, int limit, db_stat_
     sqlite3_bind_int(stmt, 2, limit);
     int cap = limit > 0 ? limit : 64, n = 0;
     db_stat_sample_t *arr = calloc(cap, sizeof(db_stat_sample_t));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&db->lock);
+        return false;
+    }
     while (sqlite3_step(stmt) == SQLITE_ROW && n < cap) {
         db_col_text(arr[n].stream_id, sizeof(arr[n].stream_id), stmt, 0);
         arr[n].bitrate_in_kbps = sqlite3_column_double(stmt, 1);
