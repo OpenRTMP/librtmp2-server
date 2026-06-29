@@ -223,6 +223,76 @@ int test_db_main(void)
             pass("db_stream_delete");
     }
 
+    /* Cascade delete removes active publishers/players */
+    {
+        db_stream_t s;
+        memset(&s, 0, sizeof(s));
+        strncpy(s.id, "cascade", sizeof(s.id));
+        strncpy(s.name, "Cascade Test", sizeof(s.name));
+        strncpy(s.app, "live", sizeof(s.app));
+        strncpy(s.publish_key, "pub_cascade", sizeof(s.publish_key));
+        strncpy(s.play_key, "pl_cascade", sizeof(s.play_key));
+        strncpy(s.stats_key, "st_cascade", sizeof(s.stats_key));
+        s.enabled = true;
+        s.created_at = time(NULL);
+        if (!db_stream_add(db, &s))
+            errors += fail("cascade setup stream", "failed");
+        else {
+            db_publisher_t p;
+            memset(&p, 0, sizeof(p));
+            strncpy(p.id, "pub_cascade_1", sizeof(p.id));
+            strncpy(p.stream_id, "cascade", sizeof(p.stream_id));
+            p.active = true;
+            p.connected_at = time(NULL);
+            if (!db_publisher_add(db, &p))
+                errors += fail("cascade setup publisher", "failed");
+            else if (!db_stream_delete(db, "cascade"))
+                errors += fail("cascade delete stream", "failed");
+            else {
+                db_publisher_t *arr = NULL;
+                int count = 0;
+                db_publisher_list(db, "cascade", &arr, &count);
+                if (count != 0)
+                    errors += fail("cascade delete", "publisher orphaned after stream delete");
+                else
+                    pass("db_stream_delete cascades publishers");
+                db_publisher_free_list(arr);
+            }
+        }
+    }
+
+    /* Max-length id (63 chars) must load with NUL terminator */
+    {
+        char long_id[64];
+        memset(long_id, 'a', 63);
+        long_id[63] = '\0';
+
+        db_stream_t s;
+        memset(&s, 0, sizeof(s));
+        memcpy(s.id, long_id, 64);
+        strncpy(s.name, "Long ID", sizeof(s.name));
+        strncpy(s.app, "live", sizeof(s.app));
+        strncpy(s.publish_key, "pub_long", sizeof(s.publish_key));
+        strncpy(s.play_key, "pl_long", sizeof(s.play_key));
+        strncpy(s.stats_key, "st_long", sizeof(s.stats_key));
+        s.enabled = true;
+        s.created_at = time(NULL);
+
+        if (!db_stream_add(db, &s))
+            errors += fail("max-length id add", "failed");
+        else {
+            db_stream_t got;
+            memset(&got, 0, sizeof(got));
+            if (!db_stream_get(db, long_id, &got))
+                errors += fail("max-length id get", "not found");
+            else if (strlen(got.id) != 63 || strcmp(got.id, long_id) != 0)
+                errors += fail("max-length id get", "wrong id or missing NUL terminator");
+            else
+                pass("max-length stream id loads safely");
+            db_stream_delete(db, long_id);
+        }
+    }
+
     db_close(db);
     unlink(tmp);
 
