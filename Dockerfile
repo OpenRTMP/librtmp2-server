@@ -1,7 +1,7 @@
 # Build stage
 FROM rust:latest AS builder
 
-RUN apk add --no-cache build-base
+RUN apt install build-base -y
 
 WORKDIR /build
 COPY . .
