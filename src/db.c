@@ -140,6 +140,22 @@ static int exec_simple(db_context_t *db, const char *sql)
     return rc;
 }
 
+/* Copy a TEXT column into a fixed buffer. Always NUL-terminates (strncpy alone
+ * leaves dst unterminated when the value fills dstlen-1 bytes). Handles NULL
+ * columns without passing NULL to strncpy. */
+static void db_col_text(char *dst, size_t dstlen, sqlite3_stmt *stmt, int col)
+{
+    if (dstlen == 0) return;
+    const unsigned char *text = sqlite3_column_text(stmt, col);
+    if (!text) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t n = dstlen - 1;
+    strncpy(dst, (const char *)text, n);
+    dst[n] = '\0';
+}
+
 /* ==================== STREAMS ==================== */
 
 bool db_stream_add(db_context_t *db, const db_stream_t *s)
@@ -173,14 +189,14 @@ bool db_stream_add(db_context_t *db, const db_stream_t *s)
 
 static bool db_stream_load_row(sqlite3_stmt *stmt, db_stream_t *out)
 {
-    strncpy(out->id, (const char*)sqlite3_column_text(stmt, 0), sizeof(out->id)-1);
-    strncpy(out->name, (const char*)sqlite3_column_text(stmt, 1), sizeof(out->name)-1);
-    strncpy(out->app, (const char*)sqlite3_column_text(stmt, 2), sizeof(out->app)-1);
-    strncpy(out->publish_key, (const char*)sqlite3_column_text(stmt, 3), sizeof(out->publish_key)-1);
-    strncpy(out->play_key, (const char*)sqlite3_column_text(stmt, 4), sizeof(out->play_key)-1);
-    strncpy(out->stats_key, (const char*)sqlite3_column_text(stmt, 5), sizeof(out->stats_key)-1);
+    db_col_text(out->id, sizeof(out->id), stmt, 0);
+    db_col_text(out->name, sizeof(out->name), stmt, 1);
+    db_col_text(out->app, sizeof(out->app), stmt, 2);
+    db_col_text(out->publish_key, sizeof(out->publish_key), stmt, 3);
+    db_col_text(out->play_key, sizeof(out->play_key), stmt, 4);
+    db_col_text(out->stats_key, sizeof(out->stats_key), stmt, 5);
     out->enabled = sqlite3_column_int(stmt, 6) != 0;
-    strncpy(out->allowed_codecs, (const char*)sqlite3_column_text(stmt, 7), sizeof(out->allowed_codecs)-1);
+    db_col_text(out->allowed_codecs, sizeof(out->allowed_codecs), stmt, 7);
     out->created_at = (time_t)sqlite3_column_int64(stmt, 8);
     return true;
 }
@@ -295,16 +311,53 @@ bool db_stream_update(db_context_t *db, const char *id, const db_stream_t *s)
     return rc == SQLITE_DONE;
 }
 
-bool db_stream_delete(db_context_t *db, const char *id)
+/* Run one bound DELETE inside the already-open transaction. Returns true on
+ * SQLITE_DONE, false on a prepare or step failure so the caller can roll
+ * back instead of leaving a partially cascaded delete. */
+static bool db_exec_delete_by_stream_id(db_context_t *db, const char *sql, const char *id)
 {
-    pthread_mutex_lock(&db->lock);
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(db->conn, "DELETE FROM streams WHERE id=?", -1, &stmt, NULL);
+    if (sqlite3_prepare_v2(db->conn, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
     sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db->lock);
     return rc == SQLITE_DONE;
+}
+
+bool db_stream_delete(db_context_t *db, const char *id)
+{
+    pthread_mutex_lock(&db->lock);
+
+    /* Cascade: remove dependent rows so deleted streams cannot leave ghost
+     * active publishers/players that pollute stats after stream re-creation.
+     * Wrapped in a transaction so a failure partway through (e.g. SQLITE_BUSY)
+     * cannot leave the cascade half-applied. */
+    char *err = NULL;
+    if (sqlite3_exec(db->conn, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
+        log_error("DB error starting cascade delete transaction: %s", err);
+        sqlite3_free(err);
+        pthread_mutex_unlock(&db->lock);
+        return false;
+    }
+
+    bool ok = db_exec_delete_by_stream_id(db, "DELETE FROM publishers WHERE stream_id=?", id) &&
+              db_exec_delete_by_stream_id(db, "DELETE FROM players WHERE stream_id=?", id) &&
+              db_exec_delete_by_stream_id(db, "DELETE FROM stats_samples WHERE stream_id=?", id) &&
+              db_exec_delete_by_stream_id(db, "DELETE FROM streams WHERE id=?", id);
+
+    if (ok) {
+        if (sqlite3_exec(db->conn, "COMMIT", NULL, NULL, &err) != SQLITE_OK) {
+            log_error("DB error committing cascade delete: %s", err);
+            sqlite3_free(err);
+            ok = false;
+        }
+    }
+    if (!ok) {
+        sqlite3_exec(db->conn, "ROLLBACK", NULL, NULL, NULL);
+    }
+
+    pthread_mutex_unlock(&db->lock);
+    return ok;
 }
 
 bool db_stream_list(db_context_t *db, db_stream_t **out_array, int *out_count)
@@ -413,13 +466,13 @@ bool db_publisher_remove(db_context_t *db, const char *id)
 
 static void load_publisher_row(sqlite3_stmt *stmt, db_publisher_t *out)
 {
-    strncpy(out->id, (const char*)sqlite3_column_text(stmt, 0), sizeof(out->id)-1);
-    strncpy(out->stream_id, (const char*)sqlite3_column_text(stmt, 1), sizeof(out->stream_id)-1);
-    strncpy(out->remote_addr, (const char*)sqlite3_column_text(stmt, 2), sizeof(out->remote_addr)-1);
-    strncpy(out->app, (const char*)sqlite3_column_text(stmt, 3), sizeof(out->app)-1);
-    strncpy(out->stream_name, (const char*)sqlite3_column_text(stmt, 4), sizeof(out->stream_name)-1);
-    strncpy(out->video_codec, (const char*)sqlite3_column_text(stmt, 5), sizeof(out->video_codec)-1);
-    strncpy(out->audio_codec, (const char*)sqlite3_column_text(stmt, 6), sizeof(out->audio_codec)-1);
+    db_col_text(out->id, sizeof(out->id), stmt, 0);
+    db_col_text(out->stream_id, sizeof(out->stream_id), stmt, 1);
+    db_col_text(out->remote_addr, sizeof(out->remote_addr), stmt, 2);
+    db_col_text(out->app, sizeof(out->app), stmt, 3);
+    db_col_text(out->stream_name, sizeof(out->stream_name), stmt, 4);
+    db_col_text(out->video_codec, sizeof(out->video_codec), stmt, 5);
+    db_col_text(out->audio_codec, sizeof(out->audio_codec), stmt, 6);
     out->video_width = (uint32_t)sqlite3_column_int(stmt, 7);
     out->video_height = (uint32_t)sqlite3_column_int(stmt, 8);
     out->fps = sqlite3_column_double(stmt, 9);
@@ -524,11 +577,11 @@ bool db_player_remove(db_context_t *db, const char *id)
 
 static void load_player_row(sqlite3_stmt *stmt, db_player_t *out)
 {
-    strncpy(out->id, (const char*)sqlite3_column_text(stmt, 0), sizeof(out->id)-1);
-    strncpy(out->stream_id, (const char*)sqlite3_column_text(stmt, 1), sizeof(out->stream_id)-1);
-    strncpy(out->remote_addr, (const char*)sqlite3_column_text(stmt, 2), sizeof(out->remote_addr)-1);
-    strncpy(out->app, (const char*)sqlite3_column_text(stmt, 3), sizeof(out->app)-1);
-    strncpy(out->stream_name, (const char*)sqlite3_column_text(stmt, 4), sizeof(out->stream_name)-1);
+    db_col_text(out->id, sizeof(out->id), stmt, 0);
+    db_col_text(out->stream_id, sizeof(out->stream_id), stmt, 1);
+    db_col_text(out->remote_addr, sizeof(out->remote_addr), stmt, 2);
+    db_col_text(out->app, sizeof(out->app), stmt, 3);
+    db_col_text(out->stream_name, sizeof(out->stream_name), stmt, 4);
     out->bytes_out = (uint64_t)sqlite3_column_int64(stmt, 5);
     out->bitrate_kbps = sqlite3_column_double(stmt, 6);
     out->connected_at = (time_t)sqlite3_column_int64(stmt, 7);
@@ -607,14 +660,19 @@ bool db_stat_recent(db_context_t *db, const char *stream_id, int limit, db_stat_
     sqlite3_bind_int(stmt, 2, limit);
     int cap = limit > 0 ? limit : 64, n = 0;
     db_stat_sample_t *arr = calloc(cap, sizeof(db_stat_sample_t));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&db->lock);
+        return false;
+    }
     while (sqlite3_step(stmt) == SQLITE_ROW && n < cap) {
-        strncpy(arr[n].stream_id, (const char*)sqlite3_column_text(stmt, 0), sizeof(arr[n].stream_id)-1);
+        db_col_text(arr[n].stream_id, sizeof(arr[n].stream_id), stmt, 0);
         arr[n].bitrate_in_kbps = sqlite3_column_double(stmt, 1);
         arr[n].fps = sqlite3_column_double(stmt, 2);
         arr[n].width = (uint32_t)sqlite3_column_int(stmt, 3);
         arr[n].height = (uint32_t)sqlite3_column_int(stmt, 4);
-        strncpy(arr[n].video_codec, (const char*)sqlite3_column_text(stmt, 5), sizeof(arr[n].video_codec)-1);
-        strncpy(arr[n].audio_codec, (const char*)sqlite3_column_text(stmt, 6), sizeof(arr[n].audio_codec)-1);
+        db_col_text(arr[n].video_codec, sizeof(arr[n].video_codec), stmt, 5);
+        db_col_text(arr[n].audio_codec, sizeof(arr[n].audio_codec), stmt, 6);
         arr[n].player_count = sqlite3_column_int(stmt, 7);
         arr[n].ts = (time_t)sqlite3_column_int64(stmt, 8);
         n++;
