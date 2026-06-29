@@ -304,7 +304,7 @@ impl Db {
              (id,stream_id,remote_addr,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,connected_at,active) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
             params![p.id, p.stream_id, p.remote_addr, p.app, p.stream_name, p.video_codec, p.audio_codec,
-                    p.video_width, p.video_height, p.fps, p.bytes_in, p.bitrate_kbps, p.connected_at],
+                    p.video_width, p.video_height, p.fps, p.bytes_in as i64, p.bitrate_kbps, p.connected_at],
         )
         .is_ok()
     }
@@ -325,7 +325,7 @@ impl Db {
                 p.video_width,
                 p.video_height,
                 p.fps,
-                p.bytes_in,
+                p.bytes_in as i64,
                 p.bitrate_kbps,
                 p.active,
                 id
@@ -353,7 +353,7 @@ impl Db {
             video_width: row.get(7)?,
             video_height: row.get(8)?,
             fps: row.get(9)?,
-            bytes_in: row.get(10)?,
+            bytes_in: row.get::<_, i64>(10)? as u64,
             bitrate_kbps: row.get(11)?,
             connected_at: row.get(12)?,
             active: row.get(13)?,
@@ -410,7 +410,7 @@ impl Db {
                 p.remote_addr,
                 p.app,
                 p.stream_name,
-                p.bytes_out,
+                p.bytes_out as i64,
                 p.bitrate_kbps,
                 p.connected_at
             ],
@@ -428,7 +428,7 @@ impl Db {
                 p.remote_addr,
                 p.app,
                 p.stream_name,
-                p.bytes_out,
+                p.bytes_out as i64,
                 p.bitrate_kbps,
                 p.active,
                 id
@@ -451,7 +451,7 @@ impl Db {
             remote_addr: row.get(2)?,
             app: row.get(3)?,
             stream_name: row.get(4)?,
-            bytes_out: row.get(5)?,
+            bytes_out: row.get::<_, i64>(5)? as u64,
             bitrate_kbps: row.get(6)?,
             connected_at: row.get(7)?,
             active: row.get(8)?,

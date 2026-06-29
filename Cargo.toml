@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
