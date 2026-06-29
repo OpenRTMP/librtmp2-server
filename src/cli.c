@@ -29,6 +29,7 @@ int main(int argc, char **argv)
 
     char config_path[256] = "config.json";
     int verbose = 0;
+    const char *cli_api_token = NULL;
 
     /* Parse CLI args */
     for (int i = 1; i < argc; i++) {
@@ -41,7 +42,7 @@ int main(int argc, char **argv)
             int port = atoi(argv[++i]);
             snprintf(config.http_bind, sizeof(config.http_bind), "0.0.0.0:%d", port);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            strncpy(config.api_token, argv[++i], sizeof(config.api_token) - 1);
+            cli_api_token = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = 1;
         } else if (strcmp(argv[i], "-h") == 0) {
@@ -70,14 +71,22 @@ int main(int argc, char **argv)
     /* Environment variables override config file values */
     config_apply_env(&config);
 
+    /* CLI flag takes highest priority: reapply after config_load() (which
+     * resets api_token via config_set_defaults()) and config_apply_env(). */
+    if (cli_api_token) {
+        strncpy(config.api_token, cli_api_token, sizeof(config.api_token) - 1);
+        config.api_token[sizeof(config.api_token) - 1] = '\0';
+    }
+
     if (verbose) config.log_level = 3;
 
-    /* If auth.api_token is still empty after config load, the server would
-     * silently allow unauthenticated access to every Bearer-protected
-     * endpoint. Refuse to start instead of creating an open server. */
-    if (!config.api_token[0]) {
-        fprintf(stderr, "FATAL: auth.api_token is not set. "
-                        "Configure a token in %s or via -t flag.\n", config_path);
+    /* Refuse to start with missing, placeholder, or otherwise weak API tokens.
+     * An empty token would bypass Bearer auth; the shipped config placeholder
+     * is public knowledge and must not be accepted as a real secret. */
+    if (!config_api_token_usable(config.api_token)) {
+        fprintf(stderr, "FATAL: auth.api_token is missing or uses a known weak "
+                        "placeholder. Set a strong random token in %s, via -t, "
+                        "or LRTMP2_API_TOKEN.\n", config_path);
         return 1;
     }
 

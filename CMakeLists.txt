@@ -59,6 +59,7 @@ add_library(lrtmp2server_lib STATIC
     src/db.c
     src/http.c
     src/rtmp_callbacks.c
+    src/keygen.c
     src/logger.c
     ${mongoose_SOURCE_DIR}/mongoose.c
 )

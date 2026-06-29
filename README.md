@@ -197,9 +197,9 @@ Response:
   "id": "mystream",
   "name": "My Live Stream",
   "app": "live",
-  "publish_key": "pub_mystream_1719480000",
-  "play_key": "pl_mystream_1719480001",
-  "stats_key": "st_mystream_1719480002",
+  "publish_key": "pub_a1b2c3d4e5f6789012345678abcdef01",
+  "play_key": "pl_fedcba0987654321fedcba0987654321",
+  "stats_key": "st_0123456789abcdef0123456789abcdef",
   "enabled": true
 }
 ```

@@ -81,8 +81,8 @@ static int interop_create_stream(const char *stream_id, char *pub_key, size_t pu
     if (resp.data) {
         char *p = strstr(resp.data, "\"publish_key\"");
         if (p) {
-            p = strchr(p, '"'); /* field */
-            p = strchr(p + 1, '"'); /* value */
+            p = strchr(p + 1, '"'); /* closing quote of field name */
+            p = strchr(p + 1, '"'); /* opening quote of value */
             char *end = strchr(p + 1, '"');
             if (end && (size_t)(end - p - 1) < pub_key_sz) {
                 memcpy(pub_key, p + 1, end - p - 1);
@@ -148,8 +148,16 @@ static int interop_check_stats(const char *stats_key, int expect_pub, int expect
 
     int ok = 0;
     if (resp.data) {
-        /* Quick JSON check: look for "publishers":N and "players":N */
-        char *p = strstr(resp.data, "\"publishers\"");
+        /* Quick JSON check: look for "publishers":N and "players":N inside
+         * the "summary" object. The response also has a top-level
+         * "players":[...] array (the per-player list) that appears before
+         * "summary" — searching from resp.data would match that array key
+         * instead and atoi() the literal '[' into 0. Scope the search to
+         * the summary object so we only ever read the counts. */
+        char *summary = strstr(resp.data, "\"summary\"");
+        char *base = summary ? summary : resp.data;
+
+        char *p = strstr(base, "\"publishers\"");
         if (p) {
             int val = atoi(strchr(p, ':') + 1);
             if (val != expect_pub) {
@@ -161,7 +169,7 @@ static int interop_check_stats(const char *stats_key, int expect_pub, int expect
             goto done;
         }
 
-        p = strstr(resp.data, "\"players\"");
+        p = strstr(base, "\"players\"");
         if (p) {
             int val = atoi(strchr(p, ':') + 1);
             if (val != expect_players) {
@@ -225,9 +233,11 @@ int test_interop_obs_main(void)
         }
 
         char url[256];
-        /* OBS connects with: rtmp://server/live, stream name = stream_id, key = pub_key */
+        /* OBS connects with: rtmp://server/live/<pub_key> — the publish key
+         * IS the stream key on the wire; the server validates it against
+         * the random key returned by stream creation, not the stream id. */
         snprintf(url, sizeof(url), "rtmp://127.0.0.1:%d/live/%s",
-                 INTEROP_RTMP_PORT, stream_id);
+                 INTEROP_RTMP_PORT, pub_key);
 
         rc = lrtmp2_client_connect(pub, url);
         interop_result_record(&result, rc == 0);
@@ -302,7 +312,7 @@ int test_interop_obs_main(void)
 
         char player_url[256];
         snprintf(player_url, sizeof(player_url), "rtmp://127.0.0.1:%d/live/%s",
-                 INTEROP_RTMP_PORT, stream_id);
+                 INTEROP_RTMP_PORT, play_key);
 
         rc = lrtmp2_client_connect(player, player_url);
         interop_result_record(&result, rc == 0);

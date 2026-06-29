@@ -18,6 +18,9 @@ void config_apply_env(server_config_t *config);
 /* Load default config */
 void config_set_defaults(server_config_t *config);
 
+/* Returns false for empty, placeholder, or other known-weak API tokens. */
+bool config_api_token_usable(const char *token);
+
 #ifdef __cplusplus
 }
 #endif

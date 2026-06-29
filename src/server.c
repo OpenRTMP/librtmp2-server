@@ -18,13 +18,12 @@
 #include <signal.h>
 #include <stdlib.h>
 
-/* Defined in rtmp_callbacks.c */
+/* Defined in rtmp_callbacks.c — opaque here, only ever held by pointer/value
+ * inside lrtmp2_server_app_t and passed straight through to rtmp_bridge_setup. */
+typedef struct conn_state conn_state_t;
 typedef struct {
     db_context_t *db;
-    char publish_key[128];
-    char play_key[128];
-    int  is_publisher;
-    int  is_player;
+    conn_state_t *conns;
 } rtmp_bridge_t;
 
 extern void rtmp_bridge_setup(lrtmp2_server_config_t *config, rtmp_bridge_t *bridge,
