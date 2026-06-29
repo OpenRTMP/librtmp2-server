@@ -81,8 +81,8 @@ static int interop_create_stream(const char *stream_id, char *pub_key, size_t pu
     if (resp.data) {
         char *p = strstr(resp.data, "\"publish_key\"");
         if (p) {
-            p = strchr(p, '"'); /* field */
-            p = strchr(p + 1, '"'); /* value */
+            p = strchr(p + 1, '"'); /* closing quote of field name */
+            p = strchr(p + 1, '"'); /* opening quote of value */
             char *end = strchr(p + 1, '"');
             if (end && (size_t)(end - p - 1) < pub_key_sz) {
                 memcpy(pub_key, p + 1, end - p - 1);
