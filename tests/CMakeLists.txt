@@ -39,7 +39,12 @@ add_test(NAME unit_tests COMMAND run_tests)
 # Interop tests — end-to-end tests that spawn the real server binary
 # and drive it via librtmp2 client API + HTTP/curl.
 # ---------------------------------------------------------------------------
-find_package(CURL REQUIRED)
+find_package(CURL)
+if(NOT CURL_FOUND)
+    message(STATUS "CURL not found — interop tests will be skipped")
+endif()
+
+if(CURL_FOUND)
 
 add_executable(run_interop_tests
     integration/main.c
@@ -72,3 +77,5 @@ add_test(NAME interop_tests COMMAND run_interop_tests)
 set_tests_properties(interop_tests PROPERTIES
     TIMEOUT 60
     DEPENDS unit_tests)  # run after unit tests pass
+
+endif()  # CURL_FOUND
