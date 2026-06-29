@@ -82,6 +82,7 @@ add_dependencies(run_interop_tests librtmp2-server)
 add_test(NAME interop_tests COMMAND run_interop_tests)
 set_tests_properties(interop_tests PROPERTIES
     TIMEOUT 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}  # librtmp2-server binary lives here, not in tests/
     DEPENDS unit_tests)  # run after unit tests pass
 
 endif()  # CURL_FOUND
