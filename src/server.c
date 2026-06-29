@@ -110,6 +110,9 @@ int server_app_run(lrtmp2_server_app_t *app)
     /* Create RTMP server with bridge to DB */
     lrtmp2_server_config_t rtmp_config;
     rtmp_bridge_setup(&rtmp_config, &app->bridge, app->db);
+    if (app->config.rtmp_max_conn > 0) {
+        rtmp_config.max_connections = app->config.rtmp_max_conn;
+    }
 
     /* RTMPS: enable TLS termination if the operator configured it. librtmp2
      * builds TLS in by default but it can be compiled out, so refuse to start
