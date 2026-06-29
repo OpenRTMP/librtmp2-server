@@ -48,18 +48,17 @@ fn run() -> Result<(), String> {
         ServerConfig::default()
     };
 
+    // Environment variables override config file values.
+    config_apply_env(&mut config);
+
+    // CLI flags take highest priority: applied after config file load and
+    // env application.
     if let Some(port) = cli.rtmp_port {
         config.rtmp_bind = format!("0.0.0.0:{port}");
     }
     if let Some(port) = cli.http_port {
         config.http_bind = format!("0.0.0.0:{port}");
     }
-
-    // Environment variables override config file values.
-    config_apply_env(&mut config);
-
-    // CLI flag takes highest priority: reapply after config file load and
-    // env application.
     if let Some(token) = cli.api_token {
         config.api_token = token;
     }

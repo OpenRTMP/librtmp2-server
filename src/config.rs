@@ -244,10 +244,9 @@ pub fn config_apply_env(config: &mut ServerConfig) {
     }
 
     if let Ok(v) = std::env::var("LRTMP2_LOG_LEVEL") {
-        if let Ok(lvl) = v.parse::<i32>() {
-            if (0..=5).contains(&lvl) {
-                config.log_level = lvl;
-            }
+        match v.parse::<i32>() {
+            Ok(lvl) if (0..=3).contains(&lvl) => config.log_level = lvl,
+            _ => crate::log_warn!("Ignoring invalid LRTMP2_LOG_LEVEL value '{v}' (expected 0-3)"),
         }
     }
 }

@@ -32,7 +32,8 @@ pub fn close() {
 
 fn write_line(prefix: &str, msg: &str) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let line = format!("[{now}] {prefix} {msg}\n");
+    let safe_msg = msg.replace('\r', "\\r").replace('\n', "\\n");
+    let line = format!("[{now}] {prefix} {safe_msg}\n");
     let mut guard = FILE.lock().unwrap();
     if let Some(f) = guard.as_mut() {
         let _ = f.write_all(line.as_bytes());
@@ -44,8 +45,12 @@ fn write_line(prefix: &str, msg: &str) {
     }
 }
 
+pub fn enabled(level: Level) -> bool {
+    (level as u8) <= LEVEL.load(Ordering::Relaxed)
+}
+
 pub fn log(level: Level, msg: &str) {
-    if (level as u8) > LEVEL.load(Ordering::Relaxed) {
+    if !enabled(level) {
         return;
     }
     let prefix = match level {
@@ -59,17 +64,33 @@ pub fn log(level: Level, msg: &str) {
 
 #[macro_export]
 macro_rules! log_error {
-    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Error, &format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::logger::enabled($crate::logger::Level::Error) {
+            $crate::logger::log($crate::logger::Level::Error, &format!($($arg)*));
+        }
+    };
 }
 #[macro_export]
 macro_rules! log_warn {
-    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Warn, &format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::logger::enabled($crate::logger::Level::Warn) {
+            $crate::logger::log($crate::logger::Level::Warn, &format!($($arg)*));
+        }
+    };
 }
 #[macro_export]
 macro_rules! log_info {
-    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Info, &format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::logger::enabled($crate::logger::Level::Info) {
+            $crate::logger::log($crate::logger::Level::Info, &format!($($arg)*));
+        }
+    };
 }
 #[macro_export]
 macro_rules! log_debug {
-    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Debug, &format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::logger::enabled($crate::logger::Level::Debug) {
+            $crate::logger::log($crate::logger::Level::Debug, &format!($($arg)*));
+        }
+    };
 }

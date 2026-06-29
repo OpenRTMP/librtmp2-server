@@ -114,7 +114,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         stream_key: &str,
         remote_addr: &str,
     ) -> Result<(), ()> {
-        crate::log_info!("RTMP: publish request app='{app}' key='{stream_key}'");
+        crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
 
         let Some(stream) = self.db.stream_find_by_publish_key(stream_key) else {
             crate::log_warn!("RTMP: publish rejected — invalid publish_key for app='{app}'");
@@ -131,12 +131,18 @@ impl RtmpEventHandler for DbRtmpBridge {
             connected_at: crate::db::now_ts(),
             ..Default::default()
         };
-        self.db.publisher_add(&pub_row);
+        if !self.db.publisher_add(&pub_row) {
+            crate::log_warn!("RTMP: publish rejected — failed to record publisher row");
+            return Err(());
+        }
 
         let pub_id = pub_row.id.clone();
-        if let Some(cs) = self.conns.lock().unwrap().get_mut(&conn) {
-            cs.publisher = Some(pub_row);
-        }
+        self.conns
+            .lock()
+            .unwrap()
+            .entry(conn)
+            .or_default()
+            .publisher = Some(pub_row);
 
         crate::log_info!(
             "RTMP: publish accepted stream='{}' publisher={pub_id}",
@@ -152,7 +158,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         stream_key: &str,
         remote_addr: &str,
     ) -> Result<(), ()> {
-        crate::log_info!("RTMP: play request app='{app}' key='{stream_key}'");
+        crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
 
         let Some(stream) = self.db.stream_find_by_play_key(stream_key) else {
             crate::log_warn!("RTMP: play rejected — invalid play_key for app='{app}'");
@@ -169,12 +175,13 @@ impl RtmpEventHandler for DbRtmpBridge {
             connected_at: crate::db::now_ts(),
             ..Default::default()
         };
-        self.db.player_add(&player_row);
+        if !self.db.player_add(&player_row) {
+            crate::log_warn!("RTMP: play rejected — failed to record player row");
+            return Err(());
+        }
 
         let player_id = player_row.id.clone();
-        if let Some(cs) = self.conns.lock().unwrap().get_mut(&conn) {
-            cs.player = Some(player_row);
-        }
+        self.conns.lock().unwrap().entry(conn).or_default().player = Some(player_row);
 
         crate::log_info!(
             "RTMP: play accepted stream='{}' player={player_id}",

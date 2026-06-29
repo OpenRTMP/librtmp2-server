@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS streams (
 );
 CREATE TABLE IF NOT EXISTS publishers (
   id TEXT PRIMARY KEY,
-  stream_id TEXT NOT NULL,
+  stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
   remote_addr TEXT NOT NULL DEFAULT '',
   app TEXT NOT NULL DEFAULT '',
   stream_name TEXT NOT NULL DEFAULT '',
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS publishers (
 );
 CREATE TABLE IF NOT EXISTS players (
   id TEXT PRIMARY KEY,
-  stream_id TEXT NOT NULL,
+  stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
   remote_addr TEXT NOT NULL DEFAULT '',
   app TEXT NOT NULL DEFAULT '',
   stream_name TEXT NOT NULL DEFAULT '',
@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS players (
 );
 CREATE TABLE IF NOT EXISTS stats_samples (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  stream_id TEXT NOT NULL,
+  stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
   bitrate_in_kbps REAL NOT NULL DEFAULT 0,
   fps REAL NOT NULL DEFAULT 0,
   width INTEGER NOT NULL DEFAULT 0,
@@ -300,7 +300,7 @@ impl Db {
     pub fn publisher_add(&self, p: &Publisher) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO publishers \
+            "INSERT INTO publishers \
              (id,stream_id,remote_addr,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,connected_at,active) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
             params![p.id, p.stream_id, p.remote_addr, p.app, p.stream_name, p.video_codec, p.audio_codec,
@@ -401,7 +401,7 @@ impl Db {
     pub fn player_add(&self, p: &Player) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO players \
+            "INSERT INTO players \
              (id,stream_id,remote_addr,app,stream_name,bytes_out,bitrate_kbps,connected_at,active) \
              VALUES (?,?,?,?,?,?,?,?,1)",
             params![

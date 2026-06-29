@@ -209,11 +209,17 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
     };
 
     let now = now_ts();
+    let app_name = pubs
+        .first()
+        .map(|p| p.app.as_str())
+        .or_else(|| players.first().map(|pl| pl.app.as_str()))
+        .unwrap_or("live");
     let mut out = String::with_capacity(8192);
-    out.push_str(
+    out.push_str(&format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rtmp>\n  <server>\n\
-         \x20\x20\x20\x20<application>\n      <name>live</name>\n      <live>\n",
-    );
+         \x20\x20\x20\x20<application>\n      <name>{}</name>\n      <live>\n",
+        xml_escape(app_name),
+    ));
 
     for p in &pubs {
         let uptime_ms = (now - p.connected_at) * 1000;
@@ -458,7 +464,13 @@ async fn handle_stream_delete(
     if state.db.stream_get(&id).is_none() {
         return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
     }
-    state.db.stream_delete(&id);
+    if !state.db.stream_delete(&id) {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Failed to delete stream",
+        );
+    }
     crate::log_info!("Stream deleted: {id}");
     Json(json!({"status": "deleted"})).into_response()
 }
