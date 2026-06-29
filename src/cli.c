@@ -9,8 +9,7 @@
 #include <stdlib.h>
 #include <signal.h>
 
-#include "librtmp2-server/config.h"
-#include "librtmp2-server/logger.h"
+static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [-c config.json]\n", prog);
     fprintf(stderr, "\n");

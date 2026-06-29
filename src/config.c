@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <strings.h>  /* strcasecmp */
 
 void config_set_defaults(server_config_t *config)
 {
@@ -29,6 +30,10 @@ bool config_api_token_usable(const char *token)
 {
     if (!token || !token[0]) return false;
 
+    /* Reject tokens too short to resist brute-force regardless of content. */
+    enum { MIN_TOKEN_LEN = 16 };
+    if (strlen(token) < MIN_TOKEN_LEN) return false;
+
     static const char *const weak_tokens[] = {
         "<replace-with-random-token>",
         "changeme",
@@ -37,11 +42,17 @@ bool config_api_token_usable(const char *token)
         "api_token",
         "test-token",
         "test-token-123",
+        "admin",
+        "administrator",
+        "123456",
+        "12345678",
+        "letmein",
+        "default",
         NULL
     };
 
     for (int i = 0; weak_tokens[i]; i++) {
-        if (strcmp(token, weak_tokens[i]) == 0) return false;
+        if (strcasecmp(token, weak_tokens[i]) == 0) return false;
     }
     return true;
 }
