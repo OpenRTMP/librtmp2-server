@@ -69,6 +69,11 @@ target_link_libraries(run_interop_tests
         m
 )
 
+if(ENABLE_TLS)
+    # Pre-built librtmp2.a carries unresolved OpenSSL symbols when built with TLS.
+    target_link_libraries(run_interop_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 # Interop tests need the server binary to be built first
 add_dependencies(run_interop_tests librtmp2-server)
 
