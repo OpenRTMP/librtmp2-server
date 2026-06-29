@@ -1,12 +1,12 @@
 //! OS-backed cryptographically secure key material.
 
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 
 /// `prefix` followed by 32 hex chars (16 bytes / 128 bits of entropy).
 pub fn keygen_secret(prefix: &str) -> String {
     let mut rnd = [0u8; 16];
-    OsRng.fill_bytes(&mut rnd);
+    SysRng.try_fill_bytes(&mut rnd).expect("OS RNG failure");
 
     let mut out = String::with_capacity(prefix.len() + 32);
     out.push_str(prefix);

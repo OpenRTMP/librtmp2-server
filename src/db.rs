@@ -298,18 +298,26 @@ impl Db {
     // ==================== PUBLISHERS ====================
 
     pub fn publisher_add(&self, p: &Publisher) -> bool {
+        let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
+            crate::log_error!("publisher_add: bytes_in {} overflows i64", p.bytes_in);
+            return false;
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO publishers \
              (id,stream_id,remote_addr,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,connected_at,active) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
             params![p.id, p.stream_id, p.remote_addr, p.app, p.stream_name, p.video_codec, p.audio_codec,
-                    p.video_width, p.video_height, p.fps, p.bytes_in, p.bitrate_kbps, p.connected_at],
+                    p.video_width, p.video_height, p.fps, bytes_in, p.bitrate_kbps, p.connected_at],
         )
         .is_ok()
     }
 
     pub fn publisher_update(&self, id: &str, p: &Publisher) -> bool {
+        let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
+            crate::log_error!("publisher_update: bytes_in {} overflows i64", p.bytes_in);
+            return false;
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE publishers SET stream_id=?,remote_addr=?,app=?,stream_name=?,\
@@ -325,7 +333,7 @@ impl Db {
                 p.video_width,
                 p.video_height,
                 p.fps,
-                p.bytes_in,
+                bytes_in,
                 p.bitrate_kbps,
                 p.active,
                 id
@@ -353,7 +361,13 @@ impl Db {
             video_width: row.get(7)?,
             video_height: row.get(8)?,
             fps: row.get(9)?,
-            bytes_in: row.get(10)?,
+            bytes_in: u64::try_from(row.get::<_, i64>(10)?).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Integer,
+                    "negative bytes_in".into(),
+                )
+            })?,
             bitrate_kbps: row.get(11)?,
             connected_at: row.get(12)?,
             active: row.get(13)?,
@@ -399,6 +413,10 @@ impl Db {
     // ==================== PLAYERS ====================
 
     pub fn player_add(&self, p: &Player) -> bool {
+        let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
+            crate::log_error!("player_add: bytes_out {} overflows i64", p.bytes_out);
+            return false;
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO players \
@@ -410,7 +428,7 @@ impl Db {
                 p.remote_addr,
                 p.app,
                 p.stream_name,
-                p.bytes_out,
+                bytes_out,
                 p.bitrate_kbps,
                 p.connected_at
             ],
@@ -419,6 +437,10 @@ impl Db {
     }
 
     pub fn player_update(&self, id: &str, p: &Player) -> bool {
+        let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
+            crate::log_error!("player_update: bytes_out {} overflows i64", p.bytes_out);
+            return false;
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE players SET stream_id=?,remote_addr=?,app=?,stream_name=?,\
@@ -428,7 +450,7 @@ impl Db {
                 p.remote_addr,
                 p.app,
                 p.stream_name,
-                p.bytes_out,
+                bytes_out,
                 p.bitrate_kbps,
                 p.active,
                 id
@@ -451,7 +473,13 @@ impl Db {
             remote_addr: row.get(2)?,
             app: row.get(3)?,
             stream_name: row.get(4)?,
-            bytes_out: row.get(5)?,
+            bytes_out: u64::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Integer,
+                    "negative bytes_out".into(),
+                )
+            })?,
             bitrate_kbps: row.get(6)?,
             connected_at: row.get(7)?,
             active: row.get(8)?,
