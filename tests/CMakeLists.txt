@@ -71,4 +71,4 @@ add_dependencies(run_interop_tests librtmp2-server)
 add_test(NAME interop_tests COMMAND run_interop_tests)
 set_tests_properties(interop_tests PROPERTIES
     TIMEOUT 60
-    DEPENDS unit_tests  # run after unit tests pass)
+    DEPENDS unit_tests)  # run after unit tests pass
