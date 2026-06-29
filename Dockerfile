@@ -1,8 +1,6 @@
 # Build stage
 FROM rust:latest AS builder
 
-RUN apt install build-base -y
-
 WORKDIR /build
 COPY . .
 RUN cargo build --release
