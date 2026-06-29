@@ -16,14 +16,14 @@ COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/
 COPY --from=builder /build/config.example.json /etc/librtmp2-server/config.json
 
 # Create non-root user and data directory
-RUN adduser -D -H -s /sbin/nologin appuser && \
+RUN adduser -D -H -s /sbin/nologin openrtmp && \
     mkdir -p /data && \
-    chown appuser:appuser /data
+    chown openrtmp:openrtmp /data
 
 ENV LRTMP2_DB=/data/server.db
 
 # Drop privileges
-USER appuser
+USER openrtmp
 
 EXPOSE 1935 8080
 
