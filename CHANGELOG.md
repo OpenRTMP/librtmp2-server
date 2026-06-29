@@ -13,40 +13,44 @@ begin at `1.0.0`.
 
 ## [Unreleased] — alpha
 
+### Changed
+- **Rewritten in Rust.** The C implementation (CMake/Makefile build, Mongoose
+  HTTP server, hand-rolled JSON/SQLite glue) has been fully replaced by a Rust
+  crate built on `axum` (HTTP API) and `rusqlite` (SQLite persistence).
+  Config, db, HTTP API, CLI, logging, and key generation are all native Rust
+  now; the HTTP API surface is unchanged.
+- The RTMP/E-RTMP protocol implementation is **not** part of this crate. It is
+  developed separately as a Rust `librtmp2` crate and plugs into this server
+  through the [`RtmpEventHandler`](src/rtmp_bridge.rs) trait
+  (`on_connect` / `on_publish` / `on_play` / `on_frame` / `on_close`), which
+  replaces the old C function-pointer + `userdata` callback contract.
+- CI (`tests.yml`, `release.yml`) now runs `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo build`, and
+  `cargo test` instead of the old CMake/ctest pipeline.
+- `Dockerfile` is now a `rust:1-alpine` → `alpine:latest` multi-stage build.
+
 ### Added
-- RTMPS (TLS) support via librtmp2/OpenSSL, toggled by the operator through a
-  `tls` config block (`enabled`, `cert_file`, `key_file`) or the
+- RTMPS (TLS) configuration support — toggled by the operator through a `tls`
+  config block (`enabled`, `cert_file`, `key_file`) or the
   `LRTMP2_TLS_ENABLED` / `LRTMP2_TLS_CERT_FILE` / `LRTMP2_TLS_KEY_FILE`
-  environment variables; off by default
-- Build toggles to drop the OpenSSL dependency (`make TLS=0`,
-  `cmake -DENABLE_TLS=OFF`); enabling TLS without library support is refused at
-  startup with a clear error
-- Full RTMP server implementation with librtmp2 integration
+  environment variables; validated at startup (enabling TLS without both a
+  cert and key file is refused with a clear error). Off by default. Actual
+  RTMPS termination lands once the RTMP listener is wired in.
 - HTTP API with SQLite backend persistence
 - Configuration file support (`config.example.json`)
 - CLI interface (`./librtmp2-server`) for quick starts
-- Integration tests for RTMP:// ingest, client publish, and E-RTMP v1/v2 flows
-- Frame logging and diagnostic capabilities
-- Asan/UBSan hardened builds
-- **Interop tests** — automated end-to-end verification of real-world
-  compatibility scenarios:
-  - `test_interop_obs` — OBS-style publish/play handshake via librtmp2 client
-  - `test_interop_ffmpeg` — FFmpeg-style ingestion and stream lifecycle
-  - `test_interop_haishinkkit` — HaishinKit-style mobile publish pattern
-  - `test_interop_concurrent_streams` — multiple concurrent publishers/players
+- Unit tests covering config, db, HTTP API, keygen, and the RTMP bridge seam
 
 ### Security
-- Input validation for HTTP requests and RTMP streams
+- Input validation for HTTP requests
 - Secure configuration handling with environment variables
-- Bounds-checked database operations
+- Constant-time Bearer token comparison
+- Weak/placeholder API token rejection
 
 ### Documentation
-- `README.md` for server setup
-- `docs/rtmp-server-architecture.md` for architectural overview
-- Example configurations for various use cases
-- Integration test documentation
+- `README.md` updated for the Rust build/run/architecture
 
 ### Planned
+- Wire the Rust `librtmp2` crate's RTMP listener into `RtmpEventHandler`
 - REST API enhancements for server management
-- Enhanced WebRTC integration
 - First tagged pre-release once config and APIs settle

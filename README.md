@@ -6,13 +6,12 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
 [![License](https://img.shields.io/github/license/OpenRTMP/librtmp2-server)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)]()
-[![Language](https://img.shields.io/badge/language-C-blue)]()
+[![Language](https://img.shields.io/badge/language-Rust-orange)]()
 
 ---
 
 ## Features
 
-- **RTMP / E-RTMP ingest** — Legacy RTMP + Enhanced RTMP v1/v2 (HEVC, AV1, VP9)
 - **SQLite persistence** — Streams, publishers, players, stats all in a DB
 - **Unique keys per stream** — `publish_key`, `play_key`, `stats_key`
 - **Privacy by design** — No one can see streams/stats without the exact key
@@ -25,21 +24,33 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
 ## Architecture
 
+`librtmp2-server` is written in Rust (axum + rusqlite). It owns everything
+*around* the RTMP protocol — config, persistence, the HTTP/REST API, CLI,
+logging, and key generation — and exposes an [`RtmpEventHandler`
+trait](src/rtmp_bridge.rs) (`on_connect` / `on_publish` / `on_play` /
+`on_frame` / `on_close`) as the integration seam for the actual RTMP/E-RTMP
+protocol implementation.
+
+The RTMP protocol layer itself lives in a separate
+[librtmp2](https://github.com/OpenRTMP/librtmp2) crate (also being rewritten
+in Rust) and is not yet wired into this server's listener — see
+[`src/server.rs`](src/server.rs) for where that integration will land.
+
 ```text
 OBS / FFmpeg / App
         │
         ▼
-  librtmp2-server
-  ├── RTMP Listener (port 1935)
+  librtmp2-server (Rust)
+  ├── RTMP Listener (port 1935)      ← not yet wired up; pending librtmp2 (Rust)
   ├── SQLite (streams, publishers, players, stats)
-  ├── HTTP API     (port 8080)
+  ├── HTTP API     (port 8080, axum)
   │   ├── /api/v1/streams    CRUD
   │   ├── /stats             JSON stats (key-protected)
   │   └── /stats-nginx       XML stats (nginx-compatible)
   └── Config
         │
         ▼
-      librtmp2
+      librtmp2 (Rust, in progress)
       ├── Handshake
       ├── Chunking
       ├── AMF
@@ -54,37 +65,27 @@ OBS / FFmpeg / App
 
 ### Dependencies
 
-- C11 compiler (gcc / clang)
-- CMake >= 3.16
-- pthread + SQLite3 dev
-- OpenSSL dev (for RTMPS; optional — see below)
-- [librtmp2](https://github.com/OpenRTMP/librtmp2)
+- Rust (stable toolchain) — see [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install)
+- SQLite is vendored via rusqlite's `bundled` feature — no system SQLite3 needed
 
 ### Compile
 
 ```bash
-# Build librtmp2 first
-git clone https://github.com/OpenRTMP/librtmp2.git
-cd librtmp2 && make release && cd ..
-
-# Build the server
 git clone https://github.com/OpenRTMP/librtmp2-server.git
 cd librtmp2-server
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DLRTMP2_DIR=../../librtmp2
-make -j$(nproc)
+cargo build --release
 ```
 
 ### Run
 
 ```bash
-./librtmp2-server -c config.example.json
+./target/release/librtmp2-server -c config.example.json
 ```
 
 Or with CLI flags:
 
 ```bash
-./librtmp2-server -p 1935 -w 8080 -t my-secret-token -v
+./target/release/librtmp2-server -p 1935 -w 8080 -t my-secret-token -v
 ```
 
 ---
@@ -118,27 +119,16 @@ Or with CLI flags:
 
 ## RTMPS (TLS)
 
-RTMPS termination is provided by librtmp2 (OpenSSL) and is **built in by
-default**. To enable it, set `tls.enabled` and point at a PEM certificate chain
-and private key:
+RTMPS termination will be provided by the RTMP listener once the Rust
+`librtmp2` crate is wired in. The `tls` config block and
+`LRTMP2_TLS_ENABLED` / `LRTMP2_TLS_CERT_FILE` / `LRTMP2_TLS_KEY_FILE`
+environment variables are already validated by this server at startup —
+enabling TLS without both a cert and key file configured is refused with a
+clear error — but no listener currently terminates connections.
 
 ```json
 "tls": { "enabled": true, "cert_file": "/path/fullchain.pem", "key_file": "/path/privkey.pem" }
 ```
-
-Equivalent environment variables: `LRTMP2_TLS_ENABLED=1`,
-`LRTMP2_TLS_CERT_FILE`, `LRTMP2_TLS_KEY_FILE`. When `tls.enabled` is `false`
-(the default) the listener speaks plaintext RTMP.
-
-To build **without** TLS (no OpenSSL dependency), disable it in both projects:
-
-```bash
-make TLS=0                      # Makefile build
-cmake .. -DENABLE_TLS=OFF       # CMake build
-```
-
-Enabling TLS in the config while the library was built without it is refused at
-startup with a clear error.
 
 ---
 
@@ -232,13 +222,13 @@ curl "http://localhost:8080/stats?key=st_mystream_1719480002"
 }
 ```
 
-### Stats nginx-rtmp XML (für externe Tools)
+### Stats nginx-rtmp XML
 
 ```bash
 curl "http://localhost:8080/stats-nginx?key=st_mystream_1719480002"
 ```
 
-Gibt das gleiche XML-Format wie `nginx-rtmp-module` zurück.
+Returns the same XML format as `nginx-rtmp-module`.
 
 ---
 
@@ -254,17 +244,16 @@ docker compose up -d
 
 ```text
 librtmp2-server/
-├── include/librtmp2-server/   Public headers
-├── src/                       Source files
-│   ├── cli.c                  Entry point & arg parsing
-│   ├── server.c               Main app context
-│   ├── config.c               JSON config loader
-│   ├── db.c                   SQLite persistence
-│   ├── http.c                 HTTP server (Mongoose)
-│   ├── rtmp_callbacks.c       librtmp2 → DB bridge
-│   └── logger.c               Logging
-├── tests/                     Unit tests
-├── CMakeLists.txt
+├── src/
+│   ├── main.rs           CLI entry point & arg parsing (clap)
+│   ├── server.rs         App lifecycle, HTTP+RTMP wiring
+│   ├── config.rs         JSON config loader
+│   ├── db.rs             SQLite persistence (rusqlite)
+│   ├── http.rs           HTTP API (axum)
+│   ├── rtmp_bridge.rs    RTMP protocol ↔ DB integration seam
+│   ├── keygen.rs         Stream key generation
+│   └── logger.rs         Logging
+├── Cargo.toml
 ├── Dockerfile
 ├── docker-compose.yml
 └── config.example.json

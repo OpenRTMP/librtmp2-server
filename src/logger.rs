@@ -1,0 +1,75 @@
+//! Simple level-filtered logging to stderr or a file.
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Level {
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Debug = 3,
+}
+
+static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
+static FILE: Mutex<Option<File>> = Mutex::new(None);
+
+pub fn init(level: i32, file_path: &str) {
+    LEVEL.store(level.clamp(0, 3) as u8, Ordering::Relaxed);
+    if !file_path.is_empty() {
+        if let Ok(f) = OpenOptions::new().create(true).append(true).open(file_path) {
+            *FILE.lock().unwrap() = Some(f);
+        }
+    }
+}
+
+pub fn close() {
+    *FILE.lock().unwrap() = None;
+}
+
+fn write_line(prefix: &str, msg: &str) {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let line = format!("[{now}] {prefix} {msg}\n");
+    let mut guard = FILE.lock().unwrap();
+    if let Some(f) = guard.as_mut() {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    } else {
+        drop(guard);
+        eprint!("{line}");
+        let _ = std::io::stderr().flush();
+    }
+}
+
+pub fn log(level: Level, msg: &str) {
+    if (level as u8) > LEVEL.load(Ordering::Relaxed) {
+        return;
+    }
+    let prefix = match level {
+        Level::Error => "ERROR",
+        Level::Warn => "WARN ",
+        Level::Info => "INFO ",
+        Level::Debug => "DEBUG",
+    };
+    write_line(prefix, msg);
+}
+
+#[macro_export]
+macro_rules! log_error {
+    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Error, &format!($($arg)*)) };
+}
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Warn, &format!($($arg)*)) };
+}
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Info, &format!($($arg)*)) };
+}
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => { $crate::logger::log($crate::logger::Level::Debug, &format!($($arg)*)) };
+}
