@@ -18,14 +18,34 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+/* Per-connection state, keyed by the conn pointer. The librtmp2 server
+ * config carries a single userdata pointer shared across every connection
+ * (lrtmp2_server_config_t has one userdata slot, not one per conn), so
+ * publish/play/close state cannot live directly on rtmp_bridge_t — with two
+ * connections active (e.g. a publisher and a player), each on_publish/
+ * on_play call would clobber the other connection's tracked key, and
+ * on_close would act on whichever connection's data happened to be there. */
+typedef struct conn_state {
+    lrtmp2_conn_t      *conn;
+    int                 is_publisher;
+    int                 is_player;
+    db_publisher_t      pub;
+    db_player_t         player;
+    struct conn_state  *next;
+} conn_state_t;
+
 typedef struct {
-    db_context_t *db;
-    /* We track per-connection info between callbacks */
-    char publish_key[128];
-    char play_key[128];
-    int  is_publisher;
-    int  is_player;
+    db_context_t  *db;
+    conn_state_t  *conns;
 } rtmp_bridge_t;
+
+static conn_state_t *conn_state_find(rtmp_bridge_t *bridge, lrtmp2_conn_t *conn)
+{
+    for (conn_state_t *cs = bridge->conns; cs; cs = cs->next) {
+        if (cs->conn == conn) return cs;
+    }
+    return NULL;
+}
 
 /* Get remote address string from connection's client_fd */
 static void get_remote_addr(int fd, char *out, size_t outlen)
@@ -50,7 +70,17 @@ static void get_remote_addr(int fd, char *out, size_t outlen)
 
 static int on_connect(lrtmp2_conn_t *conn, void *userdata)
 {
-    (void)conn;
+    rtmp_bridge_t *bridge = (rtmp_bridge_t *)userdata;
+
+    conn_state_t *cs = calloc(1, sizeof(*cs));
+    if (!cs) {
+        log_error("RTMP: failed to allocate per-connection state");
+        return -1;
+    }
+    cs->conn = conn;
+    cs->next = bridge->conns;
+    bridge->conns = cs;
+
     log_debug("RTMP: new connection");
     return 0; /* accept all, auth happens on publish/play */
 }
@@ -58,6 +88,7 @@ static int on_connect(lrtmp2_conn_t *conn, void *userdata)
 static int on_publish(lrtmp2_conn_t *conn, const char *app, const char *stream_key, void *userdata)
 {
     rtmp_bridge_t *bridge = (rtmp_bridge_t *)userdata;
+    conn_state_t *cs = conn_state_find(bridge, conn);
 
     log_info("RTMP: publish request app='%s' key='%s'", app, stream_key);
 
@@ -86,8 +117,10 @@ static int on_publish(lrtmp2_conn_t *conn, const char *app, const char *stream_k
 
     db_publisher_add(bridge->db, &pub);
 
-    strncpy(bridge->publish_key, stream_key, sizeof(bridge->publish_key) - 1);
-    bridge->is_publisher = 1;
+    if (cs) {
+        cs->pub = pub;
+        cs->is_publisher = 1;
+    }
 
     log_info("RTMP: publish accepted stream='%s' publisher=%s", stream.id, pub.id);
     return 0;
@@ -96,6 +129,7 @@ static int on_publish(lrtmp2_conn_t *conn, const char *app, const char *stream_k
 static int on_play(lrtmp2_conn_t *conn, const char *app, const char *stream_key, void *userdata)
 {
     rtmp_bridge_t *bridge = (rtmp_bridge_t *)userdata;
+    conn_state_t *cs = conn_state_find(bridge, conn);
 
     log_info("RTMP: play request app='%s' key='%s'", app, stream_key);
 
@@ -120,8 +154,10 @@ static int on_play(lrtmp2_conn_t *conn, const char *app, const char *stream_key,
 
     db_player_add(bridge->db, &player);
 
-    strncpy(bridge->play_key, stream_key, sizeof(bridge->play_key) - 1);
-    bridge->is_player = 1;
+    if (cs) {
+        cs->player = player;
+        cs->is_player = 1;
+    }
 
     log_info("RTMP: play accepted stream='%s' player=%s", stream.id, player.id);
     return 0;
@@ -148,49 +184,37 @@ static int on_frame(lrtmp2_conn_t *conn, const lrtmp2_frame_t *frame, void *user
 static void on_close(lrtmp2_conn_t *conn, void *userdata)
 {
     rtmp_bridge_t *bridge = (rtmp_bridge_t *)userdata;
-    (void)conn;
 
-    if (bridge->is_publisher && bridge->publish_key[0]) {
-        /* Find the publisher by matching its stream_id, not just "first active".
-         * The bridge->publish_key is the RTMP stream key; cross-reference it via
-         * the streams table to get the stream_id, then match the publisher. */
-        db_stream_t stream;
-        if (db_stream_find_by_publish_key(bridge->db, bridge->publish_key, &stream)) {
-            db_publisher_t *pubs = NULL;
-            int count = 0;
-            db_publisher_list(bridge->db, stream.id, &pubs, &count);
-            for (int i = 0; i < count; i++) {
-                if (pubs[i].active) {
-                    pubs[i].active = false;
-                    db_publisher_update(bridge->db, pubs[i].id, &pubs[i]);
-                    log_info("RTMP: publisher disconnected: stream=%s id=%s",
-                             stream.id, pubs[i].id);
-                    break;
-                }
-            }
-            db_publisher_free_list(pubs);
+    /* Unlink this connection's state from the bridge first — the row data
+     * (and which role(s) it held) lives entirely in cs, captured at
+     * publish/play time, so closing never touches another connection. */
+    conn_state_t **link = &bridge->conns;
+    conn_state_t *cs = NULL;
+    while (*link) {
+        if ((*link)->conn == conn) {
+            cs = *link;
+            *link = cs->next;
+            break;
         }
+        link = &(*link)->next;
+    }
+    if (!cs) return;
+
+    if (cs->is_publisher) {
+        cs->pub.active = false;
+        db_publisher_update(bridge->db, cs->pub.id, &cs->pub);
+        log_info("RTMP: publisher disconnected: stream=%s id=%s",
+                 cs->pub.stream_id, cs->pub.id);
     }
 
-    if (bridge->is_player && bridge->play_key[0]) {
-        /* Same cross-reference for players via play_key → stream_id */
-        db_stream_t stream;
-        if (db_stream_find_by_play_key(bridge->db, bridge->play_key, &stream)) {
-            db_player_t *players = NULL;
-            int count = 0;
-            db_player_list(bridge->db, stream.id, &players, &count);
-            for (int i = 0; i < count; i++) {
-                if (players[i].active) {
-                    players[i].active = false;
-                    db_player_update(bridge->db, players[i].id, &players[i]);
-                    log_info("RTMP: player disconnected: stream=%s id=%s",
-                             stream.id, players[i].id);
-                    break;
-                }
-            }
-            db_player_free_list(players);
-        }
+    if (cs->is_player) {
+        cs->player.active = false;
+        db_player_update(bridge->db, cs->player.id, &cs->player);
+        log_info("RTMP: player disconnected: stream=%s id=%s",
+                 cs->player.stream_id, cs->player.id);
     }
+
+    free(cs);
 }
 
 /* Setup librtmp2 server config with our bridge */
