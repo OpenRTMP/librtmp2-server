@@ -2,6 +2,7 @@
  * keygen.c — OS-backed cryptographically secure key material
  */
 #include "librtmp2-server/keygen.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,12 +10,16 @@
 
 static bool read_urandom(unsigned char *buf, size_t len)
 {
-    int fd = open("/dev/urandom", O_RDONLY);
+    int fd;
+    do {
+        fd = open("/dev/urandom", O_RDONLY);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0) return false;
 
     size_t got = 0;
     while (got < len) {
         ssize_t n = read(fd, buf + got, len - got);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             close(fd);
             return false;

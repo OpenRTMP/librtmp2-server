@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-/* Fill `out` with `prefix` followed by random hex (32 bytes entropy).
+/* Fill `out` with `prefix` followed by 32 hex chars (16 bytes / 128 bits of entropy).
  * Returns false on failure (buffer too small or OS randomness unavailable). */
 bool keygen_secret(char *out, size_t outlen, const char *prefix);
 
