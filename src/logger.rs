@@ -20,8 +20,9 @@ static FILE: Mutex<Option<File>> = Mutex::new(None);
 pub fn init(level: i32, file_path: &str) {
     LEVEL.store(level.clamp(0, 3) as u8, Ordering::Relaxed);
     if !file_path.is_empty() {
-        if let Ok(f) = OpenOptions::new().create(true).append(true).open(file_path) {
-            *FILE.lock().unwrap() = Some(f);
+        match OpenOptions::new().create(true).append(true).open(file_path) {
+            Ok(f) => *FILE.lock().unwrap() = Some(f),
+            Err(e) => eprintln!("WARN  failed to open log file '{file_path}': {e}"),
         }
     }
 }
