@@ -148,8 +148,16 @@ static int interop_check_stats(const char *stats_key, int expect_pub, int expect
 
     int ok = 0;
     if (resp.data) {
-        /* Quick JSON check: look for "publishers":N and "players":N */
-        char *p = strstr(resp.data, "\"publishers\"");
+        /* Quick JSON check: look for "publishers":N and "players":N inside
+         * the "summary" object. The response also has a top-level
+         * "players":[...] array (the per-player list) that appears before
+         * "summary" — searching from resp.data would match that array key
+         * instead and atoi() the literal '[' into 0. Scope the search to
+         * the summary object so we only ever read the counts. */
+        char *summary = strstr(resp.data, "\"summary\"");
+        char *base = summary ? summary : resp.data;
+
+        char *p = strstr(base, "\"publishers\"");
         if (p) {
             int val = atoi(strchr(p, ':') + 1);
             if (val != expect_pub) {
@@ -161,7 +169,7 @@ static int interop_check_stats(const char *stats_key, int expect_pub, int expect
             goto done;
         }
 
-        p = strstr(resp.data, "\"players\"");
+        p = strstr(base, "\"players\"");
         if (p) {
             int val = atoi(strchr(p, ':') + 1);
             if (val != expect_players) {
