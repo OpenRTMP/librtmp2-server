@@ -55,7 +55,7 @@ ifdef UBSAN
 endif
 
 # Source files (excluding cli.c which has main())
-LIB_SRCS = src/config.c src/db.c src/http.c src/rtmp_callbacks.c src/server.c src/logger.c
+LIB_SRCS = src/config.c src/db.c src/http.c src/keygen.c src/rtmp_callbacks.c src/server.c src/logger.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # Mongoose object
@@ -72,6 +72,7 @@ TEST_SRCS = tests/unit/main.c tests/unit/test_db.c tests/unit/test_config.c test
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 TEST_BIN = tests/run_tests
 TEST_BIN_ASAN = tests/run_tests_asan
+TEST_LIB_OBJS = src/config.o src/db.o src/keygen.o src/logger.o
 
 # Interop test files — end-to-end tests that spawn the real server binary
 INTEROP_SRCS = tests/integration/main.c tests/integration/test_interop_obs.c tests/integration/test_interop_ffmpeg.c tests/integration/test_interop_haishinkkit.c tests/integration/test_interop_concurrent.c
@@ -131,12 +132,12 @@ $(SERVER_BIN): src/cli.o $(LIB_OBJS) $(MONGOOSE_OBJ) $(LRTMP2_A)
 tests/unit/%.o: tests/unit/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TEST_BIN): $(TEST_OBJS) src/config.o src/db.o src/logger.o $(LRTMP2_A)
-	$(CC) $(LDFLAGS) -o $@ $(TEST_OBJS) src/config.o src/db.o src/logger.o $(SQLITE_LIBS) $(OPENSSL_LIBS) -lpthread -lm
+$(TEST_BIN): $(TEST_OBJS) $(TEST_LIB_OBJS) $(LRTMP2_A)
+	$(CC) $(LDFLAGS) -o $@ $(TEST_OBJS) $(TEST_LIB_OBJS) $(SQLITE_LIBS) $(OPENSSL_LIBS) -lpthread -lm
 
-$(TEST_BIN_ASAN): $(TEST_SRCS) src/config.c src/db.c src/logger.c
+$(TEST_BIN_ASAN): $(TEST_SRCS) src/config.c src/db.c src/keygen.c src/logger.c
 	$(CC) $(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -g -O0 -DDEBUG \
-	    -o $@ $(TEST_SRCS) src/config.c src/db.c src/logger.c \
+	    -o $@ $(TEST_SRCS) src/config.c src/db.c src/keygen.c src/logger.c \
 	    $(SQLITE_LIBS) -lpthread -lm
 
 test: $(TEST_BIN)
@@ -153,8 +154,8 @@ ubsan:
 tests/integration/%.o: tests/integration/%.c | $(MONGOOSE_HDR)
 	$(CC) $(CFLAGS) $(CURL_CFLAGS) -c $< -o $@
 
-$(INTEROP_BIN): $(INTEROP_OBJS) src/config.o src/db.o src/logger.o $(LRTMP2_A)
-	$(CC) $(LDFLAGS) -o $@ $(INTEROP_OBJS) src/config.o src/db.o src/logger.o $(LRTMP2_A) $(SQLITE_LIBS) $(OPENSSL_LIBS) $(CURL_LIBS) -lpthread -lm
+$(INTEROP_BIN): $(INTEROP_OBJS) src/config.o src/db.o src/keygen.o src/logger.o $(LRTMP2_A)
+	$(CC) $(LDFLAGS) -o $@ $(INTEROP_OBJS) src/config.o src/db.o src/keygen.o src/logger.o $(LRTMP2_A) $(SQLITE_LIBS) $(OPENSSL_LIBS) $(CURL_LIBS) -lpthread -lm
 
 # Run interop tests — server binary must be built first, then we
 # spawn it, drive it, and tear it down.
@@ -165,6 +166,6 @@ interop: $(SERVER_BIN) $(INTEROP_BIN)
 
 clean:
 	rm -f $(LIB_OBJS) $(MONGOOSE_OBJ) src/cli.o $(STATIC_LIB) $(SERVER_BIN)
-	rm -f $(TEST_OBJS) $(TEST_BIN) $(TEST_BIN_ASAN)
+	rm -f $(TEST_OBJS) $(TEST_BIN) $(TEST_BIN_ASAN) $(TEST_LIB_OBJS)
 	rm -f $(INTEROP_OBJS) $(INTEROP_BIN)
 	rm -rf $(MONGOOSE_DIR)

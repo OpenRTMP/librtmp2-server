@@ -4,6 +4,7 @@
 add_library(lrtmp2server_test_lib STATIC
     ../src/config.c
     ../src/db.c
+    ../src/keygen.c
     ../src/logger.c
 )
 

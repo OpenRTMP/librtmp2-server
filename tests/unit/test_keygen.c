@@ -3,12 +3,38 @@
 #include <stdlib.h>
 #include <time.h>
 #include "librtmp2-server/db.h"
+#include "librtmp2-server/keygen.h"
 
 /* Regression test for #5: publisher/player IDs must not collide when
  * created in the same second. The fix appends a random hex suffix. */
 
+static int test_stream_key_entropy(void)
+{
+    char a[64], b[64];
+    if (!keygen_secret(a, sizeof(a), "pub_")) {
+        fprintf(stderr, "FAIL: keygen_secret returned false\n");
+        return 1;
+    }
+    if (!keygen_secret(b, sizeof(b), "pub_")) {
+        fprintf(stderr, "FAIL: keygen_secret second call returned false\n");
+        return 1;
+    }
+    if (strcmp(a, b) == 0) {
+        fprintf(stderr, "FAIL: duplicate stream keys generated: %s\n", a);
+        return 1;
+    }
+    if (strncmp(a, "pub_", 4) != 0 || strlen(a) != 4 + 32) {
+        fprintf(stderr, "FAIL: unexpected key format: %s\n", a);
+        return 1;
+    }
+    printf("PASS: test_stream_key_entropy — keys are unpredictable\n");
+    return 0;
+}
+
 int test_keygen_main(void)
 {
+    if (test_stream_key_entropy() != 0) return 1;
+
     db_context_t *db = db_open(":memory:");
     if (!db) { fprintf(stderr, "FAIL: cannot open DB\n"); return 1; }
 

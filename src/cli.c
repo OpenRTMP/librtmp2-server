@@ -9,7 +9,8 @@
 #include <stdlib.h>
 #include <signal.h>
 
-static void print_usage(const char *prog)
+#include "librtmp2-server/config.h"
+#include "librtmp2-server/logger.h"
 {
     fprintf(stderr, "Usage: %s [-c config.json]\n", prog);
     fprintf(stderr, "\n");
@@ -72,12 +73,13 @@ int main(int argc, char **argv)
 
     if (verbose) config.log_level = 3;
 
-    /* If auth.api_token is still empty after config load, the server would
-     * silently allow unauthenticated access to every Bearer-protected
-     * endpoint. Refuse to start instead of creating an open server. */
-    if (!config.api_token[0]) {
-        fprintf(stderr, "FATAL: auth.api_token is not set. "
-                        "Configure a token in %s or via -t flag.\n", config_path);
+    /* Refuse to start with missing, placeholder, or otherwise weak API tokens.
+     * An empty token would bypass Bearer auth; the shipped config placeholder
+     * is public knowledge and must not be accepted as a real secret. */
+    if (!config_api_token_usable(config.api_token)) {
+        fprintf(stderr, "FATAL: auth.api_token is missing or uses a known weak "
+                        "placeholder. Set a strong random token in %s, via -t, "
+                        "or LRTMP2_API_TOKEN.\n", config_path);
         return 1;
     }
 

@@ -177,6 +177,24 @@ int test_config_main(void)
         unsetenv("LRTMP2_TLS_KEY_FILE");
     }
 
+    /* Weak / placeholder API tokens must be rejected */
+    {
+        if (config_api_token_usable(""))
+            errors += fail("api_token empty", "should reject empty token");
+        else
+            pass("api_token rejects empty");
+
+        if (config_api_token_usable("<replace-with-random-token>"))
+            errors += fail("api_token placeholder", "should reject placeholder");
+        else
+            pass("api_token rejects placeholder");
+
+        if (!config_api_token_usable("a-strong-random-secret-value"))
+            errors += fail("api_token strong", "should accept strong token");
+        else
+            pass("api_token accepts strong token");
+    }
+
     if (errors == 0)
         printf("  ✓ All config tests passed\n");
     return errors;

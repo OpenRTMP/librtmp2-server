@@ -13,6 +13,7 @@
  */
 #include "librtmp2-server/http.h"
 #include "librtmp2-server/db.h"
+#include "librtmp2-server/keygen.h"
 #include "librtmp2-server/logger.h"
 #include "mongoose.h"
 #include <stdio.h>
@@ -569,11 +570,13 @@ static void handle_stream_create(struct mg_connection *c, struct http_server *ht
     if (!s.name[0]) strncpy(s.name, s.id, sizeof(s.name) - 1);
     if (!s.allowed_codecs[0]) strncpy(s.allowed_codecs, "avc1,hvc1,av01", sizeof(s.allowed_codecs) - 1);
 
-    /* Generate unique keys */
-    long t = (long)time(NULL);
-    snprintf(s.publish_key, sizeof(s.publish_key), "pub_%s_%ld", s.id, t);
-    snprintf(s.play_key, sizeof(s.play_key), "pl_%s_%ld", s.id, t + 1);
-    snprintf(s.stats_key, sizeof(s.stats_key), "st_%s_%ld", s.id, t + 2);
+    /* Cryptographically unpredictable keys — never derive from stream id/time. */
+    if (!keygen_secret(s.publish_key, sizeof(s.publish_key), "pub_") ||
+        !keygen_secret(s.play_key, sizeof(s.play_key), "pl_") ||
+        !keygen_secret(s.stats_key, sizeof(s.stats_key), "st_")) {
+        err_json(c, 500, "INTERNAL", "Failed to generate stream keys");
+        return;
+    }
     s.enabled = true;
     s.created_at = time(NULL);
 
@@ -584,13 +587,22 @@ static void handle_stream_create(struct mg_connection *c, struct http_server *ht
 
     log_info("Stream created: id=%s app=%s", s.id, s.app);
 
-    char resp[1024];
+    char e_id[1024], e_name[1024], e_app[1024];
+    char e_pub[256], e_play[256], e_stats[256];
+    json_escape(s.id, e_id, sizeof(e_id));
+    json_escape(s.name, e_name, sizeof(e_name));
+    json_escape(s.app, e_app, sizeof(e_app));
+    json_escape(s.publish_key, e_pub, sizeof(e_pub));
+    json_escape(s.play_key, e_play, sizeof(e_play));
+    json_escape(s.stats_key, e_stats, sizeof(e_stats));
+
+    char resp[4096];
     int n = snprintf(resp, sizeof(resp),
         "{\"id\":\"%s\",\"name\":\"%s\",\"app\":\"%s\","
         "\"publish_key\":\"%s\",\"play_key\":\"%s\",\"stats_key\":\"%s\","
         "\"enabled\":true,\"created_at\":%ld}",
-        s.id, s.name, s.app,
-        s.publish_key, s.play_key, s.stats_key,
+        e_id, e_name, e_app,
+        e_pub, e_play, e_stats,
         (long)s.created_at);
     send_json(c, 201, resp, (size_t)n);
 }

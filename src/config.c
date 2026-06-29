@@ -25,6 +25,27 @@ void config_set_defaults(server_config_t *config)
     config->log_level = 2; /* info */
 }
 
+bool config_api_token_usable(const char *token)
+{
+    if (!token || !token[0]) return false;
+
+    static const char *const weak_tokens[] = {
+        "<replace-with-random-token>",
+        "changeme",
+        "secret",
+        "password",
+        "api_token",
+        "test-token",
+        "test-token-123",
+        NULL
+    };
+
+    for (int i = 0; weak_tokens[i]; i++) {
+        if (strcmp(token, weak_tokens[i]) == 0) return false;
+    }
+    return true;
+}
+
 /* --- minimal JSON helpers --- */
 
 static const char *skip_ws(const char *p)
