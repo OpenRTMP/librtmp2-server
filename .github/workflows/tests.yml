@@ -17,7 +17,7 @@ jobs:
     - uses: actions/checkout@v7
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev libcurl4-openssl-dev
 
     - name: Clone librtmp2 (matching PR branch if it exists, else default)
       env:
@@ -63,7 +63,7 @@ jobs:
     - uses: actions/checkout@v7
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev libssl-dev
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libsqlite3-dev libssl-dev libcurl4-openssl-dev
 
     - name: Clone librtmp2 (matching PR branch if it exists, else default)
       env:
