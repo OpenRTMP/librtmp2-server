@@ -81,11 +81,11 @@ pub struct DbRtmpBridge {
 }
 
 fn gen_id(prefix: &str) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     format!(
         "{prefix}{}_{:08x}",
         crate::db::now_ts(),
-        rand::thread_rng().gen::<u32>()
+        rand::rng().random::<u32>()
     )
 }
 
