@@ -22,6 +22,9 @@ pub struct ServerApp {
 }
 
 impl ServerApp {
+    /// Opens the database, loads or auto-generates the API token, and wires
+    /// together all server components. Returns an error if the database cannot
+    /// be opened or the token cannot be persisted.
     pub fn create(mut config: ServerConfig) -> Result<ServerApp, String> {
         let db_path = std::env::var("LRTMP2_DB")
             .ok()
