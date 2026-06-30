@@ -78,7 +78,9 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "TLS_ENABLED" => match val {
             "1" | "true" => config.tls_enabled = true,
             "0" | "false" => config.tls_enabled = false,
-            _ => eprintln!("Config: ignoring invalid TLS_ENABLED value '{val}' (expected 1/0/true/false)"),
+            _ => eprintln!(
+                "Config: ignoring invalid TLS_ENABLED value '{val}' (expected 1/0/true/false)"
+            ),
         },
         "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
         "TLS_KEY_FILE" => config.tls_key_file = val.to_string(),
