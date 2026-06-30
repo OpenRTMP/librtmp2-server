@@ -91,37 +91,65 @@ impl ServerApp {
         // uses a blocking poll loop, so it lives outside the Tokio runtime.
         let rtmp_bind = self.config.rtmp_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
+        let rtmp_tls_enabled = self.config.tls_enabled;
+        let rtmp_tls_cert = self.config.tls_cert_file.clone();
+        let rtmp_tls_key = self.config.tls_key_file.clone();
+
+        let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             use librtmp2::server::Server as RtmpServer;
             use librtmp2::types::ServerConfig as RtmpConfig;
 
+            // Build CStrings inside the thread so the pointers remain valid
+            // for the duration of RtmpServer::new().
+            let cert_cstr = std::ffi::CString::new(rtmp_tls_cert).ok();
+            let key_cstr = std::ffi::CString::new(rtmp_tls_key).ok();
+
             let cfg = RtmpConfig {
                 max_connections: rtmp_max_conn,
                 chunk_size: 4096,
-                tls_enabled: 0,
-                tls_cert_file: std::ptr::null(),
-                tls_key_file: std::ptr::null(),
+                tls_enabled: if rtmp_tls_enabled { 1 } else { 0 },
+                tls_cert_file: cert_cstr
+                    .as_ref()
+                    .map(|s| s.as_ptr() as *const u8)
+                    .unwrap_or(std::ptr::null()),
+                tls_key_file: key_cstr
+                    .as_ref()
+                    .map(|s| s.as_ptr() as *const u8)
+                    .unwrap_or(std::ptr::null()),
                 tls_ca_file: std::ptr::null(),
                 tls_insecure: 0,
             };
             let mut server = match RtmpServer::new(cfg) {
                 Ok(s) => s,
                 Err(e) => {
-                    crate::log_warn!("RTMP server init failed: {e}");
+                    let msg = format!("RTMP server init failed: {e}");
+                    crate::log_warn!("{msg}");
+                    let _ = rtmp_ready_tx.send(Err(msg));
                     return;
                 }
             };
             if let Err(e) = server.listen(&rtmp_bind) {
-                crate::log_warn!("RTMP bind on {rtmp_bind} failed: {e}");
+                let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
+                crate::log_warn!("{msg}");
+                let _ = rtmp_ready_tx.send(Err(msg));
                 return;
             }
             crate::log_info!("RTMP listening on {rtmp_bind}");
+            let _ = rtmp_ready_tx.send(Ok(()));
             loop {
-                if server.poll(50).is_err() {
+                if let Err(e) = server.poll(50) {
+                    crate::log_warn!("RTMP polling stopped: {e}");
                     break;
                 }
             }
         });
+
+        rtmp_ready_rx
+            .await
+            .map_err(|_| {
+                "RTMP startup thread exited before reporting readiness".to_string()
+            })??;
 
         crate::log_info!(
             "Server ready — HTTP: {}, RTMP: {}",
