@@ -46,6 +46,7 @@ pub struct FrameInfo {
 /// Callback contract the RTMP protocol layer drives. Mirrors librtmp2's
 /// `on_connect` / `on_publish` / `on_play` / `on_frame` / `on_close` hooks.
 pub trait RtmpEventHandler: Send + Sync {
+    /// Called immediately after a new TCP connection is accepted.
     fn on_connect(&self, conn: ConnId);
     /// Return `Err` to reject the publish (invalid publish_key).
     fn on_publish(
@@ -66,6 +67,7 @@ pub trait RtmpEventHandler: Send + Sync {
     /// Called for every incoming frame. Return `false` to kick the connection
     /// (e.g. codec not in `allowed_codecs`).
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool;
+    /// Called when the connection is closed (cleanly or by error).
     fn on_close(&self, conn: ConnId);
 }
 
