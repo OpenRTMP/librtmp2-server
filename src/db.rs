@@ -85,6 +85,10 @@ pub fn now_ts() -> i64 {
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  val TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS streams (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL DEFAULT '',
@@ -177,6 +181,30 @@ impl Db {
         Ok(Db {
             conn: Mutex::new(conn),
         })
+    }
+
+    // ==================== SETTINGS ====================
+
+    pub fn token_get(&self) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT val FROM settings WHERE key='api_token'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .filter(|v: &String| !v.is_empty())
+    }
+
+    pub fn token_set(&self, token: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings(key,val) VALUES('api_token',?) \
+             ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+            rusqlite::params![token],
+        )
+        .is_ok()
     }
 
     // ==================== STREAMS ====================

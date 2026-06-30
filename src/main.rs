@@ -7,7 +7,7 @@ mod rtmp_bridge;
 mod server;
 
 use clap::Parser;
-use config::{config_apply_env, config_load, config_write_token, ServerConfig};
+use config::{config_apply_env, config_load, ServerConfig};
 use server::ServerApp;
 
 #[derive(Parser, Debug)]
@@ -62,25 +62,10 @@ fn run() -> Result<(), String> {
         config.log_level = 3;
     }
 
-    // Auto-generate the API token if none is stored yet. The generated token
-    // is written back to the config file so it survives restarts.
-    if config.api_token.is_empty() {
-        let token = keygen::keygen_secret("tk_")?;
-        let cfg_path = &config.config_file;
-        config_write_token(cfg_path, &token)
-            .map_err(|e| format!("Could not persist API token: {e}"))?;
-        eprintln!(
-            "============================================================\n\
-             Generated API token (saved to {cfg_path}):\n\
-             {token}\n\
-             ============================================================"
-        );
-        config.api_token = token;
-    }
-
     logger::init(config.log_level, &config.log_file);
 
     let result = (|| -> Result<(), String> {
+        // ServerApp::create opens the database and resolves the API token.
         let app = ServerApp::create(config)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

@@ -15,6 +15,7 @@ pub struct ServerConfig {
     /// HTTP API + UI, e.g. "0.0.0.0:8080"
     pub http_bind: String,
 
+    /// Populated at startup from the database, never from the config file.
     pub api_token: String,
     pub require_stream_key: bool,
 
@@ -56,10 +57,13 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
     let (key, val) = line.split_once('=')?;
     let key = key.trim().to_string();
     let val = val.trim();
-    // Strip optional surrounding quotes (single or double).
-    let val = if (val.starts_with('"') && val.ends_with('"'))
-        || (val.starts_with('\'') && val.ends_with('\''))
-    {
+    // Strip optional surrounding quotes (single or double), but only when both
+    // the opening and closing character are present and the string is at least
+    // two characters long — a bare `KEY="` would otherwise panic on the slice.
+    let is_quoted = val.len() >= 2
+        && ((val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\'')));
+    let val = if is_quoted {
         &val[1..val.len() - 1]
     } else {
         val
@@ -68,41 +72,37 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
 }
 
 /// Apply a key/value pair from the config file to `config`.
+/// `API_TOKEN` is intentionally not handled here; the token is managed
+/// exclusively by the database layer and cannot be set via the config file.
 fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
     match key {
         "RTMP_BIND" => config.rtmp_bind = val.to_string(),
-        "RTMP_MAX_CONNECTIONS" => {
-            if let Ok(v) = val.parse::<i32>() {
-                config.rtmp_max_conn = v;
-            }
-        }
-        "RTMP_CHUNK_SIZE" => {
-            if let Ok(v) = val.parse::<i32>() {
-                config.rtmp_chunk_size = v;
-            }
-        }
+        "RTMP_MAX_CONNECTIONS" => match val.parse::<i32>() {
+            Ok(v) => config.rtmp_max_conn = v,
+            Err(_) => eprintln!("Config: ignoring invalid RTMP_MAX_CONNECTIONS value '{val}'"),
+        },
+        "RTMP_CHUNK_SIZE" => match val.parse::<i32>() {
+            Ok(v) => config.rtmp_chunk_size = v,
+            Err(_) => eprintln!("Config: ignoring invalid RTMP_CHUNK_SIZE value '{val}'"),
+        },
         "TLS_ENABLED" => match val {
             "1" | "true" => config.tls_enabled = true,
             "0" | "false" => config.tls_enabled = false,
-            _ => {}
+            _ => eprintln!("Config: ignoring invalid TLS_ENABLED value '{val}' (expected 1/0/true/false)"),
         },
         "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
         "TLS_KEY_FILE" => config.tls_key_file = val.to_string(),
         "HTTP_BIND" => config.http_bind = val.to_string(),
-        "API_TOKEN" => config.api_token = val.to_string(),
         "REQUIRE_STREAM_KEY" => match val {
             "1" | "true" => config.require_stream_key = true,
             "0" | "false" => config.require_stream_key = false,
-            _ => {}
+            _ => eprintln!("Config: ignoring invalid REQUIRE_STREAM_KEY value '{val}' (expected 1/0/true/false)"),
         },
         "WEB_ROOT" => config.web_root = val.to_string(),
-        "LOG_LEVEL" => {
-            if let Ok(v) = val.parse::<i32>() {
-                if (0..=3).contains(&v) {
-                    config.log_level = v;
-                }
-            }
-        }
+        "LOG_LEVEL" => match val.parse::<i32>() {
+            Ok(v) if (0..=3).contains(&v) => config.log_level = v,
+            _ => eprintln!("Config: ignoring invalid LOG_LEVEL value '{val}' (expected 0-3)"),
+        },
         "LOG_FILE" => config.log_file = val.to_string(),
         _ => {} // Unknown keys are silently ignored.
     }
@@ -132,45 +132,8 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
-/// Write or update `API_TOKEN=<token>` in the given `.env` file.
-///
-/// If the file already contains an `API_TOKEN` line it is replaced in-place;
-/// otherwise the line is appended so the rest of the config is untouched.
-pub fn config_write_token(path: &str, token: &str) -> Result<(), String> {
-    let line = format!("API_TOKEN={token}");
-
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let mut found = false;
-    let mut lines: Vec<String> = existing
-        .lines()
-        .map(|l| {
-            if let Some((k, _)) = parse_env_line(l) {
-                if k == "API_TOKEN" {
-                    found = true;
-                    return line.clone();
-                }
-            }
-            l.to_string()
-        })
-        .collect();
-
-    if !found {
-        if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-            lines.push(String::new());
-        }
-        lines.push(line);
-    }
-
-    let mut out = lines.join("\n");
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-
-    std::fs::write(path, out).map_err(|e| format!("Cannot write config file {path}: {e}"))
-}
-
-/// Environment variables override config file values (except API_TOKEN,
-/// which is always auto-generated and managed by the server).
+/// Environment variables override config file values.
+/// `LRTMP2_API_TOKEN` is intentionally not handled; the token lives in the DB.
 pub fn config_apply_env(config: &mut ServerConfig) {
     if let Ok(v) = std::env::var("LRTMP2_RTMP_BIND") {
         if !v.is_empty() {
@@ -248,7 +211,6 @@ mod tests {
              TLS_CERT_FILE=/etc/ssl/cert.pem\n\
              TLS_KEY_FILE=/etc/ssl/key.pem\n\
              HTTP_BIND=127.0.0.1:8081\n\
-             API_TOKEN=auto-generated-test-token-xyz\n\
              LOG_LEVEL=3\n",
         )
         .unwrap();
@@ -257,11 +219,26 @@ mod tests {
         assert_eq!(config.rtmp_bind, "127.0.0.1:1936");
         assert_eq!(config.rtmp_max_conn, 50);
         assert_eq!(config.http_bind, "127.0.0.1:8081");
-        assert_eq!(config.api_token, "auto-generated-test-token-xyz");
+        assert!(
+            config.api_token.is_empty(),
+            "api_token must not be set from config file"
+        );
         assert_eq!(config.log_level, 3);
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/etc/ssl/cert.pem");
         assert_eq!(config.tls_key_file, "/etc/ssl/key.pem");
+    }
+
+    #[test]
+    fn api_token_ignored_in_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.env");
+        std::fs::write(&path, "API_TOKEN=should-be-ignored\n").unwrap();
+        let config = config_load(path.to_str().unwrap()).unwrap();
+        assert!(
+            config.api_token.is_empty(),
+            "API_TOKEN in config file must be ignored"
+        );
     }
 
     #[test]
@@ -286,26 +263,15 @@ mod tests {
             parse_env_line("KEY=val=with=equals"),
             Some(("KEY".to_string(), "val=with=equals".to_string()))
         );
-    }
-
-    #[test]
-    fn write_token_appends_and_updates() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.env");
-        std::fs::write(&path, "HTTP_BIND=0.0.0.0:8080\n").unwrap();
-
-        // First write: appends.
-        config_write_token(path.to_str().unwrap(), "first-token-aabbccdd11223344").unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("API_TOKEN=first-token-aabbccdd11223344"));
-        assert!(content.contains("HTTP_BIND=0.0.0.0:8080"));
-
-        // Second write: replaces in-place without duplicating.
-        config_write_token(path.to_str().unwrap(), "second-token-aabbccdd11223344").unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("API_TOKEN=second-token-aabbccdd11223344"));
-        assert!(!content.contains("first-token"));
-        assert_eq!(content.matches("API_TOKEN=").count(), 1);
+        // Single-char quote edge cases must not panic.
+        assert_eq!(
+            parse_env_line(r#"KEY=""#),
+            Some(("KEY".to_string(), "\"".to_string()))
+        );
+        assert_eq!(
+            parse_env_line("KEY='"),
+            Some(("KEY".to_string(), "'".to_string()))
+        );
     }
 
     #[test]

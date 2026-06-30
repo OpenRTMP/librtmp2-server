@@ -22,7 +22,7 @@ pub struct ServerApp {
 }
 
 impl ServerApp {
-    pub fn create(config: ServerConfig) -> Result<ServerApp, String> {
+    pub fn create(mut config: ServerConfig) -> Result<ServerApp, String> {
         let db_path = std::env::var("LRTMP2_DB")
             .ok()
             .filter(|v| !v.is_empty())
@@ -31,6 +31,26 @@ impl ServerApp {
         let db = Arc::new(
             Db::open(&db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
         );
+
+        // The API token lives exclusively in the database. On first startup it
+        // is generated here; afterwards it is loaded from the settings table.
+        config.api_token = match db.token_get() {
+            Some(t) => t,
+            None => {
+                let token = crate::keygen::keygen_secret("tk_")?;
+                if !db.token_set(&token) {
+                    return Err("Failed to persist API token in database".into());
+                }
+                eprintln!(
+                    "============================================================\n\
+                     Generated API token (stored in database {db_path}):\n\
+                     {token}\n\
+                     ============================================================"
+                );
+                token
+            }
+        };
+
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db)));
 
         Ok(ServerApp {
