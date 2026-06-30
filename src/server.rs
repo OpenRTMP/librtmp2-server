@@ -314,12 +314,12 @@ impl ServerApp {
                 reject_indices.sort_unstable();
                 reject_indices.dedup();
                 for idx in reject_indices.into_iter().rev() {
-                    if let Some(conn) = server.connections.get(idx) {
-                        if conn.client_fd >= 0 {
-                            let conn_id = conn.client_fd as u64;
-                            tracked.remove(&conn_id);
-                            rtmp_bridge.on_close(conn_id);
-                        }
+                    if let Some(conn) = server.connections.get(idx)
+                        && conn.client_fd >= 0
+                    {
+                        let conn_id = conn.client_fd as u64;
+                        tracked.remove(&conn_id);
+                        rtmp_bridge.on_close(conn_id);
                     }
                     server.connections.remove(idx);
                 }

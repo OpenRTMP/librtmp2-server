@@ -319,21 +319,21 @@ impl RtmpEventHandler for DbRtmpBridge {
         // Enforce allowed_codecs: reject if the detected codec is not listed.
         if !frame.codec.is_empty() {
             let guard = self.conns.lock().unwrap();
-            if let Some(cs) = guard.get(&conn) {
-                if !cs.allowed_codecs.is_empty() {
-                    let allowed = cs
-                        .allowed_codecs
-                        .split(',')
-                        .map(|s| s.trim())
-                        .any(|c| c.eq_ignore_ascii_case(&frame.codec));
-                    if !allowed {
-                        crate::log_warn!(
-                            "RTMP: codec '{}' not in allowed list '{}' — closing conn={conn}",
-                            frame.codec,
-                            cs.allowed_codecs
-                        );
-                        return false;
-                    }
+            if let Some(cs) = guard.get(&conn)
+                && !cs.allowed_codecs.is_empty()
+            {
+                let allowed = cs
+                    .allowed_codecs
+                    .split(',')
+                    .map(|s| s.trim())
+                    .any(|c| c.eq_ignore_ascii_case(&frame.codec));
+                if !allowed {
+                    crate::log_warn!(
+                        "RTMP: codec '{}' not in allowed list '{}' — closing conn={conn}",
+                        frame.codec,
+                        cs.allowed_codecs
+                    );
+                    return false;
                 }
             }
         }

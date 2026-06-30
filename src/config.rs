@@ -128,40 +128,40 @@ fn config_apply_env_from<F>(config: &mut ServerConfig, mut get: F)
 where
     F: FnMut(&str) -> Option<String>,
 {
-    if let Some(v) = get("LRTMP2_RTMP_BIND") {
-        if !v.is_empty() {
-            config.rtmp_bind = v;
+    if let Some(v) = get("LRTMP2_RTMP_BIND")
+        && !v.is_empty()
+    {
+        config.rtmp_bind = v;
+    }
+
+    if let Some(v) = get("LRTMP2_HTTP_BIND")
+        && !v.is_empty()
+    {
+        config.http_bind = v;
+    }
+
+    if let Some(v) = get("LRTMP2_TLS_ENABLED")
+        && !v.is_empty()
+    {
+        match v.as_str() {
+            "1" | "true" => config.tls_enabled = true,
+            "0" | "false" => config.tls_enabled = false,
+            _ => crate::log_warn!(
+                "Ignoring invalid LRTMP2_TLS_ENABLED value '{v}' (expected 1/0/true/false)"
+            ),
         }
     }
 
-    if let Some(v) = get("LRTMP2_HTTP_BIND") {
-        if !v.is_empty() {
-            config.http_bind = v;
-        }
+    if let Some(v) = get("LRTMP2_TLS_CERT_FILE")
+        && !v.is_empty()
+    {
+        config.tls_cert_file = v;
     }
 
-    if let Some(v) = get("LRTMP2_TLS_ENABLED") {
-        if !v.is_empty() {
-            match v.as_str() {
-                "1" | "true" => config.tls_enabled = true,
-                "0" | "false" => config.tls_enabled = false,
-                _ => crate::log_warn!(
-                    "Ignoring invalid LRTMP2_TLS_ENABLED value '{v}' (expected 1/0/true/false)"
-                ),
-            }
-        }
-    }
-
-    if let Some(v) = get("LRTMP2_TLS_CERT_FILE") {
-        if !v.is_empty() {
-            config.tls_cert_file = v;
-        }
-    }
-
-    if let Some(v) = get("LRTMP2_TLS_KEY_FILE") {
-        if !v.is_empty() {
-            config.tls_key_file = v;
-        }
+    if let Some(v) = get("LRTMP2_TLS_KEY_FILE")
+        && !v.is_empty()
+    {
+        config.tls_key_file = v;
     }
 
     if let Some(v) = get("LRTMP2_LOG_LEVEL") {
