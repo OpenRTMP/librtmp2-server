@@ -419,21 +419,33 @@ async fn handle_stream_create(
         Ok(k) => k,
         Err(e) => {
             crate::log_error!("publish key generation failed: {e}");
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Key generation failed");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Key generation failed",
+            );
         }
     };
     let play_key = match keygen_secret("pl_") {
         Ok(k) => k,
         Err(e) => {
             crate::log_error!("play key generation failed: {e}");
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Key generation failed");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Key generation failed",
+            );
         }
     };
     let stats_key = match keygen_secret("st_") {
         Ok(k) => k,
         Err(e) => {
             crate::log_error!("stats key generation failed: {e}");
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Key generation failed");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Key generation failed",
+            );
         }
     };
     let s = Stream {
