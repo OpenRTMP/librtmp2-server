@@ -270,19 +270,36 @@ impl ServerApp {
                         entry.audio_codec = new_audio.clone();
                     }
 
-                    // Enforce codec policy via the bridge (which checks allowed_codecs).
-                    if !entry.video_codec.is_empty() {
+                    // Enforce codec policy for both video and audio.
+                    let mut codec_allowed = true;
+                    for (kind, codec) in [
+                        (
+                            crate::rtmp_bridge::FrameKind::Video,
+                            entry.video_codec.as_str(),
+                        ),
+                        (
+                            crate::rtmp_bridge::FrameKind::Audio,
+                            entry.audio_codec.as_str(),
+                        ),
+                    ] {
+                        if codec.is_empty() {
+                            continue;
+                        }
                         let frame = crate::rtmp_bridge::FrameInfo {
-                            kind: crate::rtmp_bridge::FrameKind::Video,
+                            kind,
                             timestamp: 0,
                             size: 0,
-                            codec: entry.video_codec.clone(),
+                            codec: codec.to_string(),
                         };
                         if !rtmp_bridge.on_frame(conn_id, &frame) {
                             crate::log_warn!("RTMP: codec enforcement kicked conn={conn_id}");
-                            reject_indices.push(idx);
-                            continue;
+                            codec_allowed = false;
+                            break;
                         }
+                    }
+                    if !codec_allowed {
+                        reject_indices.push(idx);
+                        continue;
                     }
 
                     // Update publisher stats (rate-limited inside the bridge).
@@ -316,6 +333,22 @@ impl ServerApp {
                     tracked.remove(&conn_id);
                     rtmp_bridge.on_close(conn_id);
                 }
+
+                // Drain deletion markers that no live connection still references.
+                let live_stream_ids: std::collections::HashSet<String> = tracked
+                    .values()
+                    .filter(|c| !c.stream_id.is_empty())
+                    .map(|c| c.stream_id.clone())
+                    .collect();
+                deleted_streams
+                    .lock()
+                    .unwrap()
+                    .retain(|id| live_stream_ids.contains(id));
+            }
+
+            // Notify the bridge about connections that never got an explicit close event.
+            for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
+                rtmp_bridge.on_close(conn_id);
             }
         });
 
@@ -329,15 +362,16 @@ impl ServerApp {
             self.config.rtmp_bind
         );
 
-        axum::serve(http_listener, app)
+        let http_result = axum::serve(http_listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
-            .map_err(|e| format!("HTTP server error: {e}"))?;
+            .map_err(|e| format!("HTTP server error: {e}"));
 
         crate::log_info!("Shutting down...");
         rtmp_stop.store(true, Ordering::Relaxed);
         let _ = rtmp_thread.join();
         crate::log_info!("RTMP thread joined.");
+        http_result?;
         Ok(())
     }
 }
