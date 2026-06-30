@@ -116,6 +116,13 @@ impl RtmpEventHandler for DbRtmpBridge {
             crate::log_warn!("RTMP: publish rejected — invalid publish_key for app='{app}'");
             return Err(());
         };
+        if stream.app != app {
+            crate::log_warn!(
+                "RTMP: publish rejected — key belongs to app='{}', requested app='{app}'",
+                stream.app
+            );
+            return Err(());
+        }
 
         let pub_row = Publisher {
             id: gen_id("pub_"),
@@ -160,6 +167,13 @@ impl RtmpEventHandler for DbRtmpBridge {
             crate::log_warn!("RTMP: play rejected — invalid play_key for app='{app}'");
             return Err(());
         };
+        if stream.app != app {
+            crate::log_warn!(
+                "RTMP: play rejected — key belongs to app='{}', requested app='{app}'",
+                stream.app
+            );
+            return Err(());
+        }
 
         let player_row = Player {
             id: gen_id("pl_"),
@@ -258,6 +272,28 @@ mod tests {
         let bridge = DbRtmpBridge::new(db);
         bridge.on_connect(1);
         assert!(bridge.on_publish(1, "live", "bogus", "1.2.3.4:1").is_err());
+    }
+
+    #[test]
+    fn publish_rejects_key_for_wrong_app() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_publish(1, "other", "pub_k", "1.2.3.4:1").is_err());
+        assert_eq!(db.publisher_list(Some("s1")).len(), 0);
+    }
+
+    #[test]
+    fn play_rejects_key_for_wrong_app() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_play(1, "other", "pl_k", "1.2.3.4:1").is_err());
+        assert_eq!(db.player_list(Some("s1")).len(), 0);
     }
 
     #[test]
