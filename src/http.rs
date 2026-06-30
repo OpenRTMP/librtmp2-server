@@ -46,7 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64
 }
 
@@ -115,7 +115,7 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
 
 fn bearer_ok(state: &AppState, headers: &HeaderMap) -> bool {
     if state.config.api_token.is_empty() {
-        return true;
+        return false;
     }
     let Some(hdr) = headers.get("Authorization").and_then(|v| v.to_str().ok()) else {
         return false;
@@ -159,7 +159,7 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                 "id": p.stream_id,
                 "name": p.stream_name,
                 "app": p.app,
-                "uptime": now - p.connected_at,
+                "uptime": (now - p.connected_at).max(0),
                 "bitrate_kbps": p.bitrate_kbps,
                 "bytes_in": p.bytes_in,
                 "video": {
@@ -181,7 +181,7 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                 "id": pl.id,
                 "stream_name": pl.stream_name,
                 "app": pl.app,
-                "uptime": now - pl.connected_at,
+                "uptime": (now - pl.connected_at).max(0),
                 "bitrate_kbps": pl.bitrate_kbps,
                 "bytes_out": pl.bytes_out,
                 "client": { "address": pl.remote_addr },
@@ -222,7 +222,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
     ));
 
     for p in &pubs {
-        let uptime_ms = (now - p.connected_at) * 1000;
+        let uptime_ms = (now - p.connected_at).max(0) * 1000;
         let bw_in = (p.bitrate_kbps * 1000.0) as i64;
         out.push_str(&format!(
             "        <stream>\n\
@@ -280,7 +280,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
     }
 
     for pl in &players {
-        let uptime_ms = (now - pl.connected_at) * 1000;
+        let uptime_ms = (now - pl.connected_at).max(0) * 1000;
         let bw_out = (pl.bitrate_kbps * 1000.0) as i64;
         out.push_str(&format!(
             "        <stream>\n\
@@ -415,13 +415,27 @@ async fn handle_stream_create(
         .unwrap_or_else(|| "avc1,hvc1,av01".to_string());
 
     // Cryptographically unpredictable keys — never derive from stream id/time.
+    let (publish_key, play_key, stats_key) = match (
+        keygen_secret("pub_"),
+        keygen_secret("pl_"),
+        keygen_secret("st_"),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Key generation failed",
+            )
+        }
+    };
     let s = Stream {
         id: id.clone(),
         name,
         app,
-        publish_key: keygen_secret("pub_"),
-        play_key: keygen_secret("pl_"),
-        stats_key: keygen_secret("st_"),
+        publish_key,
+        play_key,
+        stats_key,
         enabled: true,
         allowed_codecs,
         created_at: now_ts(),
@@ -461,18 +475,18 @@ async fn handle_stream_delete(
             "Missing or invalid token",
         );
     }
-    if state.db.stream_get(&id).is_none() {
-        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
-    }
-    if !state.db.stream_delete(&id) {
-        return err_json(
+    match state.db.stream_delete(&id) {
+        Some(true) => {
+            crate::log_info!("Stream deleted: {id}");
+            Json(json!({"status": "deleted"})).into_response()
+        }
+        Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found"),
+        None => err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "Failed to delete stream",
-        );
+        ),
     }
-    crate::log_info!("Stream deleted: {id}");
-    Json(json!({"status": "deleted"})).into_response()
 }
 
 async fn handle_stream_stats(

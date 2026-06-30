@@ -82,11 +82,7 @@ pub struct DbRtmpBridge {
 
 fn gen_id(prefix: &str) -> String {
     use rand::RngExt;
-    format!(
-        "{prefix}{}_{:08x}",
-        crate::db::now_ts(),
-        rand::rng().random::<u32>()
-    )
+    format!("{prefix}{:016x}", rand::rng().random::<u64>())
 }
 
 impl DbRtmpBridge {
@@ -211,7 +207,10 @@ impl RtmpEventHandler for DbRtmpBridge {
 
     fn on_close(&self, conn: ConnId) {
         let cs = self.conns.lock().unwrap().remove(&conn);
-        let Some(cs) = cs else { return };
+        let Some(cs) = cs else {
+            crate::log_warn!("RTMP: on_close for untracked connection {conn}");
+            return;
+        };
 
         if let Some(mut pub_row) = cs.publisher {
             pub_row.active = false;
