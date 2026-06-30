@@ -17,7 +17,8 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
@@ -27,6 +28,9 @@ use crate::keygen::keygen_secret;
 pub struct AppState {
     pub db: Arc<Db>,
     pub config: ServerConfig,
+    /// Stream IDs deleted via this API while RTMP connections are active.
+    /// The RTMP poll loop reads this set and evicts matching connections.
+    pub deleted_streams: Arc<Mutex<HashSet<String>>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -561,6 +565,9 @@ async fn handle_stream_delete(
     match state.db.stream_delete(&id) {
         Some(true) => {
             crate::log_info!("Stream deleted: {id}");
+            // Signal the RTMP poll loop to evict any active connections for
+            // this stream. The set is drained once no connections remain.
+            state.deleted_streams.lock().unwrap().insert(id);
             Json(json!({"status": "deleted"})).into_response()
         }
         Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found"),
@@ -601,6 +608,7 @@ mod tests {
         Arc::new(AppState {
             db: Arc::new(Db::open(":memory:").unwrap()),
             config,
+            deleted_streams: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
