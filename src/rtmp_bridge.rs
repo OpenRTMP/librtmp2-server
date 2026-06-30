@@ -98,6 +98,7 @@ fn gen_id(prefix: &str) -> String {
 }
 
 impl DbRtmpBridge {
+    /// Create a new bridge backed by the given database handle.
     pub fn new(db: Arc<Db>) -> Self {
         DbRtmpBridge {
             db,

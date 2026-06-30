@@ -33,6 +33,7 @@ pub struct AppState {
     pub deleted_streams: Arc<Mutex<HashSet<String>>>,
 }
 
+/// Build the Axum router, wiring all HTTP handlers to the shared application state.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/health", get(handle_health))
