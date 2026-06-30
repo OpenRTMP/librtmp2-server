@@ -79,18 +79,23 @@ cargo build --release
 ### Run
 
 ```bash
-./target/release/librtmp2-server -c config.example.env
+cp config.example.env config.env
+LRTMP2_DB=./server.db ./target/release/librtmp2-server -c config.env
 ```
 
-Or with CLI flags:
+Or with CLI port/log-level flags:
 
 ```bash
-./target/release/librtmp2-server -p 1935 -w 8080 -t my-secret-token -v
+LRTMP2_DB=./server.db ./target/release/librtmp2-server -p 1935 -w 8080 -v
 ```
+
+The API token is generated on first startup, stored in the SQLite database, and printed once to stderr. Use that printed token for Bearer-authenticated API calls and for `librtmp2-server-panel`.
 
 ---
 
 ## Configuration
+
+`LRTMP2_DB` or `LRTMP2_DB_PATH` must point to the SQLite database file. Listener and logging settings live in `config.env`:
 
 ```env
 # RTMP listener address
@@ -177,7 +182,7 @@ Each stream has **three unique, auto-generated keys**:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/streams \
-  -H "Authorization: Bearer $(openssl rand -hex 32)" \
+  -H "Authorization: Bearer <generated-api-token>" \
   -H "Content-Type: application/json" \
   -d '{"id":"mystream","name":"My Live Stream","app":"live"}'
 ```
@@ -198,7 +203,7 @@ Response:
 ### Publish with OBS
 
 - Server: `rtmp://your-server/live`
-- Stream Key: `pub_mystream_1719480000`
+- Stream Key: use the `publish_key` returned by `POST /api/v1/streams`
 
 ### View stats (JSON)
 

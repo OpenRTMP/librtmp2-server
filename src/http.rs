@@ -142,6 +142,34 @@ pub struct KeyQuery {
     key: String,
 }
 
+fn is_valid_stream_key_part(value: &str) -> bool {
+    if value.is_empty() || value.len() > 63 {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn is_valid_display_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn is_valid_allowed_codecs(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.split(',').all(|codec| {
+            !codec.is_empty()
+                && codec.len() <= 32
+                && codec
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
+}
+
 // ---------- JSON stats builder ----------
 
 fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
@@ -398,21 +426,57 @@ async fn handle_stream_create(
     }
 
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let Some(id) = req.id.filter(|s| !s.is_empty()) else {
+    let Some(id) = req
+        .id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Missing 'id' field");
     };
     let app = req
         .app
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "live".to_string());
     let name = req
         .name
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| id.clone());
     let allowed_codecs = req
         .allowed_codecs
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "avc1,hvc1,av01".to_string());
+
+    if !is_valid_stream_key_part(&id) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Stream id must be 1-63 characters and use only letters, numbers, dots, underscores, or hyphens",
+        );
+    }
+    if !is_valid_stream_key_part(&app) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "App must be 1-63 characters and use only letters, numbers, dots, underscores, or hyphens",
+        );
+    }
+    if !is_valid_display_name(&name) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Name must be 1-128 characters and must not contain control characters",
+        );
+    }
+    if !is_valid_allowed_codecs(&allowed_codecs) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "allowed_codecs must be a comma-separated list of codec tokens",
+        );
+    }
 
     // Cryptographically unpredictable keys — never derive from stream id/time.
     let publish_key = match keygen_secret("pub_") {
@@ -580,6 +644,22 @@ mod tests {
         assert_eq!(xml_escape("<a&b>\"'"), "&lt;a&amp;b&gt;&quot;&apos;");
     }
 
+    #[test]
+    fn stream_create_validation_helpers_reject_unsafe_values() {
+        assert!(is_valid_stream_key_part("live.main_1"));
+        assert!(is_valid_stream_key_part(&"a".repeat(63)));
+        assert!(!is_valid_stream_key_part(""));
+        assert!(!is_valid_stream_key_part("-starts-with-hyphen"));
+        assert!(!is_valid_stream_key_part("bad/id"));
+        assert!(!is_valid_stream_key_part(&"a".repeat(64)));
+
+        assert!(is_valid_display_name("Main Stream"));
+        assert!(!is_valid_display_name("bad\nname"));
+        assert!(is_valid_allowed_codecs("avc1,hvc1,av01,mp4a.40.2"));
+        assert!(!is_valid_allowed_codecs("avc1,,hvc1"));
+        assert!(!is_valid_allowed_codecs("avc1,../../oops"));
+    }
+
     #[tokio::test]
     async fn health_requires_no_auth() {
         let app = router(test_state("a-strong-random-secret-value"));
@@ -608,6 +688,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_stream_rejects_invalid_fields() {
+        let app = router(test_state("a-strong-random-secret-value"));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"id":"bad/id","app":"live"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"id":"ok","app":"bad/app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
