@@ -1,7 +1,9 @@
 //! Server application lifecycle: wires together the database, the HTTP API,
 //! and the RTMP listener, then runs until a shutdown signal arrives.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
@@ -13,6 +15,9 @@ pub struct ServerApp {
     config: ServerConfig,
     db: Arc<Db>,
     rtmp_bridge: Arc<DbRtmpBridge>,
+    /// Stream IDs deleted via HTTP while connections are live. The RTMP poll
+    /// loop reads this set and kicks any connection whose stream_id appears.
+    deleted_streams: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ServerApp {
@@ -55,11 +60,13 @@ impl ServerApp {
         };
 
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db)));
+        let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
 
         Ok(ServerApp {
             config,
             db,
             rtmp_bridge,
+            deleted_streams,
         })
     }
 
@@ -79,6 +86,7 @@ impl ServerApp {
         let state = Arc::new(AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
+            deleted_streams: Arc::clone(&self.deleted_streams),
         });
         let app = http::router(state);
 
@@ -95,18 +103,27 @@ impl ServerApp {
         let rtmp_tls_cert = self.config.tls_cert_file.clone();
         let rtmp_tls_key = self.config.tls_key_file.clone();
         let rtmp_bridge = Arc::clone(&self.rtmp_bridge);
+        let deleted_streams = Arc::clone(&self.deleted_streams);
+        let rtmp_stop = Arc::new(AtomicBool::new(false));
+        let rtmp_stop_clone = Arc::clone(&rtmp_stop);
 
         let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
+        let rtmp_thread = std::thread::spawn(move || {
             use librtmp2::server::Server as RtmpServer;
             use librtmp2::types::ServerConfig as RtmpConfig;
-            use std::collections::{HashMap, HashSet};
+            use std::collections::HashMap;
 
             #[derive(Default)]
             struct TrackedConn {
                 connected: bool,
                 publishing: bool,
                 playing: bool,
+                /// DB stream id, set after on_publish / on_play succeeds.
+                stream_id: String,
+                /// Last detected video codec string from the protocol layer.
+                video_codec: String,
+                /// Last detected audio codec string from the protocol layer.
+                audio_codec: String,
             }
 
             // Build CStrings inside the thread so the pointers remain valid
@@ -150,13 +167,22 @@ impl ServerApp {
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
             loop {
+                if rtmp_stop_clone.load(Ordering::Relaxed) {
+                    server.stop();
+                    break;
+                }
+
                 if let Err(e) = server.poll(50) {
                     crate::log_warn!("RTMP polling stopped: {e}");
                     break;
                 }
 
-                let mut current_ids = HashSet::new();
+                let mut current_ids = std::collections::HashSet::new();
                 let mut reject_indices = Vec::new();
+
+                // Snapshot deleted stream IDs once per poll cycle.
+                let deleted_now: std::collections::HashSet<String> =
+                    deleted_streams.lock().unwrap().iter().cloned().collect();
 
                 for (idx, conn) in server.connections.iter().enumerate() {
                     if conn.client_fd < 0 {
@@ -176,29 +202,113 @@ impl ServerApp {
 
                     if stream.is_publishing && !entry.publishing {
                         match rtmp_bridge.on_publish(conn_id, &conn.app, &stream.name, "") {
-                            Ok(()) => entry.publishing = true,
+                            Ok(()) => {
+                                entry.publishing = true;
+                                entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+                            }
                             Err(()) => {
                                 crate::log_warn!(
                                     "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
                                     conn.app
                                 );
                                 reject_indices.push(idx);
+                                continue;
                             }
                         }
                     }
 
                     if stream.is_playing && !entry.playing {
                         match rtmp_bridge.on_play(conn_id, &conn.app, &stream.name, "") {
-                            Ok(()) => entry.playing = true,
+                            Ok(()) => {
+                                entry.playing = true;
+                                if entry.stream_id.is_empty() {
+                                    entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+                                }
+                            }
                             Err(()) => {
                                 crate::log_warn!(
                                     "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
                                     conn.app
                                 );
                                 reject_indices.push(idx);
+                                continue;
                             }
                         }
                     }
+
+                    // Kick connections whose stream was deleted.
+                    if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
+                        crate::log_info!(
+                            "RTMP: kicking conn={conn_id} — stream '{}' was deleted",
+                            entry.stream_id
+                        );
+                        reject_indices.push(idx);
+                        continue;
+                    }
+
+                    // Codec enforcement and stats: only for active publishers.
+                    if !stream.is_publishing {
+                        continue;
+                    }
+
+                    // Pick up newly detected codecs from the protocol layer.
+                    let new_video = conn
+                        .detected_video_codec
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_string();
+                    let new_audio = conn
+                        .detected_audio_codec
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_string();
+
+                    if !new_video.is_empty() && new_video != entry.video_codec {
+                        entry.video_codec = new_video.clone();
+                    }
+                    if !new_audio.is_empty() && new_audio != entry.audio_codec {
+                        entry.audio_codec = new_audio.clone();
+                    }
+
+                    // Enforce codec policy for both video and audio.
+                    let mut codec_allowed = true;
+                    for (kind, codec) in [
+                        (
+                            crate::rtmp_bridge::FrameKind::Video,
+                            entry.video_codec.as_str(),
+                        ),
+                        (
+                            crate::rtmp_bridge::FrameKind::Audio,
+                            entry.audio_codec.as_str(),
+                        ),
+                    ] {
+                        if codec.is_empty() {
+                            continue;
+                        }
+                        let frame = crate::rtmp_bridge::FrameInfo {
+                            kind,
+                            timestamp: 0,
+                            size: 0,
+                            codec: codec.to_string(),
+                        };
+                        if !rtmp_bridge.on_frame(conn_id, &frame) {
+                            crate::log_warn!("RTMP: codec enforcement kicked conn={conn_id}");
+                            codec_allowed = false;
+                            break;
+                        }
+                    }
+                    if !codec_allowed {
+                        reject_indices.push(idx);
+                        continue;
+                    }
+
+                    // Update publisher stats (rate-limited inside the bridge).
+                    rtmp_bridge.update_publisher_stats(
+                        conn_id,
+                        conn.bytes_received as u64,
+                        &entry.video_codec,
+                        &entry.audio_codec,
+                    );
                 }
 
                 reject_indices.sort_unstable();
@@ -223,6 +333,22 @@ impl ServerApp {
                     tracked.remove(&conn_id);
                     rtmp_bridge.on_close(conn_id);
                 }
+
+                // Drain deletion markers that no live connection still references.
+                let live_stream_ids: std::collections::HashSet<String> = tracked
+                    .values()
+                    .filter(|c| !c.stream_id.is_empty())
+                    .map(|c| c.stream_id.clone())
+                    .collect();
+                deleted_streams
+                    .lock()
+                    .unwrap()
+                    .retain(|id| live_stream_ids.contains(id));
+            }
+
+            // Notify the bridge about connections that never got an explicit close event.
+            for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
+                rtmp_bridge.on_close(conn_id);
             }
         });
 
@@ -236,12 +362,16 @@ impl ServerApp {
             self.config.rtmp_bind
         );
 
-        axum::serve(http_listener, app)
+        let http_result = axum::serve(http_listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
-            .map_err(|e| format!("HTTP server error: {e}"))?;
+            .map_err(|e| format!("HTTP server error: {e}"));
 
         crate::log_info!("Shutting down...");
+        rtmp_stop.store(true, Ordering::Relaxed);
+        let _ = rtmp_thread.join();
+        crate::log_info!("RTMP thread joined.");
+        http_result?;
         Ok(())
     }
 }

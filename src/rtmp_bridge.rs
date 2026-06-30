@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::db::{Db, Player, Publisher};
 
@@ -38,12 +39,14 @@ pub struct FrameInfo {
     pub kind: FrameKind,
     pub timestamp: u32,
     pub size: u32,
+    /// Codec string, e.g. "avc1", "hvc1", "mp4a".
     pub codec: String,
 }
 
 /// Callback contract the RTMP protocol layer drives. Mirrors librtmp2's
 /// `on_connect` / `on_publish` / `on_play` / `on_frame` / `on_close` hooks.
 pub trait RtmpEventHandler: Send + Sync {
+    /// Called immediately after a new TCP connection is accepted.
     fn on_connect(&self, conn: ConnId);
     /// Return `Err` to reject the publish (invalid publish_key).
     fn on_publish(
@@ -61,7 +64,10 @@ pub trait RtmpEventHandler: Send + Sync {
         stream_key: &str,
         remote_addr: &str,
     ) -> Result<(), ()>;
-    fn on_frame(&self, conn: ConnId, frame: &FrameInfo);
+    /// Called for every incoming frame. Return `false` to kick the connection
+    /// (e.g. codec not in `allowed_codecs`).
+    fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool;
+    /// Called when the connection is closed (cleanly or by error).
     fn on_close(&self, conn: ConnId);
 }
 
@@ -69,6 +75,14 @@ pub trait RtmpEventHandler: Send + Sync {
 struct ConnState {
     publisher: Option<Publisher>,
     player: Option<Player>,
+    /// DB stream id for the published stream, set in on_publish.
+    pub stream_id: String,
+    /// Comma-separated allowed codec list from the stream row.
+    pub allowed_codecs: String,
+    /// Timestamp of the last stats flush to the DB.
+    last_stats_at: Option<Instant>,
+    /// bytes_received snapshot at the last stats flush.
+    bytes_at_last_stats: u64,
 }
 
 /// DB-backed [`RtmpEventHandler`]. Each connection's role(s) and DB row(s)
@@ -86,11 +100,88 @@ fn gen_id(prefix: &str) -> String {
 }
 
 impl DbRtmpBridge {
+    /// Create a new bridge backed by the given database handle.
     pub fn new(db: Arc<Db>) -> Self {
         DbRtmpBridge {
             db,
             conns: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return the DB stream id for a publishing connection, or empty string.
+    pub fn stream_id_for_conn(&self, conn: ConnId) -> String {
+        self.conns
+            .lock()
+            .unwrap()
+            .get(&conn)
+            .map(|s| s.stream_id.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return the allowed_codecs string for a publishing connection.
+    pub fn allowed_codecs_for_conn(&self, conn: ConnId) -> String {
+        self.conns
+            .lock()
+            .unwrap()
+            .get(&conn)
+            .map(|s| s.allowed_codecs.clone())
+            .unwrap_or_default()
+    }
+
+    /// Update publisher stats (bytes_in, bitrate, codec) in the DB.
+    /// Called from the server poll loop after every poll iteration.
+    pub fn update_publisher_stats(
+        &self,
+        conn: ConnId,
+        bytes_received: u64,
+        video_codec: &str,
+        audio_codec: &str,
+    ) {
+        let mut guard = self.conns.lock().unwrap();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+        let Some(ref mut pub_row) = cs.publisher else {
+            return;
+        };
+
+        let now = Instant::now();
+        let elapsed_secs = cs
+            .last_stats_at
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+
+        let bytes_delta = bytes_received.saturating_sub(cs.bytes_at_last_stats);
+
+        // Only flush to DB if at least 1 second has passed (rate-limit writes).
+        if elapsed_secs < 1.0 && cs.last_stats_at.is_some() {
+            return;
+        }
+
+        let bitrate_kbps = if elapsed_secs > 0.0 {
+            (bytes_delta as f64 * 8.0) / (elapsed_secs * 1000.0)
+        } else {
+            0.0
+        };
+
+        pub_row.bytes_in = bytes_received;
+        pub_row.bitrate_kbps = bitrate_kbps;
+        if !video_codec.is_empty() {
+            pub_row.video_codec = video_codec.to_string();
+        }
+        if !audio_codec.is_empty() {
+            pub_row.audio_codec = audio_codec.to_string();
+        }
+
+        cs.last_stats_at = Some(now);
+        cs.bytes_at_last_stats = bytes_received;
+
+        // Clone the row to release the lock before the DB call.
+        let pub_id = pub_row.id.clone();
+        let pub_row_clone = pub_row.clone();
+        drop(guard);
+
+        self.db.publisher_update(&pub_id, &pub_row_clone);
     }
 }
 
@@ -140,12 +231,14 @@ impl RtmpEventHandler for DbRtmpBridge {
         }
 
         let pub_id = pub_row.id.clone();
-        self.conns
-            .lock()
-            .unwrap()
-            .entry(conn)
-            .or_default()
-            .publisher = Some(pub_row);
+        let stream_id = stream.id.clone();
+        let allowed_codecs = stream.allowed_codecs.clone();
+
+        let mut guard = self.conns.lock().unwrap();
+        let cs = guard.entry(conn).or_default();
+        cs.publisher = Some(pub_row);
+        cs.stream_id = stream_id;
+        cs.allowed_codecs = allowed_codecs;
 
         crate::log_info!(
             "RTMP: publish accepted stream='{}' publisher={pub_id}",
@@ -191,7 +284,14 @@ impl RtmpEventHandler for DbRtmpBridge {
         }
 
         let player_id = player_row.id.clone();
-        self.conns.lock().unwrap().entry(conn).or_default().player = Some(player_row);
+        let stream_id = stream.id.clone();
+        let mut guard = self.conns.lock().unwrap();
+        let cs = guard.entry(conn).or_default();
+        cs.player = Some(player_row);
+        // Store stream_id for player connections too (used for deletion signalling).
+        if cs.stream_id.is_empty() {
+            cs.stream_id = stream_id;
+        }
 
         crate::log_info!(
             "RTMP: play accepted stream='{}' player={player_id}",
@@ -200,7 +300,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         Ok(())
     }
 
-    fn on_frame(&self, _conn: ConnId, frame: &FrameInfo) {
+    fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool {
         match frame.kind {
             FrameKind::Video => crate::log_debug!(
                 "RTMP: VIDEO frame ts={} size={} codec={}",
@@ -215,8 +315,30 @@ impl RtmpEventHandler for DbRtmpBridge {
                 frame.codec
             ),
         }
-        // TODO: update publisher stats in DB (bitrate, codec, fps) once the
-        // RTMP layer exposes per-frame size/timing through this seam.
+
+        // Enforce allowed_codecs: reject if the detected codec is not listed.
+        if !frame.codec.is_empty() {
+            let guard = self.conns.lock().unwrap();
+            if let Some(cs) = guard.get(&conn) {
+                if !cs.allowed_codecs.is_empty() {
+                    let allowed = cs
+                        .allowed_codecs
+                        .split(',')
+                        .map(|s| s.trim())
+                        .any(|c| c.eq_ignore_ascii_case(&frame.codec));
+                    if !allowed {
+                        crate::log_warn!(
+                            "RTMP: codec '{}' not in allowed list '{}' — closing conn={conn}",
+                            frame.codec,
+                            cs.allowed_codecs
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
     }
 
     fn on_close(&self, conn: ConnId) {
@@ -325,5 +447,42 @@ mod tests {
         bridge.on_close(1);
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
         assert_eq!(db.publisher_list(Some("s2")).len(), 1);
+    }
+
+    #[test]
+    fn on_frame_rejects_disallowed_codec() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
+
+        // "vp9" is not in "avc1,hvc1,av01"
+        let frame = FrameInfo {
+            kind: FrameKind::Video,
+            timestamp: 0,
+            size: 100,
+            codec: "vp9".to_string(),
+        };
+        assert!(!bridge.on_frame(1, &frame));
+    }
+
+    #[test]
+    fn on_frame_allows_listed_codec() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
+
+        let frame = FrameInfo {
+            kind: FrameKind::Video,
+            timestamp: 0,
+            size: 100,
+            codec: "avc1".to_string(),
+        };
+        assert!(bridge.on_frame(1, &frame));
     }
 }
