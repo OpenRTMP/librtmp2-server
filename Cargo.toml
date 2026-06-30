@@ -13,6 +13,7 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
+librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", branch = "claude/relay-send-frame", default-features = false }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

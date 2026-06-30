@@ -1,10 +1,5 @@
 //! Server application lifecycle: wires together the database, the HTTP API,
-//! and the RTMP bridge, then runs until a shutdown signal arrives.
-//!
-//! The RTMP protocol implementation itself (`librtmp2`) is being rewritten in
-//! Rust separately and isn't wired in yet. [`rtmp_bridge::DbRtmpBridge`] is the
-//! seam that crate's server should drive once it exists — see the comment in
-//! [`ServerApp::run`] for exactly where its listener would be started.
+//! and the RTMP listener, then runs until a shutdown signal arrives.
 
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -87,23 +82,80 @@ impl ServerApp {
         });
         let app = http::router(state);
 
-        let listener = TcpListener::bind(&self.config.http_bind)
+        let http_listener = TcpListener::bind(&self.config.http_bind)
             .await
             .map_err(|e| format!("Failed to bind HTTP on {}: {e}", self.config.http_bind))?;
         crate::log_info!("HTTP listening on {}", self.config.http_bind);
 
-        // The RTMP listener itself is the integration seam for the Rust
-        // `librtmp2` crate: once it exists, start it here bound to
-        // `self.config.rtmp_bind`, configured with `self.config.rtmp_max_conn`,
-        // and driving `self.rtmp_bridge` (an
-        // `Arc<dyn RtmpEventHandler>`) on connect/publish/play/frame/close.
-        crate::log_warn!(
-            "RTMP listener not yet started — librtmp2 (Rust) is not wired in (bind would be {})",
+        // Start the RTMP listener in a background thread. librtmp2's Server
+        // uses a blocking poll loop, so it lives outside the Tokio runtime.
+        let rtmp_bind = self.config.rtmp_bind.clone();
+        let rtmp_max_conn = self.config.rtmp_max_conn;
+        let rtmp_tls_enabled = self.config.tls_enabled;
+        let rtmp_tls_cert = self.config.tls_cert_file.clone();
+        let rtmp_tls_key = self.config.tls_key_file.clone();
+
+        let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            use librtmp2::server::Server as RtmpServer;
+            use librtmp2::types::ServerConfig as RtmpConfig;
+
+            // Build CStrings inside the thread so the pointers remain valid
+            // for the duration of RtmpServer::new().
+            let cert_cstr = std::ffi::CString::new(rtmp_tls_cert).ok();
+            let key_cstr = std::ffi::CString::new(rtmp_tls_key).ok();
+
+            let cfg = RtmpConfig {
+                max_connections: rtmp_max_conn,
+                chunk_size: 4096,
+                tls_enabled: if rtmp_tls_enabled { 1 } else { 0 },
+                tls_cert_file: cert_cstr
+                    .as_ref()
+                    .map(|s| s.as_ptr() as *const u8)
+                    .unwrap_or(std::ptr::null()),
+                tls_key_file: key_cstr
+                    .as_ref()
+                    .map(|s| s.as_ptr() as *const u8)
+                    .unwrap_or(std::ptr::null()),
+                tls_ca_file: std::ptr::null(),
+                tls_insecure: 0,
+            };
+            let mut server = match RtmpServer::new(cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("RTMP server init failed: {e}");
+                    crate::log_warn!("{msg}");
+                    let _ = rtmp_ready_tx.send(Err(msg));
+                    return;
+                }
+            };
+            if let Err(e) = server.listen(&rtmp_bind) {
+                let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
+                crate::log_warn!("{msg}");
+                let _ = rtmp_ready_tx.send(Err(msg));
+                return;
+            }
+            crate::log_info!("RTMP listening on {rtmp_bind}");
+            let _ = rtmp_ready_tx.send(Ok(()));
+            loop {
+                if let Err(e) = server.poll(50) {
+                    crate::log_warn!("RTMP polling stopped: {e}");
+                    break;
+                }
+            }
+        });
+
+        rtmp_ready_rx
+            .await
+            .map_err(|_| "RTMP startup thread exited before reporting readiness".to_string())??;
+
+        crate::log_info!(
+            "Server ready — HTTP: {}, RTMP: {}",
+            self.config.http_bind,
             self.config.rtmp_bind
         );
-        crate::log_info!("Server ready — HTTP: {}", self.config.http_bind);
 
-        axum::serve(listener, app)
+        axum::serve(http_listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| format!("HTTP server error: {e}"))?;
