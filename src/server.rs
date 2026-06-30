@@ -37,7 +37,7 @@ impl ServerApp {
         config.api_token = match db.token_get() {
             Some(t) => t,
             None => {
-                let token = crate::keygen::keygen_secret("tk_")?;
+                let token = crate::keygen::keygen_secret("")?;
                 if !db.token_set(&token) {
                     return Err("Failed to persist API token in database".into());
                 }
