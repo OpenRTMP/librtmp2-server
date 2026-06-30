@@ -5,7 +5,7 @@
 //! at a time anyway, so this matches the C version's locking model without
 //! needing a connection pool.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};

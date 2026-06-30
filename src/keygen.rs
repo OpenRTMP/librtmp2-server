@@ -1,7 +1,7 @@
 //! OS-backed cryptographically secure key material.
 
-use rand::rngs::SysRng;
 use rand::TryRng;
+use rand::rngs::SysRng;
 
 /// `prefix` followed by 32 hex chars (16 bytes / 128 bits of entropy).
 pub fn keygen_secret(prefix: &str) -> Result<String, String> {

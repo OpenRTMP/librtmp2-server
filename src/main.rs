@@ -7,7 +7,7 @@ mod rtmp_bridge;
 mod server;
 
 use clap::Parser;
-use config::{config_apply_env, config_load, ServerConfig};
+use config::{ServerConfig, config_apply_env, config_load};
 use server::ServerApp;
 
 #[derive(Parser, Debug)]

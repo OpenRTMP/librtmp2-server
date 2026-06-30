@@ -2,8 +2,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
