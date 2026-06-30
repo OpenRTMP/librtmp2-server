@@ -85,6 +85,10 @@ pub fn now_ts() -> i64 {
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  val TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS streams (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL DEFAULT '',
@@ -177,6 +181,41 @@ impl Db {
         Ok(Db {
             conn: Mutex::new(conn),
         })
+    }
+
+    // ==================== SETTINGS ====================
+
+    /// Returns the stored API token, or `Ok(None)` if none has been generated
+    /// yet. Returns `Err` on a real database read failure so callers can
+    /// distinguish "not found" from "broken DB".
+    pub fn token_get(&self) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT val FROM settings WHERE key='api_token'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("DB error reading API token: {e}"))
+        .map(|opt| opt.filter(|v| !v.is_empty()))
+    }
+
+    /// Persists `token` as the API token. Inserts a new row, or updates an
+    /// existing row only when its value is empty (repairing a corrupted state).
+    /// Returns `Ok(true)` if the token was written, `Ok(false)` if a non-empty
+    /// token was already present (the caller should re-read with [`token_get`]
+    /// to get the winner's value).
+    pub fn token_set(&self, token: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn
+            .execute(
+                "INSERT INTO settings(key,val) VALUES('api_token',?) \
+                 ON CONFLICT(key) DO UPDATE SET val=excluded.val \
+                 WHERE settings.val=''",
+                rusqlite::params![token],
+            )
+            .map_err(|e| format!("DB error persisting API token: {e}"))?;
+        Ok(rows > 0)
     }
 
     // ==================== STREAMS ====================

@@ -22,7 +22,10 @@ pub struct ServerApp {
 }
 
 impl ServerApp {
-    pub fn create(config: ServerConfig) -> Result<ServerApp, String> {
+    /// Opens the database, loads or auto-generates the API token, and wires
+    /// together all server components. Returns an error if the database cannot
+    /// be opened or the token cannot be persisted.
+    pub fn create(mut config: ServerConfig) -> Result<ServerApp, String> {
         let db_path = std::env::var("LRTMP2_DB")
             .ok()
             .filter(|v| !v.is_empty())
@@ -31,6 +34,31 @@ impl ServerApp {
         let db = Arc::new(
             Db::open(&db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
         );
+
+        // The API token lives exclusively in the database. On first startup it
+        // is generated here; afterwards it is loaded from the settings table.
+        config.api_token = match db.token_get()? {
+            Some(t) => t,
+            None => {
+                let candidate = crate::keygen::keygen_secret("")?;
+                if db.token_set(&candidate)? {
+                    // We inserted the token — print it once so the operator
+                    // can use the API.
+                    eprintln!(
+                        "============================================================\n\
+                         Generated API token (stored in database {db_path}):\n\
+                         {candidate}\n\
+                         ============================================================"
+                    );
+                    candidate
+                } else {
+                    // Another process inserted first; read back the winner's token.
+                    db.token_get()?
+                        .ok_or("API token missing after concurrent insert")?
+                }
+            }
+        };
+
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db)));
 
         Ok(ServerApp {
@@ -66,8 +94,8 @@ impl ServerApp {
 
         // The RTMP listener itself is the integration seam for the Rust
         // `librtmp2` crate: once it exists, start it here bound to
-        // `self.config.rtmp_bind`, configured with `self.config.rtmp_max_conn`
-        // / `rtmp_chunk_size`, and driving `self.rtmp_bridge` (an
+        // `self.config.rtmp_bind`, configured with `self.config.rtmp_max_conn`,
+        // and driving `self.rtmp_bridge` (an
         // `Arc<dyn RtmpEventHandler>`) on connect/publish/play/frame/close.
         crate::log_warn!(
             "RTMP listener not yet started — librtmp2 (Rust) is not wired in (bind would be {})",
