@@ -2,8 +2,8 @@
 //! and the RTMP listener, then runs until a shutdown signal arrives.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
@@ -181,12 +181,8 @@ impl ServerApp {
                 let mut reject_indices = Vec::new();
 
                 // Snapshot deleted stream IDs once per poll cycle.
-                let deleted_now: std::collections::HashSet<String> = deleted_streams
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .cloned()
-                    .collect();
+                let deleted_now: std::collections::HashSet<String> =
+                    deleted_streams.lock().unwrap().iter().cloned().collect();
 
                 for (idx, conn) in server.connections.iter().enumerate() {
                     if conn.client_fd < 0 {
@@ -283,9 +279,7 @@ impl ServerApp {
                             codec: entry.video_codec.clone(),
                         };
                         if !rtmp_bridge.on_frame(conn_id, &frame) {
-                            crate::log_warn!(
-                                "RTMP: codec enforcement kicked conn={conn_id}"
-                            );
+                            crate::log_warn!("RTMP: codec enforcement kicked conn={conn_id}");
                             reject_indices.push(idx);
                             continue;
                         }
