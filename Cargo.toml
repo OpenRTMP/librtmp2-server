@@ -1,11 +1,9 @@
 [package]
 name = "librtmp2-server"
 version = "0.1.0"
-edition = "2021"
-# 1.95 because rusqlite 0.40's own source relies on cfg_select, stabilized in
-# that release; lower floors here would fail to compile rusqlite, not just warn.
+edition = "2024"
 rust-version = "1.95"
-license = "Apache-2.0"
+license = "MIT"
 description = "RTMP / E-RTMP media server built on librtmp2"
 
 [[bin]]
@@ -13,7 +11,7 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", branch = "claude/openrtmp-bugs-risks-amf3n6", default-features = false }
+librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", branch = "main", default-features = false }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
