@@ -123,7 +123,11 @@ impl ServerApp {
             }
         });
 
-        crate::log_info!("Server ready — HTTP: {}, RTMP: {}", self.config.http_bind, self.config.rtmp_bind);
+        crate::log_info!(
+            "Server ready — HTTP: {}, RTMP: {}",
+            self.config.http_bind,
+            self.config.rtmp_bind
+        );
 
         axum::serve(http_listener, app)
             .with_graceful_shutdown(shutdown_signal())
