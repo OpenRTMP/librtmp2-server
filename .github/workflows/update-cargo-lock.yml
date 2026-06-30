@@ -11,13 +11,12 @@ permissions:
 
 jobs:
   update-cargo-lock:
-    # Prevent loops when the workflow bot pushes Cargo.lock updates.
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
