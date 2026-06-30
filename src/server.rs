@@ -147,9 +147,7 @@ impl ServerApp {
 
         rtmp_ready_rx
             .await
-            .map_err(|_| {
-                "RTMP startup thread exited before reporting readiness".to_string()
-            })??;
+            .map_err(|_| "RTMP startup thread exited before reporting readiness".to_string())??;
 
         crate::log_info!(
             "Server ready — HTTP: {}, RTMP: {}",
