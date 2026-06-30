@@ -7,7 +7,6 @@ services:
     container_name: librtmp2-server
     restart: unless-stopped
     environment:
-      - LRTMP2_API_TOKEN=${LRTMP2_API_TOKEN:?Set LRTMP2_API_TOKEN in .env}
       - LRTMP2_HTTP_BIND=0.0.0.0:8080
       - LRTMP2_RTMP_BIND=0.0.0.0:1935
       - LRTMP2_LOG_LEVEL=2

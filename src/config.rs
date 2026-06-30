@@ -1,6 +1,4 @@
-//! JSON configuration file parsing.
-
-use serde::Deserialize;
+//! `.env`-style configuration file parsing.
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -22,7 +20,6 @@ pub struct ServerConfig {
 
     pub web_root: String,
     /// Path the config was loaded from, kept for diagnostics/reload support.
-    #[allow(dead_code)]
     pub config_file: String,
 
     /// 0=error, 1=warn, 2=info, 3=debug
@@ -40,8 +37,6 @@ impl Default for ServerConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             http_bind: "0.0.0.0:8080".to_string(),
-            // Left empty by default — the server refuses to start with
-            // protected endpoints unless a real token is configured.
             api_token: String::new(),
             require_stream_key: true,
             web_root: "./web".to_string(),
@@ -52,140 +47,81 @@ impl Default for ServerConfig {
     }
 }
 
-/// Returns false for empty, placeholder, or other known-weak API tokens.
-pub fn config_api_token_usable(token: &str) -> bool {
-    const MIN_TOKEN_LEN: usize = 16;
-    if token.is_empty() || token.len() < MIN_TOKEN_LEN {
-        return false;
+/// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
+fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
     }
-
-    const WEAK_TOKENS: &[&str] = &[
-        "<replace-with-random-token>",
-        "changeme",
-        "secret",
-        "password",
-        "api_token",
-        "test-token",
-        "test-token-123",
-        "admin",
-        "administrator",
-        "123456",
-        "12345678",
-        "letmein",
-        "default",
-    ];
-
-    !WEAK_TOKENS.iter().any(|w| w.eq_ignore_ascii_case(token))
+    let (key, val) = line.split_once('=')?;
+    let key = key.trim().to_string();
+    let val = val.trim();
+    // Strip optional surrounding quotes (single or double).
+    let val = if (val.starts_with('"') && val.ends_with('"'))
+        || (val.starts_with('\'') && val.ends_with('\''))
+    {
+        &val[1..val.len() - 1]
+    } else {
+        val
+    };
+    Some((key, val.to_string()))
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawConfig {
-    api_token: Option<String>,
-    require_stream_key: Option<bool>,
-    log_level: Option<i32>,
-    log_file: Option<String>,
-    web_root: Option<String>,
-    rtmp: Option<RawRtmp>,
-    tls: Option<RawTls>,
-    http: Option<RawHttp>,
-    auth: Option<RawAuth>,
+/// Apply a key/value pair from the config file to `config`.
+fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
+    match key {
+        "RTMP_BIND" => config.rtmp_bind = val.to_string(),
+        "RTMP_MAX_CONNECTIONS" => {
+            if let Ok(v) = val.parse::<i32>() {
+                config.rtmp_max_conn = v;
+            }
+        }
+        "RTMP_CHUNK_SIZE" => {
+            if let Ok(v) = val.parse::<i32>() {
+                config.rtmp_chunk_size = v;
+            }
+        }
+        "TLS_ENABLED" => match val {
+            "1" | "true" => config.tls_enabled = true,
+            "0" | "false" => config.tls_enabled = false,
+            _ => {}
+        },
+        "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
+        "TLS_KEY_FILE" => config.tls_key_file = val.to_string(),
+        "HTTP_BIND" => config.http_bind = val.to_string(),
+        "API_TOKEN" => config.api_token = val.to_string(),
+        "REQUIRE_STREAM_KEY" => match val {
+            "1" | "true" => config.require_stream_key = true,
+            "0" | "false" => config.require_stream_key = false,
+            _ => {}
+        },
+        "WEB_ROOT" => config.web_root = val.to_string(),
+        "LOG_LEVEL" => {
+            if let Ok(v) = val.parse::<i32>() {
+                if (0..=3).contains(&v) {
+                    config.log_level = v;
+                }
+            }
+        }
+        "LOG_FILE" => config.log_file = val.to_string(),
+        _ => {} // Unknown keys are silently ignored.
+    }
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawRtmp {
-    bind: Option<String>,
-    max_connections: Option<i32>,
-    chunk_size: Option<i32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawTls {
-    enabled: Option<bool>,
-    cert_file: Option<String>,
-    key_file: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawHttp {
-    bind: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawAuth {
-    api_token: Option<String>,
-    require_stream_key: Option<bool>,
-}
-
-/// Load config from a JSON file, starting from defaults.
+/// Load config from a `.env` file, starting from defaults.
 pub fn config_load(path: &str) -> Result<ServerConfig, String> {
     let mut config = ServerConfig::default();
 
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot open config file: {path} ({e})"))?;
 
-    let raw: RawConfig =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid config JSON in {path}: {e}"))?;
-
-    if let Some(v) = raw.api_token {
-        config.api_token = v;
-    }
-    if let Some(v) = raw.require_stream_key {
-        config.require_stream_key = v;
-    }
-    if let Some(v) = raw.log_level {
-        config.log_level = v;
-    }
-    if let Some(v) = raw.log_file {
-        config.log_file = v;
-    }
-    if let Some(v) = raw.web_root {
-        config.web_root = v;
-    }
-
-    if let Some(rtmp) = raw.rtmp {
-        if let Some(v) = rtmp.bind {
-            config.rtmp_bind = v;
-        }
-        if let Some(v) = rtmp.max_connections {
-            config.rtmp_max_conn = v;
-        }
-        if let Some(v) = rtmp.chunk_size {
-            config.rtmp_chunk_size = v;
+    for line in text.lines() {
+        if let Some((key, val)) = parse_env_line(line) {
+            apply_kv(&mut config, &key, &val);
         }
     }
 
-    if let Some(tls) = raw.tls {
-        if let Some(v) = tls.enabled {
-            config.tls_enabled = v;
-        }
-        if let Some(v) = tls.cert_file {
-            config.tls_cert_file = v;
-        }
-        if let Some(v) = tls.key_file {
-            config.tls_key_file = v;
-        }
-    }
-
-    if let Some(http) = raw.http {
-        if let Some(v) = http.bind {
-            config.http_bind = v;
-        }
-    }
-
-    if let Some(auth) = raw.auth {
-        if let Some(v) = auth.api_token {
-            config.api_token = v;
-        }
-        if let Some(v) = auth.require_stream_key {
-            config.require_stream_key = v;
-        }
-    }
-
+    config.config_file = path.to_string();
     crate::log_info!("Config loaded from {path}");
     crate::log_debug!(
         "RTMP bind={}, HTTP bind={}",
@@ -196,14 +132,46 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
-/// Environment variables override config file values.
-pub fn config_apply_env(config: &mut ServerConfig) {
-    if let Ok(v) = std::env::var("LRTMP2_API_TOKEN") {
-        if !v.is_empty() {
-            config.api_token = v;
+/// Write or update `API_TOKEN=<token>` in the given `.env` file.
+///
+/// If the file already contains an `API_TOKEN` line it is replaced in-place;
+/// otherwise the line is appended so the rest of the config is untouched.
+pub fn config_write_token(path: &str, token: &str) -> Result<(), String> {
+    let line = format!("API_TOKEN={token}");
+
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut found = false;
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|l| {
+            if let Some((k, _)) = parse_env_line(l) {
+                if k == "API_TOKEN" {
+                    found = true;
+                    return line.clone();
+                }
+            }
+            l.to_string()
+        })
+        .collect();
+
+    if !found {
+        if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+            lines.push(String::new());
         }
+        lines.push(line);
     }
 
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+
+    std::fs::write(path, out).map_err(|e| format!("Cannot write config file {path}: {e}"))
+}
+
+/// Environment variables override config file values (except API_TOKEN,
+/// which is always auto-generated and managed by the server).
+pub fn config_apply_env(config: &mut ServerConfig) {
     if let Ok(v) = std::env::var("LRTMP2_RTMP_BIND") {
         if !v.is_empty() {
             config.rtmp_bind = v;
@@ -218,9 +186,6 @@ pub fn config_apply_env(config: &mut ServerConfig) {
 
     if let Ok(v) = std::env::var("LRTMP2_TLS_ENABLED") {
         if !v.is_empty() {
-            // Only recognized values flip the flag; a typo or unsupported
-            // form leaves the configured value untouched rather than
-            // silently downgrading to plaintext.
             match v.as_str() {
                 "1" | "true" => config.tls_enabled = true,
                 "0" | "false" => config.tls_enabled = false,
@@ -256,8 +221,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Environment variable tests mutate global process state, so they must
-    // not run concurrently with each other.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -273,18 +236,20 @@ mod tests {
     }
 
     #[test]
-    fn load_from_file() {
+    fn load_from_env_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
+        let path = dir.path().join("config.env");
         std::fs::write(
             &path,
-            r#"{
-                "rtmp": {"bind": "127.0.0.1:1936", "max_connections": 50},
-                "tls": {"enabled": true, "cert_file": "/etc/ssl/cert.pem", "key_file": "/etc/ssl/key.pem"},
-                "http": {"bind": "127.0.0.1:8081"},
-                "auth": {"api_token": "test-token-123"},
-                "log_level": 3
-            }"#,
+            "# test config\n\
+             RTMP_BIND=127.0.0.1:1936\n\
+             RTMP_MAX_CONNECTIONS=50\n\
+             TLS_ENABLED=true\n\
+             TLS_CERT_FILE=/etc/ssl/cert.pem\n\
+             TLS_KEY_FILE=/etc/ssl/key.pem\n\
+             HTTP_BIND=127.0.0.1:8081\n\
+             API_TOKEN=auto-generated-test-token-xyz\n\
+             LOG_LEVEL=3\n",
         )
         .unwrap();
 
@@ -292,7 +257,7 @@ mod tests {
         assert_eq!(config.rtmp_bind, "127.0.0.1:1936");
         assert_eq!(config.rtmp_max_conn, 50);
         assert_eq!(config.http_bind, "127.0.0.1:8081");
-        assert_eq!(config.api_token, "test-token-123");
+        assert_eq!(config.api_token, "auto-generated-test-token-xyz");
         assert_eq!(config.log_level, 3);
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/etc/ssl/cert.pem");
@@ -301,7 +266,46 @@ mod tests {
 
     #[test]
     fn load_missing_file_fails() {
-        assert!(config_load("/nonexistent/path.json").is_err());
+        assert!(config_load("/nonexistent/path.env").is_err());
+    }
+
+    #[test]
+    fn parse_env_line_handles_comments_and_blanks() {
+        assert!(parse_env_line("").is_none());
+        assert!(parse_env_line("  ").is_none());
+        assert!(parse_env_line("# a comment").is_none());
+        assert_eq!(
+            parse_env_line("KEY=value"),
+            Some(("KEY".to_string(), "value".to_string()))
+        );
+        assert_eq!(
+            parse_env_line(r#"KEY="quoted""#),
+            Some(("KEY".to_string(), "quoted".to_string()))
+        );
+        assert_eq!(
+            parse_env_line("KEY=val=with=equals"),
+            Some(("KEY".to_string(), "val=with=equals".to_string()))
+        );
+    }
+
+    #[test]
+    fn write_token_appends_and_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.env");
+        std::fs::write(&path, "HTTP_BIND=0.0.0.0:8080\n").unwrap();
+
+        // First write: appends.
+        config_write_token(path.to_str().unwrap(), "first-token-aabbccdd11223344").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("API_TOKEN=first-token-aabbccdd11223344"));
+        assert!(content.contains("HTTP_BIND=0.0.0.0:8080"));
+
+        // Second write: replaces in-place without duplicating.
+        config_write_token(path.to_str().unwrap(), "second-token-aabbccdd11223344").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("API_TOKEN=second-token-aabbccdd11223344"));
+        assert!(!content.contains("first-token"));
+        assert_eq!(content.matches("API_TOKEN=").count(), 1);
     }
 
     #[test]
@@ -318,28 +322,16 @@ mod tests {
         assert_eq!(config.tls_cert_file, "/env/cert.pem");
         assert_eq!(config.tls_key_file, "/env/key.pem");
 
-        // An invalid value must not silently flip TLS off.
         std::env::set_var("LRTMP2_TLS_ENABLED", "yesplease");
-        // pretend the JSON enabled it
         let mut config = ServerConfig {
             tls_enabled: true,
             ..Default::default()
         };
         config_apply_env(&mut config);
-        assert!(
-            config.tls_enabled,
-            "invalid value should leave TLS unchanged"
-        );
+        assert!(config.tls_enabled, "invalid value should leave TLS unchanged");
 
         std::env::remove_var("LRTMP2_TLS_ENABLED");
         std::env::remove_var("LRTMP2_TLS_CERT_FILE");
         std::env::remove_var("LRTMP2_TLS_KEY_FILE");
-    }
-
-    #[test]
-    fn weak_tokens_rejected() {
-        assert!(!config_api_token_usable(""));
-        assert!(!config_api_token_usable("<replace-with-random-token>"));
-        assert!(config_api_token_usable("a-strong-random-secret-value"));
     }
 }
