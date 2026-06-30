@@ -79,7 +79,7 @@ cargo build --release
 ### Run
 
 ```bash
-./target/release/librtmp2-server -c config.example.json
+./target/release/librtmp2-server -c config.example.env
 ```
 
 Or with CLI flags:
@@ -92,27 +92,26 @@ Or with CLI flags:
 
 ## Configuration
 
-```json
-{
-  "rtmp": {
-    "bind": "0.0.0.0:1935",
-    "max_connections": 100,
-    "chunk_size": 4096
-  },
-  "tls": {
-    "enabled": false,
-    "cert_file": "/etc/librtmp2-server/fullchain.pem",
-    "key_file": "/etc/librtmp2-server/privkey.pem"
-  },
-  "http": {
-    "bind": "0.0.0.0:8080"
-  },
-  "auth": {
-    "api_token": "<replace-with-random-token>"
-  },
-  "log_level": 2,
-  "log_file": ""
-}
+```env
+# RTMP listener address
+RTMP_BIND=0.0.0.0:1935
+
+# Maximum concurrent RTMP connections
+RTMP_MAX_CONNECTIONS=100
+
+# RTMPS (TLS) - disabled by default
+TLS_ENABLED=false
+TLS_CERT_FILE=/etc/librtmp2-server/fullchain.pem
+TLS_KEY_FILE=/etc/librtmp2-server/privkey.pem
+
+# HTTP API and UI listener address
+HTTP_BIND=0.0.0.0:8080
+
+# Log level: 0=error 1=warn 2=info 3=debug
+LOG_LEVEL=2
+
+# Log file path (empty = stderr only)
+LOG_FILE=
 ```
 
 ---
@@ -126,8 +125,10 @@ environment variables are already validated by this server at startup —
 enabling TLS without both a cert and key file configured is refused with a
 clear error — but no listener currently terminates connections.
 
-```json
-"tls": { "enabled": true, "cert_file": "/path/fullchain.pem", "key_file": "/path/privkey.pem" }
+```env
+TLS_ENABLED=true
+TLS_CERT_FILE=/path/fullchain.pem
+TLS_KEY_FILE=/path/privkey.pem
 ```
 
 ---
@@ -247,7 +248,7 @@ librtmp2-server/
 ├── src/
 │   ├── main.rs           CLI entry point & arg parsing (clap)
 │   ├── server.rs         App lifecycle, HTTP+RTMP wiring
-│   ├── config.rs         JSON config loader
+│   ├── config.rs         .env config loader
 │   ├── db.rs             SQLite persistence (rusqlite)
 │   ├── http.rs           HTTP API (axum)
 │   ├── rtmp_bridge.rs    RTMP protocol ↔ DB integration seam
@@ -256,7 +257,7 @@ librtmp2-server/
 ├── Cargo.toml
 ├── Dockerfile
 ├── docker-compose.yml
-└── config.example.json
+└── config.example.env
 ```
 
 ---

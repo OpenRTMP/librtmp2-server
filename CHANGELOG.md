@@ -37,7 +37,7 @@ begin at `1.0.0`.
   cert and key file is refused with a clear error). Off by default. Actual
   RTMPS termination lands once the RTMP listener is wired in.
 - HTTP API with SQLite backend persistence
-- Configuration file support (`config.example.json`)
+- Configuration file support (`config.example.env`)
 - CLI interface (`./librtmp2-server`) for quick starts
 - Unit tests covering config, db, HTTP API, keygen, and the RTMP bridge seam
 

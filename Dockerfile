@@ -11,7 +11,7 @@ FROM alpine:latest
 RUN apk add --no-cache libgcc
 
 COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/
-COPY --from=builder /build/config.example.json /etc/librtmp2-server/config.json
+COPY --from=builder /build/config.example.env /etc/librtmp2-server/config.env
 
 # Create non-root user and data directory
 RUN adduser -D -H -s /sbin/nologin openrtmp && \
@@ -29,4 +29,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD wget -qO- http://localhost:8080/api/v1/health || exit 1
 
 ENTRYPOINT ["librtmp2-server"]
-CMD ["-c", "/etc/librtmp2-server/config.json"]
+CMD ["-c", "/etc/librtmp2-server/config.env"]
