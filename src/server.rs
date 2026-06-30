@@ -34,20 +34,25 @@ impl ServerApp {
 
         // The API token lives exclusively in the database. On first startup it
         // is generated here; afterwards it is loaded from the settings table.
-        config.api_token = match db.token_get() {
+        config.api_token = match db.token_get()? {
             Some(t) => t,
             None => {
-                let token = crate::keygen::keygen_secret("")?;
-                if !db.token_set(&token) {
-                    return Err("Failed to persist API token in database".into());
+                let candidate = crate::keygen::keygen_secret("")?;
+                if db.token_set(&candidate)? {
+                    // We inserted the token — print it once so the operator
+                    // can use the API.
+                    eprintln!(
+                        "============================================================\n\
+                         Generated API token (stored in database {db_path}):\n\
+                         {candidate}\n\
+                         ============================================================"
+                    );
+                    candidate
+                } else {
+                    // Another process inserted first; read back the winner's token.
+                    db.token_get()?
+                        .ok_or("API token missing after concurrent insert")?
                 }
-                eprintln!(
-                    "============================================================\n\
-                     Generated API token (stored in database {db_path}):\n\
-                     {token}\n\
-                     ============================================================"
-                );
-                token
             }
         };
 

@@ -185,26 +185,34 @@ impl Db {
 
     // ==================== SETTINGS ====================
 
-    pub fn token_get(&self) -> Option<String> {
+    /// Returns the stored API token, or `Ok(None)` if none has been generated
+    /// yet. Returns `Err` on a real database read failure so callers can
+    /// distinguish "not found" from "broken DB".
+    pub fn token_get(&self) -> Result<Option<String>, String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT val FROM settings WHERE key='api_token'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
         .optional()
-        .unwrap_or(None)
-        .filter(|v: &String| !v.is_empty())
+        .map_err(|e| format!("DB error reading API token: {e}"))
+        .map(|opt| opt.filter(|v| !v.is_empty()))
     }
 
-    pub fn token_set(&self, token: &str) -> bool {
+    /// Persists `token` as the API token using an insert-only strategy so an
+    /// existing token is never overwritten. Returns `Ok(true)` if the row was
+    /// newly inserted, `Ok(false)` if a token was already present (the caller
+    /// should re-read with [`token_get`] to get the winner's value).
+    pub fn token_set(&self, token: &str) -> Result<bool, String> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO settings(key,val) VALUES('api_token',?) \
-             ON CONFLICT(key) DO UPDATE SET val=excluded.val",
-            rusqlite::params![token],
-        )
-        .is_ok()
+        let rows = conn
+            .execute(
+                "INSERT OR IGNORE INTO settings(key,val) VALUES('api_token',?)",
+                rusqlite::params![token],
+            )
+            .map_err(|e| format!("DB error persisting API token: {e}"))?;
+        Ok(rows > 0)
     }
 
     // ==================== STREAMS ====================
