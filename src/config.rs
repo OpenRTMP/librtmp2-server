@@ -121,19 +121,26 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
 /// Environment variables override config file values.
 /// `LRTMP2_API_TOKEN` is intentionally not handled; the token lives in the DB.
 pub fn config_apply_env(config: &mut ServerConfig) {
-    if let Ok(v) = std::env::var("LRTMP2_RTMP_BIND") {
+    config_apply_env_from(config, |key| std::env::var(key).ok());
+}
+
+fn config_apply_env_from<F>(config: &mut ServerConfig, mut get: F)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if let Some(v) = get("LRTMP2_RTMP_BIND") {
         if !v.is_empty() {
             config.rtmp_bind = v;
         }
     }
 
-    if let Ok(v) = std::env::var("LRTMP2_HTTP_BIND") {
+    if let Some(v) = get("LRTMP2_HTTP_BIND") {
         if !v.is_empty() {
             config.http_bind = v;
         }
     }
 
-    if let Ok(v) = std::env::var("LRTMP2_TLS_ENABLED") {
+    if let Some(v) = get("LRTMP2_TLS_ENABLED") {
         if !v.is_empty() {
             match v.as_str() {
                 "1" | "true" => config.tls_enabled = true,
@@ -145,19 +152,19 @@ pub fn config_apply_env(config: &mut ServerConfig) {
         }
     }
 
-    if let Ok(v) = std::env::var("LRTMP2_TLS_CERT_FILE") {
+    if let Some(v) = get("LRTMP2_TLS_CERT_FILE") {
         if !v.is_empty() {
             config.tls_cert_file = v;
         }
     }
 
-    if let Ok(v) = std::env::var("LRTMP2_TLS_KEY_FILE") {
+    if let Some(v) = get("LRTMP2_TLS_KEY_FILE") {
         if !v.is_empty() {
             config.tls_key_file = v;
         }
     }
 
-    if let Ok(v) = std::env::var("LRTMP2_LOG_LEVEL") {
+    if let Some(v) = get("LRTMP2_LOG_LEVEL") {
         match v.parse::<i32>() {
             Ok(lvl) if (0..=3).contains(&lvl) => config.log_level = lvl,
             _ => crate::log_warn!("Ignoring invalid LRTMP2_LOG_LEVEL value '{v}' (expected 0-3)"),
@@ -168,9 +175,7 @@ pub fn config_apply_env(config: &mut ServerConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::collections::HashMap;
 
     #[test]
     fn defaults() {
@@ -262,31 +267,28 @@ mod tests {
 
     #[test]
     fn env_overrides_tls() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("LRTMP2_TLS_ENABLED", "1");
-        std::env::set_var("LRTMP2_TLS_CERT_FILE", "/env/cert.pem");
-        std::env::set_var("LRTMP2_TLS_KEY_FILE", "/env/key.pem");
+        let env = HashMap::from([
+            ("LRTMP2_TLS_ENABLED", "1"),
+            ("LRTMP2_TLS_CERT_FILE", "/env/cert.pem"),
+            ("LRTMP2_TLS_KEY_FILE", "/env/key.pem"),
+        ]);
 
         let mut config = ServerConfig::default();
-        config_apply_env(&mut config);
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
 
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/env/cert.pem");
         assert_eq!(config.tls_key_file, "/env/key.pem");
 
-        std::env::set_var("LRTMP2_TLS_ENABLED", "yesplease");
+        let env = HashMap::from([("LRTMP2_TLS_ENABLED", "yesplease")]);
         let mut config = ServerConfig {
             tls_enabled: true,
             ..Default::default()
         };
-        config_apply_env(&mut config);
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
         assert!(
             config.tls_enabled,
             "invalid value should leave TLS unchanged"
         );
-
-        std::env::remove_var("LRTMP2_TLS_ENABLED");
-        std::env::remove_var("LRTMP2_TLS_CERT_FILE");
-        std::env::remove_var("LRTMP2_TLS_KEY_FILE");
     }
 }
