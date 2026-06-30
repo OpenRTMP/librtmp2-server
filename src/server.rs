@@ -1,10 +1,5 @@
 //! Server application lifecycle: wires together the database, the HTTP API,
-//! and the RTMP bridge, then runs until a shutdown signal arrives.
-//!
-//! The RTMP protocol implementation itself (`librtmp2`) is being rewritten in
-//! Rust separately and isn't wired in yet. [`rtmp_bridge::DbRtmpBridge`] is the
-//! seam that crate's server should drive once it exists — see the comment in
-//! [`ServerApp::run`] for exactly where its listener would be started.
+//! and the RTMP listener, then runs until a shutdown signal arrives.
 
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -87,23 +82,50 @@ impl ServerApp {
         });
         let app = http::router(state);
 
-        let listener = TcpListener::bind(&self.config.http_bind)
+        let http_listener = TcpListener::bind(&self.config.http_bind)
             .await
             .map_err(|e| format!("Failed to bind HTTP on {}: {e}", self.config.http_bind))?;
         crate::log_info!("HTTP listening on {}", self.config.http_bind);
 
-        // The RTMP listener itself is the integration seam for the Rust
-        // `librtmp2` crate: once it exists, start it here bound to
-        // `self.config.rtmp_bind`, configured with `self.config.rtmp_max_conn`,
-        // and driving `self.rtmp_bridge` (an
-        // `Arc<dyn RtmpEventHandler>`) on connect/publish/play/frame/close.
-        crate::log_warn!(
-            "RTMP listener not yet started — librtmp2 (Rust) is not wired in (bind would be {})",
-            self.config.rtmp_bind
-        );
-        crate::log_info!("Server ready — HTTP: {}", self.config.http_bind);
+        // Start the RTMP listener in a background thread. librtmp2's Server
+        // uses a blocking poll loop, so it lives outside the Tokio runtime.
+        let rtmp_bind = self.config.rtmp_bind.clone();
+        let rtmp_max_conn = self.config.rtmp_max_conn;
+        std::thread::spawn(move || {
+            use librtmp2::server::Server as RtmpServer;
+            use librtmp2::types::ServerConfig as RtmpConfig;
 
-        axum::serve(listener, app)
+            let cfg = RtmpConfig {
+                max_connections: rtmp_max_conn,
+                chunk_size: 4096,
+                tls_enabled: 0,
+                tls_cert_file: std::ptr::null(),
+                tls_key_file: std::ptr::null(),
+                tls_ca_file: std::ptr::null(),
+                tls_insecure: 0,
+            };
+            let mut server = match RtmpServer::new(cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::log_warn!("RTMP server init failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = server.listen(&rtmp_bind) {
+                crate::log_warn!("RTMP bind on {rtmp_bind} failed: {e}");
+                return;
+            }
+            crate::log_info!("RTMP listening on {rtmp_bind}");
+            loop {
+                if server.poll(50).is_err() {
+                    break;
+                }
+            }
+        });
+
+        crate::log_info!("Server ready — HTTP: {}, RTMP: {}", self.config.http_bind, self.config.rtmp_bind);
+
+        axum::serve(http_listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| format!("HTTP server error: {e}"))?;
