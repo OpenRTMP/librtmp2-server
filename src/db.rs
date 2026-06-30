@@ -149,6 +149,11 @@ fn restrict_db_file_permissions(path: &str) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    // In-memory and URI-style databases have no backing file to restrict.
+    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+        return;
+    }
+
     let mode = fs::Permissions::from_mode(0o600);
     for candidate in [path, &format!("{path}-wal"), &format!("{path}-shm")] {
         if let Err(e) = fs::set_permissions(candidate, mode.clone()) {
