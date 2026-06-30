@@ -328,7 +328,10 @@ mod tests {
             ..Default::default()
         };
         config_apply_env(&mut config);
-        assert!(config.tls_enabled, "invalid value should leave TLS unchanged");
+        assert!(
+            config.tls_enabled,
+            "invalid value should leave TLS unchanged"
+        );
 
         std::env::remove_var("LRTMP2_TLS_ENABLED");
         std::env::remove_var("LRTMP2_TLS_CERT_FILE");
