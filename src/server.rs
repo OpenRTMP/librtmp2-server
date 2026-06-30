@@ -26,7 +26,7 @@ impl ServerApp {
         let db_path = std::env::var("LRTMP2_DB")
             .ok()
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "/tmp/librtmp2-server.db".to_string());
+            .ok_or("LRTMP2_DB environment variable must be set to the SQLite database path")?;
 
         let db = Arc::new(
             Db::open(&db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,

@@ -80,7 +80,7 @@ pub struct StatSample {
 pub fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64
 }
 
@@ -142,12 +142,37 @@ CREATE INDEX IF NOT EXISTS idx_pub_active ON publishers(active);
 CREATE INDEX IF NOT EXISTS idx_player_active ON players(active);
 ";
 
+/// WAL mode creates sibling `-wal`/`-shm` files; restrict all three so stream
+/// keys stored in SQLite are not world-readable on multi-user hosts.
+#[cfg(unix)]
+fn restrict_db_file_permissions(path: &str) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    // In-memory and URI-style databases have no backing file to restrict.
+    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+        return;
+    }
+
+    let mode = fs::Permissions::from_mode(0o600);
+    for candidate in [path, &format!("{path}-wal"), &format!("{path}-shm")] {
+        if let Err(e) = fs::set_permissions(candidate, mode.clone()) {
+            // -wal/-shm may not exist yet on a brand-new database.
+            if candidate == path {
+                crate::log_warn!("Could not restrict permissions on {candidate}: {e}");
+            }
+        }
+    }
+}
+
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Db> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        #[cfg(unix)]
+        restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
             conn: Mutex::new(conn),
@@ -219,6 +244,10 @@ impl Db {
     }
 
     fn stream_find_by(&self, column: &str, key: &str) -> Option<Stream> {
+        if !matches!(column, "publish_key" | "play_key" | "stats_key") {
+            crate::log_error!("stream_find_by: rejected disallowed column '{column}'");
+            return None;
+        }
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             &format!(
@@ -256,43 +285,56 @@ impl Db {
 
     /// Cascade: remove dependent rows so deleted streams cannot leave ghost
     /// active publishers/players that pollute stats after stream re-creation.
-    pub fn stream_delete(&self, id: &str) -> bool {
+    ///
+    /// Returns `Some(true)` = deleted, `Some(false)` = not found, `None` = DB error.
+    pub fn stream_delete(&self, id: &str) -> Option<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("DB error starting cascade delete transaction: {e}");
-                return false;
+                return None;
             }
         };
 
-        let ok = tx
-            .execute("DELETE FROM publishers WHERE stream_id=?", params![id])
-            .and_then(|_| tx.execute("DELETE FROM players WHERE stream_id=?", params![id]))
-            .and_then(|_| tx.execute("DELETE FROM stats_samples WHERE stream_id=?", params![id]))
-            .and_then(|_| tx.execute("DELETE FROM streams WHERE id=?", params![id]))
-            .is_ok();
+        let result = (|| -> rusqlite::Result<usize> {
+            tx.execute("DELETE FROM publishers WHERE stream_id=?", params![id])?;
+            tx.execute("DELETE FROM players WHERE stream_id=?", params![id])?;
+            tx.execute("DELETE FROM stats_samples WHERE stream_id=?", params![id])?;
+            tx.execute("DELETE FROM streams WHERE id=?", params![id])
+        })();
 
-        if ok {
-            tx.commit().is_ok()
-        } else {
-            let _ = tx.rollback();
-            false
+        match result {
+            Ok(rows) => match tx.commit() {
+                Ok(()) => Some(rows > 0),
+                Err(e) => {
+                    crate::log_error!("DB cascade delete commit error for {id}: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                crate::log_error!("DB cascade delete error for {id}: {e}");
+                let _ = tx.rollback();
+                None
+            }
         }
     }
 
     pub fn stream_list(&self) -> Vec<Stream> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM streams ORDER BY created_at",
-                Self::STREAM_COLS
-            ))
-            .unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {} FROM streams ORDER BY created_at",
+            Self::STREAM_COLS
+        )) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("stream_list: prepare failed: {e}");
+                return Vec::new();
+            }
+        };
         stmt.query_map([], Self::load_stream_row)
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     // ==================== PUBLISHERS ====================
@@ -380,28 +422,34 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         match stream_id {
             Some(sid) => {
-                let mut stmt = conn
-                    .prepare(&format!(
-                        "SELECT {} FROM publishers WHERE stream_id=? AND active=1",
-                        Self::PUBLISHER_COLS
-                    ))
-                    .unwrap();
+                let mut stmt = match conn.prepare(&format!(
+                    "SELECT {} FROM publishers WHERE stream_id=? AND active=1",
+                    Self::PUBLISHER_COLS
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("publisher_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
+                };
                 stmt.query_map(params![sid], Self::load_publisher_row)
-                    .unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
             }
             None => {
-                let mut stmt = conn
-                    .prepare(&format!(
-                        "SELECT {} FROM publishers WHERE active=1",
-                        Self::PUBLISHER_COLS
-                    ))
-                    .unwrap();
+                let mut stmt = match conn.prepare(&format!(
+                    "SELECT {} FROM publishers WHERE active=1",
+                    Self::PUBLISHER_COLS
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("publisher_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
+                };
                 stmt.query_map([], Self::load_publisher_row)
-                    .unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
             }
         }
     }
@@ -493,28 +541,34 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         match stream_id {
             Some(sid) => {
-                let mut stmt = conn
-                    .prepare(&format!(
-                        "SELECT {} FROM players WHERE stream_id=? AND active=1",
-                        Self::PLAYER_COLS
-                    ))
-                    .unwrap();
+                let mut stmt = match conn.prepare(&format!(
+                    "SELECT {} FROM players WHERE stream_id=? AND active=1",
+                    Self::PLAYER_COLS
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("player_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
+                };
                 stmt.query_map(params![sid], Self::load_player_row)
-                    .unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
             }
             None => {
-                let mut stmt = conn
-                    .prepare(&format!(
-                        "SELECT {} FROM players WHERE active=1",
-                        Self::PLAYER_COLS
-                    ))
-                    .unwrap();
+                let mut stmt = match conn.prepare(&format!(
+                    "SELECT {} FROM players WHERE active=1",
+                    Self::PLAYER_COLS
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("player_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
+                };
                 stmt.query_map([], Self::load_player_row)
-                    .unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
             }
         }
     }
@@ -550,12 +604,16 @@ impl Db {
     #[allow(dead_code)]
     pub fn stat_recent(&self, stream_id: &str, limit: i64) -> Vec<StatSample> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,audio_codec,player_count,ts \
-                 FROM stats_samples WHERE stream_id=? ORDER BY ts DESC LIMIT ?",
-            )
-            .unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,audio_codec,player_count,ts \
+             FROM stats_samples WHERE stream_id=? ORDER BY ts DESC LIMIT ?",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("stat_recent: prepare failed: {e}");
+                return Vec::new();
+            }
+        };
         stmt.query_map(params![stream_id, limit], |row| {
             Ok(StatSample {
                 stream_id: row.get(0)?,
@@ -569,15 +627,28 @@ impl Db {
                 ts: row.get(8)?,
             })
         })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn db_file_permissions_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perms.db");
+        let path_str = path.to_str().unwrap();
+        let _db = Db::open(path_str).unwrap();
+
+        let mode = std::fs::metadata(path_str).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "database must not be world-readable");
+    }
 
     fn sample_stream(id: &str, pub_key: &str, play_key: &str, stats_key: &str) -> Stream {
         Stream {
@@ -695,7 +766,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(db.stream_delete("cascade"));
+        assert!(matches!(db.stream_delete("cascade"), Some(true)));
         assert_eq!(db.publisher_list(Some("cascade")).len(), 0);
         assert!(db.stream_get("cascade").is_none());
     }
