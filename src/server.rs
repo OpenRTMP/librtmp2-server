@@ -94,8 +94,8 @@ impl ServerApp {
 
         // The RTMP listener itself is the integration seam for the Rust
         // `librtmp2` crate: once it exists, start it here bound to
-        // `self.config.rtmp_bind`, configured with `self.config.rtmp_max_conn`
-        // / `rtmp_chunk_size`, and driving `self.rtmp_bridge` (an
+        // `self.config.rtmp_bind`, configured with `self.config.rtmp_max_conn`,
+        // and driving `self.rtmp_bridge` (an
         // `Arc<dyn RtmpEventHandler>`) on connect/publish/play/frame/close.
         crate::log_warn!(
             "RTMP listener not yet started — librtmp2 (Rust) is not wired in (bind would be {})",

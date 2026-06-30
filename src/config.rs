@@ -5,7 +5,6 @@ pub struct ServerConfig {
     /// RTMP listener, e.g. "0.0.0.0:1935"
     pub rtmp_bind: String,
     pub rtmp_max_conn: i32,
-    pub rtmp_chunk_size: i32,
 
     /// RTMPS (TLS) — off by default.
     pub tls_enabled: bool,
@@ -17,9 +16,7 @@ pub struct ServerConfig {
 
     /// Populated at startup from the database, never from the config file.
     pub api_token: String,
-    pub require_stream_key: bool,
 
-    pub web_root: String,
     /// Path the config was loaded from, kept for diagnostics/reload support.
     pub config_file: String,
 
@@ -33,14 +30,11 @@ impl Default for ServerConfig {
         ServerConfig {
             rtmp_bind: "0.0.0.0:1935".to_string(),
             rtmp_max_conn: 100,
-            rtmp_chunk_size: 4096,
             tls_enabled: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             http_bind: "0.0.0.0:8080".to_string(),
             api_token: String::new(),
-            require_stream_key: true,
-            web_root: "./web".to_string(),
             config_file: String::new(),
             log_level: 2,
             log_file: String::new(),
@@ -81,10 +75,6 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
             Ok(v) => config.rtmp_max_conn = v,
             Err(_) => eprintln!("Config: ignoring invalid RTMP_MAX_CONNECTIONS value '{val}'"),
         },
-        "RTMP_CHUNK_SIZE" => match val.parse::<i32>() {
-            Ok(v) => config.rtmp_chunk_size = v,
-            Err(_) => eprintln!("Config: ignoring invalid RTMP_CHUNK_SIZE value '{val}'"),
-        },
         "TLS_ENABLED" => match val {
             "1" | "true" => config.tls_enabled = true,
             "0" | "false" => config.tls_enabled = false,
@@ -93,12 +83,6 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
         "TLS_KEY_FILE" => config.tls_key_file = val.to_string(),
         "HTTP_BIND" => config.http_bind = val.to_string(),
-        "REQUIRE_STREAM_KEY" => match val {
-            "1" | "true" => config.require_stream_key = true,
-            "0" | "false" => config.require_stream_key = false,
-            _ => eprintln!("Config: ignoring invalid REQUIRE_STREAM_KEY value '{val}' (expected 1/0/true/false)"),
-        },
-        "WEB_ROOT" => config.web_root = val.to_string(),
         "LOG_LEVEL" => match val.parse::<i32>() {
             Ok(v) if (0..=3).contains(&v) => config.log_level = v,
             _ => eprintln!("Config: ignoring invalid LOG_LEVEL value '{val}' (expected 0-3)"),
