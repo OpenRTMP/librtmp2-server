@@ -415,18 +415,25 @@ async fn handle_stream_create(
         .unwrap_or_else(|| "avc1,hvc1,av01".to_string());
 
     // Cryptographically unpredictable keys — never derive from stream id/time.
-    let (publish_key, play_key, stats_key) = match (
-        keygen_secret("pub_"),
-        keygen_secret("pl_"),
-        keygen_secret("st_"),
-    ) {
-        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-        _ => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Key generation failed",
-            )
+    let publish_key = match keygen_secret("pub_") {
+        Ok(k) => k,
+        Err(e) => {
+            crate::log_error!("publish key generation failed: {e}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Key generation failed");
+        }
+    };
+    let play_key = match keygen_secret("pl_") {
+        Ok(k) => k,
+        Err(e) => {
+            crate::log_error!("play key generation failed: {e}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Key generation failed");
+        }
+    };
+    let stats_key = match keygen_secret("st_") {
+        Ok(k) => k,
+        Err(e) => {
+            crate::log_error!("stats key generation failed: {e}");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Key generation failed");
         }
     };
     let s = Stream {
@@ -519,6 +526,34 @@ mod tests {
             db: Arc::new(Db::open(":memory:").unwrap()),
             config,
         })
+    }
+
+    #[tokio::test]
+    async fn empty_api_token_always_denies() {
+        let app = router(test_state(""));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

@@ -280,13 +280,13 @@ impl Db {
         })();
 
         match result {
-            Ok(rows) => {
-                if tx.commit().is_ok() {
-                    Some(rows > 0)
-                } else {
+            Ok(rows) => match tx.commit() {
+                Ok(()) => Some(rows > 0),
+                Err(e) => {
+                    crate::log_error!("DB cascade delete commit error for {id}: {e}");
                     None
                 }
-            }
+            },
             Err(e) => {
                 crate::log_error!("DB cascade delete error for {id}: {e}");
                 let _ = tx.rollback();
@@ -297,11 +297,15 @@ impl Db {
 
     pub fn stream_list(&self) -> Vec<Stream> {
         let conn = self.conn.lock().unwrap();
-        let Ok(mut stmt) = conn.prepare(&format!(
+        let mut stmt = match conn.prepare(&format!(
             "SELECT {} FROM streams ORDER BY created_at",
             Self::STREAM_COLS
-        )) else {
-            return Vec::new();
+        )) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("stream_list: prepare failed: {e}");
+                return Vec::new();
+            }
         };
         stmt.query_map([], Self::load_stream_row)
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -393,22 +397,30 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         match stream_id {
             Some(sid) => {
-                let Ok(mut stmt) = conn.prepare(&format!(
+                let mut stmt = match conn.prepare(&format!(
                     "SELECT {} FROM publishers WHERE stream_id=? AND active=1",
                     Self::PUBLISHER_COLS
-                )) else {
-                    return Vec::new();
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("publisher_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
                 };
                 stmt.query_map(params![sid], Self::load_publisher_row)
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
             }
             None => {
-                let Ok(mut stmt) = conn.prepare(&format!(
+                let mut stmt = match conn.prepare(&format!(
                     "SELECT {} FROM publishers WHERE active=1",
                     Self::PUBLISHER_COLS
-                )) else {
-                    return Vec::new();
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("publisher_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
                 };
                 stmt.query_map([], Self::load_publisher_row)
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -504,22 +516,30 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         match stream_id {
             Some(sid) => {
-                let Ok(mut stmt) = conn.prepare(&format!(
+                let mut stmt = match conn.prepare(&format!(
                     "SELECT {} FROM players WHERE stream_id=? AND active=1",
                     Self::PLAYER_COLS
-                )) else {
-                    return Vec::new();
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("player_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
                 };
                 stmt.query_map(params![sid], Self::load_player_row)
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
             }
             None => {
-                let Ok(mut stmt) = conn.prepare(&format!(
+                let mut stmt = match conn.prepare(&format!(
                     "SELECT {} FROM players WHERE active=1",
                     Self::PLAYER_COLS
-                )) else {
-                    return Vec::new();
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log_error!("player_list: prepare failed: {e}");
+                        return Vec::new();
+                    }
                 };
                 stmt.query_map([], Self::load_player_row)
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -559,11 +579,15 @@ impl Db {
     #[allow(dead_code)]
     pub fn stat_recent(&self, stream_id: &str, limit: i64) -> Vec<StatSample> {
         let conn = self.conn.lock().unwrap();
-        let Ok(mut stmt) = conn.prepare(
+        let mut stmt = match conn.prepare(
             "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,audio_codec,player_count,ts \
              FROM stats_samples WHERE stream_id=? ORDER BY ts DESC LIMIT ?",
-        ) else {
-            return Vec::new();
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("stat_recent: prepare failed: {e}");
+                return Vec::new();
+            }
         };
         stmt.query_map(params![stream_id, limit], |row| {
             Ok(StatSample {
