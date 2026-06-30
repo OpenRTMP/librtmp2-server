@@ -22,9 +22,10 @@ impl ServerApp {
     /// be opened or the token cannot be persisted.
     pub fn create(mut config: ServerConfig) -> Result<ServerApp, String> {
         let db_path = std::env::var("LRTMP2_DB")
+            .or_else(|_| std::env::var("LRTMP2_DB_PATH"))
             .ok()
             .filter(|v| !v.is_empty())
-            .ok_or("LRTMP2_DB environment variable must be set to the SQLite database path")?;
+            .ok_or("LRTMP2_DB or LRTMP2_DB_PATH environment variable must be set to the SQLite database path")?;
 
         let db = Arc::new(
             Db::open(&db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
