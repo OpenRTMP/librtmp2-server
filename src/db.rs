@@ -200,15 +200,18 @@ impl Db {
         .map(|opt| opt.filter(|v| !v.is_empty()))
     }
 
-    /// Persists `token` as the API token using an insert-only strategy so an
-    /// existing token is never overwritten. Returns `Ok(true)` if the row was
-    /// newly inserted, `Ok(false)` if a token was already present (the caller
-    /// should re-read with [`token_get`] to get the winner's value).
+    /// Persists `token` as the API token. Inserts a new row, or updates an
+    /// existing row only when its value is empty (repairing a corrupted state).
+    /// Returns `Ok(true)` if the token was written, `Ok(false)` if a non-empty
+    /// token was already present (the caller should re-read with [`token_get`]
+    /// to get the winner's value).
     pub fn token_set(&self, token: &str) -> Result<bool, String> {
         let conn = self.conn.lock().unwrap();
         let rows = conn
             .execute(
-                "INSERT OR IGNORE INTO settings(key,val) VALUES('api_token',?)",
+                "INSERT INTO settings(key,val) VALUES('api_token',?) \
+                 ON CONFLICT(key) DO UPDATE SET val=excluded.val \
+                 WHERE settings.val=''",
                 rusqlite::params![token],
             )
             .map_err(|e| format!("DB error persisting API token: {e}"))?;
