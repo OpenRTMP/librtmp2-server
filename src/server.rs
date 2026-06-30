@@ -7,12 +7,11 @@ use tokio::net::TcpListener;
 use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
-use crate::rtmp_bridge::DbRtmpBridge;
+use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 
 pub struct ServerApp {
     config: ServerConfig,
     db: Arc<Db>,
-    #[allow(dead_code)] // wired in once the Rust librtmp2 crate exists
     rtmp_bridge: Arc<DbRtmpBridge>,
 }
 
@@ -95,11 +94,20 @@ impl ServerApp {
         let rtmp_tls_enabled = self.config.tls_enabled;
         let rtmp_tls_cert = self.config.tls_cert_file.clone();
         let rtmp_tls_key = self.config.tls_key_file.clone();
+        let rtmp_bridge = Arc::clone(&self.rtmp_bridge);
 
         let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             use librtmp2::server::Server as RtmpServer;
             use librtmp2::types::ServerConfig as RtmpConfig;
+            use std::collections::{HashMap, HashSet};
+
+            #[derive(Default)]
+            struct TrackedConn {
+                connected: bool,
+                publishing: bool,
+                playing: bool,
+            }
 
             // Build CStrings inside the thread so the pointers remain valid
             // for the duration of RtmpServer::new().
@@ -138,10 +146,82 @@ impl ServerApp {
             }
             crate::log_info!("RTMP listening on {rtmp_bind}");
             let _ = rtmp_ready_tx.send(Ok(()));
+
+            let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+
             loop {
                 if let Err(e) = server.poll(50) {
                     crate::log_warn!("RTMP polling stopped: {e}");
                     break;
+                }
+
+                let mut current_ids = HashSet::new();
+                let mut reject_indices = Vec::new();
+
+                for (idx, conn) in server.connections.iter().enumerate() {
+                    if conn.client_fd < 0 {
+                        continue;
+                    }
+                    let conn_id = conn.client_fd as u64;
+                    current_ids.insert(conn_id);
+                    let entry = tracked.entry(conn_id).or_default();
+                    if !entry.connected {
+                        rtmp_bridge.on_connect(conn_id);
+                        entry.connected = true;
+                    }
+
+                    let Some(stream) = conn.current_stream.as_ref() else {
+                        continue;
+                    };
+
+                    if stream.is_publishing && !entry.publishing {
+                        match rtmp_bridge.on_publish(conn_id, &conn.app, &stream.name, "") {
+                            Ok(()) => entry.publishing = true,
+                            Err(()) => {
+                                crate::log_warn!(
+                                    "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
+                                    conn.app
+                                );
+                                reject_indices.push(idx);
+                            }
+                        }
+                    }
+
+                    if stream.is_playing && !entry.playing {
+                        match rtmp_bridge.on_play(conn_id, &conn.app, &stream.name, "") {
+                            Ok(()) => entry.playing = true,
+                            Err(()) => {
+                                crate::log_warn!(
+                                    "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
+                                    conn.app
+                                );
+                                reject_indices.push(idx);
+                            }
+                        }
+                    }
+                }
+
+                reject_indices.sort_unstable();
+                reject_indices.dedup();
+                for idx in reject_indices.into_iter().rev() {
+                    if let Some(conn) = server.connections.get(idx) {
+                        if conn.client_fd >= 0 {
+                            let conn_id = conn.client_fd as u64;
+                            tracked.remove(&conn_id);
+                            rtmp_bridge.on_close(conn_id);
+                        }
+                    }
+                    server.connections.remove(idx);
+                }
+
+                let closed_ids: Vec<u64> = tracked
+                    .keys()
+                    .copied()
+                    .filter(|id| !current_ids.contains(id))
+                    .collect();
+                for conn_id in closed_ids {
+                    tracked.remove(&conn_id);
+                    rtmp_bridge.on_close(conn_id);
                 }
             }
         });
