@@ -41,9 +41,10 @@ fn run() -> Result<(), String> {
         config_load(&cli.config)?
     } else {
         eprintln!("No config file at {}, using defaults", cli.config);
-        let mut c = ServerConfig::default();
-        c.config_file = cli.config.clone();
-        c
+        ServerConfig {
+            config_file: cli.config.clone(),
+            ..Default::default()
+        }
     };
 
     // Environment variables override config file values.
