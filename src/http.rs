@@ -115,7 +115,7 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
 
 fn bearer_ok(state: &AppState, headers: &HeaderMap) -> bool {
     if state.config.api_token.is_empty() {
-        return true;
+        return false;
     }
     let Some(hdr) = headers.get("Authorization").and_then(|v| v.to_str().ok()) else {
         return false;

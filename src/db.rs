@@ -142,12 +142,33 @@ CREATE INDEX IF NOT EXISTS idx_pub_active ON publishers(active);
 CREATE INDEX IF NOT EXISTS idx_player_active ON players(active);
 ";
 
+/// WAL mode creates sibling `-wal`/`-shm` files; restrict all of them so
+/// stream keys stored in SQLite are not world-readable when the default
+/// `/tmp/librtmp2-server.db` path is used on multi-user hosts.
+#[cfg(unix)]
+fn restrict_db_file_permissions(path: &str) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::Permissions::from_mode(0o600);
+    for candidate in [path, &format!("{path}-wal"), &format!("{path}-shm")] {
+        if let Err(e) = fs::set_permissions(candidate, mode.clone()) {
+            // `-wal`/`-shm` may not exist yet on a brand-new database.
+            if candidate == path {
+                crate::log_warn!("Could not restrict permissions on {candidate}: {e}");
+            }
+        }
+    }
+}
+
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Db> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        #[cfg(unix)]
+        restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
             conn: Mutex::new(conn),
@@ -591,6 +612,20 @@ mod tests {
             allowed_codecs: "avc1,hvc1,av01".to_string(),
             created_at: now_ts(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_file_permissions_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perms.db");
+        let path_str = path.to_str().unwrap();
+        let _db = Db::open(path_str).unwrap();
+
+        let mode = std::fs::metadata(path_str).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "database must not be world-readable");
     }
 
     #[test]
