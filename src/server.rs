@@ -184,7 +184,7 @@ impl ServerApp {
                 let deleted_now: std::collections::HashSet<String> =
                     deleted_streams.lock().unwrap().iter().cloned().collect();
 
-                for (idx, conn) in server.connections.iter().enumerate() {
+                for (idx, conn) in server.connections.iter_mut().enumerate() {
                     if conn.client_fd < 0 {
                         continue;
                     }
@@ -205,6 +205,7 @@ impl ServerApp {
                             Ok(()) => {
                                 entry.publishing = true;
                                 entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+                                conn.relay_enabled = true;
                             }
                             Err(()) => {
                                 crate::log_warn!(
@@ -224,6 +225,7 @@ impl ServerApp {
                                 if entry.stream_id.is_empty() {
                                     entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
                                 }
+                                conn.relay_enabled = true;
                             }
                             Err(()) => {
                                 crate::log_warn!(
@@ -314,10 +316,12 @@ impl ServerApp {
                 reject_indices.sort_unstable();
                 reject_indices.dedup();
                 for idx in reject_indices.into_iter().rev() {
-                    if let Some(conn) = server.connections.get(idx)
+                    if let Some(conn) = server.connections.get_mut(idx)
                         && conn.client_fd >= 0
                     {
                         let conn_id = conn.client_fd as u64;
+                        conn.relay_enabled = false;
+                        conn.pending_relay.clear();
                         tracked.remove(&conn_id);
                         rtmp_bridge.on_close(conn_id);
                     }
