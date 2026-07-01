@@ -163,31 +163,31 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
 }
 
 fn migrate_schema(conn: &Connection) {
-    if table_has_column(conn, "publishers", "remote_addr") {
-        if let Err(e) = conn.execute("ALTER TABLE publishers DROP COLUMN remote_addr", []) {
-            crate::log_warn!("Could not drop publishers.remote_addr: {e}");
-        }
+    if table_has_column(conn, "publishers", "remote_addr")
+        && let Err(e) = conn.execute("ALTER TABLE publishers DROP COLUMN remote_addr", [])
+    {
+        crate::log_warn!("Could not drop publishers.remote_addr: {e}");
     }
-    if table_has_column(conn, "players", "remote_addr") {
-        if let Err(e) = conn.execute("ALTER TABLE players DROP COLUMN remote_addr", []) {
-            crate::log_warn!("Could not drop players.remote_addr: {e}");
-        }
+    if table_has_column(conn, "players", "remote_addr")
+        && let Err(e) = conn.execute("ALTER TABLE players DROP COLUMN remote_addr", [])
+    {
+        crate::log_warn!("Could not drop players.remote_addr: {e}");
     }
-    if !table_has_column(conn, "publishers", "rtt_ms") {
-        if let Err(e) = conn.execute(
+    if !table_has_column(conn, "publishers", "rtt_ms")
+        && let Err(e) = conn.execute(
             "ALTER TABLE publishers ADD COLUMN rtt_ms REAL NOT NULL DEFAULT 0",
             [],
-        ) {
-            crate::log_warn!("Could not add publishers.rtt_ms: {e}");
-        }
+        )
+    {
+        crate::log_warn!("Could not add publishers.rtt_ms: {e}");
     }
-    if !table_has_column(conn, "players", "rtt_ms") {
-        if let Err(e) = conn.execute(
+    if !table_has_column(conn, "players", "rtt_ms")
+        && let Err(e) = conn.execute(
             "ALTER TABLE players ADD COLUMN rtt_ms REAL NOT NULL DEFAULT 0",
             [],
-        ) {
-            crate::log_warn!("Could not add players.rtt_ms: {e}");
-        }
+        )
+    {
+        crate::log_warn!("Could not add players.rtt_ms: {e}");
     }
 }
 
@@ -431,10 +431,6 @@ impl Db {
     }
 
     // ==================== PUBLISHERS ====================
-
-    pub fn publisher_add(&self, p: &Publisher) -> bool {
-        self.publisher_try_acquire(p)
-    }
 
     /// Atomically insert an active publisher only when the stream has none.
     pub fn publisher_try_acquire(&self, p: &Publisher) -> bool {
@@ -877,8 +873,9 @@ mod tests {
             bitrate_kbps: 2500.0,
             connected_at: now_ts(),
             active: true,
+            ..Default::default()
         };
-        assert!(db.publisher_add(&p));
+        assert!(db.publisher_try_acquire(&p));
         assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
 
         let player = Player {
@@ -890,6 +887,7 @@ mod tests {
             bitrate_kbps: 2400.0,
             connected_at: now_ts(),
             active: true,
+            ..Default::default()
         };
         assert!(db.player_add(&player));
         assert_eq!(db.player_list(Some("stream1")).len(), 1);
@@ -925,7 +923,7 @@ mod tests {
             "st_cascade",
         ))
         .unwrap();
-        db.publisher_add(&Publisher {
+        db.publisher_try_acquire(&Publisher {
             id: "pub_cascade_1".to_string(),
             stream_id: "cascade".to_string(),
             active: true,
@@ -971,7 +969,7 @@ mod tests {
         ))
         .unwrap();
 
-        db.publisher_add(&Publisher {
+        db.publisher_try_acquire(&Publisher {
             id: "pub_1000_abc".to_string(),
             stream_id: "stream1".to_string(),
             app: "live".to_string(),
@@ -979,7 +977,7 @@ mod tests {
             connected_at: now_ts(),
             ..Default::default()
         });
-        db.publisher_add(&Publisher {
+        db.publisher_try_acquire(&Publisher {
             id: "pub_1000_def".to_string(),
             stream_id: "stream2".to_string(),
             app: "live".to_string(),

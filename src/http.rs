@@ -836,7 +836,7 @@ mod tests {
             created_at: now_ts(),
         };
         state.db.stream_add(&stream).unwrap();
-        state.db.publisher_add(&Publisher {
+        state.db.publisher_try_acquire(&Publisher {
             id: "pub_sess".to_string(),
             stream_id: "pubstream".to_string(),
             app: "live".to_string(),
