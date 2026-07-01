@@ -62,8 +62,8 @@ and stats.
 The RTMP protocol layer is provided by the Rust
 [`librtmp2`](https://github.com/OpenRTMP/librtmp2) crate and is integrated into
 this server's listener. `src/server.rs` starts the RTMP listener, polls active
-connections, and forwards publish/play/frame/close events into the DB-backed
-[`RtmpEventHandler`](src/rtmp_bridge.rs) bridge.
+connections, and forwards connect/publish/play/close events into the DB-backed
+[`RtmpEventHandler`](src/rtmp_bridge.rs) bridge while also updating codec/stats data.
 
 Both `librtmp2-server` and `librtmp2` are under active development and should be
 considered Alpha software.
