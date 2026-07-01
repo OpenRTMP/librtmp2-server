@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Build (default features)
+      run: cargo build --all-features --verbose
+
+    - name: Run tests (default features)
+      run: cargo test --all-features --verbose
+
+    - name: Build & test without TLS
+      run: |
+        cargo build --no-default-features --verbose
+        cargo test --no-default-features --verbose
+
+    - name: Clippy
+      run: cargo clippy --all-features --all-targets
