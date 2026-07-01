@@ -205,6 +205,7 @@ impl ServerApp {
                             Ok(()) => {
                                 entry.publishing = true;
                                 entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+                                conn.relay_enabled = true;
                             }
                             Err(()) => {
                                 crate::log_warn!(
@@ -224,6 +225,7 @@ impl ServerApp {
                                 if entry.stream_id.is_empty() {
                                     entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
                                 }
+                                conn.relay_enabled = true;
                             }
                             Err(()) => {
                                 crate::log_warn!(
@@ -318,6 +320,7 @@ impl ServerApp {
                         && conn.client_fd >= 0
                     {
                         let conn_id = conn.client_fd as u64;
+                        conn.relay_enabled = false;
                         conn.pending_relay.clear();
                         tracked.remove(&conn_id);
                         rtmp_bridge.on_close(conn_id);
