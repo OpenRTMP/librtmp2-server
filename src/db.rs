@@ -76,6 +76,12 @@ pub struct StatSample {
     pub ts: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAddError {
+    Duplicate,
+    Db,
+}
+
 #[allow(dead_code)]
 pub fn now_ts() -> i64 {
     SystemTime::now()
@@ -97,7 +103,7 @@ CREATE TABLE IF NOT EXISTS streams (
   play_key TEXT UNIQUE NOT NULL,
   stats_key TEXT UNIQUE NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
-  allowed_codecs TEXT NOT NULL DEFAULT 'avc1,hvc1,av01',
+  allowed_codecs TEXT NOT NULL DEFAULT 'avc1,hvc1,av01,mp4a',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS publishers (
@@ -220,7 +226,7 @@ impl Db {
 
     // ==================== STREAMS ====================
 
-    pub fn stream_add(&self, s: &Stream) -> bool {
+    pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
         let conn = self.conn.lock().unwrap();
         let rc = conn.execute(
             "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,allowed_codecs,created_at) \
@@ -230,11 +236,19 @@ impl Db {
         match rc {
             Ok(_) => {
                 crate::log_info!("Stream added: id={} app={}", s.id, s.app);
-                true
+                Ok(())
             }
             Err(e) => {
                 crate::log_error!("Failed to add stream {}: {e}", s.id);
-                false
+                if matches!(
+                    e,
+                    rusqlite::Error::SqliteFailure(ref err, _)
+                        if err.code == rusqlite::ErrorCode::ConstraintViolation
+                ) {
+                    Err(StreamAddError::Duplicate)
+                } else {
+                    Err(StreamAddError::Db)
+                }
             }
         }
     }
@@ -698,7 +712,7 @@ mod tests {
             play_key: play_key.to_string(),
             stats_key: stats_key.to_string(),
             enabled: true,
-            allowed_codecs: "avc1,hvc1,av01".to_string(),
+            allowed_codecs: "avc1,hvc1,av01,mp4a".to_string(),
             created_at: now_ts(),
         }
     }
@@ -708,7 +722,8 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
 
         let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
-        assert!(db.stream_add(&s));
+        assert!(db.stream_add(&s).is_ok());
+        assert_eq!(db.stream_add(&s), Err(StreamAddError::Duplicate));
 
         let got = db.stream_get("stream1").expect("not found");
         assert_eq!(got.name, "stream1 name");
@@ -732,7 +747,8 @@ mod tests {
             "pub_key_123",
             "pl_key_456",
             "st_key_789",
-        ));
+        ))
+        .unwrap();
 
         let mut p = Publisher {
             id: "pub1".to_string(),
@@ -796,7 +812,8 @@ mod tests {
             "pub_cascade",
             "pl_cascade",
             "st_cascade",
-        ));
+        ))
+        .unwrap();
         db.publisher_add(&Publisher {
             id: "pub_cascade_1".to_string(),
             stream_id: "cascade".to_string(),
@@ -814,7 +831,8 @@ mod tests {
     fn max_length_stream_id_round_trips() {
         let db = Db::open(":memory:").unwrap();
         let long_id = "a".repeat(63);
-        db.stream_add(&sample_stream(&long_id, "pub_long", "pl_long", "st_long"));
+        db.stream_add(&sample_stream(&long_id, "pub_long", "pl_long", "st_long"))
+            .unwrap();
 
         let got = db.stream_get(&long_id).expect("not found");
         assert_eq!(got.id.len(), 63);
@@ -832,13 +850,15 @@ mod tests {
             "pub_key_1",
             "pl_key_1",
             "st_key_1",
-        ));
+        ))
+        .unwrap();
         db.stream_add(&sample_stream(
             "stream2",
             "pub_key_2",
             "pl_key_2",
             "st_key_2",
-        ));
+        ))
+        .unwrap();
 
         db.publisher_add(&Publisher {
             id: "pub_1000_abc".to_string(),
