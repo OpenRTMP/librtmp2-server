@@ -31,7 +31,6 @@ pub struct Stream {
 pub struct Publisher {
     pub id: String,
     pub stream_id: String,
-    pub remote_addr: String,
     pub app: String,
     pub stream_name: String,
     pub video_codec: String,
@@ -41,6 +40,7 @@ pub struct Publisher {
     pub fps: f64,
     pub bytes_in: u64,
     pub bitrate_kbps: f64,
+    pub rtt_ms: f64,
     pub connected_at: i64,
     pub active: bool,
 }
@@ -49,11 +49,11 @@ pub struct Publisher {
 pub struct Player {
     pub id: String,
     pub stream_id: String,
-    pub remote_addr: String,
     pub app: String,
     pub stream_name: String,
     pub bytes_out: u64,
     pub bitrate_kbps: f64,
+    pub rtt_ms: f64,
     pub connected_at: i64,
     pub active: bool,
 }
@@ -109,7 +109,6 @@ CREATE TABLE IF NOT EXISTS streams (
 CREATE TABLE IF NOT EXISTS publishers (
   id TEXT PRIMARY KEY,
   stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
-  remote_addr TEXT NOT NULL DEFAULT '',
   app TEXT NOT NULL DEFAULT '',
   stream_name TEXT NOT NULL DEFAULT '',
   video_codec TEXT NOT NULL DEFAULT '',
@@ -119,17 +118,18 @@ CREATE TABLE IF NOT EXISTS publishers (
   fps REAL NOT NULL DEFAULT 0,
   bytes_in INTEGER NOT NULL DEFAULT 0,
   bitrate_kbps REAL NOT NULL DEFAULT 0,
+  rtt_ms REAL NOT NULL DEFAULT 0,
   connected_at INTEGER NOT NULL,
   active INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS players (
   id TEXT PRIMARY KEY,
   stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
-  remote_addr TEXT NOT NULL DEFAULT '',
   app TEXT NOT NULL DEFAULT '',
   stream_name TEXT NOT NULL DEFAULT '',
   bytes_out INTEGER NOT NULL DEFAULT 0,
   bitrate_kbps REAL NOT NULL DEFAULT 0,
+  rtt_ms REAL NOT NULL DEFAULT 0,
   connected_at INTEGER NOT NULL,
   active INTEGER NOT NULL DEFAULT 1
 );
@@ -151,6 +151,48 @@ CREATE INDEX IF NOT EXISTS idx_stats_stream ON stats_samples(stream_id);
 CREATE INDEX IF NOT EXISTS idx_pub_active ON publishers(active);
 CREATE INDEX IF NOT EXISTS idx_player_active ON players(active);
 ";
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({table})");
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    stmt.query_map([], |row| row.get::<_, String>(1))
+        .map(|rows| {
+            rows.filter_map(|r| r.ok())
+                .any(|name| name == column)
+        })
+        .unwrap_or(false)
+}
+
+fn migrate_schema(conn: &Connection) {
+    if table_has_column(conn, "publishers", "remote_addr") {
+        if let Err(e) = conn.execute("ALTER TABLE publishers DROP COLUMN remote_addr", []) {
+            crate::log_warn!("Could not drop publishers.remote_addr: {e}");
+        }
+    }
+    if table_has_column(conn, "players", "remote_addr") {
+        if let Err(e) = conn.execute("ALTER TABLE players DROP COLUMN remote_addr", []) {
+            crate::log_warn!("Could not drop players.remote_addr: {e}");
+        }
+    }
+    if !table_has_column(conn, "publishers", "rtt_ms") {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE publishers ADD COLUMN rtt_ms REAL NOT NULL DEFAULT 0",
+            [],
+        ) {
+            crate::log_warn!("Could not add publishers.rtt_ms: {e}");
+        }
+    }
+    if !table_has_column(conn, "players", "rtt_ms") {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE players ADD COLUMN rtt_ms REAL NOT NULL DEFAULT 0",
+            [],
+        ) {
+            crate::log_warn!("Could not add players.rtt_ms: {e}");
+        }
+    }
+}
 
 /// WAL mode creates sibling `-wal`/`-shm` files; restrict all three so stream
 /// keys stored in SQLite are not world-readable on multi-user hosts.
@@ -181,6 +223,7 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_schema(&conn);
         #[cfg(unix)]
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
@@ -393,19 +436,59 @@ impl Db {
     // ==================== PUBLISHERS ====================
 
     pub fn publisher_add(&self, p: &Publisher) -> bool {
+        self.publisher_try_acquire(p)
+    }
+
+    /// Atomically insert an active publisher only when the stream has none.
+    pub fn publisher_try_acquire(&self, p: &Publisher) -> bool {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
-            crate::log_error!("publisher_add: bytes_in {} overflows i64", p.bytes_in);
+            crate::log_error!("publisher_try_acquire: bytes_in {} overflows i64", p.bytes_in);
             return false;
         };
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO publishers \
-             (id,stream_id,remote_addr,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,connected_at,active) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
-            params![p.id, p.stream_id, p.remote_addr, p.app, p.stream_name, p.video_codec, p.audio_codec,
-                    p.video_width, p.video_height, p.fps, bytes_in, p.bitrate_kbps, p.connected_at],
-        )
-        .is_ok()
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                crate::log_error!("publisher_try_acquire: begin tx failed: {e}");
+                return false;
+            }
+        };
+        let active: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1",
+                params![p.stream_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+        if active > 0 {
+            return false;
+        }
+        if tx
+            .execute(
+                "INSERT INTO publishers \
+                 (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                params![
+                    p.id,
+                    p.stream_id,
+                    p.app,
+                    p.stream_name,
+                    p.video_codec,
+                    p.audio_codec,
+                    p.video_width,
+                    p.video_height,
+                    p.fps,
+                    bytes_in,
+                    p.bitrate_kbps,
+                    p.rtt_ms,
+                    p.connected_at
+                ],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        tx.commit().is_ok()
     }
 
     pub fn publisher_update(&self, id: &str, p: &Publisher) -> bool {
@@ -415,12 +498,11 @@ impl Db {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE publishers SET stream_id=?,remote_addr=?,app=?,stream_name=?,\
+            "UPDATE publishers SET stream_id=?,app=?,stream_name=?,\
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
-             bytes_in=?,bitrate_kbps=?,active=? WHERE id=?",
+             bytes_in=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
             params![
                 p.stream_id,
-                p.remote_addr,
                 p.app,
                 p.stream_name,
                 p.video_codec,
@@ -430,6 +512,7 @@ impl Db {
                 p.fps,
                 bytes_in,
                 p.bitrate_kbps,
+                p.rtt_ms,
                 p.active,
                 id
             ],
@@ -448,28 +531,28 @@ impl Db {
         Ok(Publisher {
             id: row.get(0)?,
             stream_id: row.get(1)?,
-            remote_addr: row.get(2)?,
-            app: row.get(3)?,
-            stream_name: row.get(4)?,
-            video_codec: row.get(5)?,
-            audio_codec: row.get(6)?,
-            video_width: row.get(7)?,
-            video_height: row.get(8)?,
-            fps: row.get(9)?,
-            bytes_in: u64::try_from(row.get::<_, i64>(10)?).map_err(|_| {
+            app: row.get(2)?,
+            stream_name: row.get(3)?,
+            video_codec: row.get(4)?,
+            audio_codec: row.get(5)?,
+            video_width: row.get(6)?,
+            video_height: row.get(7)?,
+            fps: row.get(8)?,
+            bytes_in: u64::try_from(row.get::<_, i64>(9)?).map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    10,
+                    9,
                     rusqlite::types::Type::Integer,
                     "negative bytes_in".into(),
                 )
             })?,
-            bitrate_kbps: row.get(11)?,
+            bitrate_kbps: row.get(10)?,
+            rtt_ms: row.get(11)?,
             connected_at: row.get(12)?,
             active: row.get(13)?,
         })
     }
 
-    const PUBLISHER_COLS: &'static str = "id,stream_id,remote_addr,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,connected_at,active";
+    const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,rtt_ms,connected_at,active";
 
     pub fn publisher_list(&self, stream_id: Option<&str>) -> Vec<Publisher> {
         let conn = self.conn.lock().unwrap();
@@ -521,16 +604,16 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO players \
-             (id,stream_id,remote_addr,app,stream_name,bytes_out,bitrate_kbps,connected_at,active) \
+             (id,stream_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
              VALUES (?,?,?,?,?,?,?,?,1)",
             params![
                 p.id,
                 p.stream_id,
-                p.remote_addr,
                 p.app,
                 p.stream_name,
                 bytes_out,
                 p.bitrate_kbps,
+                p.rtt_ms,
                 p.connected_at
             ],
         )
@@ -544,15 +627,15 @@ impl Db {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE players SET stream_id=?,remote_addr=?,app=?,stream_name=?,\
-             bytes_out=?,bitrate_kbps=?,active=? WHERE id=?",
+            "UPDATE players SET stream_id=?,app=?,stream_name=?,\
+             bytes_out=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
             params![
                 p.stream_id,
-                p.remote_addr,
                 p.app,
                 p.stream_name,
                 bytes_out,
                 p.bitrate_kbps,
+                p.rtt_ms,
                 p.active,
                 id
             ],
@@ -571,24 +654,24 @@ impl Db {
         Ok(Player {
             id: row.get(0)?,
             stream_id: row.get(1)?,
-            remote_addr: row.get(2)?,
-            app: row.get(3)?,
-            stream_name: row.get(4)?,
-            bytes_out: u64::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+            app: row.get(2)?,
+            stream_name: row.get(3)?,
+            bytes_out: u64::try_from(row.get::<_, i64>(4)?).map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    5,
+                    4,
                     rusqlite::types::Type::Integer,
                     "negative bytes_out".into(),
                 )
             })?,
             bitrate_kbps: row.get(6)?,
-            connected_at: row.get(7)?,
-            active: row.get(8)?,
+            rtt_ms: row.get(7)?,
+            connected_at: row.get(8)?,
+            active: row.get(9)?,
         })
     }
 
     const PLAYER_COLS: &'static str =
-        "id,stream_id,remote_addr,app,stream_name,bytes_out,bitrate_kbps,connected_at,active";
+        "id,stream_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active";
 
     pub fn player_list(&self, stream_id: Option<&str>) -> Vec<Player> {
         let conn = self.conn.lock().unwrap();
@@ -718,6 +801,31 @@ mod tests {
     }
 
     #[test]
+    fn publisher_try_acquire_rejects_second_slot() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream("stream1", "live_key_123", "play_key_456", "sts_key_789"))
+            .unwrap();
+
+        let first = Publisher {
+            id: "pub1".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        let second = Publisher {
+            id: "pub2".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&first));
+        assert!(!db.publisher_try_acquire(&second));
+        assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
+    }
+
+    #[test]
     fn stream_crud_and_keys() {
         let db = Db::open(":memory:").unwrap();
 
@@ -753,7 +861,6 @@ mod tests {
         let mut p = Publisher {
             id: "pub1".to_string(),
             stream_id: "stream1".to_string(),
-            remote_addr: "127.0.0.1:54321".to_string(),
             app: "live".to_string(),
             stream_name: "test".to_string(),
             video_codec: "h264".to_string(),
@@ -772,7 +879,6 @@ mod tests {
         let player = Player {
             id: "pl1".to_string(),
             stream_id: "stream1".to_string(),
-            remote_addr: "10.0.0.1:12345".to_string(),
             app: "live".to_string(),
             stream_name: "test".to_string(),
             bytes_out: 512000,

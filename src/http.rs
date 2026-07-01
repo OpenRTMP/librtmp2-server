@@ -6,8 +6,8 @@
 //!   POST   /api/v1/streams                      Bearer token, returns keys
 //!   DELETE /api/v1/streams/:id                   Bearer token
 //!
-//!   GET    /stats?key=<stats_key>               JSON stats (modern)
-//!   GET    /api/v1/streams/:id/stats?key=<sk>   JSON per-stream stats
+//!   GET    /stats?key=<stats_key>               flat JSON stats (no stream ids)
+//!   GET    /api/v1/streams/:id/stats            Bearer = full JSON; key = flat public JSON
 //!   GET    /stats-nginx?key=<stats_key>         XML (nginx-rtmp compatible)
 
 use axum::extract::{Path, Query, State};
@@ -78,6 +78,15 @@ fn xml_response(status: StatusCode, body: String) -> Response {
         status,
         [("Content-Type", "application/xml; charset=utf-8")],
         body,
+    )
+        .into_response()
+}
+
+fn public_stats_text(status: StatusCode, msg: &str) -> Response {
+    (
+        status,
+        [("Content-Type", "text/plain; charset=utf-8")],
+        msg.to_string(),
     )
         .into_response()
 }
@@ -194,6 +203,7 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                 "app": p.app,
                 "uptime": (now - p.connected_at).max(0),
                 "bitrate_kbps": p.bitrate_kbps,
+                "rtt_ms": p.rtt_ms,
                 "bytes_in": p.bytes_in,
                 "video": {
                     "codec": p.video_codec,
@@ -215,6 +225,7 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                 "app": pl.app,
                 "uptime": (now - pl.connected_at).max(0),
                 "bitrate_kbps": pl.bitrate_kbps,
+                "rtt_ms": pl.rtt_ms,
                 "bytes_out": pl.bytes_out,
             })
         })
@@ -229,6 +240,27 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
             "total_clients": pubs.len() + players.len(),
         },
     })
+}
+
+/// Key-protected public stats: flat JSON while live; `None` when offline.
+fn build_public_json_stats(db: &Db, stream_id: &str) -> Option<Value> {
+    let pubs = db.publisher_list(Some(stream_id));
+    let p = pubs.first()?;
+    let now = now_ts();
+
+    Some(json!({
+        "uptime": (now - p.connected_at).max(0),
+        "bitrate_kbps": p.bitrate_kbps,
+        "rtt_ms": p.rtt_ms,
+        "bytes_in": p.bytes_in,
+        "video": {
+            "codec": p.video_codec,
+            "width": p.video_width,
+            "height": p.video_height,
+            "fps": p.fps,
+        },
+        "audio": { "codec": p.audio_codec },
+    }))
 }
 
 // ---------- XML stats (nginx-rtmp compatible) ----------
@@ -352,16 +384,15 @@ async fn handle_stats_json(
     Query(q): Query<KeyQuery>,
 ) -> Response {
     if q.key.is_empty() {
-        return err_json(
-            StatusCode::UNAUTHORIZED,
-            "MISSING_KEY",
-            "stats_key required",
-        );
+        return public_stats_text(StatusCode::UNAUTHORIZED, "stats_key required");
     }
     let Some(s) = state.db.stream_find_by_stats_key(&q.key) else {
-        return err_json(StatusCode::FORBIDDEN, "INVALID_KEY", "Invalid stats key");
+        return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     };
-    Json(build_json_stats(&state.db, Some(&s.id))).into_response()
+    match build_public_json_stats(&state.db, &s.id) {
+        Some(body) => Json(body).into_response(),
+        None => public_stats_text(StatusCode::OK, "Stream offline"),
+    }
 }
 
 async fn handle_stats_nginx(
@@ -593,16 +624,23 @@ async fn handle_stream_stats(
     Path(id): Path<String>,
     Query(q): Query<KeyQuery>,
 ) -> Response {
+    let bearer = bearer_ok(&state, &headers);
     if state.db.stream_get(&id).is_none() {
-        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        if bearer {
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        }
+        return public_stats_text(StatusCode::NOT_FOUND, "Stream not found");
     }
-    if bearer_ok(&state, &headers) {
+    if bearer {
         return Json(build_json_stats(&state.db, Some(&id))).into_response();
     }
     if !stats_key_ok(&state, &q.key, Some(&id)) {
-        return err_json(StatusCode::FORBIDDEN, "FORBIDDEN", "Invalid stats key");
+        return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     }
-    Json(build_json_stats(&state.db, Some(&id))).into_response()
+    match build_public_json_stats(&state.db, &id) {
+        Some(body) => Json(body).into_response(),
+        None => public_stats_text(StatusCode::OK, "Stream offline"),
+    }
 }
 
 #[cfg(test)]
@@ -779,5 +817,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_stats_live_json_omits_identifiers() {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test".to_string(),
+            play_key: "play_test".to_string(),
+            stats_key: "st_test".to_string(),
+            enabled: true,
+            allowed_codecs: "avc1,mp4a".to_string(),
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.db.publisher_add(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats?key=st_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("streams").is_none());
+        assert!(json.get("players").is_none());
+        assert!(json.get("summary").is_none());
+        assert!(json.get("id").is_none());
+        assert!(json.get("name").is_none());
+        assert!(json.get("app").is_none());
+        assert!(json.get("uptime").is_some());
+    }
+
+    #[tokio::test]
+    async fn public_stats_offline_and_errors_are_plain_text() {
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "offstream".to_string(),
+            name: "Offline".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_off".to_string(),
+            play_key: "play_off".to_string(),
+            stats_key: "st_off".to_string(),
+            enabled: true,
+            allowed_codecs: "avc1,mp4a".to_string(),
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+
+        let app = router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/stats?key=st_off")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "Stream offline");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/stats?key=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "Invalid stats key");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "stats_key required");
     }
 }

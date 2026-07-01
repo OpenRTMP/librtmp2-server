@@ -47,13 +47,13 @@ pub struct FrameInfo {
 pub trait RtmpEventHandler: Send + Sync {
     /// Called immediately after a new TCP connection is accepted.
     fn on_connect(&self, conn: ConnId);
-    /// Return `Err` to reject the publish (invalid publish_key).
-    fn on_publish(
+    /// Atomically authorize a publish (DB slot + per-connection state).
+    /// Called from the RTMP publish callback before media relay is enabled.
+    fn authorize_publish(
         &self,
         conn: ConnId,
         app: &str,
         stream_key: &str,
-        remote_addr: &str,
     ) -> Result<(), ()>;
     /// Return `Err` to reject the play request (invalid play_key).
     fn on_play(
@@ -61,7 +61,6 @@ pub trait RtmpEventHandler: Send + Sync {
         conn: ConnId,
         app: &str,
         stream_key: &str,
-        remote_addr: &str,
     ) -> Result<(), ()>;
     /// Validate frame/codec metadata. The current server integration uses this
     /// for codec enforcement and does not guarantee one call per incoming media
@@ -81,6 +80,8 @@ struct ConnState {
     pub allowed_codecs: String,
     /// Timestamp of the last stats flush to the DB.
     last_stats_at: Option<Instant>,
+    /// Timestamp of the last RTT flush to the DB.
+    last_rtt_at: Option<Instant>,
     /// bytes_received snapshot at the last stats flush.
     bytes_at_last_stats: u64,
 }
@@ -123,24 +124,22 @@ impl DbRtmpBridge {
             .unwrap_or_default()
     }
 
-    /// Validate a publish request before the RTMP layer sends `Publish.Start`.
-    /// Rejects unknown keys, wrong apps, and streams that already have a publisher.
-    pub fn validate_publish(&self, app: &str, publish_key: &str) -> bool {
-        let Some(stream) = self.db.stream_find_by_publish_key(publish_key) else {
-            return false;
-        };
-        if stream.app != app {
-            return false;
-        }
-        self.db.publisher_list(Some(&stream.id)).is_empty()
-    }
-
     /// Validate a play request before the RTMP layer sends `Play.Start`.
     pub fn validate_play(&self, app: &str, play_key: &str) -> bool {
         let Some(stream) = self.db.stream_find_by_play_key(play_key) else {
             return false;
         };
         stream.app == app
+    }
+
+    /// Whether this connection already owns an authorized publisher slot.
+    pub fn has_publisher(&self, conn: ConnId) -> bool {
+        self.conns
+            .lock()
+            .unwrap()
+            .get(&conn)
+            .map(|s| s.publisher.is_some())
+            .unwrap_or(false)
     }
 
     /// Update publisher stats (bytes_in, bitrate, codec) in the DB.
@@ -198,6 +197,46 @@ impl DbRtmpBridge {
 
         self.db.publisher_update(&pub_id, &pub_row_clone);
     }
+
+    /// Persist the latest measured client↔server RTT for this connection.
+    pub fn update_rtt(&self, conn: ConnId, rtt_ms: f64) {
+        if !rtt_ms.is_finite() || rtt_ms <= 0.0 {
+            return;
+        }
+
+        let mut guard = self.conns.lock().unwrap();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+
+        let now = Instant::now();
+        let elapsed_secs = cs
+            .last_rtt_at
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(f64::INFINITY);
+        if elapsed_secs < 1.0 && cs.last_rtt_at.is_some() {
+            return;
+        }
+
+        if let Some(ref mut pub_row) = cs.publisher {
+            pub_row.rtt_ms = rtt_ms;
+            cs.last_rtt_at = Some(now);
+            let pub_id = pub_row.id.clone();
+            let row = pub_row.clone();
+            drop(guard);
+            self.db.publisher_update(&pub_id, &row);
+            return;
+        }
+
+        if let Some(ref mut player_row) = cs.player {
+            player_row.rtt_ms = rtt_ms;
+            cs.last_rtt_at = Some(now);
+            let player_id = player_row.id.clone();
+            let row = player_row.clone();
+            drop(guard);
+            self.db.player_update(&player_id, &row);
+        }
+    }
 }
 
 impl RtmpEventHandler for DbRtmpBridge {
@@ -209,12 +248,11 @@ impl RtmpEventHandler for DbRtmpBridge {
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
-    fn on_publish(
+    fn authorize_publish(
         &self,
         conn: ConnId,
         app: &str,
         stream_key: &str,
-        remote_addr: &str,
     ) -> Result<(), ()> {
         crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
 
@@ -226,13 +264,6 @@ impl RtmpEventHandler for DbRtmpBridge {
             crate::log_warn!(
                 "RTMP: publish rejected — key belongs to app='{}', requested app='{app}'",
                 stream.app
-            );
-            return Err(());
-        }
-        if !self.db.publisher_list(Some(&stream.id)).is_empty() {
-            crate::log_warn!(
-                "RTMP: publish rejected — stream '{}' already has an active publisher",
-                stream.id
             );
             return Err(());
         }
@@ -248,19 +279,20 @@ impl RtmpEventHandler for DbRtmpBridge {
         let pub_row = Publisher {
             id: pub_id,
             stream_id: stream.id.clone(),
-            remote_addr: remote_addr.to_string(),
             app: app.to_string(),
             stream_name: stream.name.clone(),
             active: true,
             connected_at: crate::db::now_ts(),
             ..Default::default()
         };
-        if !self.db.publisher_add(&pub_row) {
-            crate::log_warn!("RTMP: publish rejected — failed to record publisher row");
+        if !self.db.publisher_try_acquire(&pub_row) {
+            crate::log_warn!(
+                "RTMP: publish rejected — stream '{}' already has an active publisher",
+                stream.id
+            );
             return Err(());
         }
 
-        let pub_id = pub_row.id.clone();
         let stream_id = stream.id.clone();
         let allowed_codecs = stream.allowed_codecs.clone();
 
@@ -271,8 +303,9 @@ impl RtmpEventHandler for DbRtmpBridge {
         cs.allowed_codecs = allowed_codecs;
 
         crate::log_info!(
-            "RTMP: publish accepted stream='{}' publisher session={pub_id}",
-            stream.id
+            "RTMP: publish authorized stream='{}' publisher session={}",
+            stream.id,
+            cs.publisher.as_ref().map(|p| p.id.as_str()).unwrap_or("")
         );
         Ok(())
     }
@@ -282,7 +315,6 @@ impl RtmpEventHandler for DbRtmpBridge {
         conn: ConnId,
         app: &str,
         stream_key: &str,
-        remote_addr: &str,
     ) -> Result<(), ()> {
         crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
 
@@ -309,7 +341,6 @@ impl RtmpEventHandler for DbRtmpBridge {
         let player_row = Player {
             id: player_id,
             stream_id: stream.id.clone(),
-            remote_addr: remote_addr.to_string(),
             app: app.to_string(),
             stream_name: stream.name.clone(),
             active: true,
@@ -431,7 +462,7 @@ mod tests {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = DbRtmpBridge::new(db);
         bridge.on_connect(1);
-        assert!(bridge.on_publish(1, "live", "bogus", "1.2.3.4:1").is_err());
+        assert!(bridge.authorize_publish(1, "live", "bogus").is_err());
     }
 
     #[test]
@@ -442,7 +473,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_publish(1, "other", "pub_k", "1.2.3.4:1").is_err());
+        assert!(bridge.authorize_publish(1, "other", "pub_k").is_err());
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
     }
 
@@ -454,7 +485,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_play(1, "other", "pl_k", "1.2.3.4:1").is_err());
+        assert!(bridge.on_play(1, "other", "pl_k").is_err());
         assert_eq!(db.player_list(Some("s1")).len(), 0);
     }
 
@@ -466,7 +497,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
         assert_eq!(db.publisher_list(Some("s1")).len(), 1);
 
         bridge.on_close(1);
@@ -484,8 +515,8 @@ mod tests {
 
         bridge.on_connect(1);
         bridge.on_connect(2);
-        assert!(bridge.on_publish(1, "live", "pub_k1", "1.1.1.1:1").is_ok());
-        assert!(bridge.on_publish(2, "live", "pub_k2", "2.2.2.2:2").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
+        assert!(bridge.authorize_publish(2, "live", "pub_k2").is_ok());
 
         bridge.on_close(1);
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
@@ -493,19 +524,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_publish_rejects_second_publisher() {
+    fn authorize_publish_rejects_second_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
             .unwrap();
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
-        assert!(bridge.validate_publish("live", "pub_k"));
         bridge.on_connect(1);
-        assert!(bridge.on_publish(1, "live", "pub_k", "").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
 
-        assert!(!bridge.validate_publish("live", "pub_k"));
         bridge.on_connect(2);
-        assert!(bridge.on_publish(2, "live", "pub_k", "").is_err());
+        assert!(bridge.authorize_publish(2, "live", "pub_k").is_err());
     }
 
     #[test]
@@ -516,7 +545,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
 
         // "vp9" is not in "avc1,hvc1,av01,mp4a"
         let frame = FrameInfo {
@@ -536,7 +565,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
 
         let frame = FrameInfo {
             kind: FrameKind::Video,
@@ -555,7 +584,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
 
         let frame = FrameInfo {
             kind: FrameKind::Audio,

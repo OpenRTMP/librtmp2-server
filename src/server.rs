@@ -15,13 +15,14 @@ use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 /// registered on the RTMP thread before the poll loop starts.
 static RTMP_BRIDGE: OnceLock<Arc<DbRtmpBridge>> = OnceLock::new();
 
-fn rtmp_publish_cb(app: &str, stream_key: &str) -> bool {
+fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
     RTMP_BRIDGE
         .get()
-        .is_some_and(|b| b.validate_publish(app, stream_key))
+        .is_some_and(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
 }
 
-fn rtmp_play_cb(app: &str, play_key: &str) -> bool {
+fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
+    let _ = conn_id;
     RTMP_BRIDGE
         .get()
         .is_some_and(|b| b.validate_play(app, play_key))
@@ -134,7 +135,7 @@ impl ServerApp {
                 connected: bool,
                 publishing: bool,
                 playing: bool,
-                /// DB stream id, set after on_publish / on_play succeeds.
+                /// DB stream id, set after publish/play is fully enabled.
                 stream_id: String,
                 /// Last detected video codec string from the protocol layer.
                 video_codec: String,
@@ -171,6 +172,7 @@ impl ServerApp {
                     return;
                 }
             };
+            server.defer_media_relay = true;
             if let Err(e) = server.listen(&rtmp_bind) {
                 let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
                 crate::log_warn!("{msg}");
@@ -208,7 +210,7 @@ impl ServerApp {
                     if conn.client_fd < 0 {
                         continue;
                     }
-                    let conn_id = conn.client_fd as u64;
+                    let conn_id = conn.conn_id;
                     current_ids.insert(conn_id);
                     let entry = tracked.entry(conn_id).or_default();
                     if !entry.connected {
@@ -221,29 +223,35 @@ impl ServerApp {
                     };
 
                     if stream.is_publishing && !entry.publishing {
-                        match rtmp_bridge.on_publish(conn_id, &conn.app, &stream.name, "") {
-                            Ok(()) => {
-                                entry.publishing = true;
-                                entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
-                            }
-                            Err(()) => {
-                                crate::log_warn!(
-                                    "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
-                                    conn.app
-                                );
-                                reject_indices.push(idx);
-                                continue;
-                            }
+                        if !rtmp_bridge.has_publisher(conn_id) {
+                            crate::log_warn!(
+                                "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
+                                conn.app
+                            );
+                            reject_indices.push(idx);
+                            continue;
                         }
+                        crate::log_info!(
+                            "RTMP: publisher connected from {}",
+                            conn.remote_addr
+                        );
+                        entry.publishing = true;
+                        entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+                        conn.relay_enabled = true;
                     }
 
                     if stream.is_playing && !entry.playing {
-                        match rtmp_bridge.on_play(conn_id, &conn.app, &stream.name, "") {
+                        crate::log_info!(
+                            "RTMP: play request from {}",
+                            conn.remote_addr
+                        );
+                        match rtmp_bridge.on_play(conn_id, &conn.app, &stream.name) {
                             Ok(()) => {
                                 entry.playing = true;
                                 if entry.stream_id.is_empty() {
                                     entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
                                 }
+                                conn.relay_enabled = true;
                             }
                             Err(()) => {
                                 crate::log_warn!(
@@ -331,13 +339,20 @@ impl ServerApp {
                     );
                 }
 
+                for conn in server.connections.iter() {
+                    if conn.client_fd < 0 {
+                        continue;
+                    }
+                    rtmp_bridge.update_rtt(conn.conn_id, conn.rtt_ms);
+                }
+
                 reject_indices.sort_unstable();
                 reject_indices.dedup();
                 for idx in reject_indices.into_iter().rev() {
                     if let Some(conn) = server.connections.get_mut(idx)
                         && conn.client_fd >= 0
                     {
-                        let conn_id = conn.client_fd as u64;
+                        let conn_id = conn.conn_id;
                         conn.relay_enabled = false;
                         conn.pending_relay.clear();
                         tracked.remove(&conn_id);
