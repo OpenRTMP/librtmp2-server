@@ -659,10 +659,10 @@ impl Db {
                     "negative bytes_out".into(),
                 )
             })?,
-            bitrate_kbps: row.get(6)?,
-            rtt_ms: row.get(7)?,
-            connected_at: row.get(8)?,
-            active: row.get(9)?,
+            bitrate_kbps: row.get(5)?,
+            rtt_ms: row.get(6)?,
+            connected_at: row.get(7)?,
+            active: row.get(8)?,
         })
     }
 
