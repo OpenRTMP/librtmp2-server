@@ -28,7 +28,11 @@ fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
         .is_some_and(|b| b.validate_play(app, play_key))
 }
 
-fn rtmp_media_cb(conn_id: u64, frame_type: librtmp2::types::FrameType, codec: Option<&str>) -> bool {
+fn rtmp_media_cb(
+    conn_id: u64,
+    frame_type: librtmp2::types::FrameType,
+    codec: Option<&str>,
+) -> bool {
     let Some(bridge) = RTMP_BRIDGE.get() else {
         return true;
     };
