@@ -231,20 +231,14 @@ impl ServerApp {
                             reject_indices.push(idx);
                             continue;
                         }
-                        crate::log_info!(
-                            "RTMP: publisher connected from {}",
-                            conn.remote_addr
-                        );
+                        crate::log_info!("RTMP: publisher connected from {}", conn.remote_addr);
                         entry.publishing = true;
                         entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
                         conn.relay_enabled = true;
                     }
 
                     if stream.is_playing && !entry.playing {
-                        crate::log_info!(
-                            "RTMP: play request from {}",
-                            conn.remote_addr
-                        );
+                        crate::log_info!("RTMP: play request from {}", conn.remote_addr);
                         match rtmp_bridge.on_play(conn_id, &conn.app, &stream.name) {
                             Ok(()) => {
                                 entry.playing = true;

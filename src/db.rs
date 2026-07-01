@@ -158,10 +158,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
         return false;
     };
     stmt.query_map([], |row| row.get::<_, String>(1))
-        .map(|rows| {
-            rows.filter_map(|r| r.ok())
-                .any(|name| name == column)
-        })
+        .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == column))
         .unwrap_or(false)
 }
 
@@ -442,7 +439,10 @@ impl Db {
     /// Atomically insert an active publisher only when the stream has none.
     pub fn publisher_try_acquire(&self, p: &Publisher) -> bool {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
-            crate::log_error!("publisher_try_acquire: bytes_in {} overflows i64", p.bytes_in);
+            crate::log_error!(
+                "publisher_try_acquire: bytes_in {} overflows i64",
+                p.bytes_in
+            );
             return false;
         };
         let conn = self.conn.lock().unwrap();
@@ -803,8 +803,13 @@ mod tests {
     #[test]
     fn publisher_try_acquire_rejects_second_slot() {
         let db = Db::open(":memory:").unwrap();
-        db.stream_add(&sample_stream("stream1", "live_key_123", "play_key_456", "sts_key_789"))
-            .unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "live_key_123",
+            "play_key_456",
+            "sts_key_789",
+        ))
+        .unwrap();
 
         let first = Publisher {
             id: "pub1".to_string(),

@@ -49,19 +49,9 @@ pub trait RtmpEventHandler: Send + Sync {
     fn on_connect(&self, conn: ConnId);
     /// Atomically authorize a publish (DB slot + per-connection state).
     /// Called from the RTMP publish callback before media relay is enabled.
-    fn authorize_publish(
-        &self,
-        conn: ConnId,
-        app: &str,
-        stream_key: &str,
-    ) -> Result<(), ()>;
+    fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
     /// Return `Err` to reject the play request (invalid play_key).
-    fn on_play(
-        &self,
-        conn: ConnId,
-        app: &str,
-        stream_key: &str,
-    ) -> Result<(), ()>;
+    fn on_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
     /// Validate frame/codec metadata. The current server integration uses this
     /// for codec enforcement and does not guarantee one call per incoming media
     /// frame.
@@ -248,12 +238,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
-    fn authorize_publish(
-        &self,
-        conn: ConnId,
-        app: &str,
-        stream_key: &str,
-    ) -> Result<(), ()> {
+    fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
 
         let Some(stream) = self.db.stream_find_by_publish_key(stream_key) else {
@@ -310,12 +295,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         Ok(())
     }
 
-    fn on_play(
-        &self,
-        conn: ConnId,
-        app: &str,
-        stream_key: &str,
-    ) -> Result<(), ()> {
+    fn on_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
 
         let Some(stream) = self.db.stream_find_by_play_key(stream_key) else {
