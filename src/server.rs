@@ -9,7 +9,7 @@ use tokio::net::TcpListener;
 use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
-use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
+use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
 
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
@@ -26,6 +26,24 @@ fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
     RTMP_BRIDGE
         .get()
         .is_some_and(|b| b.validate_play(app, play_key))
+}
+
+fn rtmp_media_cb(conn_id: u64, frame_type: librtmp2::types::FrameType, codec: Option<&str>) -> bool {
+    let Some(bridge) = RTMP_BRIDGE.get() else {
+        return true;
+    };
+    let kind = match frame_type {
+        librtmp2::types::FrameType::Video => FrameKind::Video,
+        librtmp2::types::FrameType::Audio => FrameKind::Audio,
+        _ => return true,
+    };
+    let frame = FrameInfo {
+        kind,
+        timestamp: 0,
+        size: 0,
+        codec: codec.unwrap_or("").to_string(),
+    };
+    bridge.on_frame(conn_id, &frame)
 }
 
 pub struct ServerApp {
@@ -173,6 +191,7 @@ impl ServerApp {
                 }
             };
             server.defer_media_relay = true;
+            server.on_media_cb = Some(rtmp_media_cb);
             if let Err(e) = server.listen(&rtmp_bind) {
                 let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
                 crate::log_warn!("{msg}");
@@ -234,6 +253,7 @@ impl ServerApp {
                         crate::log_info!("RTMP: publisher connected from {}", conn.remote_addr);
                         entry.publishing = true;
                         entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+                        conn.relay_key = entry.stream_id.clone();
                         conn.relay_enabled = true;
                     }
 
@@ -245,6 +265,7 @@ impl ServerApp {
                                 if entry.stream_id.is_empty() {
                                     entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
                                 }
+                                conn.relay_key = entry.stream_id.clone();
                                 conn.relay_enabled = true;
                             }
                             Err(()) => {
@@ -268,69 +289,37 @@ impl ServerApp {
                         continue;
                     }
 
-                    // Codec enforcement and stats: only for active publishers.
-                    if !stream.is_publishing {
-                        continue;
-                    }
+                    // Publisher stats: media bytes only (excludes RTMP control overhead).
+                    if stream.is_publishing {
+                        let new_video = conn
+                            .detected_video_codec
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_string();
+                        let new_audio = conn
+                            .detected_audio_codec
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_string();
 
-                    // Pick up newly detected codecs from the protocol layer.
-                    let new_video = conn
-                        .detected_video_codec
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_string();
-                    let new_audio = conn
-                        .detected_audio_codec
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_string();
-
-                    if !new_video.is_empty() && new_video != entry.video_codec {
-                        entry.video_codec = new_video.clone();
-                    }
-                    if !new_audio.is_empty() && new_audio != entry.audio_codec {
-                        entry.audio_codec = new_audio.clone();
-                    }
-
-                    // Enforce codec policy for both video and audio.
-                    let mut codec_allowed = true;
-                    for (kind, codec) in [
-                        (
-                            crate::rtmp_bridge::FrameKind::Video,
-                            entry.video_codec.as_str(),
-                        ),
-                        (
-                            crate::rtmp_bridge::FrameKind::Audio,
-                            entry.audio_codec.as_str(),
-                        ),
-                    ] {
-                        if codec.is_empty() {
-                            continue;
+                        if !new_video.is_empty() && new_video != entry.video_codec {
+                            entry.video_codec = new_video;
                         }
-                        let frame = crate::rtmp_bridge::FrameInfo {
-                            kind,
-                            timestamp: 0,
-                            size: 0,
-                            codec: codec.to_string(),
-                        };
-                        if !rtmp_bridge.on_frame(conn_id, &frame) {
-                            crate::log_warn!("RTMP: codec enforcement kicked conn={conn_id}");
-                            codec_allowed = false;
-                            break;
+                        if !new_audio.is_empty() && new_audio != entry.audio_codec {
+                            entry.audio_codec = new_audio;
                         }
-                    }
-                    if !codec_allowed {
-                        reject_indices.push(idx);
-                        continue;
+
+                        rtmp_bridge.update_publisher_stats(
+                            conn_id,
+                            conn.media_bytes_received,
+                            &entry.video_codec,
+                            &entry.audio_codec,
+                        );
                     }
 
-                    // Update publisher stats (rate-limited inside the bridge).
-                    rtmp_bridge.update_publisher_stats(
-                        conn_id,
-                        conn.bytes_received as u64,
-                        &entry.video_codec,
-                        &entry.audio_codec,
-                    );
+                    if stream.is_playing {
+                        rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
+                    }
                 }
 
                 for conn in server.connections.iter() {
@@ -348,6 +337,7 @@ impl ServerApp {
                     {
                         let conn_id = conn.conn_id;
                         conn.relay_enabled = false;
+                        conn.relay_key.clear();
                         conn.pending_relay.clear();
                         tracked.remove(&conn_id);
                         rtmp_bridge.on_close(conn_id);

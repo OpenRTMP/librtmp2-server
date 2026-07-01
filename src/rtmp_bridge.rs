@@ -132,12 +132,12 @@ impl DbRtmpBridge {
             .unwrap_or(false)
     }
 
-    /// Update publisher stats (bytes_in, bitrate, codec) in the DB.
+    /// Update publisher stats (media bytes_in, bitrate, codec) in the DB.
     /// Called from the server poll loop after every poll iteration.
     pub fn update_publisher_stats(
         &self,
         conn: ConnId,
-        bytes_received: u64,
+        media_bytes_received: u64,
         video_codec: &str,
         audio_codec: &str,
     ) {
@@ -155,7 +155,7 @@ impl DbRtmpBridge {
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
 
-        let bytes_delta = bytes_received.saturating_sub(cs.bytes_at_last_stats);
+        let bytes_delta = media_bytes_received.saturating_sub(cs.bytes_at_last_stats);
 
         // Only flush to DB if at least 1 second has passed (rate-limit writes).
         if elapsed_secs < 1.0 && cs.last_stats_at.is_some() {
@@ -168,7 +168,7 @@ impl DbRtmpBridge {
             0.0
         };
 
-        pub_row.bytes_in = bytes_received;
+        pub_row.bytes_in = media_bytes_received;
         pub_row.bitrate_kbps = bitrate_kbps;
         if !video_codec.is_empty() {
             pub_row.video_codec = video_codec.to_string();
@@ -178,7 +178,7 @@ impl DbRtmpBridge {
         }
 
         cs.last_stats_at = Some(now);
-        cs.bytes_at_last_stats = bytes_received;
+        cs.bytes_at_last_stats = media_bytes_received;
 
         // Clone the row to release the lock before the DB call.
         let pub_id = pub_row.id.clone();
@@ -186,6 +186,45 @@ impl DbRtmpBridge {
         drop(guard);
 
         self.db.publisher_update(&pub_id, &pub_row_clone);
+    }
+
+    /// Update player stats (media bytes_out, bitrate) in the DB.
+    pub fn update_player_stats(&self, conn: ConnId, media_bytes_sent: u64) {
+        let mut guard = self.conns.lock().unwrap();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+        let Some(ref mut player_row) = cs.player else {
+            return;
+        };
+
+        let now = Instant::now();
+        let elapsed_secs = cs
+            .last_stats_at
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        let bytes_delta = media_bytes_sent.saturating_sub(cs.bytes_at_last_stats);
+
+        if elapsed_secs < 1.0 && cs.last_stats_at.is_some() {
+            return;
+        }
+
+        let bitrate_kbps = if elapsed_secs > 0.0 {
+            (bytes_delta as f64 * 8.0) / (elapsed_secs * 1000.0)
+        } else {
+            0.0
+        };
+
+        player_row.bytes_out = media_bytes_sent;
+        player_row.bitrate_kbps = bitrate_kbps;
+        cs.last_stats_at = Some(now);
+        cs.bytes_at_last_stats = media_bytes_sent;
+
+        let player_id = player_row.id.clone();
+        let row = player_row.clone();
+        drop(guard);
+
+        self.db.player_update(&player_id, &row);
     }
 
     /// Persist the latest measured client↔server RTT for this connection.
@@ -573,5 +612,21 @@ mod tests {
             codec: "mp4a".to_string(),
         };
         assert!(bridge.on_frame(1, &frame));
+    }
+
+    #[test]
+    fn update_player_stats_persists_bytes_out() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_play(1, "live", "pl_k").is_ok());
+        bridge.update_player_stats(1, 4096);
+
+        let players = db.player_list(Some("s1"));
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].bytes_out, 4096);
     }
 }
