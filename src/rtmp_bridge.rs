@@ -1,20 +1,18 @@
 //! Integration seam between the RTMP protocol layer and the SQLite-backed
 //! server state.
 //!
-//! `librtmp2` (the RTMP protocol implementation) is being rewritten in Rust
-//! separately. This module defines the callback contract that crate is
-//! expected to drive — [`RtmpEventHandler`] — plus [`DbRtmpBridge`], the
-//! concrete implementation that mirrors the original C `rtmp_callbacks.c`:
-//! validating publish/play keys against the database, tracking per-connection
-//! publisher/player rows, and deactivating them on disconnect.
+//! `librtmp2` provides the RTMP protocol implementation. This module defines
+//! the server-side callback contract — [`RtmpEventHandler`] — plus
+//! [`DbRtmpBridge`], the DB-backed implementation that validates publish/play
+//! keys, tracks per-connection publisher/player rows, updates publisher stats,
+//! and deactivates rows on disconnect.
 //!
-//! Once the Rust `librtmp2` crate exists, its server type should accept an
-//! `Arc<dyn RtmpEventHandler>` (or call these methods directly) instead of
-//! C function-pointer callbacks with a shared `userdata` slot.
+//! `src/server.rs` drives this bridge from the integrated `librtmp2` server poll
+//! loop. The current integration forwards connection lifecycle and publish/play
+//! state into this bridge, and uses codec/frame metadata for policy checks and
+//! stats updates. It does not imply that every incoming media frame is currently
+//! forwarded as a full per-frame callback.
 
-// This whole module is a seam: nothing in this repo drives `RtmpEventHandler`
-// yet, since that's the future `librtmp2` crate's job. Exercised only by
-// this module's own tests until that crate exists and wires it in.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -43,8 +41,8 @@ pub struct FrameInfo {
     pub codec: String,
 }
 
-/// Callback contract the RTMP protocol layer drives. Mirrors librtmp2's
-/// `on_connect` / `on_publish` / `on_play` / `on_frame` / `on_close` hooks.
+/// Callback contract used by the RTMP server integration. Mirrors librtmp2's
+/// `on_connect` / `on_publish` / `on_play` / `on_frame` / `on_close` hook shape.
 pub trait RtmpEventHandler: Send + Sync {
     /// Called immediately after a new TCP connection is accepted.
     fn on_connect(&self, conn: ConnId);
@@ -64,8 +62,9 @@ pub trait RtmpEventHandler: Send + Sync {
         stream_key: &str,
         remote_addr: &str,
     ) -> Result<(), ()>;
-    /// Called for every incoming frame. Return `false` to kick the connection
-    /// (e.g. codec not in `allowed_codecs`).
+    /// Validate frame/codec metadata. The current server integration uses this
+    /// for codec enforcement and does not guarantee one call per incoming media
+    /// frame.
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool;
     /// Called when the connection is closed (cleanly or by error).
     fn on_close(&self, conn: ConnId);
