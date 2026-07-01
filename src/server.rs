@@ -3,13 +3,29 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
+
+/// RTMP publish/play callbacks are plain function pointers; the bridge is
+/// registered on the RTMP thread before the poll loop starts.
+static RTMP_BRIDGE: OnceLock<Arc<DbRtmpBridge>> = OnceLock::new();
+
+fn rtmp_publish_cb(app: &str, stream_key: &str) -> bool {
+    RTMP_BRIDGE
+        .get()
+        .is_some_and(|b| b.validate_publish(app, stream_key))
+}
+
+fn rtmp_play_cb(app: &str, play_key: &str) -> bool {
+    RTMP_BRIDGE
+        .get()
+        .is_some_and(|b| b.validate_play(app, play_key))
+}
 
 pub struct ServerApp {
     config: ServerConfig,
@@ -40,7 +56,7 @@ impl ServerApp {
         config.api_token = match db.token_get()? {
             Some(t) => t,
             None => {
-                let candidate = crate::keygen::keygen_secret("")?;
+                let candidate = crate::keygen::keygen_api_token()?;
                 if db.token_set(&candidate)? {
                     // We inserted the token — print it once so the operator
                     // can use the API.
@@ -72,7 +88,7 @@ impl ServerApp {
 
     /// Runs until SIGINT/SIGTERM. Blocks the calling task.
     pub async fn run(&self) -> Result<(), String> {
-        crate::log_info!("librtmp2-server v0.1.0 starting...");
+        crate::log_info!("OpenRTMP librtmp2-server alpha starting...");
 
         if self.config.tls_enabled {
             if self.config.tls_cert_file.is_empty() || self.config.tls_key_file.is_empty() {
@@ -164,6 +180,10 @@ impl ServerApp {
             crate::log_info!("RTMP listening on {rtmp_bind}");
             let _ = rtmp_ready_tx.send(Ok(()));
 
+            let _ = RTMP_BRIDGE.set(Arc::clone(&rtmp_bridge));
+            server.on_publish_cb = Some(rtmp_publish_cb);
+            server.on_play_cb = Some(rtmp_play_cb);
+
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
             loop {
@@ -205,7 +225,6 @@ impl ServerApp {
                             Ok(()) => {
                                 entry.publishing = true;
                                 entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
-                                conn.relay_enabled = true;
                             }
                             Err(()) => {
                                 crate::log_warn!(
@@ -225,7 +244,6 @@ impl ServerApp {
                                 if entry.stream_id.is_empty() {
                                     entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
                                 }
-                                conn.relay_enabled = true;
                             }
                             Err(()) => {
                                 crate::log_warn!(

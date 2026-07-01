@@ -119,7 +119,8 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
 }
 
 /// Environment variables override config file values.
-/// `LRTMP2_API_TOKEN` is intentionally not handled; the token lives in the DB.
+/// The API token is managed exclusively by the database layer and cannot be
+/// set via environment or config file.
 pub fn config_apply_env(config: &mut ServerConfig) {
     config_apply_env_from(config, |key| std::env::var(key).ok());
 }

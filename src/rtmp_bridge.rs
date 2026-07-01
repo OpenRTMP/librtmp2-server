@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::db::{Db, Player, Publisher};
+use crate::keygen::{self, PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY};
 
 /// Opaque per-connection identifier assigned by the RTMP layer. The original
 /// C code keyed connection state off the `lrtmp2_conn_t*` pointer; any stable,
@@ -93,11 +94,6 @@ pub struct DbRtmpBridge {
     conns: Mutex<HashMap<ConnId, ConnState>>,
 }
 
-fn gen_id(prefix: &str) -> String {
-    use rand::RngExt;
-    format!("{prefix}{:016x}", rand::rng().random::<u64>())
-}
-
 impl DbRtmpBridge {
     /// Create a new bridge backed by the given database handle.
     pub fn new(db: Arc<Db>) -> Self {
@@ -125,6 +121,26 @@ impl DbRtmpBridge {
             .get(&conn)
             .map(|s| s.allowed_codecs.clone())
             .unwrap_or_default()
+    }
+
+    /// Validate a publish request before the RTMP layer sends `Publish.Start`.
+    /// Rejects unknown keys, wrong apps, and streams that already have a publisher.
+    pub fn validate_publish(&self, app: &str, publish_key: &str) -> bool {
+        let Some(stream) = self.db.stream_find_by_publish_key(publish_key) else {
+            return false;
+        };
+        if stream.app != app {
+            return false;
+        }
+        self.db.publisher_list(Some(&stream.id)).is_empty()
+    }
+
+    /// Validate a play request before the RTMP layer sends `Play.Start`.
+    pub fn validate_play(&self, app: &str, play_key: &str) -> bool {
+        let Some(stream) = self.db.stream_find_by_play_key(play_key) else {
+            return false;
+        };
+        stream.app == app
     }
 
     /// Update publisher stats (bytes_in, bitrate, codec) in the DB.
@@ -213,9 +229,24 @@ impl RtmpEventHandler for DbRtmpBridge {
             );
             return Err(());
         }
+        if !self.db.publisher_list(Some(&stream.id)).is_empty() {
+            crate::log_warn!(
+                "RTMP: publish rejected — stream '{}' already has an active publisher",
+                stream.id
+            );
+            return Err(());
+        }
+
+        let pub_id = match keygen::keygen_stream_key(PREFIX_PUBLISH_KEY) {
+            Ok(id) => id,
+            Err(e) => {
+                crate::log_warn!("RTMP: publish rejected — session id generation failed: {e}");
+                return Err(());
+            }
+        };
 
         let pub_row = Publisher {
-            id: gen_id("pub_"),
+            id: pub_id,
             stream_id: stream.id.clone(),
             remote_addr: remote_addr.to_string(),
             app: app.to_string(),
@@ -240,7 +271,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         cs.allowed_codecs = allowed_codecs;
 
         crate::log_info!(
-            "RTMP: publish accepted stream='{}' publisher={pub_id}",
+            "RTMP: publish accepted stream='{}' publisher session={pub_id}",
             stream.id
         );
         Ok(())
@@ -267,8 +298,16 @@ impl RtmpEventHandler for DbRtmpBridge {
             return Err(());
         }
 
+        let player_id = match keygen::keygen_stream_key(PREFIX_PLAY_KEY) {
+            Ok(id) => id,
+            Err(e) => {
+                crate::log_warn!("RTMP: play rejected — session id generation failed: {e}");
+                return Err(());
+            }
+        };
+
         let player_row = Player {
-            id: gen_id("pl_"),
+            id: player_id,
             stream_id: stream.id.clone(),
             remote_addr: remote_addr.to_string(),
             app: app.to_string(),
@@ -293,7 +332,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         }
 
         crate::log_info!(
-            "RTMP: play accepted stream='{}' player={player_id}",
+            "RTMP: play accepted stream='{}' player session={player_id}",
             stream.id
         );
         Ok(())
@@ -351,7 +390,7 @@ impl RtmpEventHandler for DbRtmpBridge {
             pub_row.active = false;
             self.db.publisher_update(&pub_row.id, &pub_row);
             crate::log_info!(
-                "RTMP: publisher disconnected: stream={} id={}",
+                "RTMP: publisher disconnected: stream={} session={}",
                 pub_row.stream_id,
                 pub_row.id
             );
@@ -361,7 +400,7 @@ impl RtmpEventHandler for DbRtmpBridge {
             player_row.active = false;
             self.db.player_update(&player_row.id, &player_row);
             crate::log_info!(
-                "RTMP: player disconnected: stream={} id={}",
+                "RTMP: player disconnected: stream={} session={}",
                 player_row.stream_id,
                 player_row.id
             );
@@ -451,6 +490,22 @@ mod tests {
         bridge.on_close(1);
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
         assert_eq!(db.publisher_list(Some("s2")).len(), 1);
+    }
+
+    #[test]
+    fn validate_publish_rejects_second_publisher() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        assert!(bridge.validate_publish("live", "pub_k"));
+        bridge.on_connect(1);
+        assert!(bridge.on_publish(1, "live", "pub_k", "").is_ok());
+
+        assert!(!bridge.validate_publish("live", "pub_k"));
+        bridge.on_connect(2);
+        assert!(bridge.on_publish(2, "live", "pub_k", "").is_err());
     }
 
     #[test]

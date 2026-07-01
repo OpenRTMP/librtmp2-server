@@ -2,7 +2,7 @@
 //!
 //! Endpoints:
 //!   GET    /api/v1/health                       no auth
-//!   GET    /api/v1/streams                      Bearer token
+//!   GET    /api/v1/streams                      Bearer token (includes keys)
 //!   POST   /api/v1/streams                      Bearer token, returns keys
 //!   DELETE /api/v1/streams/:id                   Bearer token
 //!
@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
 use crate::db::{Db, Stream, StreamAddError};
-use crate::keygen::keygen_secret;
+use crate::keygen::keygen_stream_key;
 
 pub struct AppState {
     pub db: Arc<Db>,
@@ -202,7 +202,6 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                     "fps": p.fps,
                 },
                 "audio": { "codec": p.audio_codec },
-                "client": { "address": p.remote_addr, "publisher": true },
             })
         })
         .collect();
@@ -217,7 +216,6 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                 "uptime": (now - pl.connected_at).max(0),
                 "bitrate_kbps": pl.bitrate_kbps,
                 "bytes_out": pl.bytes_out,
-                "client": { "address": pl.remote_addr },
             })
         })
         .collect();
@@ -299,7 +297,6 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
 
         out.push_str(&format!(
             "          <client>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<address>{}</address>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<flashver>FMLE/3.0</flashver>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<dropped>0</dropped>\n\
@@ -308,7 +305,6 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<active>1</active>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<publisher>1</publisher>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20</client>\n        </stream>\n",
-            xml_escape(&p.remote_addr),
         ));
     }
 
@@ -324,7 +320,6 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
              \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>{bw_out}</bw_out>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>{}</bytes_out>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<client>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<address>{}</address>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<flashver>FMLE/3.0</flashver>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<dropped>0</dropped>\n\
@@ -335,7 +330,6 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
              \x20\x20\x20\x20\x20\x20\x20\x20</client>\n        </stream>\n",
             xml_escape(&pl.stream_name),
             pl.bytes_out,
-            xml_escape(&pl.remote_addr),
         ));
     }
 
@@ -391,7 +385,7 @@ async fn handle_streams_list(State(state): State<Arc<AppState>>, headers: Header
             "Missing or invalid token",
         );
     }
-    // Never expose keys in list view.
+    // Bearer-authenticated admin view — includes keys for panels like librtmp2-server-panel.
     let list: Vec<Value> = state
         .db
         .stream_list()
@@ -401,6 +395,9 @@ async fn handle_streams_list(State(state): State<Arc<AppState>>, headers: Header
                 "id": s.id,
                 "name": s.name,
                 "app": s.app,
+                "publish_key": s.publish_key,
+                "play_key": s.play_key,
+                "stats_key": s.stats_key,
                 "enabled": s.enabled,
                 "created_at": s.created_at,
             })
@@ -484,7 +481,7 @@ async fn handle_stream_create(
     }
 
     // Cryptographically unpredictable keys — never derive from stream id/time.
-    let publish_key = match keygen_secret("pub_") {
+    let publish_key = match keygen_stream_key(crate::keygen::PREFIX_PUBLISH_KEY) {
         Ok(k) => k,
         Err(e) => {
             crate::log_error!("publish key generation failed: {e}");
@@ -495,7 +492,7 @@ async fn handle_stream_create(
             );
         }
     };
-    let play_key = match keygen_secret("pl_") {
+    let play_key = match keygen_stream_key(crate::keygen::PREFIX_PLAY_KEY) {
         Ok(k) => k,
         Err(e) => {
             crate::log_error!("play key generation failed: {e}");
@@ -506,7 +503,7 @@ async fn handle_stream_create(
             );
         }
     };
-    let stats_key = match keygen_secret("st_") {
+    let stats_key = match keygen_stream_key(crate::keygen::PREFIX_STATS_KEY) {
         Ok(k) => k,
         Err(e) => {
             crate::log_error!("stats key generation failed: {e}");
@@ -592,14 +589,18 @@ async fn handle_stream_delete(
 
 async fn handle_stream_stats(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<KeyQuery>,
 ) -> Response {
-    if !stats_key_ok(&state, &q.key, Some(&id)) {
-        return err_json(StatusCode::FORBIDDEN, "FORBIDDEN", "Invalid stats key");
-    }
     if state.db.stream_get(&id).is_none() {
         return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+    }
+    if bearer_ok(&state, &headers) {
+        return Json(build_json_stats(&state.db, Some(&id))).into_response();
+    }
+    if !stats_key_ok(&state, &q.key, Some(&id)) {
+        return err_json(StatusCode::FORBIDDEN, "FORBIDDEN", "Invalid stats key");
     }
     Json(build_json_stats(&state.db, Some(&id))).into_response()
 }
