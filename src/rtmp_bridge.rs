@@ -383,7 +383,7 @@ mod tests {
             play_key: play_key.to_string(),
             stats_key: format!("st_{id}"),
             enabled: true,
-            allowed_codecs: "avc1,hvc1,av01".to_string(),
+            allowed_codecs: "avc1,hvc1,av01,mp4a".to_string(),
             created_at: crate::db::now_ts(),
         }
     }
@@ -399,7 +399,8 @@ mod tests {
     #[test]
     fn publish_rejects_key_for_wrong_app() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -410,7 +411,8 @@ mod tests {
     #[test]
     fn play_rejects_key_for_wrong_app() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -421,7 +423,8 @@ mod tests {
     #[test]
     fn publish_then_close_deactivates_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -435,8 +438,10 @@ mod tests {
     #[test]
     fn close_only_affects_its_own_connection() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"));
-        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"));
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -452,13 +457,14 @@ mod tests {
     #[test]
     fn on_frame_rejects_disallowed_codec() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
         assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
 
-        // "vp9" is not in "avc1,hvc1,av01"
+        // "vp9" is not in "avc1,hvc1,av01,mp4a"
         let frame = FrameInfo {
             kind: FrameKind::Video,
             timestamp: 0,
@@ -471,7 +477,8 @@ mod tests {
     #[test]
     fn on_frame_allows_listed_codec() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"));
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -482,6 +489,25 @@ mod tests {
             timestamp: 0,
             size: 100,
             codec: "avc1".to_string(),
+        };
+        assert!(bridge.on_frame(1, &frame));
+    }
+
+    #[test]
+    fn on_frame_allows_default_aac_audio_codec() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_publish(1, "live", "pub_k", "1.2.3.4:1").is_ok());
+
+        let frame = FrameInfo {
+            kind: FrameKind::Audio,
+            timestamp: 0,
+            size: 100,
+            codec: "mp4a".to_string(),
         };
         assert!(bridge.on_frame(1, &frame));
     }

@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
-use crate::db::{Db, Stream};
+use crate::db::{Db, Stream, StreamAddError};
 use crate::keygen::keygen_secret;
 
 pub struct AppState {
@@ -452,7 +452,7 @@ async fn handle_stream_create(
         .allowed_codecs
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "avc1,hvc1,av01".to_string());
+        .unwrap_or_else(|| "avc1,hvc1,av01,mp4a".to_string());
 
     if !is_valid_stream_key_part(&id) {
         return err_json(
@@ -529,8 +529,18 @@ async fn handle_stream_create(
         created_at: now_ts(),
     };
 
-    if !state.db.stream_add(&s) {
-        return err_json(StatusCode::CONFLICT, "CONFLICT", "Stream ID already exists");
+    match state.db.stream_add(&s) {
+        Ok(()) => {}
+        Err(StreamAddError::Duplicate) => {
+            return err_json(StatusCode::CONFLICT, "CONFLICT", "Stream ID already exists");
+        }
+        Err(StreamAddError::Db) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to create stream",
+            );
+        }
     }
 
     crate::log_info!("Stream created: id={} app={}", s.id, s.app);
@@ -752,6 +762,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            state.db.stream_get("mystream").unwrap().allowed_codecs,
+            "avc1,hvc1,av01,mp4a"
+        );
 
         let resp = app
             .oneshot(
