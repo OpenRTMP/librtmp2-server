@@ -31,9 +31,27 @@ pub fn close() {
     *FILE.lock() = None;
 }
 
+/// Escapes all control characters (newlines, carriage returns, ANSI escape
+/// sequences, etc.) so that untrusted input (e.g. the RTMP `app`/stream name
+/// from an unauthenticated peer) cannot forge fake log lines or inject
+/// terminal escape sequences into a log file tailed/cat'd to a terminal.
+fn sanitize_for_log(msg: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(msg.len());
+    for c in msg.chars() {
+        if c.is_control() {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn write_line(prefix: &str, msg: &str) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let safe_msg = msg.replace('\r', "\\r").replace('\n', "\\n");
+    let safe_msg = sanitize_for_log(msg);
     let line = format!("[{now}] {prefix} {safe_msg}\n");
     let mut guard = FILE.lock();
     if let Some(f) = guard.as_mut() {
@@ -94,4 +112,31 @@ macro_rules! log_debug {
             $crate::logger::log($crate::logger::Level::Debug, &format!($($arg)*));
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_escapes_newlines_and_carriage_returns() {
+        assert_eq!(sanitize_for_log("a\nb\rc"), "a\\x0ab\\x0dc");
+    }
+
+    #[test]
+    fn sanitize_escapes_ansi_escape_sequences() {
+        // A crafted `app` name could otherwise inject terminal control
+        // sequences (e.g. to hide/rewrite prior log output) into a log file
+        // that an operator tails with a real terminal.
+        let malicious = "app\x1b[31mFAKE ERROR\x1b[0m";
+        let safe = sanitize_for_log(malicious);
+        assert!(!safe.contains('\x1b'));
+        assert!(safe.contains("\\x1b"));
+    }
+
+    #[test]
+    fn sanitize_leaves_normal_text_and_utf8_untouched() {
+        let msg = "stream 'café' app='live'";
+        assert_eq!(sanitize_for_log(msg), msg);
+    }
 }

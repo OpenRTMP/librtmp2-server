@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: rtmp_bridge (2026-07-02)
+Last scanned: logger (2026-07-02)
 
 ## Modules
 
@@ -9,8 +9,35 @@ Last scanned: rtmp_bridge (2026-07-02)
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [ ] keygen — Stream key generation
-- [ ] logger — Logging
+- [x] keygen — Stream key generation
+- [x] logger — Logging
+
+## Findings (2026-07-02 logger pass)
+
+- **Medium (fixed):** `write_line()` only escaped `\r`/`\n` in log messages.
+  `app` (RTMP `connect`/`publish`/`play` command target) is attacker-controlled
+  and unauthenticated at the point it's logged (`authorize_publish`/
+  `authorize_play` in rtmp_bridge.rs log it before the stream key is even
+  validated), and was interpolated directly into `log_info!`/`log_warn!`
+  format strings. Any other C0/C1 control byte — notably ANSI escape
+  sequences (`\x1b[...`) — passed straight through into the log file/stderr,
+  letting a remote peer inject terminal escape sequences (rewrite/hide prior
+  log lines, move cursor, etc.) when an operator tails the log in a real
+  terminal. Fixed by escaping every `char::is_control()` codepoint (not just
+  `\r`/`\n`) as `\xHH` in `sanitize_for_log()`; added unit tests for
+  newline/CR forging and ANSI escape injection.
+
+## Findings (2026-07-02 keygen pass)
+
+No critical bugs found. `keygen_with_entropy()` uses `rand::rngs::SysRng`
+(OS/`getrandom`-backed CSPRNG, not a PRNG) with 128-bit entropy for
+stream/play/stats/viewer keys and 256-bit for the API token; all four key
+columns (`publish_key`, `play_key`, `stats_key` in `streams`, `play_key` in
+`stream_viewers`) are `UNIQUE NOT NULL` in the schema, so a (practically
+impossible) collision would surface as an insert error rather than silently
+overwriting another row. All call sites (http.rs, rtmp_bridge.rs, db.rs,
+server.rs) propagate `Err` on RNG failure instead of falling back to a
+predictable key.
 
 ## Findings (2026-07-02 rtmp_bridge pass)
 
