@@ -391,9 +391,9 @@ impl ServerApp {
             http_listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|e| format!("HTTP server error: {e}"));
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| format!("HTTP server error: {e}"));
 
         crate::log_info!("Shutting down...");
         rtmp_stop.store(true, Ordering::Relaxed);

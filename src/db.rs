@@ -304,7 +304,16 @@ impl Db {
         let rc = conn.execute(
             "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
              VALUES (?,?,?,?,?,?,?,?)",
-            params![s.id, s.name, s.app, s.publish_key, s.play_key, s.stats_key, s.enabled, s.created_at],
+            params![
+                s.id,
+                s.name,
+                s.app,
+                s.publish_key,
+                s.play_key,
+                s.stats_key,
+                s.enabled,
+                s.created_at
+            ],
         );
         match rc {
             Ok(_) => {
