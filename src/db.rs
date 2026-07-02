@@ -335,14 +335,7 @@ impl Db {
             .execute(
                 "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
                  VALUES (?,?,?,?,?,?)",
-                params![
-                    viewer_id,
-                    s.id,
-                    "Player 1",
-                    s.play_key,
-                    true,
-                    s.created_at
-                ],
+                params![viewer_id, s.id, "Player 1", s.play_key, true, s.created_at],
             )
             .is_err()
         {
@@ -767,7 +760,10 @@ impl Db {
             return false;
         }
         let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
-            crate::log_error!("player_try_acquire: bytes_out {} overflows i64", p.bytes_out);
+            crate::log_error!(
+                "player_try_acquire: bytes_out {} overflows i64",
+                p.bytes_out
+            );
             return false;
         };
         let conn = self.conn.lock().unwrap();

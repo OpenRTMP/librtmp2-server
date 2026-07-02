@@ -607,11 +607,7 @@ async fn handle_stream_create(
 
     crate::log_info!("Stream created: id={} app={}", s.id, s.app);
 
-    (
-        StatusCode::CREATED,
-        Json(stream_to_json(&state.db, &s)),
-    )
-        .into_response()
+    (StatusCode::CREATED, Json(stream_to_json(&state.db, &s))).into_response()
 }
 
 async fn handle_stream_delete(
@@ -736,7 +732,11 @@ async fn handle_stream_player_create(
         );
     }
 
-    crate::log_info!("Play key created: stream={} name={}", stream.id, viewer.name);
+    crate::log_info!(
+        "Play key created: stream={} name={}",
+        stream.id,
+        viewer.name
+    );
     (StatusCode::CREATED, Json(viewer_to_json(&viewer))).into_response()
 }
 

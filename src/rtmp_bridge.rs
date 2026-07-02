@@ -478,12 +478,7 @@ impl RtmpEventHandler for DbRtmpBridge {
             if !self.db.player_update(&prior_id, prior) {
                 crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
                 prior.active = true;
-                self.conns
-                    .lock()
-                    .unwrap()
-                    .entry(conn)
-                    .or_default()
-                    .player = old_player;
+                self.conns.lock().unwrap().entry(conn).or_default().player = old_player;
                 return Err(());
             }
         }
@@ -604,7 +599,8 @@ mod tests {
     }
 
     fn add_stream_with_player(db: &Db, id: &str, pub_key: &str, play_key: &str) {
-        db.stream_add(&sample_stream(id, pub_key, play_key)).unwrap();
+        db.stream_add(&sample_stream(id, pub_key, play_key))
+            .unwrap();
     }
 
     #[test]
@@ -805,6 +801,9 @@ mod tests {
 
         bridge.on_connect(99);
         assert!(bridge.on_play(99, "live", "pl_k").is_err());
-        assert_eq!(db.viewer_active_count(&viewer.id), crate::db::MAX_CONNECTIONS_PER_PLAY_KEY);
+        assert_eq!(
+            db.viewer_active_count(&viewer.id),
+            crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
+        );
     }
 }
