@@ -15,6 +15,8 @@ pub const PREFIX_PUBLISH_KEY: &str = "live_";
 pub const PREFIX_PLAY_KEY: &str = "play_";
 /// Prefix for stats URL keys (`?key=...`).
 pub const PREFIX_STATS_KEY: &str = "sts_";
+/// Prefix for configured viewer-slot row ids (panel-managed play access).
+pub const PREFIX_VIEWER_ID: &str = "vi_";
 
 fn keygen_with_entropy(prefix: &str, entropy_bytes: usize) -> Result<String, String> {
     let mut rnd = vec![0u8; entropy_bytes];

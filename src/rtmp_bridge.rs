@@ -60,6 +60,8 @@ pub trait RtmpEventHandler: Send + Sync {
 struct ConnState {
     publisher: Option<Publisher>,
     player: Option<Player>,
+    /// Configured play-key row id for the active viewer session.
+    viewer_id: String,
     /// DB stream id for the published stream, set in on_publish.
     pub stream_id: String,
     /// Timestamp of the last publisher stats flush to the DB.
@@ -112,10 +114,16 @@ impl DbRtmpBridge {
 
     /// Validate a play request before the RTMP layer sends `Play.Start`.
     pub fn validate_play(&self, app: &str, play_key: &str) -> bool {
-        let Some(stream) = self.db.stream_find_by_play_key(play_key) else {
+        let Some(viewer) = self.db.viewer_find_by_play_key(play_key) else {
             return false;
         };
-        stream.app == app
+        let Some(stream) = self.db.stream_get(&viewer.stream_id) else {
+            return false;
+        };
+        if !stream.enabled || stream.app != app {
+            return false;
+        }
+        self.db.viewer_active_count(&viewer.id) < crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
     }
 
     /// Whether this connection already owns an authorized publisher slot.
@@ -421,10 +429,18 @@ impl RtmpEventHandler for DbRtmpBridge {
     fn on_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
 
-        let Some(stream) = self.db.stream_find_by_play_key(stream_key) else {
+        let Some(viewer) = self.db.viewer_find_by_play_key(stream_key) else {
             crate::log_warn!("RTMP: play rejected — invalid play_key for app='{app}'");
             return Err(());
         };
+        let Some(stream) = self.db.stream_get(&viewer.stream_id) else {
+            crate::log_warn!("RTMP: play rejected — stream missing for play_key");
+            return Err(());
+        };
+        if !stream.enabled {
+            crate::log_warn!("RTMP: play rejected — stream '{}' is disabled", stream.id);
+            return Err(());
+        }
         if stream.app != app {
             crate::log_warn!(
                 "RTMP: play rejected — key belongs to app='{}', requested app='{app}'",
@@ -444,60 +460,75 @@ impl RtmpEventHandler for DbRtmpBridge {
         let player_row = Player {
             id: player_id,
             stream_id: stream.id.clone(),
+            viewer_id: viewer.id.clone(),
             app: app.to_string(),
             stream_name: stream.name.clone(),
             active: true,
             connected_at: crate::db::now_ts(),
             ..Default::default()
         };
-        if !self.db.player_add(&player_row) {
-            crate::log_warn!("RTMP: play rejected — failed to record player row");
+
+        let mut old_player = {
+            let mut guard = self.conns.lock().unwrap();
+            guard.get_mut(&conn).and_then(|cs| cs.player.take())
+        };
+        if let Some(ref mut prior) = old_player {
+            prior.active = false;
+            let prior_id = prior.id.clone();
+            if !self.db.player_update(&prior_id, prior) {
+                crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
+                prior.active = true;
+                self.conns
+                    .lock()
+                    .unwrap()
+                    .entry(conn)
+                    .or_default()
+                    .player = old_player;
+                return Err(());
+            }
+        }
+
+        if !self.db.player_try_acquire(&player_row) {
+            if let Some(mut prior) = old_player.take() {
+                prior.active = true;
+                let prior_id = prior.id.clone();
+                let prior_viewer_id = prior.viewer_id.clone();
+                let prior_stream_id = prior.stream_id.clone();
+                if self.db.player_update(&prior_id, &prior) {
+                    let mut guard = self.conns.lock().unwrap();
+                    let cs = guard.entry(conn).or_default();
+                    cs.player = Some(prior);
+                    cs.viewer_id = prior_viewer_id;
+                    if cs.publisher.is_none() {
+                        cs.stream_id = prior_stream_id;
+                    }
+                }
+            }
+            crate::log_warn!(
+                "RTMP: play rejected — connection limit ({}) reached for play key",
+                crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
+            );
             return Err(());
         }
 
         let player_id = player_row.id.clone();
         let stream_id = stream.id.clone();
-        let old_player = {
+        let viewer_id = viewer.id.clone();
+        let replacing_player = old_player.is_some();
+
+        {
             let mut guard = self.conns.lock().unwrap();
             let cs = guard.entry(conn).or_default();
-            let old_player = cs.player.take();
             cs.player = Some(player_row);
-            // Store stream_id for player-only connections too (used for deletion signalling).
+            cs.viewer_id = viewer_id;
             if cs.publisher.is_none() || cs.stream_id.is_empty() {
                 cs.stream_id = stream_id;
             }
-            old_player
-        };
-        let replacing_player = old_player.is_some();
-
-        if let Some(mut old_player) = old_player {
-            old_player.active = false;
-            let old_id = old_player.id.clone();
-            if !self.db.player_update(&old_id, &old_player) {
-                crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
-                if !self.db.player_remove(&player_id) {
-                    crate::log_error!(
-                        "RTMP: failed to remove replacement player row after switch rollback"
-                    );
-                }
-                old_player.active = true;
-                let old_stream_id = old_player.stream_id.clone();
-                let mut guard = self.conns.lock().unwrap();
-                let cs = guard.entry(conn).or_default();
-                cs.player = Some(old_player);
-                if cs.publisher.is_none() {
-                    cs.stream_id = old_stream_id;
-                }
-                return Err(());
+            if replacing_player {
+                cs.player_last_stats_at = None;
+                cs.player_bytes_at_last_stats = 0;
+                cs.player_stats_reset_pending = true;
             }
-        }
-
-        if replacing_player {
-            let mut guard = self.conns.lock().unwrap();
-            let cs = guard.entry(conn).or_default();
-            cs.player_last_stats_at = None;
-            cs.player_bytes_at_last_stats = 0;
-            cs.player_stats_reset_pending = true;
         }
 
         crate::log_info!(
@@ -572,6 +603,10 @@ mod tests {
         }
     }
 
+    fn add_stream_with_player(db: &Db, id: &str, pub_key: &str, play_key: &str) {
+        db.stream_add(&sample_stream(id, pub_key, play_key)).unwrap();
+    }
+
     #[test]
     fn publish_rejects_unknown_key() {
         let db = Arc::new(Db::open(":memory:").unwrap());
@@ -583,8 +618,7 @@ mod tests {
     #[test]
     fn publish_rejects_key_for_wrong_app() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -595,8 +629,7 @@ mod tests {
     #[test]
     fn play_rejects_key_for_wrong_app() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -607,8 +640,7 @@ mod tests {
     #[test]
     fn publish_then_close_deactivates_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -622,10 +654,8 @@ mod tests {
     #[test]
     fn close_only_affects_its_own_connection() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
-            .unwrap();
-        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -641,8 +671,7 @@ mod tests {
     #[test]
     fn authorize_publish_rejects_second_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -655,8 +684,7 @@ mod tests {
     #[test]
     fn on_connect_preserves_prior_authorize_publish_state() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         // publish callback can run during poll() before the poll-loop on_connect.
@@ -670,10 +698,8 @@ mod tests {
     #[test]
     fn authorize_publish_switching_streams_deactivates_prior_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
-            .unwrap();
-        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -687,10 +713,8 @@ mod tests {
     #[test]
     fn authorize_publish_failed_switch_keeps_prior_publisher_active() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
-            .unwrap();
-        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -708,10 +732,8 @@ mod tests {
     #[test]
     fn on_play_switching_streams_deactivates_prior_player() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
-            .unwrap();
-        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -728,10 +750,8 @@ mod tests {
     #[test]
     fn player_replacement_stats_reset_is_not_consumed_by_publisher_stats() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
-            .unwrap();
-        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -759,8 +779,7 @@ mod tests {
     #[test]
     fn update_player_stats_persists_bytes_out() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
@@ -770,5 +789,22 @@ mod tests {
         let players = db.player_list(Some("s1"));
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].bytes_out, 4096);
+    }
+
+    #[test]
+    fn play_rejects_when_connection_cap_reached() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+        let viewer = db.viewer_find_by_play_key("pl_k").unwrap();
+
+        for conn in 1..=crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64 {
+            bridge.on_connect(conn);
+            assert!(bridge.on_play(conn, "live", "pl_k").is_ok());
+        }
+
+        bridge.on_connect(99);
+        assert!(bridge.on_play(99, "live", "pl_k").is_err());
+        assert_eq!(db.viewer_active_count(&viewer.id), crate::db::MAX_CONNECTIONS_PER_PLAY_KEY);
     }
 }

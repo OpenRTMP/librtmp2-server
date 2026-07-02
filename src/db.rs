@@ -14,6 +14,9 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
+/// Max simultaneous RTMP play connections per play key (not configurable).
+pub const MAX_CONNECTIONS_PER_PLAY_KEY: usize = 5;
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Stream {
     pub id: String,
@@ -22,6 +25,17 @@ pub struct Stream {
     pub publish_key: String,
     pub play_key: String,
     pub stats_key: String,
+    pub enabled: bool,
+    pub created_at: i64,
+}
+
+/// Panel-managed play key for a stream (auto-generated `play_*` key).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StreamViewer {
+    pub id: String,
+    pub stream_id: String,
+    pub name: String,
+    pub play_key: String,
     pub enabled: bool,
     pub created_at: i64,
 }
@@ -48,6 +62,8 @@ pub struct Publisher {
 pub struct Player {
     pub id: String,
     pub stream_id: String,
+    /// Configured viewer slot this session authenticated with.
+    pub viewer_id: String,
     pub app: String,
     pub stream_name: String,
     pub bytes_out: u64,
@@ -123,6 +139,7 @@ CREATE TABLE IF NOT EXISTS publishers (
 CREATE TABLE IF NOT EXISTS players (
   id TEXT PRIMARY KEY,
   stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+  viewer_id TEXT NOT NULL DEFAULT '',
   app TEXT NOT NULL DEFAULT '',
   stream_name TEXT NOT NULL DEFAULT '',
   bytes_out INTEGER NOT NULL DEFAULT 0,
@@ -148,46 +165,18 @@ CREATE INDEX IF NOT EXISTS idx_player_stream ON players(stream_id);
 CREATE INDEX IF NOT EXISTS idx_stats_stream ON stats_samples(stream_id);
 CREATE INDEX IF NOT EXISTS idx_pub_active ON publishers(active);
 CREATE INDEX IF NOT EXISTS idx_player_active ON players(active);
+CREATE TABLE IF NOT EXISTS stream_viewers (
+  id TEXT PRIMARY KEY,
+  stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+  name TEXT NOT NULL DEFAULT '',
+  play_key TEXT UNIQUE NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_viewer_stream ON stream_viewers(stream_id);
+CREATE INDEX IF NOT EXISTS idx_viewer_play_key ON stream_viewers(play_key);
+CREATE INDEX IF NOT EXISTS idx_player_viewer ON players(viewer_id);
 ";
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
-    let sql = format!("PRAGMA table_info({table})");
-    let Ok(mut stmt) = conn.prepare(&sql) else {
-        return false;
-    };
-    stmt.query_map([], |row| row.get::<_, String>(1))
-        .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == column))
-        .unwrap_or(false)
-}
-
-fn migrate_schema(conn: &Connection) {
-    if table_has_column(conn, "publishers", "remote_addr")
-        && let Err(e) = conn.execute("ALTER TABLE publishers DROP COLUMN remote_addr", [])
-    {
-        crate::log_warn!("Could not drop publishers.remote_addr: {e}");
-    }
-    if table_has_column(conn, "players", "remote_addr")
-        && let Err(e) = conn.execute("ALTER TABLE players DROP COLUMN remote_addr", [])
-    {
-        crate::log_warn!("Could not drop players.remote_addr: {e}");
-    }
-    if !table_has_column(conn, "publishers", "rtt_ms")
-        && let Err(e) = conn.execute(
-            "ALTER TABLE publishers ADD COLUMN rtt_ms REAL NOT NULL DEFAULT 0",
-            [],
-        )
-    {
-        crate::log_warn!("Could not add publishers.rtt_ms: {e}");
-    }
-    if !table_has_column(conn, "players", "rtt_ms")
-        && let Err(e) = conn.execute(
-            "ALTER TABLE players ADD COLUMN rtt_ms REAL NOT NULL DEFAULT 0",
-            [],
-        )
-    {
-        crate::log_warn!("Could not add players.rtt_ms: {e}");
-    }
-}
 
 /// WAL mode creates sibling `-wal`/`-shm` files; restrict all three so stream
 /// keys stored in SQLite are not world-readable on multi-user hosts.
@@ -254,7 +243,6 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
-        migrate_schema(&conn);
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
@@ -300,8 +288,22 @@ impl Db {
     // ==================== STREAMS ====================
 
     pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
+        let viewer_id = match crate::keygen::keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
+            Ok(id) => id,
+            Err(e) => {
+                crate::log_error!("Failed to generate viewer id for stream {}: {e}", s.id);
+                return Err(StreamAddError::Db);
+            }
+        };
         let conn = self.conn.lock().unwrap();
-        let rc = conn.execute(
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                crate::log_error!("stream_add: begin tx failed: {e}");
+                return Err(StreamAddError::Db);
+            }
+        };
+        let stream_rc = tx.execute(
             "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
              VALUES (?,?,?,?,?,?,?,?)",
             params![
@@ -315,11 +317,8 @@ impl Db {
                 s.created_at
             ],
         );
-        match rc {
-            Ok(_) => {
-                crate::log_info!("Stream added: id={} app={}", s.id, s.app);
-                Ok(())
-            }
+        match stream_rc {
+            Ok(_) => {}
             Err(e) => {
                 crate::log_error!("Failed to add stream {}: {e}", s.id);
                 if matches!(
@@ -327,10 +326,37 @@ impl Db {
                     rusqlite::Error::SqliteFailure(ref err, _)
                         if err.code == rusqlite::ErrorCode::ConstraintViolation
                 ) {
-                    Err(StreamAddError::Duplicate)
-                } else {
-                    Err(StreamAddError::Db)
+                    return Err(StreamAddError::Duplicate);
                 }
+                return Err(StreamAddError::Db);
+            }
+        }
+        if tx
+            .execute(
+                "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+                 VALUES (?,?,?,?,?,?)",
+                params![
+                    viewer_id,
+                    s.id,
+                    "Player 1",
+                    s.play_key,
+                    true,
+                    s.created_at
+                ],
+            )
+            .is_err()
+        {
+            crate::log_error!("Failed to add default play key for stream {}", s.id);
+            return Err(StreamAddError::Db);
+        }
+        match tx.commit() {
+            Ok(()) => {
+                crate::log_info!("Stream added: id={} app={}", s.id, s.app);
+                Ok(())
+            }
+            Err(e) => {
+                crate::log_error!("stream_add commit failed for {}: {e}", s.id);
+                Err(StreamAddError::Db)
             }
         }
     }
@@ -471,7 +497,108 @@ impl Db {
             .unwrap_or_default()
     }
 
-    // ==================== PUBLISHERS ====================
+    // ==================== STREAM VIEWERS (configured play keys) ====================
+
+    fn load_viewer_row(row: &rusqlite::Row) -> rusqlite::Result<StreamViewer> {
+        Ok(StreamViewer {
+            id: row.get(0)?,
+            stream_id: row.get(1)?,
+            name: row.get(2)?,
+            play_key: row.get(3)?,
+            enabled: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    }
+
+    const VIEWER_COLS: &'static str = "id,stream_id,name,play_key,enabled,created_at";
+
+    pub fn viewer_add(&self, v: &StreamViewer) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+             VALUES (?,?,?,?,?,?)",
+            params![
+                v.id,
+                v.stream_id,
+                v.name,
+                v.play_key,
+                v.enabled,
+                v.created_at
+            ],
+        )
+        .is_ok()
+    }
+
+    pub fn viewer_list(&self, stream_id: &str) -> Vec<StreamViewer> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {} FROM stream_viewers WHERE stream_id=? ORDER BY created_at",
+            Self::VIEWER_COLS
+        )) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("viewer_list: prepare failed: {e}");
+                return Vec::new();
+            }
+        };
+        stmt.query_map(params![stream_id], Self::load_viewer_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn viewer_find_by_play_key(&self, key: &str) -> Option<StreamViewer> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM stream_viewers WHERE play_key=? AND enabled=1",
+                Self::VIEWER_COLS
+            ),
+            params![key],
+            Self::load_viewer_row,
+        )
+        .optional()
+        .unwrap_or(None)
+    }
+
+    pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> Option<StreamViewer> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM stream_viewers WHERE stream_id=? AND id=?",
+                Self::VIEWER_COLS
+            ),
+            params![stream_id, viewer_id],
+            Self::load_viewer_row,
+        )
+        .optional()
+        .unwrap_or(None)
+    }
+
+    pub fn viewer_active_count(&self, viewer_id: &str) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1",
+            params![viewer_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as usize)
+        .unwrap_or(0)
+    }
+
+    /// Returns `Some(true)` if deleted, `Some(false)` if not found, `None` on DB error.
+    pub fn viewer_delete(&self, stream_id: &str, viewer_id: &str) -> Option<bool> {
+        let conn = self.conn.lock().unwrap();
+        match conn.execute(
+            "DELETE FROM stream_viewers WHERE stream_id=? AND id=?",
+            params![stream_id, viewer_id],
+        ) {
+            Ok(rows) => Some(rows > 0),
+            Err(e) => {
+                crate::log_error!("viewer_delete error for {viewer_id}: {e}");
+                None
+            }
+        }
+    }
 
     /// Atomically insert an active publisher only when the stream has none.
     pub fn publisher_try_acquire(&self, p: &Publisher) -> bool {
@@ -631,30 +758,63 @@ impl Db {
         self.publisher_list(None)
     }
 
-    // ==================== PLAYERS ====================
+    // ==================== PLAYERS (active RTMP viewer sessions) ====================
 
-    pub fn player_add(&self, p: &Player) -> bool {
+    /// Atomically insert a player session when the play key is below its connection cap.
+    pub fn player_try_acquire(&self, p: &Player) -> bool {
+        if p.viewer_id.is_empty() {
+            crate::log_error!("player_try_acquire: missing viewer_id");
+            return false;
+        }
         let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
-            crate::log_error!("player_add: bytes_out {} overflows i64", p.bytes_out);
+            crate::log_error!("player_try_acquire: bytes_out {} overflows i64", p.bytes_out);
             return false;
         };
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO players \
-             (id,stream_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
-             VALUES (?,?,?,?,?,?,?,?,1)",
-            params![
-                p.id,
-                p.stream_id,
-                p.app,
-                p.stream_name,
-                bytes_out,
-                p.bitrate_kbps,
-                p.rtt_ms,
-                p.connected_at
-            ],
-        )
-        .is_ok()
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                crate::log_error!("player_try_acquire: begin tx failed: {e}");
+                return false;
+            }
+        };
+        let active: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1",
+                params![p.viewer_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(MAX_CONNECTIONS_PER_PLAY_KEY as i64);
+        if active >= MAX_CONNECTIONS_PER_PLAY_KEY as i64 {
+            return false;
+        }
+        if tx
+            .execute(
+                "INSERT INTO players \
+                 (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
+                 VALUES (?,?,?,?,?,?,?,?,?,1)",
+                params![
+                    p.id,
+                    p.stream_id,
+                    p.viewer_id,
+                    p.app,
+                    p.stream_name,
+                    bytes_out,
+                    p.bitrate_kbps,
+                    p.rtt_ms,
+                    p.connected_at
+                ],
+            )
+            .is_err()
+        {
+            return false;
+        }
+        tx.commit().is_ok()
+    }
+
+    #[allow(dead_code)]
+    pub fn player_add(&self, p: &Player) -> bool {
+        self.player_try_acquire(p)
     }
 
     pub fn player_update(&self, id: &str, p: &Player) -> bool {
@@ -664,10 +824,11 @@ impl Db {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE players SET stream_id=?,app=?,stream_name=?,\
+            "UPDATE players SET stream_id=?,viewer_id=?,app=?,stream_name=?,\
              bytes_out=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
             params![
                 p.stream_id,
+                p.viewer_id,
                 p.app,
                 p.stream_name,
                 bytes_out,
@@ -691,24 +852,25 @@ impl Db {
         Ok(Player {
             id: row.get(0)?,
             stream_id: row.get(1)?,
-            app: row.get(2)?,
-            stream_name: row.get(3)?,
-            bytes_out: u64::try_from(row.get::<_, i64>(4)?).map_err(|_| {
+            viewer_id: row.get(2)?,
+            app: row.get(3)?,
+            stream_name: row.get(4)?,
+            bytes_out: u64::try_from(row.get::<_, i64>(5)?).map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    4,
+                    5,
                     rusqlite::types::Type::Integer,
                     "negative bytes_out".into(),
                 )
             })?,
-            bitrate_kbps: row.get(5)?,
-            rtt_ms: row.get(6)?,
-            connected_at: row.get(7)?,
-            active: row.get(8)?,
+            bitrate_kbps: row.get(6)?,
+            rtt_ms: row.get(7)?,
+            connected_at: row.get(8)?,
+            active: row.get(9)?,
         })
     }
 
     const PLAYER_COLS: &'static str =
-        "id,stream_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active";
+        "id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active";
 
     pub fn player_list(&self, stream_id: Option<&str>) -> Vec<Player> {
         let conn = self.conn.lock().unwrap();
@@ -881,7 +1043,7 @@ mod tests {
             db.stream_find_by_publish_key("pub_key_123").unwrap().id,
             "stream1"
         );
-        assert!(db.stream_find_by_play_key("pl_key_456").is_some());
+        assert!(db.viewer_find_by_play_key("pl_key_456").is_some());
         assert!(db.stream_find_by_stats_key("st_key_789").is_some());
         assert!(db.stream_find_by_stats_key("wrong_key").is_none());
 
@@ -918,9 +1080,11 @@ mod tests {
         assert!(db.publisher_try_acquire(&p));
         assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
 
+        let viewer = db.viewer_find_by_play_key("pl_key_456").unwrap();
         let player = Player {
             id: "pl1".to_string(),
             stream_id: "stream1".to_string(),
+            viewer_id: viewer.id,
             app: "live".to_string(),
             stream_name: "test".to_string(),
             bytes_out: 512000,
@@ -929,7 +1093,7 @@ mod tests {
             active: true,
             ..Default::default()
         };
-        assert!(db.player_add(&player));
+        assert!(db.player_try_acquire(&player));
         assert_eq!(db.player_list(Some("stream1")).len(), 1);
 
         let stat = StatSample {
@@ -1041,5 +1205,40 @@ mod tests {
         assert!(active_stream2[0].active);
 
         assert_eq!(db.publisher_list(Some("stream1")).len(), 0);
+    }
+
+    #[test]
+    fn player_try_acquire_enforces_per_key_connection_cap() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+        let viewer = db.viewer_find_by_play_key("pl_key_456").unwrap();
+
+        for i in 0..MAX_CONNECTIONS_PER_PLAY_KEY {
+            let player = Player {
+                id: format!("pl{i}"),
+                stream_id: "stream1".to_string(),
+                viewer_id: viewer.id.clone(),
+                connected_at: now_ts(),
+                active: true,
+                ..Default::default()
+            };
+            assert!(db.player_try_acquire(&player), "slot {i} should succeed");
+        }
+
+        let overflow = Player {
+            id: "pl_overflow".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(!db.player_try_acquire(&overflow));
     }
 }

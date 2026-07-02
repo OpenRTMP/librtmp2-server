@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
-use crate::db::{Db, Stream, StreamAddError};
+use crate::db::{Db, Stream, StreamAddError, StreamViewer};
 use crate::keygen::keygen_stream_key;
 use crate::rate_limit::{self, RateLimiter};
 
@@ -48,6 +48,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/streams/{id}", delete(handle_stream_delete))
         .route("/api/v1/streams/{id}/stats", get(handle_stream_stats))
+        .route(
+            "/api/v1/streams/{id}/players",
+            get(handle_stream_players_list).post(handle_stream_player_create),
+        )
+        .route(
+            "/api/v1/streams/{id}/players/{player_id}",
+            delete(handle_stream_player_delete),
+        )
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit::middleware,
@@ -177,6 +185,62 @@ fn is_valid_stream_key_part(value: &str) -> bool {
 
 fn is_valid_display_name(value: &str) -> bool {
     !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn viewer_to_json(v: &StreamViewer) -> Value {
+    json!({
+        "id": v.id,
+        "name": v.name,
+        "play_key": v.play_key,
+        "enabled": v.enabled,
+        "created_at": v.created_at,
+    })
+}
+
+fn stream_to_json(db: &Db, s: &Stream) -> Value {
+    let players: Vec<Value> = db
+        .viewer_list(&s.id)
+        .iter()
+        .map(|v| viewer_to_json(v))
+        .collect();
+    json!({
+        "id": s.id,
+        "name": s.name,
+        "app": s.app,
+        "publish_key": s.publish_key,
+        "play_key": s.play_key,
+        "stats_key": s.stats_key,
+        "players": players,
+        "enabled": s.enabled,
+        "created_at": s.created_at,
+    })
+}
+
+fn create_viewer_row(
+    stream_id: &str,
+    name: &str,
+    play_key: &str,
+    created_at: i64,
+) -> Result<StreamViewer, Response> {
+    let viewer_id = match keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::log_error!("viewer id generation failed: {e}");
+            return Err(err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Key generation failed",
+            ));
+        }
+    };
+    Ok(StreamViewer {
+        id: viewer_id,
+        stream_id: stream_id.to_string(),
+        name: name.to_string(),
+        play_key: play_key.to_string(),
+        enabled: true,
+        created_at,
+    })
 }
 
 // ---------- JSON stats builder ----------
@@ -415,19 +479,8 @@ async fn handle_streams_list(State(state): State<Arc<AppState>>, headers: Header
     let list: Vec<Value> = state
         .db
         .stream_list()
-        .into_iter()
-        .map(|s| {
-            json!({
-                "id": s.id,
-                "name": s.name,
-                "app": s.app,
-                "publish_key": s.publish_key,
-                "play_key": s.play_key,
-                "stats_key": s.stats_key,
-                "enabled": s.enabled,
-                "created_at": s.created_at,
-            })
-        })
+        .iter()
+        .map(|s| stream_to_json(&state.db, s))
         .collect();
     Json(list).into_response()
 }
@@ -556,16 +609,7 @@ async fn handle_stream_create(
 
     (
         StatusCode::CREATED,
-        Json(json!({
-            "id": s.id,
-            "name": s.name,
-            "app": s.app,
-            "publish_key": s.publish_key,
-            "play_key": s.play_key,
-            "stats_key": s.stats_key,
-            "enabled": true,
-            "created_at": s.created_at,
-        })),
+        Json(stream_to_json(&state.db, &s)),
     )
         .into_response()
 }
@@ -582,6 +626,9 @@ async fn handle_stream_delete(
             "Missing or invalid token",
         );
     }
+    if !is_valid_stream_key_part(&id) {
+        return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
+    }
     match state.db.stream_delete(&id) {
         Some(true) => {
             crate::log_info!("Stream deleted: {id}");
@@ -595,6 +642,139 @@ async fn handle_stream_delete(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "Failed to delete stream",
+        ),
+    }
+}
+
+async fn handle_stream_players_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    if !is_valid_stream_key_part(&id) {
+        return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
+    }
+    if state.db.stream_get(&id).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+    }
+    let list: Vec<Value> = state
+        .db
+        .viewer_list(&id)
+        .iter()
+        .map(|v| viewer_to_json(v))
+        .collect();
+    Json(list).into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct CreatePlayerRequest {
+    name: Option<String>,
+}
+
+async fn handle_stream_player_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<CreatePlayerRequest>>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    if !is_valid_stream_key_part(&id) {
+        return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
+    }
+    let Some(stream) = state.db.stream_get(&id) else {
+        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+    };
+
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let slot = state.db.viewer_list(&id).len() + 1;
+    let name = req
+        .name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("Player {slot}"));
+    if !is_valid_display_name(&name) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Name must be 1-128 characters and must not contain control characters",
+        );
+    }
+
+    let play_key = match keygen_stream_key(crate::keygen::PREFIX_PLAY_KEY) {
+        Ok(k) => k,
+        Err(e) => {
+            crate::log_error!("play key generation failed: {e}");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Key generation failed",
+            );
+        }
+    };
+    let viewer = match create_viewer_row(&stream.id, &name, &play_key, now_ts()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if !state.db.viewer_add(&viewer) {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Failed to create play key",
+        );
+    }
+
+    crate::log_info!("Play key created: stream={} name={}", stream.id, viewer.name);
+    (StatusCode::CREATED, Json(viewer_to_json(&viewer))).into_response()
+}
+
+async fn handle_stream_player_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, player_id)): Path<(String, String)>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    if !is_valid_stream_key_part(&id) {
+        return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
+    }
+    if state.db.stream_get(&id).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+    }
+    if state.db.viewer_get(&id, &player_id).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found");
+    }
+    if state.db.viewer_list(&id).len() <= 1 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Cannot delete the last play key for a stream",
+        );
+    }
+    match state.db.viewer_delete(&id, &player_id) {
+        Some(true) => Json(json!({"status": "deleted"})).into_response(),
+        Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found"),
+        None => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Failed to delete play key",
         ),
     }
 }
