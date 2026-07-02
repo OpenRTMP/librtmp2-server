@@ -68,12 +68,24 @@ struct ConnState {
     pub stream_id: String,
     /// Comma-separated allowed codec list from the stream row.
     pub allowed_codecs: String,
-    /// Timestamp of the last stats flush to the DB.
-    last_stats_at: Option<Instant>,
+    /// Timestamp of the last publisher stats flush to the DB.
+    publisher_last_stats_at: Option<Instant>,
+    /// Raw connection byte counter at the start of the current publisher session.
+    publisher_bytes_base: u64,
+    /// Publisher session-local bytes snapshot at the last stats flush.
+    publisher_bytes_at_last_stats: u64,
+    /// Rebase the next publisher stats update after replacing publisher state.
+    publisher_stats_reset_pending: bool,
+    /// Timestamp of the last player stats flush to the DB.
+    player_last_stats_at: Option<Instant>,
+    /// Raw connection byte counter at the start of the current player session.
+    player_bytes_base: u64,
+    /// Player session-local bytes snapshot at the last stats flush.
+    player_bytes_at_last_stats: u64,
+    /// Rebase the next player stats update after replacing player state.
+    player_stats_reset_pending: bool,
     /// Timestamp of the last RTT flush to the DB.
     last_rtt_at: Option<Instant>,
-    /// bytes_received snapshot at the last stats flush.
-    bytes_at_last_stats: u64,
 }
 
 /// DB-backed [`RtmpEventHandler`]. Each connection's role(s) and DB row(s)
@@ -150,15 +162,37 @@ impl DbRtmpBridge {
         };
 
         let now = Instant::now();
+        if cs.publisher_stats_reset_pending {
+            cs.publisher_stats_reset_pending = false;
+            cs.publisher_bytes_base = media_bytes_received;
+            cs.publisher_bytes_at_last_stats = 0;
+            cs.publisher_last_stats_at = Some(now);
+
+            pub_row.bytes_in = 0;
+            pub_row.bitrate_kbps = 0.0;
+            if !video_codec.is_empty() {
+                pub_row.video_codec = video_codec.to_string();
+            }
+            if !audio_codec.is_empty() {
+                pub_row.audio_codec = audio_codec.to_string();
+            }
+
+            let pub_id = pub_row.id.clone();
+            let pub_row_clone = pub_row.clone();
+            drop(guard);
+            self.db.publisher_update(&pub_id, &pub_row_clone);
+            return;
+        }
+
         let elapsed_secs = cs
-            .last_stats_at
+            .publisher_last_stats_at
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
-
-        let bytes_delta = media_bytes_received.saturating_sub(cs.bytes_at_last_stats);
+        let session_bytes = media_bytes_received.saturating_sub(cs.publisher_bytes_base);
+        let bytes_delta = session_bytes.saturating_sub(cs.publisher_bytes_at_last_stats);
 
         // Only flush to DB if at least 1 second has passed (rate-limit writes).
-        if elapsed_secs < 1.0 && cs.last_stats_at.is_some() {
+        if elapsed_secs < 1.0 && cs.publisher_last_stats_at.is_some() {
             return;
         }
 
@@ -168,7 +202,7 @@ impl DbRtmpBridge {
             0.0
         };
 
-        pub_row.bytes_in = media_bytes_received;
+        pub_row.bytes_in = session_bytes;
         pub_row.bitrate_kbps = bitrate_kbps;
         if !video_codec.is_empty() {
             pub_row.video_codec = video_codec.to_string();
@@ -177,8 +211,8 @@ impl DbRtmpBridge {
             pub_row.audio_codec = audio_codec.to_string();
         }
 
-        cs.last_stats_at = Some(now);
-        cs.bytes_at_last_stats = media_bytes_received;
+        cs.publisher_last_stats_at = Some(now);
+        cs.publisher_bytes_at_last_stats = session_bytes;
 
         // Clone the row to release the lock before the DB call.
         let pub_id = pub_row.id.clone();
@@ -199,13 +233,30 @@ impl DbRtmpBridge {
         };
 
         let now = Instant::now();
+        if cs.player_stats_reset_pending {
+            cs.player_stats_reset_pending = false;
+            cs.player_bytes_base = media_bytes_sent;
+            cs.player_bytes_at_last_stats = 0;
+            cs.player_last_stats_at = Some(now);
+
+            player_row.bytes_out = 0;
+            player_row.bitrate_kbps = 0.0;
+
+            let player_id = player_row.id.clone();
+            let row = player_row.clone();
+            drop(guard);
+            self.db.player_update(&player_id, &row);
+            return;
+        }
+
         let elapsed_secs = cs
-            .last_stats_at
+            .player_last_stats_at
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
-        let bytes_delta = media_bytes_sent.saturating_sub(cs.bytes_at_last_stats);
+        let session_bytes = media_bytes_sent.saturating_sub(cs.player_bytes_base);
+        let bytes_delta = session_bytes.saturating_sub(cs.player_bytes_at_last_stats);
 
-        if elapsed_secs < 1.0 && cs.last_stats_at.is_some() {
+        if elapsed_secs < 1.0 && cs.player_last_stats_at.is_some() {
             return;
         }
 
@@ -215,10 +266,10 @@ impl DbRtmpBridge {
             0.0
         };
 
-        player_row.bytes_out = media_bytes_sent;
+        player_row.bytes_out = session_bytes;
         player_row.bitrate_kbps = bitrate_kbps;
-        cs.last_stats_at = Some(now);
-        cs.bytes_at_last_stats = media_bytes_sent;
+        cs.player_last_stats_at = Some(now);
+        cs.player_bytes_at_last_stats = session_bytes;
 
         let player_id = player_row.id.clone();
         let row = player_row.clone();
@@ -270,10 +321,10 @@ impl DbRtmpBridge {
 
 impl RtmpEventHandler for DbRtmpBridge {
     fn on_connect(&self, conn: ConnId) {
-        self.conns
-            .lock()
-            .unwrap()
-            .insert(conn, ConnState::default());
+        // Use entry(...).or_default() so a publish/play callback that already ran
+        // during the same poll() tick keeps its ConnState — insert() would wipe
+        // an authorized publisher/player and leave a ghost active row in the DB.
+        self.conns.lock().unwrap().entry(conn).or_default();
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
@@ -309,7 +360,53 @@ impl RtmpEventHandler for DbRtmpBridge {
             connected_at: crate::db::now_ts(),
             ..Default::default()
         };
+
+        // A connection may issue publish more than once (stream switch). Temporarily
+        // release the prior row only after the new request is otherwise valid, then
+        // restore it if the new publisher slot cannot be acquired.
+        let old_pub = {
+            let mut guard = self.conns.lock().unwrap();
+            guard.get_mut(&conn).and_then(|cs| cs.publisher.take())
+        };
+        let replacing_publisher = old_pub.is_some();
+        let old_pub = if let Some(mut old_pub) = old_pub {
+            old_pub.active = false;
+            let old_id = old_pub.id.clone();
+            if !self.db.publisher_update(&old_id, &old_pub) {
+                crate::log_warn!(
+                    "RTMP: publish rejected — failed to deactivate prior publisher row"
+                );
+                old_pub.active = true;
+                self.conns
+                    .lock()
+                    .unwrap()
+                    .entry(conn)
+                    .or_default()
+                    .publisher = Some(old_pub);
+                return Err(());
+            }
+            Some(old_pub)
+        } else {
+            None
+        };
+
         if !self.db.publisher_try_acquire(&pub_row) {
+            if let Some(mut old_pub) = old_pub {
+                old_pub.active = true;
+                let old_id = old_pub.id.clone();
+                if self.db.publisher_update(&old_id, &old_pub) {
+                    self.conns
+                        .lock()
+                        .unwrap()
+                        .entry(conn)
+                        .or_default()
+                        .publisher = Some(old_pub);
+                } else {
+                    crate::log_error!(
+                        "RTMP: publish rollback failed — prior publisher row remains inactive"
+                    );
+                }
+            }
             crate::log_warn!(
                 "RTMP: publish rejected — stream '{}' already has an active publisher",
                 stream.id
@@ -325,6 +422,11 @@ impl RtmpEventHandler for DbRtmpBridge {
         cs.publisher = Some(pub_row);
         cs.stream_id = stream_id;
         cs.allowed_codecs = allowed_codecs;
+        if replacing_publisher {
+            cs.publisher_last_stats_at = None;
+            cs.publisher_bytes_at_last_stats = 0;
+            cs.publisher_stats_reset_pending = true;
+        }
 
         crate::log_info!(
             "RTMP: publish authorized stream='{}' publisher session={}",
@@ -373,12 +475,47 @@ impl RtmpEventHandler for DbRtmpBridge {
 
         let player_id = player_row.id.clone();
         let stream_id = stream.id.clone();
-        let mut guard = self.conns.lock().unwrap();
-        let cs = guard.entry(conn).or_default();
-        cs.player = Some(player_row);
-        // Store stream_id for player connections too (used for deletion signalling).
-        if cs.stream_id.is_empty() {
-            cs.stream_id = stream_id;
+        let old_player = {
+            let mut guard = self.conns.lock().unwrap();
+            let cs = guard.entry(conn).or_default();
+            let old_player = cs.player.take();
+            cs.player = Some(player_row);
+            // Store stream_id for player-only connections too (used for deletion signalling).
+            if cs.publisher.is_none() || cs.stream_id.is_empty() {
+                cs.stream_id = stream_id;
+            }
+            old_player
+        };
+        let replacing_player = old_player.is_some();
+
+        if let Some(mut old_player) = old_player {
+            old_player.active = false;
+            let old_id = old_player.id.clone();
+            if !self.db.player_update(&old_id, &old_player) {
+                crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
+                if !self.db.player_remove(&player_id) {
+                    crate::log_error!(
+                        "RTMP: failed to remove replacement player row after switch rollback"
+                    );
+                }
+                old_player.active = true;
+                let old_stream_id = old_player.stream_id.clone();
+                let mut guard = self.conns.lock().unwrap();
+                let cs = guard.entry(conn).or_default();
+                cs.player = Some(old_player);
+                if cs.publisher.is_none() {
+                    cs.stream_id = old_stream_id;
+                }
+                return Err(());
+            }
+        }
+
+        if replacing_player {
+            let mut guard = self.conns.lock().unwrap();
+            let cs = guard.entry(conn).or_default();
+            cs.player_last_stats_at = None;
+            cs.player_bytes_at_last_stats = 0;
+            cs.player_stats_reset_pending = true;
         }
 
         crate::log_info!(
@@ -612,6 +749,110 @@ mod tests {
             codec: "mp4a".to_string(),
         };
         assert!(bridge.on_frame(1, &frame));
+    }
+
+    #[test]
+    fn on_connect_preserves_prior_authorize_publish_state() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        // publish callback can run during poll() before the poll-loop on_connect.
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
+        bridge.on_connect(1);
+
+        assert!(bridge.has_publisher(1));
+        assert_eq!(db.publisher_list(Some("s1")).len(), 1);
+    }
+
+    #[test]
+    fn authorize_publish_switching_streams_deactivates_prior_publisher() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k2").is_ok());
+
+        assert_eq!(db.publisher_list(Some("s1")).len(), 0);
+        assert_eq!(db.publisher_list(Some("s2")).len(), 1);
+    }
+
+    #[test]
+    fn authorize_publish_failed_switch_keeps_prior_publisher_active() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        bridge.on_connect(2);
+        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
+        assert!(bridge.authorize_publish(2, "live", "pub_k2").is_ok());
+
+        assert!(bridge.authorize_publish(1, "live", "pub_k2").is_err());
+
+        assert!(bridge.has_publisher(1));
+        assert_eq!(db.publisher_list(Some("s1")).len(), 1);
+        assert_eq!(db.publisher_list(Some("s2")).len(), 1);
+    }
+
+    #[test]
+    fn on_play_switching_streams_deactivates_prior_player() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_play(1, "live", "pl_k1").is_ok());
+        assert!(bridge.on_play(1, "live", "pl_k2").is_ok());
+
+        assert_eq!(db.player_list(Some("s1")).len(), 0);
+        assert_eq!(db.player_list(Some("s2")).len(), 1);
+
+        let guard = bridge.conns.lock().unwrap();
+        assert_eq!(guard.get(&1).unwrap().stream_id.as_str(), "s2");
+    }
+
+    #[test]
+    fn player_replacement_stats_reset_is_not_consumed_by_publisher_stats() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
+        assert!(bridge.on_play(1, "live", "pl_k1").is_ok());
+        bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a");
+        bridge.update_player_stats(1, 2_000);
+
+        assert!(bridge.on_play(1, "live", "pl_k2").is_ok());
+        bridge.update_publisher_stats(1, 1_500, "avc1", "mp4a");
+
+        {
+            let guard = bridge.conns.lock().unwrap();
+            let cs = guard.get(&1).unwrap();
+            assert!(!cs.publisher_stats_reset_pending);
+            assert!(cs.player_stats_reset_pending);
+        }
+
+        bridge.update_player_stats(1, 2_500);
+        let players = db.player_list(Some("s2"));
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].bytes_out, 0);
     }
 
     #[test]
