@@ -624,11 +624,7 @@ async fn handle_stream_delete(
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
     if state.deleted_streams.lock().contains(&id) {
-        return err_json(
-            StatusCode::CONFLICT,
-            "CONFLICT",
-            "Stream is being deleted",
-        );
+        return err_json(StatusCode::CONFLICT, "CONFLICT", "Stream is being deleted");
     }
     match state.db.stream_get(&id) {
         DbLookup::Missing => {
@@ -654,8 +650,7 @@ async fn handle_stream_delete(
         );
     }
 
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
         if std::time::Instant::now() >= deadline {
             let _ = state.db.stream_set_enabled(&id, true);

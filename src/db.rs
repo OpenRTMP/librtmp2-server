@@ -262,15 +262,14 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
-        let stale = conn.execute("UPDATE publishers SET active=0 WHERE active=1", [])
+        let stale = conn
+            .execute("UPDATE publishers SET active=0 WHERE active=1", [])
             .unwrap_or(0)
             + conn
                 .execute("UPDATE players SET active=0 WHERE active=1", [])
                 .unwrap_or(0);
         if stale > 0 {
-            crate::log_info!(
-                "Cleared {stale} stale active publisher/player row(s) from prior run"
-            );
+            crate::log_info!("Cleared {stale} stale active publisher/player row(s) from prior run");
         }
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
