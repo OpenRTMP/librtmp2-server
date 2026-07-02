@@ -270,10 +270,14 @@ impl DbRtmpBridge {
 
 impl RtmpEventHandler for DbRtmpBridge {
     fn on_connect(&self, conn: ConnId) {
+        // Use or_insert so a publish/play callback that already ran during the same
+        // poll() tick (before this hook) keeps its ConnState — insert() would wipe
+        // an authorized publisher/player and leave a ghost active row in the DB.
         self.conns
             .lock()
             .unwrap()
-            .insert(conn, ConnState::default());
+            .entry(conn)
+            .or_insert_with(ConnState::default);
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
@@ -290,6 +294,19 @@ impl RtmpEventHandler for DbRtmpBridge {
                 stream.app
             );
             return Err(());
+        }
+
+        // A connection may issue publish more than once (stream switch). Release any
+        // prior publisher row so we do not leave active=true ghosts in the DB.
+        {
+            let mut guard = self.conns.lock().unwrap();
+            if let Some(mut old_pub) = guard.get_mut(&conn).and_then(|cs| cs.publisher.take()) {
+                old_pub.active = false;
+                let old_id = old_pub.id.clone();
+                let old_row = old_pub;
+                drop(guard);
+                self.db.publisher_update(&old_id, &old_row);
+            }
         }
 
         let pub_id = match keygen::keygen_stream_key(PREFIX_PUBLISH_KEY) {
@@ -347,6 +364,18 @@ impl RtmpEventHandler for DbRtmpBridge {
                 stream.app
             );
             return Err(());
+        }
+
+        // Same connection may play a different stream; deactivate the prior row.
+        {
+            let mut guard = self.conns.lock().unwrap();
+            if let Some(mut old_player) = guard.get_mut(&conn).and_then(|cs| cs.player.take()) {
+                old_player.active = false;
+                let old_id = old_player.id.clone();
+                let old_row = old_player;
+                drop(guard);
+                self.db.player_update(&old_id, &old_row);
+            }
         }
 
         let player_id = match keygen::keygen_stream_key(PREFIX_PLAY_KEY) {
@@ -612,6 +641,55 @@ mod tests {
             codec: "mp4a".to_string(),
         };
         assert!(bridge.on_frame(1, &frame));
+    }
+
+    #[test]
+    fn on_connect_preserves_prior_authorize_publish_state() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        // publish callback can run during poll() before the poll-loop on_connect.
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
+        bridge.on_connect(1);
+
+        assert!(bridge.has_publisher(1));
+        assert_eq!(db.publisher_list(Some("s1")).len(), 1);
+    }
+
+    #[test]
+    fn authorize_publish_switching_streams_deactivates_prior_publisher() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
+        assert!(bridge.authorize_publish(1, "live", "pub_k2").is_ok());
+
+        assert_eq!(db.publisher_list(Some("s1")).len(), 0);
+        assert_eq!(db.publisher_list(Some("s2")).len(), 1);
+    }
+
+    #[test]
+    fn on_play_switching_streams_deactivates_prior_player() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        assert!(bridge.on_play(1, "live", "pl_k1").is_ok());
+        assert!(bridge.on_play(1, "live", "pl_k2").is_ok());
+
+        assert_eq!(db.player_list(Some("s1")).len(), 0);
+        assert_eq!(db.player_list(Some("s2")).len(), 1);
     }
 
     #[test]

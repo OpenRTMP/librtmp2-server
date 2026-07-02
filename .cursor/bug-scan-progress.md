@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: server (2026-07-01)
+Last scanned: rtmp_bridge (2026-07-02)
 
 ## Modules
 
@@ -8,9 +8,19 @@ Last scanned: server (2026-07-01)
 - [x] db — SQLite persistence, stream/publisher/player CRUD
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
-- [ ] rtmp_bridge — RTMP protocol ↔ DB integration seam
+- [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [ ] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-07-02 rtmp_bridge pass)
+
+- **Critical (fixed):** `on_connect()` used `HashMap::insert`, wiping ConnState when
+  `authorize_publish()` had already run during the same `poll()` tick (fast handshake +
+  publish). Legitimate publishers were rejected as unauthorized; the DB kept an active
+  publisher row with no in-memory owner (ghost slot blocking re-publish).
+- **Critical (fixed):** `authorize_publish()` / `on_play()` overwrote per-connection
+  session rows without deactivating the prior DB row when a client switched streams on the
+  same TCP connection, leaving ghost active publishers/players.
 
 ## Findings (2026-07-01 server pass)
 
