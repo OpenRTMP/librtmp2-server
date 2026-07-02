@@ -3,7 +3,8 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
@@ -22,10 +23,9 @@ fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
 }
 
 fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
-    let _ = conn_id;
     RTMP_BRIDGE
         .get()
-        .is_some_and(|b| b.validate_play(app, play_key))
+        .is_some_and(|b| b.authorize_play(conn_id, app, play_key).is_ok())
 }
 
 fn rtmp_media_cb(
@@ -57,6 +57,8 @@ pub struct ServerApp {
     /// Stream IDs deleted via HTTP while connections are live. The RTMP poll
     /// loop reads this set and kicks any connection whose stream_id appears.
     deleted_streams: Arc<Mutex<HashSet<String>>>,
+    /// Viewer slot IDs revoked via HTTP while player connections are live.
+    revoked_viewers: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ServerApp {
@@ -100,12 +102,14 @@ impl ServerApp {
 
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db)));
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
+        let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
 
         Ok(ServerApp {
             config,
             db,
             rtmp_bridge,
             deleted_streams,
+            revoked_viewers,
         })
     }
 
@@ -126,6 +130,7 @@ impl ServerApp {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
             deleted_streams: Arc::clone(&self.deleted_streams),
+            revoked_viewers: Arc::clone(&self.revoked_viewers),
         });
         let app = http::router(state);
 
@@ -138,11 +143,13 @@ impl ServerApp {
         // uses a blocking poll loop, so it lives outside the Tokio runtime.
         let rtmp_bind = self.config.rtmp_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
+        let rtmp_resource_limits = self.config.rtmp_resource_limits();
         let rtmp_tls_enabled = self.config.tls_enabled;
         let rtmp_tls_cert = self.config.tls_cert_file.clone();
         let rtmp_tls_key = self.config.tls_key_file.clone();
         let rtmp_bridge = Arc::clone(&self.rtmp_bridge);
         let deleted_streams = Arc::clone(&self.deleted_streams);
+        let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
         let rtmp_stop_clone = Arc::clone(&rtmp_stop);
 
@@ -194,6 +201,7 @@ impl ServerApp {
                     return;
                 }
             };
+            server.resource_limits = rtmp_resource_limits;
             server.defer_media_relay = true;
             server.on_media_cb = Some(rtmp_media_cb);
             if let Err(e) = server.listen(&rtmp_bind) {
@@ -227,7 +235,9 @@ impl ServerApp {
 
                 // Snapshot deleted stream IDs once per poll cycle.
                 let deleted_now: std::collections::HashSet<String> =
-                    deleted_streams.lock().unwrap().iter().cloned().collect();
+                    deleted_streams.lock().iter().cloned().collect();
+                let revoked_now: std::collections::HashSet<String> =
+                    revoked_viewers.lock().iter().cloned().collect();
 
                 for (idx, conn) in server.connections.iter_mut().enumerate() {
                     if conn.client_fd < 0 {
@@ -262,25 +272,21 @@ impl ServerApp {
                     }
 
                     if stream.is_playing && !entry.playing {
-                        crate::log_info!("RTMP: play request from {}", conn.remote_addr);
-                        match rtmp_bridge.on_play(conn_id, &conn.app, &stream.name) {
-                            Ok(()) => {
-                                entry.playing = true;
-                                if entry.stream_id.is_empty() {
-                                    entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
-                                }
-                                conn.relay_key = entry.stream_id.clone();
-                                conn.relay_enabled = true;
-                            }
-                            Err(()) => {
-                                crate::log_warn!(
-                                    "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
-                                    conn.app
-                                );
-                                reject_indices.push(idx);
-                                continue;
-                            }
+                        if !rtmp_bridge.has_player(conn_id) {
+                            crate::log_warn!(
+                                "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
+                                conn.app
+                            );
+                            reject_indices.push(idx);
+                            continue;
                         }
+                        crate::log_info!("RTMP: player connected from {}", conn.remote_addr);
+                        entry.playing = true;
+                        if entry.stream_id.is_empty() {
+                            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+                        }
+                        conn.relay_key = entry.stream_id.clone();
+                        conn.relay_enabled = true;
                     }
 
                     // Kick connections whose stream was deleted.
@@ -288,6 +294,15 @@ impl ServerApp {
                         crate::log_info!(
                             "RTMP: kicking conn={conn_id} — stream '{}' was deleted",
                             entry.stream_id
+                        );
+                        reject_indices.push(idx);
+                        continue;
+                    }
+
+                    let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
+                    if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
+                        crate::log_info!(
+                            "RTMP: kicking conn={conn_id} — play key '{viewer_id}' was revoked"
                         );
                         reject_indices.push(idx);
                         continue;
@@ -367,8 +382,17 @@ impl ServerApp {
                     .collect();
                 deleted_streams
                     .lock()
-                    .unwrap()
                     .retain(|id| live_stream_ids.contains(id));
+
+                let live_viewer_ids: std::collections::HashSet<String> = tracked
+                    .keys()
+                    .copied()
+                    .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
+                    .filter(|viewer_id| !viewer_id.is_empty())
+                    .collect();
+                revoked_viewers
+                    .lock()
+                    .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
             }
 
             // Notify the bridge about connections that never got an explicit close event.

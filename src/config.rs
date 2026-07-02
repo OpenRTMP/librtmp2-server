@@ -1,10 +1,19 @@
 //! `.env`-style configuration file parsing.
 
+use std::net::IpAddr;
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// RTMP listener, e.g. "0.0.0.0:1935"
     pub rtmp_bind: String,
     pub rtmp_max_conn: i32,
+
+    /// Per-connection reassembly buffer cap (megabytes).
+    pub rtmp_max_reassembly_mb: u32,
+    /// Server-wide stream codec cache cap (megabytes).
+    pub rtmp_max_cache_mb: u32,
+    /// Per-publisher relay queue cap (megabytes).
+    pub rtmp_max_relay_queue_mb: u32,
 
     /// RTMPS (TLS) — off by default.
     pub tls_enabled: bool,
@@ -13,6 +22,8 @@ pub struct ServerConfig {
 
     /// HTTP API + UI, e.g. "0.0.0.0:8080"
     pub http_bind: String,
+    /// When the TCP peer is one of these addresses, use `X-Forwarded-For` for rate limiting.
+    pub http_trusted_proxies: Vec<IpAddr>,
 
     /// Populated at startup from the database, never from the config file.
     pub api_token: String,
@@ -30,16 +41,73 @@ impl Default for ServerConfig {
         ServerConfig {
             rtmp_bind: "0.0.0.0:1935".to_string(),
             rtmp_max_conn: 100,
+            rtmp_max_reassembly_mb: 32,
+            rtmp_max_cache_mb: 64,
+            rtmp_max_relay_queue_mb: 8,
             tls_enabled: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             http_bind: "0.0.0.0:8080".to_string(),
+            http_trusted_proxies: Vec::new(),
             api_token: String::new(),
             config_file: String::new(),
             log_level: 2,
             log_file: String::new(),
         }
     }
+}
+
+impl ServerConfig {
+    /// Memory limits passed into the librtmp2 server instance.
+    pub fn rtmp_resource_limits(&self) -> librtmp2::ResourceLimits {
+        librtmp2::ResourceLimits {
+            max_stream_cache_bytes: mb_to_bytes(self.rtmp_max_cache_mb),
+            max_reassembly_bytes: mb_to_bytes(self.rtmp_max_reassembly_mb),
+            max_pending_relay_bytes: mb_to_bytes(self.rtmp_max_relay_queue_mb),
+        }
+    }
+}
+
+fn mb_to_bytes(mb: u32) -> usize {
+    (mb as usize).saturating_mul(1024 * 1024)
+}
+
+fn clamp_u32(val: u32, min: u32, max: u32) -> u32 {
+    val.clamp(min, max)
+}
+
+fn parse_mb(val: &str, default: u32, min: u32, max: u32, key: &str) -> u32 {
+    match val.parse::<u32>() {
+        Ok(v) => clamp_u32(v, min, max),
+        Err(_) => {
+            eprintln!("Config: ignoring invalid {key} value '{val}'");
+            default
+        }
+    }
+}
+
+fn parse_max_connections(val: &str) -> i32 {
+    match val.parse::<i32>() {
+        Ok(v) => v.clamp(1, 10_000),
+        Err(_) => {
+            eprintln!("Config: ignoring invalid RTMP_MAX_CONNECTIONS value '{val}'");
+            100
+        }
+    }
+}
+
+fn parse_ip_list(val: &str) -> Vec<IpAddr> {
+    val.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| match part.parse::<IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => {
+                eprintln!("Config: ignoring invalid HTTP_TRUSTED_PROXIES entry '{part}'");
+                None
+            }
+        })
+        .collect()
 }
 
 /// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
@@ -71,10 +139,16 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
 fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
     match key {
         "RTMP_BIND" => config.rtmp_bind = val.to_string(),
-        "RTMP_MAX_CONNECTIONS" => match val.parse::<i32>() {
-            Ok(v) => config.rtmp_max_conn = v,
-            Err(_) => eprintln!("Config: ignoring invalid RTMP_MAX_CONNECTIONS value '{val}'"),
-        },
+        "RTMP_MAX_CONNECTIONS" => config.rtmp_max_conn = parse_max_connections(val),
+        "RTMP_MAX_REASSEMBLY_MB" => {
+            config.rtmp_max_reassembly_mb = parse_mb(val, 32, 1, 256, key);
+        }
+        "RTMP_MAX_CACHE_MB" => {
+            config.rtmp_max_cache_mb = parse_mb(val, 64, 1, 512, key);
+        }
+        "RTMP_MAX_RELAY_QUEUE_MB" => {
+            config.rtmp_max_relay_queue_mb = parse_mb(val, 8, 1, 128, key);
+        }
         "TLS_ENABLED" => match val {
             "1" | "true" => config.tls_enabled = true,
             "0" | "false" => config.tls_enabled = false,
@@ -85,6 +159,7 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
         "TLS_KEY_FILE" => config.tls_key_file = val.to_string(),
         "HTTP_BIND" => config.http_bind = val.to_string(),
+        "HTTP_TRUSTED_PROXIES" => config.http_trusted_proxies = parse_ip_list(val),
         "LOG_LEVEL" => match val.parse::<i32>() {
             Ok(v) if (0..=3).contains(&v) => config.log_level = v,
             _ => eprintln!("Config: ignoring invalid LOG_LEVEL value '{val}' (expected 0-3)"),
@@ -141,6 +216,31 @@ where
         config.http_bind = v;
     }
 
+    if let Some(v) = get("LRTMP2_RTMP_MAX_CONNECTIONS")
+        && !v.is_empty()
+    {
+        config.rtmp_max_conn = parse_max_connections(&v);
+    }
+
+    if let Some(v) = get("LRTMP2_RTMP_MAX_REASSEMBLY_MB")
+        && !v.is_empty()
+    {
+        config.rtmp_max_reassembly_mb = parse_mb(&v, 32, 1, 256, "LRTMP2_RTMP_MAX_REASSEMBLY_MB");
+    }
+
+    if let Some(v) = get("LRTMP2_RTMP_MAX_CACHE_MB")
+        && !v.is_empty()
+    {
+        config.rtmp_max_cache_mb = parse_mb(&v, 64, 1, 512, "LRTMP2_RTMP_MAX_CACHE_MB");
+    }
+
+    if let Some(v) = get("LRTMP2_RTMP_MAX_RELAY_QUEUE_MB")
+        && !v.is_empty()
+    {
+        config.rtmp_max_relay_queue_mb =
+            parse_mb(&v, 8, 1, 128, "LRTMP2_RTMP_MAX_RELAY_QUEUE_MB");
+    }
+
     if let Some(v) = get("LRTMP2_TLS_ENABLED")
         && !v.is_empty()
     {
@@ -165,6 +265,12 @@ where
         config.tls_key_file = v;
     }
 
+    if let Some(v) = get("LRTMP2_HTTP_TRUSTED_PROXIES")
+        && !v.is_empty()
+    {
+        config.http_trusted_proxies = parse_ip_list(&v);
+    }
+
     if let Some(v) = get("LRTMP2_LOG_LEVEL") {
         match v.parse::<i32>() {
             Ok(lvl) if (0..=3).contains(&lvl) => config.log_level = lvl,
@@ -184,10 +290,14 @@ mod tests {
         assert_eq!(config.rtmp_bind, "0.0.0.0:1935");
         assert_eq!(config.http_bind, "0.0.0.0:8080");
         assert_eq!(config.rtmp_max_conn, 100);
+        assert_eq!(config.rtmp_max_reassembly_mb, 32);
+        assert_eq!(config.rtmp_max_cache_mb, 64);
+        assert_eq!(config.rtmp_max_relay_queue_mb, 8);
         assert_eq!(config.log_level, 2);
         assert!(!config.tls_enabled);
         assert!(config.tls_cert_file.is_empty());
         assert!(config.tls_key_file.is_empty());
+        assert!(config.http_trusted_proxies.is_empty());
     }
 
     #[test]
@@ -199,10 +309,14 @@ mod tests {
             "# test config\n\
              RTMP_BIND=127.0.0.1:1936\n\
              RTMP_MAX_CONNECTIONS=50\n\
+             RTMP_MAX_REASSEMBLY_MB=16\n\
+             RTMP_MAX_CACHE_MB=32\n\
+             RTMP_MAX_RELAY_QUEUE_MB=4\n\
              TLS_ENABLED=true\n\
              TLS_CERT_FILE=/etc/ssl/cert.pem\n\
              TLS_KEY_FILE=/etc/ssl/key.pem\n\
              HTTP_BIND=127.0.0.1:8081\n\
+             HTTP_TRUSTED_PROXIES=127.0.0.1,10.0.0.1\n\
              LOG_LEVEL=3\n",
         )
         .unwrap();
@@ -210,6 +324,9 @@ mod tests {
         let config = config_load(path.to_str().unwrap()).expect("config_load");
         assert_eq!(config.rtmp_bind, "127.0.0.1:1936");
         assert_eq!(config.rtmp_max_conn, 50);
+        assert_eq!(config.rtmp_max_reassembly_mb, 16);
+        assert_eq!(config.rtmp_max_cache_mb, 32);
+        assert_eq!(config.rtmp_max_relay_queue_mb, 4);
         assert_eq!(config.http_bind, "127.0.0.1:8081");
         assert!(
             config.api_token.is_empty(),
@@ -219,6 +336,7 @@ mod tests {
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/etc/ssl/cert.pem");
         assert_eq!(config.tls_key_file, "/etc/ssl/key.pem");
+        assert_eq!(config.http_trusted_proxies.len(), 2);
     }
 
     #[test]
@@ -291,5 +409,11 @@ mod tests {
             config.tls_enabled,
             "invalid value should leave TLS unchanged"
         );
+    }
+
+    #[test]
+    fn max_connections_are_clamped() {
+        assert_eq!(parse_max_connections("0"), 1);
+        assert_eq!(parse_max_connections("99999"), 10_000);
     }
 }

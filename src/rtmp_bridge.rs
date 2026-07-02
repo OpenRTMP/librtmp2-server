@@ -14,7 +14,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::db::{Db, Player, Publisher};
@@ -41,15 +42,16 @@ pub struct FrameInfo {
 }
 
 /// Callback contract used by the RTMP server integration. Mirrors librtmp2's
-/// `on_connect` / `on_publish` / `on_play` / `on_frame` / `on_close` hook shape.
+/// `on_connect` / `on_publish` / `authorize_play` / `on_frame` / `on_close` hook shape.
 pub trait RtmpEventHandler: Send + Sync {
     /// Called immediately after a new TCP connection is accepted.
     fn on_connect(&self, conn: ConnId);
     /// Atomically authorize a publish (DB slot + per-connection state).
     /// Called from the RTMP publish callback before media relay is enabled.
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
-    /// Return `Err` to reject the play request (invalid play_key).
-    fn on_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
+    /// Atomically authorize a play (DB slot + per-connection state).
+    /// Called from the RTMP play callback before `Play.Start` is sent.
+    fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
     /// Optional per-frame hook for debug logging; always accepts media.
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool;
     /// Called when the connection is closed (cleanly or by error).
@@ -106,31 +108,33 @@ impl DbRtmpBridge {
     pub fn stream_id_for_conn(&self, conn: ConnId) -> String {
         self.conns
             .lock()
-            .unwrap()
             .get(&conn)
             .map(|s| s.stream_id.clone())
             .unwrap_or_default()
     }
 
-    /// Validate a play request before the RTMP layer sends `Play.Start`.
-    pub fn validate_play(&self, app: &str, play_key: &str) -> bool {
-        let Some(viewer) = self.db.viewer_find_by_play_key(play_key) else {
-            return false;
-        };
-        let Some(stream) = self.db.stream_get(&viewer.stream_id) else {
-            return false;
-        };
-        if !stream.enabled || stream.app != app {
-            return false;
-        }
-        self.db.viewer_active_count(&viewer.id) < crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
+    /// Configured viewer slot id for an active player connection.
+    pub fn viewer_id_for_conn(&self, conn: ConnId) -> String {
+        self.conns
+            .lock()
+            .get(&conn)
+            .map(|s| s.viewer_id.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether this connection already owns an authorized player slot.
+    pub fn has_player(&self, conn: ConnId) -> bool {
+        self.conns
+            .lock()
+            .get(&conn)
+            .map(|s| s.player.is_some())
+            .unwrap_or(false)
     }
 
     /// Whether this connection already owns an authorized publisher slot.
     pub fn has_publisher(&self, conn: ConnId) -> bool {
         self.conns
             .lock()
-            .unwrap()
             .get(&conn)
             .map(|s| s.publisher.is_some())
             .unwrap_or(false)
@@ -145,7 +149,7 @@ impl DbRtmpBridge {
         video_codec: &str,
         audio_codec: &str,
     ) {
-        let mut guard = self.conns.lock().unwrap();
+        let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
             return;
         };
@@ -216,7 +220,7 @@ impl DbRtmpBridge {
 
     /// Update player stats (media bytes_out, bitrate) in the DB.
     pub fn update_player_stats(&self, conn: ConnId, media_bytes_sent: u64) {
-        let mut guard = self.conns.lock().unwrap();
+        let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
             return;
         };
@@ -276,7 +280,7 @@ impl DbRtmpBridge {
             return;
         }
 
-        let mut guard = self.conns.lock().unwrap();
+        let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
             return;
         };
@@ -316,7 +320,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         // Use entry(...).or_default() so a publish/play callback that already ran
         // during the same poll() tick keeps its ConnState — insert() would wipe
         // an authorized publisher/player and leave a ghost active row in the DB.
-        self.conns.lock().unwrap().entry(conn).or_default();
+        self.conns.lock().entry(conn).or_default();
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
@@ -357,7 +361,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         // release the prior row only after the new request is otherwise valid, then
         // restore it if the new publisher slot cannot be acquired.
         let old_pub = {
-            let mut guard = self.conns.lock().unwrap();
+            let mut guard = self.conns.lock();
             guard.get_mut(&conn).and_then(|cs| cs.publisher.take())
         };
         let replacing_publisher = old_pub.is_some();
@@ -369,12 +373,7 @@ impl RtmpEventHandler for DbRtmpBridge {
                     "RTMP: publish rejected — failed to deactivate prior publisher row"
                 );
                 old_pub.active = true;
-                self.conns
-                    .lock()
-                    .unwrap()
-                    .entry(conn)
-                    .or_default()
-                    .publisher = Some(old_pub);
+                self.conns.lock().entry(conn).or_default().publisher = Some(old_pub);
                 return Err(());
             }
             Some(old_pub)
@@ -389,7 +388,6 @@ impl RtmpEventHandler for DbRtmpBridge {
                 if self.db.publisher_update(&old_id, &old_pub) {
                     self.conns
                         .lock()
-                        .unwrap()
                         .entry(conn)
                         .or_default()
                         .publisher = Some(old_pub);
@@ -408,7 +406,7 @@ impl RtmpEventHandler for DbRtmpBridge {
 
         let stream_id = stream.id.clone();
 
-        let mut guard = self.conns.lock().unwrap();
+        let mut guard = self.conns.lock();
         let cs = guard.entry(conn).or_default();
         cs.publisher = Some(pub_row);
         cs.stream_id = stream_id;
@@ -426,7 +424,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         Ok(())
     }
 
-    fn on_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
+    fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
 
         let Some(viewer) = self.db.viewer_find_by_play_key(stream_key) else {
@@ -469,7 +467,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         };
 
         let mut old_player = {
-            let mut guard = self.conns.lock().unwrap();
+            let mut guard = self.conns.lock();
             guard.get_mut(&conn).and_then(|cs| cs.player.take())
         };
         if let Some(ref mut prior) = old_player {
@@ -478,7 +476,7 @@ impl RtmpEventHandler for DbRtmpBridge {
             if !self.db.player_update(&prior_id, prior) {
                 crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
                 prior.active = true;
-                self.conns.lock().unwrap().entry(conn).or_default().player = old_player;
+                self.conns.lock().entry(conn).or_default().player = old_player;
                 return Err(());
             }
         }
@@ -490,7 +488,7 @@ impl RtmpEventHandler for DbRtmpBridge {
                 let prior_viewer_id = prior.viewer_id.clone();
                 let prior_stream_id = prior.stream_id.clone();
                 if self.db.player_update(&prior_id, &prior) {
-                    let mut guard = self.conns.lock().unwrap();
+                    let mut guard = self.conns.lock();
                     let cs = guard.entry(conn).or_default();
                     cs.player = Some(prior);
                     cs.viewer_id = prior_viewer_id;
@@ -512,7 +510,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         let replacing_player = old_player.is_some();
 
         {
-            let mut guard = self.conns.lock().unwrap();
+            let mut guard = self.conns.lock();
             let cs = guard.entry(conn).or_default();
             cs.player = Some(player_row);
             cs.viewer_id = viewer_id;
@@ -553,7 +551,7 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn on_close(&self, conn: ConnId) {
-        let cs = self.conns.lock().unwrap().remove(&conn);
+        let cs = self.conns.lock().remove(&conn);
         let Some(cs) = cs else {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");
             return;
@@ -629,7 +627,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_play(1, "other", "pl_k").is_err());
+        assert!(bridge.authorize_play(1, "other", "pl_k").is_err());
         assert_eq!(db.player_list(Some("s1")).len(), 0);
     }
 
@@ -733,13 +731,13 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_play(1, "live", "pl_k1").is_ok());
-        assert!(bridge.on_play(1, "live", "pl_k2").is_ok());
+        assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
+        assert!(bridge.authorize_play(1, "live", "pl_k2").is_ok());
 
         assert_eq!(db.player_list(Some("s1")).len(), 0);
         assert_eq!(db.player_list(Some("s2")).len(), 1);
 
-        let guard = bridge.conns.lock().unwrap();
+        let guard = bridge.conns.lock();
         assert_eq!(guard.get(&1).unwrap().stream_id.as_str(), "s2");
     }
 
@@ -752,15 +750,15 @@ mod tests {
 
         bridge.on_connect(1);
         assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
-        assert!(bridge.on_play(1, "live", "pl_k1").is_ok());
+        assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
         bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a");
         bridge.update_player_stats(1, 2_000);
 
-        assert!(bridge.on_play(1, "live", "pl_k2").is_ok());
+        assert!(bridge.authorize_play(1, "live", "pl_k2").is_ok());
         bridge.update_publisher_stats(1, 1_500, "avc1", "mp4a");
 
         {
-            let guard = bridge.conns.lock().unwrap();
+            let guard = bridge.conns.lock();
             let cs = guard.get(&1).unwrap();
             assert!(!cs.publisher_stats_reset_pending);
             assert!(cs.player_stats_reset_pending);
@@ -779,7 +777,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(Arc::clone(&db));
 
         bridge.on_connect(1);
-        assert!(bridge.on_play(1, "live", "pl_k").is_ok());
+        assert!(bridge.authorize_play(1, "live", "pl_k").is_ok());
         bridge.update_player_stats(1, 4096);
 
         let players = db.player_list(Some("s1"));
@@ -796,11 +794,11 @@ mod tests {
 
         for conn in 1..=crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64 {
             bridge.on_connect(conn);
-            assert!(bridge.on_play(conn, "live", "pl_k").is_ok());
+            assert!(bridge.authorize_play(conn, "live", "pl_k").is_ok());
         }
 
         bridge.on_connect(99);
-        assert!(bridge.on_play(99, "live", "pl_k").is_err());
+        assert!(bridge.authorize_play(99, "live", "pl_k").is_err());
         assert_eq!(
             db.viewer_active_count(&viewer.id),
             crate::db::MAX_CONNECTIONS_PER_PLAY_KEY

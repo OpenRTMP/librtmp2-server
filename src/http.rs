@@ -19,7 +19,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
@@ -33,11 +34,13 @@ pub struct AppState {
     /// Stream IDs deleted via this API while RTMP connections are active.
     /// The RTMP poll loop reads this set and evicts matching connections.
     pub deleted_streams: Arc<Mutex<HashSet<String>>>,
+    /// Viewer slot IDs revoked via HTTP while RTMP player sessions are active.
+    pub revoked_viewers: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Build the Axum router, wiring all HTTP handlers to the shared application state.
 pub fn router(state: Arc<AppState>) -> Router {
-    let limiter = RateLimiter::new();
+    let limiter = RateLimiter::new(state.config.http_trusted_proxies.clone());
     Router::new()
         .route("/api/v1/health", get(handle_health))
         .route("/stats", get(handle_stats_json))
@@ -616,7 +619,7 @@ async fn handle_stream_delete(
             crate::log_info!("Stream deleted: {id}");
             // Signal the RTMP poll loop to evict any active connections for
             // this stream. The set is drained once no connections remain.
-            state.deleted_streams.lock().unwrap().insert(id);
+            state.deleted_streams.lock().insert(id);
             Json(json!({"status": "deleted"})).into_response()
         }
         Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found"),
@@ -758,8 +761,12 @@ async fn handle_stream_player_delete(
             "Cannot delete the last play key for a stream",
         );
     }
+    state.revoked_viewers.lock().insert(player_id.clone());
     match state.db.viewer_delete(&id, &player_id) {
-        Some(true) => Json(json!({"status": "deleted"})).into_response(),
+        Some(true) => {
+            state.db.players_deactivate_for_viewer(&player_id);
+            Json(json!({"status": "deleted"})).into_response()
+        }
         Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found"),
         None => err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -810,6 +817,7 @@ mod tests {
             db: Arc::new(Db::open(":memory:").unwrap()),
             config,
             deleted_streams: Arc::new(Mutex::new(HashSet::new())),
+            revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 

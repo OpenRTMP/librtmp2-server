@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -21,21 +21,21 @@ pub fn init(level: i32, file_path: &str) {
     LEVEL.store(level.clamp(0, 3) as u8, Ordering::Relaxed);
     if !file_path.is_empty() {
         match OpenOptions::new().create(true).append(true).open(file_path) {
-            Ok(f) => *FILE.lock().unwrap() = Some(f),
+            Ok(f) => *FILE.lock() = Some(f),
             Err(e) => eprintln!("WARN  failed to open log file '{file_path}': {e}"),
         }
     }
 }
 
 pub fn close() {
-    *FILE.lock().unwrap() = None;
+    *FILE.lock() = None;
 }
 
 fn write_line(prefix: &str, msg: &str) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let safe_msg = msg.replace('\r', "\\r").replace('\n', "\\n");
     let line = format!("[{now}] {prefix} {safe_msg}\n");
-    let mut guard = FILE.lock().unwrap();
+    let mut guard = FILE.lock();
     if let Some(f) = guard.as_mut() {
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();

@@ -7,7 +7,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Db {
@@ -256,7 +256,7 @@ impl Db {
     /// yet. Returns `Err` on a real database read failure so callers can
     /// distinguish "not found" from "broken DB".
     pub fn token_get(&self) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT val FROM settings WHERE key='api_token'",
             [],
@@ -273,7 +273,7 @@ impl Db {
     /// token was already present (the caller should re-read with [`token_get`]
     /// to get the winner's value).
     pub fn token_set(&self, token: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let rows = conn
             .execute(
                 "INSERT INTO settings(key,val) VALUES('api_token',?) \
@@ -295,7 +295,7 @@ impl Db {
                 return Err(StreamAddError::Db);
             }
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -371,7 +371,7 @@ impl Db {
         "id,name,app,publish_key,play_key,stats_key,enabled,created_at";
 
     pub fn stream_get(&self, id: &str) -> Option<Stream> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             &format!("SELECT {} FROM streams WHERE id=?", Self::STREAM_COLS),
             params![id],
@@ -383,7 +383,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn stream_get_by_app(&self, app: &str, stream_name: &str) -> Option<Stream> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             &format!(
                 "SELECT {} FROM streams WHERE app=? AND name=?",
@@ -401,7 +401,7 @@ impl Db {
             crate::log_error!("stream_find_by: rejected disallowed column '{column}'");
             return None;
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             &format!(
                 "SELECT {} FROM streams WHERE {column}=? AND enabled=1",
@@ -424,7 +424,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn stream_update(&self, id: &str, s: &Stream) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE streams SET name=?,app=?,publish_key=?,play_key=?,stats_key=?,enabled=? WHERE id=?",
             params![s.name, s.app, s.publish_key, s.play_key, s.stats_key, s.enabled, id],
@@ -437,7 +437,7 @@ impl Db {
     ///
     /// Returns `Some(true)` = deleted, `Some(false)` = not found, `None` = DB error.
     pub fn stream_delete(&self, id: &str) -> Option<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -470,7 +470,7 @@ impl Db {
     }
 
     pub fn stream_list(&self) -> Vec<Stream> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = match conn.prepare(&format!(
             "SELECT {} FROM streams ORDER BY created_at",
             Self::STREAM_COLS
@@ -502,7 +502,7 @@ impl Db {
     const VIEWER_COLS: &'static str = "id,stream_id,name,play_key,enabled,created_at";
 
     pub fn viewer_add(&self, v: &StreamViewer) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
              VALUES (?,?,?,?,?,?)",
@@ -519,7 +519,7 @@ impl Db {
     }
 
     pub fn viewer_list(&self, stream_id: &str) -> Vec<StreamViewer> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = match conn.prepare(&format!(
             "SELECT {} FROM stream_viewers WHERE stream_id=? ORDER BY created_at",
             Self::VIEWER_COLS
@@ -536,7 +536,7 @@ impl Db {
     }
 
     pub fn viewer_find_by_play_key(&self, key: &str) -> Option<StreamViewer> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             &format!(
                 "SELECT {} FROM stream_viewers WHERE play_key=? AND enabled=1",
@@ -550,7 +550,7 @@ impl Db {
     }
 
     pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> Option<StreamViewer> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             &format!(
                 "SELECT {} FROM stream_viewers WHERE stream_id=? AND id=?",
@@ -564,7 +564,7 @@ impl Db {
     }
 
     pub fn viewer_active_count(&self, viewer_id: &str) -> usize {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1",
             params![viewer_id],
@@ -576,7 +576,7 @@ impl Db {
 
     /// Returns `Some(true)` if deleted, `Some(false)` if not found, `None` on DB error.
     pub fn viewer_delete(&self, stream_id: &str, viewer_id: &str) -> Option<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         match conn.execute(
             "DELETE FROM stream_viewers WHERE stream_id=? AND id=?",
             params![stream_id, viewer_id],
@@ -589,6 +589,16 @@ impl Db {
         }
     }
 
+    /// Mark active player sessions for a revoked viewer slot inactive.
+    pub fn players_deactivate_for_viewer(&self, viewer_id: &str) -> bool {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE players SET active=0 WHERE viewer_id=? AND active=1",
+            params![viewer_id],
+        )
+        .is_ok()
+    }
+
     /// Atomically insert an active publisher only when the stream has none.
     pub fn publisher_try_acquire(&self, p: &Publisher) -> bool {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
@@ -598,7 +608,7 @@ impl Db {
             );
             return false;
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -649,7 +659,7 @@ impl Db {
             crate::log_error!("publisher_update: bytes_in {} overflows i64", p.bytes_in);
             return false;
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE publishers SET stream_id=?,app=?,stream_name=?,\
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
@@ -675,7 +685,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn publisher_remove(&self, id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM publishers WHERE id=?", params![id])
             .is_ok()
     }
@@ -708,7 +718,7 @@ impl Db {
     const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,rtt_ms,connected_at,active";
 
     pub fn publisher_list(&self, stream_id: Option<&str>) -> Vec<Publisher> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         match stream_id {
             Some(sid) => {
                 let mut stmt = match conn.prepare(&format!(
@@ -762,7 +772,7 @@ impl Db {
             );
             return false;
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -814,7 +824,7 @@ impl Db {
             crate::log_error!("player_update: bytes_out {} overflows i64", p.bytes_out);
             return false;
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE players SET stream_id=?,viewer_id=?,app=?,stream_name=?,\
              bytes_out=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
@@ -835,7 +845,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn player_remove(&self, id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM players WHERE id=?", params![id])
             .is_ok()
     }
@@ -865,7 +875,7 @@ impl Db {
         "id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active";
 
     pub fn player_list(&self, stream_id: Option<&str>) -> Vec<Player> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         match stream_id {
             Some(sid) => {
                 let mut stmt = match conn.prepare(&format!(
@@ -908,7 +918,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn stat_add(&self, s: &StatSample) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO stats_samples \
              (stream_id,bitrate_in_kbps,fps,width,height,video_codec,audio_codec,player_count,ts) \
@@ -930,7 +940,7 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn stat_recent(&self, stream_id: &str, limit: i64) -> Vec<StatSample> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
             "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,audio_codec,player_count,ts \
              FROM stats_samples WHERE stream_id=? ORDER BY ts DESC LIMIT ?",
