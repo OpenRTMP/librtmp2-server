@@ -36,10 +36,12 @@ pub fn close() {
 /// from an unauthenticated peer) cannot forge fake log lines or inject
 /// terminal escape sequences into a log file tailed/cat'd to a terminal.
 fn sanitize_for_log(msg: &str) -> String {
+    use std::fmt::Write;
+
     let mut out = String::with_capacity(msg.len());
     for c in msg.chars() {
         if c.is_control() {
-            out.push_str(&format!("\\x{:02x}", c as u32));
+            let _ = write!(out, "\\x{:02x}", c as u32);
         } else {
             out.push(c);
         }
