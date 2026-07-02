@@ -24,13 +24,15 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
-use crate::db::{Db, Stream, StreamAddError, StreamViewer};
+use crate::db::{Db, DbLookup, Stream, StreamAddError, StreamViewer};
 use crate::keygen::keygen_stream_key;
 use crate::rate_limit::{self, RateLimiter};
+use crate::rtmp_bridge::DbRtmpBridge;
 
 pub struct AppState {
     pub db: Arc<Db>,
     pub config: ServerConfig,
+    pub rtmp_bridge: Arc<DbRtmpBridge>,
     /// Stream IDs deleted via this API while RTMP connections are active.
     /// The RTMP poll loop reads this set and evicts matching connections.
     pub deleted_streams: Arc<Mutex<HashSet<String>>>,
@@ -163,8 +165,8 @@ fn stats_key_ok(state: &AppState, key: &str, stream_id: Option<&str>) -> bool {
         return false;
     }
     match state.db.stream_find_by_stats_key(key) {
-        Some(s) => stream_id.is_none_or(|id| s.id == id),
-        None => false,
+        DbLookup::Ok(s) => stream_id.is_none_or(|id| s.id == id),
+        DbLookup::Missing | DbLookup::Failed => false,
     }
 }
 
@@ -434,7 +436,7 @@ async fn handle_stats_json(
     if q.key.is_empty() {
         return public_stats_text(StatusCode::UNAUTHORIZED, "stats_key required");
     }
-    let Some(s) = state.db.stream_find_by_stats_key(&q.key) else {
+    let DbLookup::Ok(s) = state.db.stream_find_by_stats_key(&q.key) else {
         return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     };
     match build_public_json_stats(&state.db, &s.id) {
@@ -450,7 +452,7 @@ async fn handle_stats_nginx(
     if q.key.is_empty() {
         return err_xml(StatusCode::UNAUTHORIZED, "Missing stats key");
     }
-    let Some(s) = state.db.stream_find_by_stats_key(&q.key) else {
+    let DbLookup::Ok(s) = state.db.stream_find_by_stats_key(&q.key) else {
         return err_xml(StatusCode::FORBIDDEN, "Invalid stats key");
     };
     xml_response(StatusCode::OK, build_nginx_xml(&state.db, Some(&s.id)))
@@ -534,6 +536,13 @@ async fn handle_stream_create(
             "Name must be 1-128 characters and must not contain control characters",
         );
     }
+    if state.deleted_streams.lock().contains(&id) {
+        return err_json(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "Stream is being deleted; try again shortly",
+        );
+    }
 
     // Cryptographically unpredictable keys — never derive from stream id/time.
     let publish_key = match keygen_stream_key(crate::keygen::PREFIX_PUBLISH_KEY) {
@@ -614,20 +623,72 @@ async fn handle_stream_delete(
     if !is_valid_stream_key_part(&id) {
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
+    if state.deleted_streams.lock().contains(&id) {
+        return err_json(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "Stream is being deleted",
+        );
+    }
+    match state.db.stream_get(&id) {
+        DbLookup::Missing => {
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        }
+        DbLookup::Failed => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to load stream",
+            );
+        }
+        DbLookup::Ok(_) => {}
+    }
+
+    state.deleted_streams.lock().insert(id.clone());
+    if state.db.stream_disable(&id).is_none() {
+        state.deleted_streams.lock().remove(&id);
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Failed to disable stream",
+        );
+    }
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
+        if std::time::Instant::now() >= deadline {
+            let _ = state.db.stream_set_enabled(&id, true);
+            state.deleted_streams.lock().remove(&id);
+            return err_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+                "Timed out waiting for active RTMP sessions to close",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     match state.db.stream_delete(&id) {
         Some(true) => {
             crate::log_info!("Stream deleted: {id}");
-            // Signal the RTMP poll loop to evict any active connections for
-            // this stream. The set is drained once no connections remain.
-            state.deleted_streams.lock().insert(id);
+            state.deleted_streams.lock().remove(&id);
             Json(json!({"status": "deleted"})).into_response()
         }
-        Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found"),
-        None => err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            "Failed to delete stream",
-        ),
+        Some(false) => {
+            let _ = state.db.stream_set_enabled(&id, true);
+            state.deleted_streams.lock().remove(&id);
+            err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found")
+        }
+        None => {
+            let _ = state.db.stream_set_enabled(&id, true);
+            state.deleted_streams.lock().remove(&id);
+            err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to delete stream",
+            )
+        }
     }
 }
 
@@ -646,8 +707,18 @@ async fn handle_stream_players_list(
     if !is_valid_stream_key_part(&id) {
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
-    if state.db.stream_get(&id).is_none() {
-        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+    match state.db.stream_get(&id) {
+        DbLookup::Missing => {
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        }
+        DbLookup::Failed => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to load stream",
+            );
+        }
+        DbLookup::Ok(_) => {}
     }
     let list: Vec<Value> = state
         .db
@@ -679,8 +750,18 @@ async fn handle_stream_player_create(
     if !is_valid_stream_key_part(&id) {
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
-    let Some(stream) = state.db.stream_get(&id) else {
-        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+    let stream = match state.db.stream_get(&id) {
+        DbLookup::Ok(s) => s,
+        DbLookup::Missing => {
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        }
+        DbLookup::Failed => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to load stream",
+            );
+        }
     };
 
     let req = body.map(|Json(r)| r).unwrap_or_default();
@@ -748,11 +829,31 @@ async fn handle_stream_player_delete(
     if !is_valid_stream_key_part(&id) {
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
-    if state.db.stream_get(&id).is_none() {
-        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+    match state.db.stream_get(&id) {
+        DbLookup::Missing => {
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        }
+        DbLookup::Failed => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to load stream",
+            );
+        }
+        DbLookup::Ok(_) => {}
     }
-    if state.db.viewer_get(&id, &player_id).is_none() {
-        return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found");
+    match state.db.viewer_get(&id, &player_id) {
+        DbLookup::Missing => {
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found");
+        }
+        DbLookup::Failed => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to load player",
+            );
+        }
+        DbLookup::Ok(_) => {}
     }
     if state.db.viewer_list(&id).len() <= 1 {
         return err_json(
@@ -783,14 +884,26 @@ async fn handle_stream_stats(
     Query(q): Query<KeyQuery>,
 ) -> Response {
     let bearer = bearer_ok(&state, &headers);
-    if state.db.stream_get(&id).is_none() {
+    if !is_valid_stream_key_part(&id) {
         if bearer {
-            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+            return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
         }
-        return public_stats_text(StatusCode::NOT_FOUND, "Stream not found");
+        return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     }
     if bearer {
-        return Json(build_json_stats(&state.db, Some(&id))).into_response();
+        match state.db.stream_get(&id) {
+            DbLookup::Ok(_) => return Json(build_json_stats(&state.db, Some(&id))).into_response(),
+            DbLookup::Missing => {
+                return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+            }
+            DbLookup::Failed => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "Failed to load stream",
+                );
+            }
+        }
     }
     if !stats_key_ok(&state, &q.key, Some(&id)) {
         return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
@@ -813,10 +926,17 @@ mod tests {
             api_token: api_token.to_string(),
             ..Default::default()
         };
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
+        let rtmp_bridge = Arc::new(DbRtmpBridge::new(
+            Arc::clone(&db),
+            Arc::clone(&deleted_streams),
+        ));
         Arc::new(AppState {
-            db: Arc::new(Db::open(":memory:").unwrap()),
+            db,
             config,
-            deleted_streams: Arc::new(Mutex::new(HashSet::new())),
+            rtmp_bridge,
+            deleted_streams,
             revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
         })
     }

@@ -10,6 +10,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Cap tracked client keys so a scan with many spoofed IPs cannot exhaust RAM.
+const MAX_TRACKED_KEYS: usize = 10_000;
+
 #[derive(Clone)]
 pub struct RateLimiter {
     inner: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
@@ -29,12 +32,18 @@ impl RateLimiter {
     fn check(&self, key: &str, max_requests: usize) -> bool {
         let now = Instant::now();
         let mut guard = self.inner.lock();
-        let entries = guard.entry(key.to_string()).or_default();
-        entries.retain(|t| now.duration_since(*t) < self.window);
-        if entries.len() >= max_requests {
+        if !guard.contains_key(key) && guard.len() >= MAX_TRACKED_KEYS {
             return false;
         }
-        entries.push(now);
+        {
+            let entries = guard.entry(key.to_string()).or_default();
+            entries.retain(|t| now.duration_since(*t) < self.window);
+            if entries.len() >= max_requests {
+                return false;
+            }
+            entries.push(now);
+        }
+        guard.retain(|_, v| !v.is_empty());
         true
     }
 }

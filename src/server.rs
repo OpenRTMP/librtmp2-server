@@ -100,9 +100,13 @@ impl ServerApp {
             }
         };
 
-        let rtmp_bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db)));
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
+
+        let rtmp_bridge = Arc::new(DbRtmpBridge::new(
+            Arc::clone(&db),
+            Arc::clone(&deleted_streams),
+        ));
 
         Ok(ServerApp {
             config,
@@ -129,6 +133,7 @@ impl ServerApp {
         let state = Arc::new(AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
+            rtmp_bridge: Arc::clone(&self.rtmp_bridge),
             deleted_streams: Arc::clone(&self.deleted_streams),
             revoked_viewers: Arc::clone(&self.revoked_viewers),
         });

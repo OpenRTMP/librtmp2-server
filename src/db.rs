@@ -97,6 +97,25 @@ pub enum StreamAddError {
     Db,
 }
 
+/// Result of a single-row lookup: found, not found, or a real DB error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbLookup<T> {
+    Ok(T),
+    Missing,
+    Failed,
+}
+
+fn map_optional<T>(result: rusqlite::Result<T>) -> DbLookup<T> {
+    match result.optional() {
+        Ok(Some(v)) => DbLookup::Ok(v),
+        Ok(None) => DbLookup::Missing,
+        Err(e) => {
+            crate::log_error!("DB query error: {e}");
+            DbLookup::Failed
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub fn now_ts() -> i64 {
     SystemTime::now()
@@ -243,6 +262,16 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        let stale = conn.execute("UPDATE publishers SET active=0 WHERE active=1", [])
+            .unwrap_or(0)
+            + conn
+                .execute("UPDATE players SET active=0 WHERE active=1", [])
+                .unwrap_or(0);
+        if stale > 0 {
+            crate::log_info!(
+                "Cleared {stale} stale active publisher/player row(s) from prior run"
+            );
+        }
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
@@ -370,56 +399,75 @@ impl Db {
     const STREAM_COLS: &'static str =
         "id,name,app,publish_key,play_key,stats_key,enabled,created_at";
 
-    pub fn stream_get(&self, id: &str) -> Option<Stream> {
+    pub fn stream_get(&self, id: &str) -> DbLookup<Stream> {
         let conn = self.conn.lock();
-        conn.query_row(
+        map_optional(conn.query_row(
             &format!("SELECT {} FROM streams WHERE id=?", Self::STREAM_COLS),
             params![id],
             Self::load_stream_row,
-        )
-        .optional()
-        .unwrap_or(None)
+        ))
     }
 
     #[allow(dead_code)]
-    pub fn stream_get_by_app(&self, app: &str, stream_name: &str) -> Option<Stream> {
+    pub fn stream_get_by_app(&self, app: &str, stream_name: &str) -> DbLookup<Stream> {
         let conn = self.conn.lock();
-        conn.query_row(
+        map_optional(conn.query_row(
             &format!(
                 "SELECT {} FROM streams WHERE app=? AND name=?",
                 Self::STREAM_COLS
             ),
             params![app, stream_name],
             Self::load_stream_row,
-        )
-        .optional()
-        .unwrap_or(None)
+        ))
     }
 
-    fn stream_find_by(&self, column: &str, key: &str) -> Option<Stream> {
+    fn stream_find_by(&self, column: &str, key: &str) -> DbLookup<Stream> {
         if !matches!(column, "publish_key" | "stats_key") {
             crate::log_error!("stream_find_by: rejected disallowed column '{column}'");
-            return None;
+            return DbLookup::Failed;
         }
         let conn = self.conn.lock();
-        conn.query_row(
+        map_optional(conn.query_row(
             &format!(
                 "SELECT {} FROM streams WHERE {column}=? AND enabled=1",
                 Self::STREAM_COLS
             ),
             params![key],
             Self::load_stream_row,
-        )
-        .optional()
-        .unwrap_or(None)
+        ))
     }
 
-    pub fn stream_find_by_publish_key(&self, key: &str) -> Option<Stream> {
+    pub fn stream_find_by_publish_key(&self, key: &str) -> DbLookup<Stream> {
         self.stream_find_by("publish_key", key)
     }
 
-    pub fn stream_find_by_stats_key(&self, key: &str) -> Option<Stream> {
+    pub fn stream_find_by_stats_key(&self, key: &str) -> DbLookup<Stream> {
         self.stream_find_by("stats_key", key)
+    }
+
+    /// Disable a stream so new publish/play attempts are rejected while RTMP
+    /// sessions drain. Returns `Some(true)` if updated, `Some(false)` if not
+    /// found, `None` on DB error.
+    pub fn stream_disable(&self, id: &str) -> Option<bool> {
+        let conn = self.conn.lock();
+        match conn.execute("UPDATE streams SET enabled=0 WHERE id=?", params![id]) {
+            Ok(rows) => Some(rows > 0),
+            Err(e) => {
+                crate::log_error!("stream_disable error for {id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Re-enable a stream after a failed delete rollback.
+    pub fn stream_set_enabled(&self, id: &str, enabled: bool) -> bool {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE streams SET enabled=? WHERE id=?",
+            params![enabled, id],
+        )
+        .map(|rows| rows > 0)
+        .unwrap_or(false)
     }
 
     #[allow(dead_code)]
@@ -535,32 +583,28 @@ impl Db {
             .unwrap_or_default()
     }
 
-    pub fn viewer_find_by_play_key(&self, key: &str) -> Option<StreamViewer> {
+    pub fn viewer_find_by_play_key(&self, key: &str) -> DbLookup<StreamViewer> {
         let conn = self.conn.lock();
-        conn.query_row(
+        map_optional(conn.query_row(
             &format!(
                 "SELECT {} FROM stream_viewers WHERE play_key=? AND enabled=1",
                 Self::VIEWER_COLS
             ),
             params![key],
             Self::load_viewer_row,
-        )
-        .optional()
-        .unwrap_or(None)
+        ))
     }
 
-    pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> Option<StreamViewer> {
+    pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> DbLookup<StreamViewer> {
         let conn = self.conn.lock();
-        conn.query_row(
+        map_optional(conn.query_row(
             &format!(
                 "SELECT {} FROM stream_viewers WHERE stream_id=? AND id=?",
                 Self::VIEWER_COLS
             ),
             params![stream_id, viewer_id],
             Self::load_viewer_row,
-        )
-        .optional()
-        .unwrap_or(None)
+        ))
     }
 
     /// Returns `Some(true)` if deleted, `Some(false)` if not found, `None` on DB error.
@@ -649,7 +693,7 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
-        conn.execute(
+        match conn.execute(
             "UPDATE publishers SET stream_id=?,app=?,stream_name=?,\
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
              bytes_in=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
@@ -668,8 +712,17 @@ impl Db {
                 p.active,
                 id
             ],
-        )
-        .is_ok()
+        ) {
+            Ok(rows) if rows > 0 => true,
+            Ok(_) => {
+                crate::log_warn!("publisher_update: no row updated for id={id}");
+                false
+            }
+            Err(e) => {
+                crate::log_error!("publisher_update error for {id}: {e}");
+                false
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -814,7 +867,7 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
-        conn.execute(
+        match conn.execute(
             "UPDATE players SET stream_id=?,viewer_id=?,app=?,stream_name=?,\
              bytes_out=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
             params![
@@ -828,8 +881,17 @@ impl Db {
                 p.active,
                 id
             ],
-        )
-        .is_ok()
+        ) {
+            Ok(rows) if rows > 0 => true,
+            Ok(_) => {
+                crate::log_warn!("player_update: no row updated for id={id}");
+                false
+            }
+            Err(e) => {
+                crate::log_error!("player_update error for {id}: {e}");
+                false
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1027,16 +1089,30 @@ mod tests {
         assert!(db.stream_add(&s).is_ok());
         assert_eq!(db.stream_add(&s), Err(StreamAddError::Duplicate));
 
-        let got = db.stream_get("stream1").expect("not found");
+        let DbLookup::Ok(got) = db.stream_get("stream1") else {
+            panic!("stream not found");
+        };
         assert_eq!(got.name, "stream1 name");
 
         assert_eq!(
-            db.stream_find_by_publish_key("pub_key_123").unwrap().id,
+            match db.stream_find_by_publish_key("pub_key_123") {
+                DbLookup::Ok(s) => s.id,
+                _ => panic!("publish key lookup failed"),
+            },
             "stream1"
         );
-        assert!(db.viewer_find_by_play_key("pl_key_456").is_some());
-        assert!(db.stream_find_by_stats_key("st_key_789").is_some());
-        assert!(db.stream_find_by_stats_key("wrong_key").is_none());
+        assert!(matches!(
+            db.viewer_find_by_play_key("pl_key_456"),
+            DbLookup::Ok(_)
+        ));
+        assert!(matches!(
+            db.stream_find_by_stats_key("st_key_789"),
+            DbLookup::Ok(_)
+        ));
+        assert!(matches!(
+            db.stream_find_by_stats_key("wrong_key"),
+            DbLookup::Missing
+        ));
 
         assert_eq!(db.stream_list().len(), 1);
     }
@@ -1071,7 +1147,9 @@ mod tests {
         assert!(db.publisher_try_acquire(&p));
         assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
 
-        let viewer = db.viewer_find_by_play_key("pl_key_456").unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key("pl_key_456") else {
+            panic!("viewer not found");
+        };
         let player = Player {
             id: "pl1".to_string(),
             stream_id: "stream1".to_string(),
@@ -1128,7 +1206,7 @@ mod tests {
 
         assert!(matches!(db.stream_delete("cascade"), Some(true)));
         assert_eq!(db.publisher_list(Some("cascade")).len(), 0);
-        assert!(db.stream_get("cascade").is_none());
+        assert!(matches!(db.stream_get("cascade"), DbLookup::Missing));
     }
 
     #[test]
@@ -1138,7 +1216,9 @@ mod tests {
         db.stream_add(&sample_stream(&long_id, "pub_long", "pl_long", "st_long"))
             .unwrap();
 
-        let got = db.stream_get(&long_id).expect("not found");
+        let DbLookup::Ok(got) = db.stream_get(&long_id) else {
+            panic!("long id stream not found");
+        };
         assert_eq!(got.id.len(), 63);
         assert_eq!(got.id, long_id);
     }
@@ -1182,7 +1262,9 @@ mod tests {
         });
 
         // Simulate on_close for pub1: find by publish_key -> stream_id -> list.
-        let found = db.stream_find_by_publish_key("pub_key_1").unwrap();
+        let DbLookup::Ok(found) = db.stream_find_by_publish_key("pub_key_1") else {
+            panic!("publish key not found");
+        };
         let mut pubs = db.publisher_list(Some(&found.id));
         assert_eq!(pubs.len(), 1);
         assert_eq!(pubs[0].id, "pub_1000_abc");
@@ -1208,7 +1290,9 @@ mod tests {
             "st_key_789",
         ))
         .unwrap();
-        let viewer = db.viewer_find_by_play_key("pl_key_456").unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key("pl_key_456") else {
+            panic!("viewer not found");
+        };
 
         for i in 0..MAX_CONNECTIONS_PER_PLAY_KEY {
             let player = Player {
