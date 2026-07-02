@@ -520,7 +520,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "librtmp2"
 version = "0.1.0"
-source = "git+https://github.com/OpenRTMP/librtmp2.git?branch=main#fbc551cccb9b36f3df41f396d848941f24774887"
+source = "git+https://github.com/OpenRTMP/librtmp2.git?branch=main#8bbc19bd90955b8bfe9fc7b200ff8a55ae6ece54"
 dependencies = [
  "cc",
  "libc",
@@ -537,6 +537,7 @@ dependencies = [
  "chrono",
  "clap",
  "librtmp2",
+ "parking_lot",
  "rand",
  "rusqlite",
  "serde",
