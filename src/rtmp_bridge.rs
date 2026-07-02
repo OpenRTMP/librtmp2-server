@@ -9,9 +9,7 @@
 //!
 //! `src/server.rs` drives this bridge from the integrated `librtmp2` server poll
 //! loop. The current integration forwards connection lifecycle and publish/play
-//! state into this bridge, and uses codec/frame metadata for policy checks and
-//! stats updates. It does not imply that every incoming media frame is currently
-//! forwarded as a full per-frame callback.
+//! state into this bridge, and uses frame metadata for stats updates.
 
 #![allow(dead_code)]
 
@@ -52,9 +50,7 @@ pub trait RtmpEventHandler: Send + Sync {
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
     /// Return `Err` to reject the play request (invalid play_key).
     fn on_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
-    /// Validate frame/codec metadata. The current server integration uses this
-    /// for codec enforcement and does not guarantee one call per incoming media
-    /// frame.
+    /// Optional per-frame hook for debug logging; always accepts media.
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool;
     /// Called when the connection is closed (cleanly or by error).
     fn on_close(&self, conn: ConnId);
@@ -66,8 +62,6 @@ struct ConnState {
     player: Option<Player>,
     /// DB stream id for the published stream, set in on_publish.
     pub stream_id: String,
-    /// Comma-separated allowed codec list from the stream row.
-    pub allowed_codecs: String,
     /// Timestamp of the last publisher stats flush to the DB.
     publisher_last_stats_at: Option<Instant>,
     /// Raw connection byte counter at the start of the current publisher session.
@@ -113,16 +107,6 @@ impl DbRtmpBridge {
             .unwrap()
             .get(&conn)
             .map(|s| s.stream_id.clone())
-            .unwrap_or_default()
-    }
-
-    /// Return the allowed_codecs string for a publishing connection.
-    pub fn allowed_codecs_for_conn(&self, conn: ConnId) -> String {
-        self.conns
-            .lock()
-            .unwrap()
-            .get(&conn)
-            .map(|s| s.allowed_codecs.clone())
             .unwrap_or_default()
     }
 
@@ -415,13 +399,11 @@ impl RtmpEventHandler for DbRtmpBridge {
         }
 
         let stream_id = stream.id.clone();
-        let allowed_codecs = stream.allowed_codecs.clone();
 
         let mut guard = self.conns.lock().unwrap();
         let cs = guard.entry(conn).or_default();
         cs.publisher = Some(pub_row);
         cs.stream_id = stream_id;
-        cs.allowed_codecs = allowed_codecs;
         if replacing_publisher {
             cs.publisher_last_stats_at = None;
             cs.publisher_bytes_at_last_stats = 0;
@@ -526,6 +508,7 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool {
+        let _ = conn;
         match frame.kind {
             FrameKind::Video => crate::log_debug!(
                 "RTMP: VIDEO frame ts={} size={} codec={}",
@@ -540,29 +523,6 @@ impl RtmpEventHandler for DbRtmpBridge {
                 frame.codec
             ),
         }
-
-        // Enforce allowed_codecs: reject if the detected codec is not listed.
-        if !frame.codec.is_empty() {
-            let guard = self.conns.lock().unwrap();
-            if let Some(cs) = guard.get(&conn)
-                && !cs.allowed_codecs.is_empty()
-            {
-                let allowed = cs
-                    .allowed_codecs
-                    .split(',')
-                    .map(|s| s.trim())
-                    .any(|c| c.eq_ignore_ascii_case(&frame.codec));
-                if !allowed {
-                    crate::log_warn!(
-                        "RTMP: codec '{}' not in allowed list '{}' — closing conn={conn}",
-                        frame.codec,
-                        cs.allowed_codecs
-                    );
-                    return false;
-                }
-            }
-        }
-
         true
     }
 
@@ -608,7 +568,6 @@ mod tests {
             play_key: play_key.to_string(),
             stats_key: format!("st_{id}"),
             enabled: true,
-            allowed_codecs: "avc1,hvc1,av01,mp4a".to_string(),
             created_at: crate::db::now_ts(),
         }
     }
@@ -691,64 +650,6 @@ mod tests {
 
         bridge.on_connect(2);
         assert!(bridge.authorize_publish(2, "live", "pub_k").is_err());
-    }
-
-    #[test]
-    fn on_frame_rejects_disallowed_codec() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
-        let bridge = DbRtmpBridge::new(Arc::clone(&db));
-
-        bridge.on_connect(1);
-        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
-
-        // "vp9" is not in "avc1,hvc1,av01,mp4a"
-        let frame = FrameInfo {
-            kind: FrameKind::Video,
-            timestamp: 0,
-            size: 100,
-            codec: "vp9".to_string(),
-        };
-        assert!(!bridge.on_frame(1, &frame));
-    }
-
-    #[test]
-    fn on_frame_allows_listed_codec() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
-        let bridge = DbRtmpBridge::new(Arc::clone(&db));
-
-        bridge.on_connect(1);
-        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
-
-        let frame = FrameInfo {
-            kind: FrameKind::Video,
-            timestamp: 0,
-            size: 100,
-            codec: "avc1".to_string(),
-        };
-        assert!(bridge.on_frame(1, &frame));
-    }
-
-    #[test]
-    fn on_frame_allows_default_aac_audio_codec() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&sample_stream("s1", "pub_k", "pl_k"))
-            .unwrap();
-        let bridge = DbRtmpBridge::new(Arc::clone(&db));
-
-        bridge.on_connect(1);
-        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
-
-        let frame = FrameInfo {
-            kind: FrameKind::Audio,
-            timestamp: 0,
-            size: 100,
-            codec: "mp4a".to_string(),
-        };
-        assert!(bridge.on_frame(1, &frame));
     }
 
     #[test]

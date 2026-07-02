@@ -125,7 +125,6 @@ Each stream is an object:
   "stream_key": "abc123",
   "enabled": true,
   "require_auth": true,
-  "allowed_codecs": ["avc1", "hvc1", "av01"],
   "created_at": "2026-06-26T00:00:00Z"
 }
 ```
@@ -189,7 +188,6 @@ At minimum, tables/collections for:
 | stream_key | string | Publish key |
 | enabled | bool | Active/inactive |
 | require_auth | bool | Auth required |
-| allowed_codecs | json/text | Allowed codecs |
 | created_at | timestamp | Creation time |
 | updated_at | timestamp | Last updated |
 

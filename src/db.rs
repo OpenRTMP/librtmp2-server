@@ -23,7 +23,6 @@ pub struct Stream {
     pub play_key: String,
     pub stats_key: String,
     pub enabled: bool,
-    pub allowed_codecs: String,
     pub created_at: i64,
 }
 
@@ -103,7 +102,6 @@ CREATE TABLE IF NOT EXISTS streams (
   play_key TEXT UNIQUE NOT NULL,
   stats_key TEXT UNIQUE NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
-  allowed_codecs TEXT NOT NULL DEFAULT 'avc1,hvc1,av01,mp4a',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS publishers (
@@ -214,6 +212,42 @@ fn restrict_db_file_permissions(path: &str) {
     }
 }
 
+#[cfg(windows)]
+fn restrict_db_file_permissions(path: &str) {
+    use std::path::Path;
+    use std::process::Command;
+
+    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+        return;
+    }
+
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    if username.is_empty() {
+        return;
+    }
+
+    let grant = format!("{username}:(F)");
+    for candidate in [path, &format!("{path}-wal"), &format!("{path}-shm")] {
+        if !Path::new(candidate).exists() {
+            continue;
+        }
+        match Command::new("icacls")
+            .args([candidate, "/inheritance:r", "/grant:r", &grant])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                crate::log_warn!(
+                    "Could not restrict permissions on {candidate}: icacls exited with {status}"
+                );
+            }
+            Err(e) => {
+                crate::log_warn!("Could not restrict permissions on {candidate}: {e}");
+            }
+        }
+    }
+}
+
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Db> {
         let conn = Connection::open(path)?;
@@ -221,7 +255,6 @@ impl Db {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         migrate_schema(&conn);
-        #[cfg(unix)]
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
@@ -269,9 +302,9 @@ impl Db {
     pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
         let conn = self.conn.lock().unwrap();
         let rc = conn.execute(
-            "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,allowed_codecs,created_at) \
-             VALUES (?,?,?,?,?,?,?,?,?)",
-            params![s.id, s.name, s.app, s.publish_key, s.play_key, s.stats_key, s.enabled, s.allowed_codecs, s.created_at],
+            "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
+             VALUES (?,?,?,?,?,?,?,?)",
+            params![s.id, s.name, s.app, s.publish_key, s.play_key, s.stats_key, s.enabled, s.created_at],
         );
         match rc {
             Ok(_) => {
@@ -302,13 +335,12 @@ impl Db {
             play_key: row.get(4)?,
             stats_key: row.get(5)?,
             enabled: row.get(6)?,
-            allowed_codecs: row.get(7)?,
-            created_at: row.get(8)?,
+            created_at: row.get(7)?,
         })
     }
 
     const STREAM_COLS: &'static str =
-        "id,name,app,publish_key,play_key,stats_key,enabled,allowed_codecs,created_at";
+        "id,name,app,publish_key,play_key,stats_key,enabled,created_at";
 
     pub fn stream_get(&self, id: &str) -> Option<Stream> {
         let conn = self.conn.lock().unwrap();
@@ -370,8 +402,8 @@ impl Db {
     pub fn stream_update(&self, id: &str, s: &Stream) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE streams SET name=?,app=?,publish_key=?,play_key=?,stats_key=?,enabled=?,allowed_codecs=? WHERE id=?",
-            params![s.name, s.app, s.publish_key, s.play_key, s.stats_key, s.enabled, s.allowed_codecs, id],
+            "UPDATE streams SET name=?,app=?,publish_key=?,play_key=?,stats_key=?,enabled=? WHERE id=?",
+            params![s.name, s.app, s.publish_key, s.play_key, s.stats_key, s.enabled, id],
         )
         .is_ok()
     }
@@ -791,7 +823,6 @@ mod tests {
             play_key: play_key.to_string(),
             stats_key: stats_key.to_string(),
             enabled: true,
-            allowed_codecs: "avc1,hvc1,av01,mp4a".to_string(),
             created_at: now_ts(),
         }
     }

@@ -12,6 +12,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
@@ -24,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::ServerConfig;
 use crate::db::{Db, Stream, StreamAddError};
 use crate::keygen::keygen_stream_key;
+use crate::rate_limit::{self, RateLimiter};
 
 pub struct AppState {
     pub db: Arc<Db>,
@@ -35,6 +37,7 @@ pub struct AppState {
 
 /// Build the Axum router, wiring all HTTP handlers to the shared application state.
 pub fn router(state: Arc<AppState>) -> Router {
+    let limiter = RateLimiter::new();
     Router::new()
         .route("/api/v1/health", get(handle_health))
         .route("/stats", get(handle_stats_json))
@@ -45,6 +48,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/streams/{id}", delete(handle_stream_delete))
         .route("/api/v1/streams/{id}/stats", get(handle_stream_stats))
+        .layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit::middleware,
+        ))
         .with_state(state)
 }
 
@@ -170,18 +177,6 @@ fn is_valid_stream_key_part(value: &str) -> bool {
 
 fn is_valid_display_name(value: &str) -> bool {
     !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(char::is_control)
-}
-
-fn is_valid_allowed_codecs(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && value.split(',').all(|codec| {
-            !codec.is_empty()
-                && codec.len() <= 32
-                && codec
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        })
 }
 
 // ---------- JSON stats builder ----------
@@ -442,7 +437,6 @@ struct CreateStreamRequest {
     id: Option<String>,
     name: Option<String>,
     app: Option<String>,
-    allowed_codecs: Option<String>,
 }
 
 async fn handle_stream_create(
@@ -476,11 +470,6 @@ async fn handle_stream_create(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| id.clone());
-    let allowed_codecs = req
-        .allowed_codecs
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "avc1,hvc1,av01,mp4a".to_string());
 
     if !is_valid_stream_key_part(&id) {
         return err_json(
@@ -501,13 +490,6 @@ async fn handle_stream_create(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
             "Name must be 1-128 characters and must not contain control characters",
-        );
-    }
-    if !is_valid_allowed_codecs(&allowed_codecs) {
-        return err_json(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "allowed_codecs must be a comma-separated list of codec tokens",
         );
     }
 
@@ -553,7 +535,6 @@ async fn handle_stream_create(
         play_key,
         stats_key,
         enabled: true,
-        allowed_codecs,
         created_at: now_ts(),
     };
 
@@ -713,9 +694,6 @@ mod tests {
 
         assert!(is_valid_display_name("Main Stream"));
         assert!(!is_valid_display_name("bad\nname"));
-        assert!(is_valid_allowed_codecs("avc1,hvc1,av01,mp4a.40.2"));
-        assert!(!is_valid_allowed_codecs("avc1,,hvc1"));
-        assert!(!is_valid_allowed_codecs("avc1,../../oops"));
     }
 
     #[tokio::test]
@@ -801,10 +779,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        assert_eq!(
-            state.db.stream_get("mystream").unwrap().allowed_codecs,
-            "avc1,hvc1,av01,mp4a"
-        );
 
         let resp = app
             .oneshot(
@@ -832,7 +806,6 @@ mod tests {
             play_key: "play_test".to_string(),
             stats_key: "st_test".to_string(),
             enabled: true,
-            allowed_codecs: "avc1,mp4a".to_string(),
             created_at: now_ts(),
         };
         state.db.stream_add(&stream).unwrap();
@@ -882,7 +855,6 @@ mod tests {
             play_key: "play_off".to_string(),
             stats_key: "st_off".to_string(),
             enabled: true,
-            allowed_codecs: "avc1,mp4a".to_string(),
             created_at: now_ts(),
         };
         state.db.stream_add(&stream).unwrap();

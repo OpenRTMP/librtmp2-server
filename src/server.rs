@@ -387,7 +387,10 @@ impl ServerApp {
             self.config.rtmp_bind
         );
 
-        let http_result = axum::serve(http_listener, app)
+        let http_result = axum::serve(
+            http_listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| format!("HTTP server error: {e}"));

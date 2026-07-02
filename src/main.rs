@@ -3,6 +3,7 @@ mod db;
 mod http;
 mod keygen;
 mod logger;
+mod rate_limit;
 mod rtmp_bridge;
 mod server;
 
