@@ -270,14 +270,10 @@ impl DbRtmpBridge {
 
 impl RtmpEventHandler for DbRtmpBridge {
     fn on_connect(&self, conn: ConnId) {
-        // Use or_insert so a publish/play callback that already ran during the same
-        // poll() tick (before this hook) keeps its ConnState — insert() would wipe
+        // Use entry(...).or_default() so a publish/play callback that already ran
+        // during the same poll() tick keeps its ConnState — insert() would wipe
         // an authorized publisher/player and leave a ghost active row in the DB.
-        self.conns
-            .lock()
-            .unwrap()
-            .entry(conn)
-            .or_default();
+        self.conns.lock().unwrap().entry(conn).or_default();
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
@@ -294,19 +290,6 @@ impl RtmpEventHandler for DbRtmpBridge {
                 stream.app
             );
             return Err(());
-        }
-
-        // A connection may issue publish more than once (stream switch). Release any
-        // prior publisher row so we do not leave active=true ghosts in the DB.
-        {
-            let mut guard = self.conns.lock().unwrap();
-            if let Some(mut old_pub) = guard.get_mut(&conn).and_then(|cs| cs.publisher.take()) {
-                old_pub.active = false;
-                let old_id = old_pub.id.clone();
-                let old_row = old_pub;
-                drop(guard);
-                self.db.publisher_update(&old_id, &old_row);
-            }
         }
 
         let pub_id = match keygen::keygen_stream_key(PREFIX_PUBLISH_KEY) {
@@ -326,7 +309,47 @@ impl RtmpEventHandler for DbRtmpBridge {
             connected_at: crate::db::now_ts(),
             ..Default::default()
         };
+
+        // A connection may issue publish more than once (stream switch). Temporarily
+        // release the prior row only after the new request is otherwise valid, then
+        // restore it if the new publisher slot cannot be acquired.
+        let old_pub = {
+            let mut guard = self.conns.lock().unwrap();
+            guard.get_mut(&conn).and_then(|cs| cs.publisher.take())
+        };
+        let old_pub = if let Some(mut old_pub) = old_pub {
+            old_pub.active = false;
+            let old_id = old_pub.id.clone();
+            if !self.db.publisher_update(&old_id, &old_pub) {
+                crate::log_warn!(
+                    "RTMP: publish rejected — failed to deactivate prior publisher row"
+                );
+                old_pub.active = true;
+                self.conns
+                    .lock()
+                    .unwrap()
+                    .entry(conn)
+                    .or_default()
+                    .publisher = Some(old_pub);
+                return Err(());
+            }
+            Some(old_pub)
+        } else {
+            None
+        };
+
         if !self.db.publisher_try_acquire(&pub_row) {
+            if let Some(mut old_pub) = old_pub {
+                old_pub.active = true;
+                let old_id = old_pub.id.clone();
+                self.db.publisher_update(&old_id, &old_pub);
+                self.conns
+                    .lock()
+                    .unwrap()
+                    .entry(conn)
+                    .or_default()
+                    .publisher = Some(old_pub);
+            }
             crate::log_warn!(
                 "RTMP: publish rejected — stream '{}' already has an active publisher",
                 stream.id
@@ -366,18 +389,6 @@ impl RtmpEventHandler for DbRtmpBridge {
             return Err(());
         }
 
-        // Same connection may play a different stream; deactivate the prior row.
-        {
-            let mut guard = self.conns.lock().unwrap();
-            if let Some(mut old_player) = guard.get_mut(&conn).and_then(|cs| cs.player.take()) {
-                old_player.active = false;
-                let old_id = old_player.id.clone();
-                let old_row = old_player;
-                drop(guard);
-                self.db.player_update(&old_id, &old_row);
-            }
-        }
-
         let player_id = match keygen::keygen_stream_key(PREFIX_PLAY_KEY) {
             Ok(id) => id,
             Err(e) => {
@@ -402,12 +413,22 @@ impl RtmpEventHandler for DbRtmpBridge {
 
         let player_id = player_row.id.clone();
         let stream_id = stream.id.clone();
-        let mut guard = self.conns.lock().unwrap();
-        let cs = guard.entry(conn).or_default();
-        cs.player = Some(player_row);
-        // Store stream_id for player connections too (used for deletion signalling).
-        if cs.stream_id.is_empty() {
-            cs.stream_id = stream_id;
+        let old_player = {
+            let mut guard = self.conns.lock().unwrap();
+            let cs = guard.entry(conn).or_default();
+            let old_player = cs.player.take();
+            cs.player = Some(player_row);
+            // Store stream_id for player-only connections too (used for deletion signalling).
+            if cs.publisher.is_none() || cs.stream_id.is_empty() {
+                cs.stream_id = stream_id;
+            }
+            old_player
+        };
+
+        if let Some(mut old_player) = old_player {
+            old_player.active = false;
+            let old_id = old_player.id.clone();
+            self.db.player_update(&old_id, &old_player);
         }
 
         crate::log_info!(
@@ -676,6 +697,27 @@ mod tests {
     }
 
     #[test]
+    fn authorize_publish_failed_switch_keeps_prior_publisher_active() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
+            .unwrap();
+        db.stream_add(&sample_stream("s2", "pub_k2", "pl_k2"))
+            .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db));
+
+        bridge.on_connect(1);
+        bridge.on_connect(2);
+        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
+        assert!(bridge.authorize_publish(2, "live", "pub_k2").is_ok());
+
+        assert!(bridge.authorize_publish(1, "live", "pub_k2").is_err());
+
+        assert!(bridge.has_publisher(1));
+        assert_eq!(db.publisher_list(Some("s1")).len(), 1);
+        assert_eq!(db.publisher_list(Some("s2")).len(), 1);
+    }
+
+    #[test]
     fn on_play_switching_streams_deactivates_prior_player() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         db.stream_add(&sample_stream("s1", "pub_k1", "pl_k1"))
@@ -690,6 +732,9 @@ mod tests {
 
         assert_eq!(db.player_list(Some("s1")).len(), 0);
         assert_eq!(db.player_list(Some("s2")).len(), 1);
+
+        let guard = bridge.conns.lock().unwrap();
+        assert_eq!(guard.get(&1).unwrap().stream_id.as_str(), "s2");
     }
 
     #[test]
