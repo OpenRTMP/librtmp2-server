@@ -277,7 +277,7 @@ impl RtmpEventHandler for DbRtmpBridge {
             .lock()
             .unwrap()
             .entry(conn)
-            .or_insert_with(ConnState::default);
+            .or_default();
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
