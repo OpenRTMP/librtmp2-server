@@ -342,13 +342,18 @@ impl RtmpEventHandler for DbRtmpBridge {
             if let Some(mut old_pub) = old_pub {
                 old_pub.active = true;
                 let old_id = old_pub.id.clone();
-                self.db.publisher_update(&old_id, &old_pub);
-                self.conns
-                    .lock()
-                    .unwrap()
-                    .entry(conn)
-                    .or_default()
-                    .publisher = Some(old_pub);
+                if self.db.publisher_update(&old_id, &old_pub) {
+                    self.conns
+                        .lock()
+                        .unwrap()
+                        .entry(conn)
+                        .or_default()
+                        .publisher = Some(old_pub);
+                } else {
+                    crate::log_error!(
+                        "RTMP: publish rollback failed — prior publisher row remains inactive"
+                    );
+                }
             }
             crate::log_warn!(
                 "RTMP: publish rejected — stream '{}' already has an active publisher",
@@ -428,7 +433,23 @@ impl RtmpEventHandler for DbRtmpBridge {
         if let Some(mut old_player) = old_player {
             old_player.active = false;
             let old_id = old_player.id.clone();
-            self.db.player_update(&old_id, &old_player);
+            if !self.db.player_update(&old_id, &old_player) {
+                crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
+                if !self.db.player_remove(&player_id) {
+                    crate::log_error!(
+                        "RTMP: failed to remove replacement player row after switch rollback"
+                    );
+                }
+                old_player.active = true;
+                let old_stream_id = old_player.stream_id.clone();
+                let mut guard = self.conns.lock().unwrap();
+                let cs = guard.entry(conn).or_default();
+                cs.player = Some(old_player);
+                if cs.publisher.is_none() {
+                    cs.stream_id = old_stream_id;
+                }
+                return Err(());
+            }
         }
 
         crate::log_info!(
