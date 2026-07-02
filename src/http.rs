@@ -198,11 +198,7 @@ fn viewer_to_json(v: &StreamViewer) -> Value {
 }
 
 fn stream_to_json(db: &Db, s: &Stream) -> Value {
-    let players: Vec<Value> = db
-        .viewer_list(&s.id)
-        .iter()
-        .map(viewer_to_json)
-        .collect();
+    let players: Vec<Value> = db.viewer_list(&s.id).iter().map(viewer_to_json).collect();
     json!({
         "id": s.id,
         "name": s.name,
