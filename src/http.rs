@@ -201,7 +201,7 @@ fn stream_to_json(db: &Db, s: &Stream) -> Value {
     let players: Vec<Value> = db
         .viewer_list(&s.id)
         .iter()
-        .map(|v| viewer_to_json(v))
+        .map(viewer_to_json)
         .collect();
     json!({
         "id": s.id,
@@ -221,19 +221,9 @@ fn create_viewer_row(
     name: &str,
     play_key: &str,
     created_at: i64,
-) -> Result<StreamViewer, Response> {
-    let viewer_id = match keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
-        Ok(id) => id,
-        Err(e) => {
-            crate::log_error!("viewer id generation failed: {e}");
-            return Err(err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Key generation failed",
-            ));
-        }
-    };
-    Ok(StreamViewer {
+) -> Option<StreamViewer> {
+    let viewer_id = keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID).ok()?;
+    Some(StreamViewer {
         id: viewer_id,
         stream_id: stream_id.to_string(),
         name: name.to_string(),
@@ -664,7 +654,7 @@ async fn handle_stream_players_list(
         .db
         .viewer_list(&id)
         .iter()
-        .map(|v| viewer_to_json(v))
+        .map(viewer_to_json)
         .collect();
     Json(list).into_response()
 }
@@ -720,9 +710,13 @@ async fn handle_stream_player_create(
             );
         }
     };
-    let viewer = match create_viewer_row(&stream.id, &name, &play_key, now_ts()) {
-        Ok(v) => v,
-        Err(resp) => return resp,
+    let Some(viewer) = create_viewer_row(&stream.id, &name, &play_key, now_ts()) else {
+        crate::log_error!("viewer id generation failed");
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Key generation failed",
+        );
     };
     if !state.db.viewer_add(&viewer) {
         return err_json(

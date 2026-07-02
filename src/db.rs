@@ -397,7 +397,7 @@ impl Db {
     }
 
     fn stream_find_by(&self, column: &str, key: &str) -> Option<Stream> {
-        if !matches!(column, "publish_key" | "play_key" | "stats_key") {
+        if !matches!(column, "publish_key" | "stats_key") {
             crate::log_error!("stream_find_by: rejected disallowed column '{column}'");
             return None;
         }
@@ -416,10 +416,6 @@ impl Db {
 
     pub fn stream_find_by_publish_key(&self, key: &str) -> Option<Stream> {
         self.stream_find_by("publish_key", key)
-    }
-
-    pub fn stream_find_by_play_key(&self, key: &str) -> Option<Stream> {
-        self.stream_find_by("play_key", key)
     }
 
     pub fn stream_find_by_stats_key(&self, key: &str) -> Option<Stream> {
