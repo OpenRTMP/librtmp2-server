@@ -56,18 +56,15 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
         .map(|info| info.0.ip())
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
 
-    if trusted_proxies.iter().any(|proxy| *proxy == peer) {
-        if let Some(xff) = request
+    if trusted_proxies.contains(&peer)
+        && let Some(xff) = request
             .headers()
             .get("X-Forwarded-For")
             .and_then(|v| v.to_str().ok())
-        {
-            if let Some(client) = xff.split(',').map(str::trim).find(|part| !part.is_empty()) {
-                if let Ok(ip) = client.parse::<IpAddr>() {
-                    return ip;
-                }
-            }
-        }
+        && let Some(client) = xff.split(',').map(str::trim).find(|part| !part.is_empty())
+        && let Ok(ip) = client.parse::<IpAddr>()
+    {
+        return ip;
     }
 
     peer

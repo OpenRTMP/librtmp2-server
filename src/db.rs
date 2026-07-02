@@ -563,17 +563,6 @@ impl Db {
         .unwrap_or(None)
     }
 
-    pub fn viewer_active_count(&self, viewer_id: &str) -> usize {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1",
-            params![viewer_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|n| n.max(0) as usize)
-        .unwrap_or(0)
-    }
-
     /// Returns `Some(true)` if deleted, `Some(false)` if not found, `None` on DB error.
     pub fn viewer_delete(&self, stream_id: &str, viewer_id: &str) -> Option<bool> {
         let conn = self.conn.lock();

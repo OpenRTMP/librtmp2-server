@@ -796,7 +796,10 @@ mod tests {
         bridge.on_connect(99);
         assert!(bridge.authorize_play(99, "live", "pl_k").is_err());
         assert_eq!(
-            db.viewer_active_count(&viewer.id),
+            db.player_list(Some(&viewer.stream_id))
+                .iter()
+                .filter(|p| p.viewer_id == viewer.id && p.active)
+                .count(),
             crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
         );
     }
