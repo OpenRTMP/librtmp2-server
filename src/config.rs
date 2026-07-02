@@ -237,8 +237,7 @@ where
     if let Some(v) = get("LRTMP2_RTMP_MAX_RELAY_QUEUE_MB")
         && !v.is_empty()
     {
-        config.rtmp_max_relay_queue_mb =
-            parse_mb(&v, 8, 1, 128, "LRTMP2_RTMP_MAX_RELAY_QUEUE_MB");
+        config.rtmp_max_relay_queue_mb = parse_mb(&v, 8, 1, 128, "LRTMP2_RTMP_MAX_RELAY_QUEUE_MB");
     }
 
     if let Some(v) = get("LRTMP2_TLS_ENABLED")

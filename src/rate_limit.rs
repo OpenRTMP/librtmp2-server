@@ -62,11 +62,7 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
             .get("X-Forwarded-For")
             .and_then(|v| v.to_str().ok())
         {
-            if let Some(client) = xff
-                .split(',')
-                .map(str::trim)
-                .find(|part| !part.is_empty())
-            {
+            if let Some(client) = xff.split(',').map(str::trim).find(|part| !part.is_empty()) {
                 if let Ok(ip) = client.parse::<IpAddr>() {
                     return ip;
                 }
@@ -84,11 +80,7 @@ pub async fn middleware(
 ) -> Response {
     let path = request.uri().path();
     let peer = client_ip(&request, limiter.trusted_proxies.as_slice());
-    let key = format!(
-        "{}:{}",
-        peer,
-        path.split('/').nth(1).unwrap_or("")
-    );
+    let key = format!("{}:{}", peer, path.split('/').nth(1).unwrap_or(""));
     let max = limit_for_path(path);
     if !limiter.check(&key, max) {
         return (

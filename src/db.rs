@@ -5,9 +5,9 @@
 //! at a time anyway, so this matches the C version's locking model without
 //! needing a connection pool.
 
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Db {

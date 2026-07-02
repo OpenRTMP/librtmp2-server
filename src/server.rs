@@ -1,10 +1,10 @@
 //! Server application lifecycle: wires together the database, the HTTP API,
 //! and the RTMP listener, then runs until a shutdown signal arrives.
 
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;

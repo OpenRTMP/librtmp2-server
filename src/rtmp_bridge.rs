@@ -13,8 +13,8 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -386,11 +386,7 @@ impl RtmpEventHandler for DbRtmpBridge {
                 old_pub.active = true;
                 let old_id = old_pub.id.clone();
                 if self.db.publisher_update(&old_id, &old_pub) {
-                    self.conns
-                        .lock()
-                        .entry(conn)
-                        .or_default()
-                        .publisher = Some(old_pub);
+                    self.conns.lock().entry(conn).or_default().publisher = Some(old_pub);
                 } else {
                     crate::log_error!(
                         "RTMP: publish rollback failed — prior publisher row remains inactive"
