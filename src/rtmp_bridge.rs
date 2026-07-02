@@ -72,8 +72,12 @@ struct ConnState {
     last_stats_at: Option<Instant>,
     /// Timestamp of the last RTT flush to the DB.
     last_rtt_at: Option<Instant>,
-    /// bytes_received snapshot at the last stats flush.
+    /// Raw connection byte counter at the start of the current tracked session.
+    bytes_base: u64,
+    /// Session-local bytes snapshot at the last stats flush.
     bytes_at_last_stats: u64,
+    /// Rebase the next stats update after replacing publisher/player state.
+    stats_reset_pending: bool,
 }
 
 /// DB-backed [`RtmpEventHandler`]. Each connection's role(s) and DB row(s)
@@ -150,12 +154,34 @@ impl DbRtmpBridge {
         };
 
         let now = Instant::now();
+        if cs.stats_reset_pending {
+            cs.stats_reset_pending = false;
+            cs.bytes_base = media_bytes_received;
+            cs.bytes_at_last_stats = 0;
+            cs.last_stats_at = Some(now);
+
+            pub_row.bytes_in = 0;
+            pub_row.bitrate_kbps = 0.0;
+            if !video_codec.is_empty() {
+                pub_row.video_codec = video_codec.to_string();
+            }
+            if !audio_codec.is_empty() {
+                pub_row.audio_codec = audio_codec.to_string();
+            }
+
+            let pub_id = pub_row.id.clone();
+            let pub_row_clone = pub_row.clone();
+            drop(guard);
+            self.db.publisher_update(&pub_id, &pub_row_clone);
+            return;
+        }
+
         let elapsed_secs = cs
             .last_stats_at
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
-
-        let bytes_delta = media_bytes_received.saturating_sub(cs.bytes_at_last_stats);
+        let session_bytes = media_bytes_received.saturating_sub(cs.bytes_base);
+        let bytes_delta = session_bytes.saturating_sub(cs.bytes_at_last_stats);
 
         // Only flush to DB if at least 1 second has passed (rate-limit writes).
         if elapsed_secs < 1.0 && cs.last_stats_at.is_some() {
@@ -168,7 +194,7 @@ impl DbRtmpBridge {
             0.0
         };
 
-        pub_row.bytes_in = media_bytes_received;
+        pub_row.bytes_in = session_bytes;
         pub_row.bitrate_kbps = bitrate_kbps;
         if !video_codec.is_empty() {
             pub_row.video_codec = video_codec.to_string();
@@ -178,7 +204,7 @@ impl DbRtmpBridge {
         }
 
         cs.last_stats_at = Some(now);
-        cs.bytes_at_last_stats = media_bytes_received;
+        cs.bytes_at_last_stats = session_bytes;
 
         // Clone the row to release the lock before the DB call.
         let pub_id = pub_row.id.clone();
@@ -199,11 +225,28 @@ impl DbRtmpBridge {
         };
 
         let now = Instant::now();
+        if cs.stats_reset_pending {
+            cs.stats_reset_pending = false;
+            cs.bytes_base = media_bytes_sent;
+            cs.bytes_at_last_stats = 0;
+            cs.last_stats_at = Some(now);
+
+            player_row.bytes_out = 0;
+            player_row.bitrate_kbps = 0.0;
+
+            let player_id = player_row.id.clone();
+            let row = player_row.clone();
+            drop(guard);
+            self.db.player_update(&player_id, &row);
+            return;
+        }
+
         let elapsed_secs = cs
             .last_stats_at
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
-        let bytes_delta = media_bytes_sent.saturating_sub(cs.bytes_at_last_stats);
+        let session_bytes = media_bytes_sent.saturating_sub(cs.bytes_base);
+        let bytes_delta = session_bytes.saturating_sub(cs.bytes_at_last_stats);
 
         if elapsed_secs < 1.0 && cs.last_stats_at.is_some() {
             return;
@@ -215,10 +258,10 @@ impl DbRtmpBridge {
             0.0
         };
 
-        player_row.bytes_out = media_bytes_sent;
+        player_row.bytes_out = session_bytes;
         player_row.bitrate_kbps = bitrate_kbps;
         cs.last_stats_at = Some(now);
-        cs.bytes_at_last_stats = media_bytes_sent;
+        cs.bytes_at_last_stats = session_bytes;
 
         let player_id = player_row.id.clone();
         let row = player_row.clone();
@@ -317,6 +360,7 @@ impl RtmpEventHandler for DbRtmpBridge {
             let mut guard = self.conns.lock().unwrap();
             guard.get_mut(&conn).and_then(|cs| cs.publisher.take())
         };
+        let replacing_publisher = old_pub.is_some();
         let old_pub = if let Some(mut old_pub) = old_pub {
             old_pub.active = false;
             let old_id = old_pub.id.clone();
@@ -370,6 +414,11 @@ impl RtmpEventHandler for DbRtmpBridge {
         cs.publisher = Some(pub_row);
         cs.stream_id = stream_id;
         cs.allowed_codecs = allowed_codecs;
+        if replacing_publisher {
+            cs.last_stats_at = None;
+            cs.bytes_at_last_stats = 0;
+            cs.stats_reset_pending = true;
+        }
 
         crate::log_info!(
             "RTMP: publish authorized stream='{}' publisher session={}",
@@ -429,6 +478,7 @@ impl RtmpEventHandler for DbRtmpBridge {
             }
             old_player
         };
+        let replacing_player = old_player.is_some();
 
         if let Some(mut old_player) = old_player {
             old_player.active = false;
@@ -450,6 +500,14 @@ impl RtmpEventHandler for DbRtmpBridge {
                 }
                 return Err(());
             }
+        }
+
+        if replacing_player {
+            let mut guard = self.conns.lock().unwrap();
+            let cs = guard.entry(conn).or_default();
+            cs.last_stats_at = None;
+            cs.bytes_at_last_stats = 0;
+            cs.stats_reset_pending = true;
         }
 
         crate::log_info!(
