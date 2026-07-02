@@ -414,12 +414,12 @@ impl RtmpEventHandler for DbRtmpBridge {
         }
 
         if !self.db.publisher_try_acquire(&pub_row) {
-            if let Some(ref prior) = old_pub {
-                if !self.restore_publisher_row(prior) {
-                    crate::log_error!(
-                        "RTMP: publish rollback failed — prior publisher row remains inactive"
-                    );
-                }
+            if let Some(ref prior) = old_pub
+                && !self.restore_publisher_row(prior)
+            {
+                crate::log_error!(
+                    "RTMP: publish rollback failed — prior publisher row remains inactive"
+                );
             }
             crate::log_warn!(
                 "RTMP: publish rejected — stream '{}' already has an active publisher",
@@ -511,10 +511,10 @@ impl RtmpEventHandler for DbRtmpBridge {
         }
 
         if !self.db.player_try_acquire(&player_row) {
-            if let Some(ref prior) = old_player {
-                if !self.restore_player_row(prior) {
-                    crate::log_error!("RTMP: play rollback failed — prior player row not restored");
-                }
+            if let Some(ref prior) = old_player
+                && !self.restore_player_row(prior)
+            {
+                crate::log_error!("RTMP: play rollback failed — prior player row not restored");
             }
             crate::log_warn!(
                 "RTMP: play rejected — connection limit ({}) reached for play key",
