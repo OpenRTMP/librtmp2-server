@@ -38,10 +38,10 @@ impl RateLimiter {
     }
 
     /// Evict the client whose most recent request is oldest (LRU).
-    fn evict_lru_key(guard: &mut HashMap<String, Vec<Instant>>) {
+    fn evict_lru_key(guard: &mut HashMap<String, Vec<Instant>>, now: Instant) {
         let Some(lru_key) = guard
             .iter()
-            .min_by_key(|(_, entries)| entries.iter().max().copied().unwrap_or_else(Instant::now))
+            .min_by_key(|(_, entries)| entries.last().copied().unwrap_or(now))
             .map(|(key, _)| key.clone())
         else {
             return;
@@ -50,14 +50,14 @@ impl RateLimiter {
     }
 
     fn check(&self, key: &str, max_requests: usize) -> bool {
-        let now = Instant::now();
         let mut guard = self.inner.lock();
+        let now = Instant::now();
         self.purge_expired(&mut guard, now);
 
         if !guard.contains_key(key) && guard.len() >= MAX_TRACKED_KEYS {
             // Reclaim a slot instead of permanently denying new clients when the
             // map was filled by one-shot scan traffic that aged out of the window.
-            Self::evict_lru_key(&mut guard);
+            Self::evict_lru_key(&mut guard, now);
             if !guard.contains_key(key) && guard.len() >= MAX_TRACKED_KEYS {
                 return false;
             }
@@ -142,7 +142,6 @@ mod tests {
         }
         assert_eq!(limiter.inner.lock().len(), MAX_TRACKED_KEYS);
 
-        std::thread::sleep(Duration::from_millis(50));
         {
             let mut guard = limiter.inner.lock();
             let stale = Instant::now() - Duration::from_secs(61);
