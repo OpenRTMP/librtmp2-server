@@ -11,7 +11,7 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-librtmp2 = { git = 'https://github.com/OpenRTMP/librtmp2.git', rev = "6b5d257b1fe65b70b1cd4e860c7b50aa67d377a7", default-features = false, features = ["tls"] }
+librtmp2 = { git = 'https://github.com/OpenRTMP/librtmp2.git', rev = "e93349edb846475c9d950018d6f4a46b8002fd5e", default-features = false, features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

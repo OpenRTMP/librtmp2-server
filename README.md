@@ -165,13 +165,13 @@ LOG_FILE=
 The RTMP listener is implemented through the integrated Rust `librtmp2` server.
 Setting `TLS_ENABLED=true` starts a **second** listener on `RTMPS_BIND` that
 speaks RTMPS — the plaintext RTMP listener on `RTMP_BIND` keeps running
-unchanged, so existing publishers/players are unaffected. Both listeners share
-the same stream-key database, connection tracking, and stats, but each gets
-its own copy of `RTMP_MAX_CONNECTIONS`, `RTMP_MAX_REASSEMBLY_MB`,
-`RTMP_MAX_CACHE_MB`, and `RTMP_MAX_RELAY_QUEUE_MB` — with RTMPS enabled, the
-process's worst-case connection count and memory budget for those limits is
-up to 2x the configured value (once for RTMP, once for RTMPS). Size the
-limits with that in mind if RTMPS is enabled.
+unchanged, so existing publishers/players are unaffected. Both listeners are
+bound on the same underlying `librtmp2` server instance, so they share one
+connection pool, one media relay, and one `RTMP_MAX_CONNECTIONS` /
+`RTMP_MAX_REASSEMBLY_MB` / `RTMP_MAX_CACHE_MB` / `RTMP_MAX_RELAY_QUEUE_MB`
+budget rather than doubling it — and a publisher on one listener is relayed
+to players on the other (publish over `rtmp://`, watch over `rtmps://`, or
+vice versa, works out of the box).
 
 Enabling TLS without both a cert and key file configured is refused with a
 clear error at startup.

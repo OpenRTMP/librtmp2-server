@@ -16,14 +16,7 @@ use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
 /// registered on the RTMP thread before the poll loop starts.
 static RTMP_BRIDGE: OnceLock<Arc<DbRtmpBridge>> = OnceLock::new();
 
-/// Conn IDs on the RTMPS listener start here so they never collide with the
-/// plaintext RTMP listener's IDs (which start at 1) — both listeners run in
-/// the same process and share the same bridge/tracking state keyed by
-/// conn_id. No realistic deployment gets anywhere near this many connections
-/// on one listener.
-const TLS_CONN_ID_BASE: u64 = 1 << 40;
-
-/// How often the combined poll loop wakes up to service both listeners.
+/// How often the poll loop wakes up to service the RTMP/RTMPS listener(s).
 const POLL_INTERVAL_MS: u64 = 50;
 
 fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
@@ -61,7 +54,7 @@ fn rtmp_media_cb(
 }
 
 /// Per-connection bookkeeping the RTMP poll loop keeps for the lifetime of
-/// each connection, on either listener.
+/// each connection.
 #[derive(Default)]
 struct TrackedConn {
     connected: bool,
@@ -75,25 +68,25 @@ struct TrackedConn {
     audio_codec: String,
 }
 
-/// Drive one poll cycle's worth of connection bookkeeping for a single
-/// `librtmp2` server instance (either the plaintext or the TLS listener):
-/// authorize new publish/play commands, reject connections the bridge
-/// doesn't own, kick connections whose stream/play-key was revoked, and
-/// flush stats. Every conn_id processed here is recorded into `current_ids`
-/// so the caller can detect connections that disappeared entirely (closed by
-/// the peer) once every listener has been polled this iteration.
+/// Drive one poll cycle's worth of connection bookkeeping: authorize new
+/// publish/play commands, reject connections the bridge doesn't own, kick
+/// connections whose stream/play-key was revoked, and flush stats. Returns
+/// the conn_ids seen this cycle so the caller can detect connections that
+/// disappeared entirely (closed by the peer, rather than rejected here).
 ///
-/// `tracked` and the bridge are shared across every listener in the process,
-/// so this only ever touches entries for conn_ids that belong to `server`
-/// (conn_id ranges are disjoint per listener — see [`TLS_CONN_ID_BASE`]).
+/// `server` is a single `librtmp2::server::Server` that may have multiple
+/// listeners bound (plaintext RTMP and, when TLS is enabled, RTMPS) — they
+/// share one `connections` list, so a publisher on one listener is relayed
+/// to players on any other listener by the library itself; this function
+/// doesn't need to know which listener a given connection came in on.
 fn process_server_connections(
     server: &mut librtmp2::server::Server,
     tracked: &mut HashMap<u64, TrackedConn>,
     rtmp_bridge: &Arc<DbRtmpBridge>,
     deleted_now: &HashSet<String>,
     revoked_now: &HashSet<String>,
-    current_ids: &mut HashSet<u64>,
-) {
+) -> HashSet<u64> {
+    let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
 
     for (idx, conn) in server.connections.iter_mut().enumerate() {
@@ -218,6 +211,8 @@ fn process_server_connections(
         }
         server.connections.remove(idx);
     }
+
+    current_ids
 }
 
 pub struct ServerApp {
@@ -319,9 +314,12 @@ impl ServerApp {
 
         // Start the RTMP listener(s) in a background thread. librtmp2's Server
         // uses a blocking poll loop, so it lives outside the Tokio runtime.
-        // The plaintext listener always runs; the RTMPS listener additionally
-        // runs alongside it when TLS is enabled — both accept connections at
-        // the same time on their own ports.
+        // One Server binds both the always-on plaintext listener and, when TLS
+        // is enabled, an additional RTMPS listener — they share one
+        // connections list, so publish/play work across either listener
+        // interchangeably (a publisher on RTMP can be watched over RTMPS and
+        // vice versa) and RTMP_MAX_CONNECTIONS / the memory limits apply once,
+        // across both listeners combined, rather than doubling per listener.
         let rtmp_bind = self.config.rtmp_bind.clone();
         let rtmps_bind = self.config.rtmps_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
@@ -340,7 +338,7 @@ impl ServerApp {
             use librtmp2::server::Server as RtmpServer;
             use librtmp2::types::ServerConfig as RtmpConfig;
 
-            let plain_cfg = RtmpConfig {
+            let cfg = RtmpConfig {
                 max_connections: rtmp_max_conn,
                 chunk_size: 4096,
                 tls_enabled: 0,
@@ -349,7 +347,7 @@ impl ServerApp {
                 tls_ca_file: std::ptr::null(),
                 tls_insecure: 0,
             };
-            let mut plain_server = match RtmpServer::new(plain_cfg) {
+            let mut server = match RtmpServer::new(cfg) {
                 Ok(s) => s,
                 Err(e) => {
                     let msg = format!("RTMP server init failed: {e}");
@@ -358,12 +356,12 @@ impl ServerApp {
                     return;
                 }
             };
-            plain_server.resource_limits = rtmp_resource_limits;
-            plain_server.defer_media_relay = true;
-            plain_server.on_media_cb = Some(rtmp_media_cb);
-            plain_server.on_publish_cb = Some(rtmp_publish_cb);
-            plain_server.on_play_cb = Some(rtmp_play_cb);
-            if let Err(e) = plain_server.listen(&rtmp_bind) {
+            server.resource_limits = rtmp_resource_limits;
+            server.defer_media_relay = true;
+            server.on_media_cb = Some(rtmp_media_cb);
+            server.on_publish_cb = Some(rtmp_publish_cb);
+            server.on_play_cb = Some(rtmp_play_cb);
+            if let Err(e) = server.listen(&rtmp_bind) {
                 let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
                 crate::log_warn!("{msg}");
                 let _ = rtmp_ready_tx.send(Err(msg));
@@ -371,53 +369,15 @@ impl ServerApp {
             }
             crate::log_info!("RTMP listening on {rtmp_bind}");
 
-            // Build CStrings inside the thread so the pointers remain valid
-            // for the duration of RtmpServer::new().
-            let cert_cstr = std::ffi::CString::new(rtmp_tls_cert).ok();
-            let key_cstr = std::ffi::CString::new(rtmp_tls_key).ok();
-
-            let mut tls_server = if rtmp_tls_enabled {
-                let tls_cfg = RtmpConfig {
-                    max_connections: rtmp_max_conn,
-                    chunk_size: 4096,
-                    tls_enabled: 1,
-                    tls_cert_file: cert_cstr
-                        .as_ref()
-                        .map(|s| s.as_ptr() as *const u8)
-                        .unwrap_or(std::ptr::null()),
-                    tls_key_file: key_cstr
-                        .as_ref()
-                        .map(|s| s.as_ptr() as *const u8)
-                        .unwrap_or(std::ptr::null()),
-                    tls_ca_file: std::ptr::null(),
-                    tls_insecure: 0,
-                };
-                let mut s = match RtmpServer::new(tls_cfg) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let msg = format!("RTMPS server init failed: {e}");
-                        crate::log_warn!("{msg}");
-                        let _ = rtmp_ready_tx.send(Err(msg));
-                        return;
-                    }
-                };
-                s.set_conn_id_base(TLS_CONN_ID_BASE);
-                s.resource_limits = rtmp_resource_limits;
-                s.defer_media_relay = true;
-                s.on_media_cb = Some(rtmp_media_cb);
-                s.on_publish_cb = Some(rtmp_publish_cb);
-                s.on_play_cb = Some(rtmp_play_cb);
-                if let Err(e) = s.listen(&rtmps_bind) {
+            if rtmp_tls_enabled {
+                if let Err(e) = server.listen_tls(&rtmps_bind, &rtmp_tls_cert, &rtmp_tls_key) {
                     let msg = format!("RTMPS bind on {rtmps_bind} failed: {e}");
                     crate::log_warn!("{msg}");
                     let _ = rtmp_ready_tx.send(Err(msg));
                     return;
                 }
                 crate::log_info!("RTMPS listening on {rtmps_bind}");
-                Some(s)
-            } else {
-                None
-            };
+            }
 
             let _ = rtmp_ready_tx.send(Ok(()));
             let _ = RTMP_BRIDGE.set(Arc::clone(&rtmp_bridge));
@@ -426,58 +386,29 @@ impl ServerApp {
 
             loop {
                 if rtmp_stop_clone.load(Ordering::Relaxed) {
-                    plain_server.stop();
-                    if let Some(ref mut s) = tls_server {
-                        s.stop();
-                    }
+                    server.stop();
                     break;
                 }
 
-                if let Err(e) = plain_server.poll(0) {
+                if let Err(e) = server.poll(0) {
                     crate::log_warn!("RTMP polling stopped: {e}");
                     break;
                 }
-                // A failure here must not take down the plaintext listener —
-                // RTMP is meant to stay available even if RTMPS breaks.
-                let mut tls_poll_failed = false;
-                if let Some(ref mut s) = tls_server
-                    && let Err(e) = s.poll(0)
-                {
-                    crate::log_warn!("RTMPS polling stopped: {e}; RTMP keeps running");
-                    tls_poll_failed = true;
-                }
-                if tls_poll_failed && let Some(mut s) = tls_server.take() {
-                    s.stop();
-                }
 
-                // Snapshot deleted stream IDs / revoked viewer IDs once per
-                // poll cycle, shared across both listeners this iteration.
                 let deleted_now: HashSet<String> = deleted_streams.lock().iter().cloned().collect();
                 let revoked_now: HashSet<String> = revoked_viewers.lock().iter().cloned().collect();
-                let mut current_ids: HashSet<u64> = HashSet::new();
 
-                process_server_connections(
-                    &mut plain_server,
+                let current_ids = process_server_connections(
+                    &mut server,
                     &mut tracked,
                     &rtmp_bridge,
                     &deleted_now,
                     &revoked_now,
-                    &mut current_ids,
                 );
-                if let Some(ref mut s) = tls_server {
-                    process_server_connections(
-                        s,
-                        &mut tracked,
-                        &rtmp_bridge,
-                        &deleted_now,
-                        &revoked_now,
-                        &mut current_ids,
-                    );
-                }
 
-                // A conn_id still in `tracked` but absent from every
-                // listener's connections this iteration was closed by the
-                // peer (rather than rejected above) — notify the bridge.
+                // A conn_id still in `tracked` but absent this cycle was
+                // closed by the peer (rather than rejected above) — notify
+                // the bridge.
                 let closed_ids: Vec<u64> = tracked
                     .keys()
                     .copied()
@@ -488,8 +419,7 @@ impl ServerApp {
                     rtmp_bridge.on_close(conn_id);
                 }
 
-                // Drain deletion/revocation markers no live connection on
-                // either listener still references.
+                // Drain deletion/revocation markers no live connection still references.
                 let live_stream_ids: HashSet<String> = tracked
                     .values()
                     .filter(|c| !c.stream_id.is_empty())

@@ -83,20 +83,27 @@ impl ServerConfig {
     }
 }
 
-/// Extract the port number from a "host:port" (or "[ipv6]:port") string.
-///
-/// A bracketed IPv6 host is handled specially: the port must immediately
-/// follow the closing `]`. Naively taking the text after the *last* `:`
-/// would misparse a portless literal like `"[::1]"` (whose last `:` sits
-/// inside the brackets) as having some port.
+/// Extract the port number from a "host:port" string, mirroring how
+/// `librtmp2::net::split_host_port` (the actual bind-time parser) tells a
+/// port apart from a bare IPv6 host:
+/// - `"[v6addr]:port"` / `"[v6addr]"` — bracketed IPv6; port must immediately
+///   follow the closing `]`, or there is none.
+/// - exactly one `:` — `"host:port"`.
+/// - zero or 2+ `:` with no brackets — no port (a bare IPv6 literal like
+///   `"::1"` has 2+ colons and *no* port of its own; naively splitting on the
+///   last `:` would misparse its final hextet as a port).
 fn port_of(bind: &str) -> u16 {
-    let port_str: Option<&str> = if let Some(bracket_end) = bind.rfind(']') {
-        bind[bracket_end + 1..].strip_prefix(':')
-    } else {
-        bind.rsplit_once(':').map(|(_, port)| port)
-    };
-    port_str
-        .and_then(|port| port.parse::<u16>().ok())
+    if let Some(bracket_end) = bind.rfind(']') {
+        return bind[bracket_end + 1..]
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(0);
+    }
+    if bind.chars().filter(|&c| c == ':').count() != 1 {
+        return 0;
+    }
+    bind.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
         .unwrap_or(0)
 }
 
@@ -479,5 +486,16 @@ mod tests {
         // as a "host:port" split — there is no port here.
         assert_eq!(port_of("[::1]"), 0);
         assert_eq!(port_of("not-a-bind"), 0);
+    }
+
+    #[test]
+    fn port_of_treats_bare_unbracketed_ipv6_as_portless() {
+        // Matches librtmp2::net::split_host_port: an unbracketed literal with
+        // 2+ colons is a bare IPv6 host with no port of its own, not
+        // "host:port". Naively splitting on the last ':' would misparse the
+        // literal's final hextet ("1") as the port.
+        assert_eq!(port_of("::1"), 0);
+        assert_eq!(port_of("fe80::1"), 0);
+        assert_eq!(port_of("2001:db8::1"), 0);
     }
 }
