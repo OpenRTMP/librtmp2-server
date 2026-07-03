@@ -94,6 +94,7 @@ impl ServerConfig {
 /// - 2+ `:` with no brackets — a bare IPv6 literal with no port of its own,
 ///   e.g. `"::1"` (naively splitting on the last `:` would misparse its
 ///   final hextet as a port).
+///
 /// The only case with an explicit port is `"[v6addr]:port"` or exactly one
 /// unbracketed `:` (`"host:port"`).
 fn port_of(bind: &str, default: u16) -> u16 {
