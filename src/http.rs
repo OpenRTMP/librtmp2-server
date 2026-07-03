@@ -215,12 +215,12 @@ fn resolve_or_generate_access_key(
             }
             Ok(key)
         }
-        None => keygen_stream_key(prefix)
-            .map_err(|_| AccessKeyFieldError::GenerationFailed),
+        None => keygen_stream_key(prefix).map_err(|_| AccessKeyFieldError::GenerationFailed),
     }
 }
 
-const ACCESS_KEY_VALIDATION_MSG: &str = "Key must be 1-63 characters and use only letters, numbers, dots, underscores, or hyphens";
+const ACCESS_KEY_VALIDATION_MSG: &str =
+    "Key must be 1-63 characters and use only letters, numbers, dots, underscores, or hyphens";
 
 fn access_keys_must_be_unique(keys: &[&str]) -> bool {
     let mut seen = HashSet::with_capacity(keys.len());
@@ -593,69 +593,63 @@ async fn handle_stream_create(
         );
     }
 
-    let publish_key = match resolve_or_generate_access_key(
-        req.publish_key,
-        crate::keygen::PREFIX_PUBLISH_KEY,
-    ) {
-        Ok(k) => k,
-        Err(AccessKeyFieldError::Invalid) => {
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                &format!("publish_key: {ACCESS_KEY_VALIDATION_MSG}"),
-            );
-        }
-        Err(AccessKeyFieldError::GenerationFailed) => {
-            crate::log_error!("publish key generation failed");
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Key generation failed",
-            );
-        }
-    };
-    let play_key = match resolve_or_generate_access_key(
-        req.play_key,
-        crate::keygen::PREFIX_PLAY_KEY,
-    ) {
-        Ok(k) => k,
-        Err(AccessKeyFieldError::Invalid) => {
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                &format!("play_key: {ACCESS_KEY_VALIDATION_MSG}"),
-            );
-        }
-        Err(AccessKeyFieldError::GenerationFailed) => {
-            crate::log_error!("play key generation failed");
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Key generation failed",
-            );
-        }
-    };
-    let stats_key = match resolve_or_generate_access_key(
-        req.stats_key,
-        crate::keygen::PREFIX_STATS_KEY,
-    ) {
-        Ok(k) => k,
-        Err(AccessKeyFieldError::Invalid) => {
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                &format!("stats_key: {ACCESS_KEY_VALIDATION_MSG}"),
-            );
-        }
-        Err(AccessKeyFieldError::GenerationFailed) => {
-            crate::log_error!("stats key generation failed");
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Key generation failed",
-            );
-        }
-    };
+    let publish_key =
+        match resolve_or_generate_access_key(req.publish_key, crate::keygen::PREFIX_PUBLISH_KEY) {
+            Ok(k) => k,
+            Err(AccessKeyFieldError::Invalid) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    &format!("publish_key: {ACCESS_KEY_VALIDATION_MSG}"),
+                );
+            }
+            Err(AccessKeyFieldError::GenerationFailed) => {
+                crate::log_error!("publish key generation failed");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "Key generation failed",
+                );
+            }
+        };
+    let play_key =
+        match resolve_or_generate_access_key(req.play_key, crate::keygen::PREFIX_PLAY_KEY) {
+            Ok(k) => k,
+            Err(AccessKeyFieldError::Invalid) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    &format!("play_key: {ACCESS_KEY_VALIDATION_MSG}"),
+                );
+            }
+            Err(AccessKeyFieldError::GenerationFailed) => {
+                crate::log_error!("play key generation failed");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "Key generation failed",
+                );
+            }
+        };
+    let stats_key =
+        match resolve_or_generate_access_key(req.stats_key, crate::keygen::PREFIX_STATS_KEY) {
+            Ok(k) => k,
+            Err(AccessKeyFieldError::Invalid) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    &format!("stats_key: {ACCESS_KEY_VALIDATION_MSG}"),
+                );
+            }
+            Err(AccessKeyFieldError::GenerationFailed) => {
+                crate::log_error!("stats key generation failed");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "Key generation failed",
+                );
+            }
+        };
     if !access_keys_must_be_unique(&[&publish_key, &play_key, &stats_key]) {
         return err_json(
             StatusCode::BAD_REQUEST,
@@ -864,27 +858,25 @@ async fn handle_stream_player_create(
         );
     }
 
-    let play_key = match resolve_or_generate_access_key(
-        req.play_key,
-        crate::keygen::PREFIX_PLAY_KEY,
-    ) {
-        Ok(k) => k,
-        Err(AccessKeyFieldError::Invalid) => {
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                &format!("play_key: {ACCESS_KEY_VALIDATION_MSG}"),
-            );
-        }
-        Err(AccessKeyFieldError::GenerationFailed) => {
-            crate::log_error!("play key generation failed");
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Key generation failed",
-            );
-        }
-    };
+    let play_key =
+        match resolve_or_generate_access_key(req.play_key, crate::keygen::PREFIX_PLAY_KEY) {
+            Ok(k) => k,
+            Err(AccessKeyFieldError::Invalid) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_REQUEST",
+                    &format!("play_key: {ACCESS_KEY_VALIDATION_MSG}"),
+                );
+            }
+            Err(AccessKeyFieldError::GenerationFailed) => {
+                crate::log_error!("play key generation failed");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "Key generation failed",
+                );
+            }
+        };
     if play_key == stream.publish_key
         || play_key == stream.stats_key
         || play_key == stream.play_key
