@@ -32,45 +32,45 @@ impl RateLimiter {
     /// Drop client keys whose sliding window has fully expired.
     fn purge_expired(&self, guard: &mut HashMap<String, Vec<Instant>>, now: Instant) {
         guard.retain(|_, entries| {
-            entries.retain(|t| now.duration_since(*t) < self.window);
+            entries.retain(|t| {
+                now.checked_duration_since(*t)
+                    .map_or(true, |age| age < self.window)
+            });
             !entries.is_empty()
         });
     }
 
-    /// Evict the client whose most recent request is oldest (LRU).
-    fn evict_lru_key(guard: &mut HashMap<String, Vec<Instant>>, now: Instant) {
-        let Some(lru_key) = guard
-            .iter()
-            .min_by_key(|(_, entries)| entries.last().copied().unwrap_or(now))
-            .map(|(key, _)| key.clone())
-        else {
-            return;
-        };
-        guard.remove(&lru_key);
-    }
-
     fn check(&self, key: &str, max_requests: usize) -> bool {
+        if max_requests == 0 {
+            return false;
+        }
+
         let mut guard = self.inner.lock();
         let now = Instant::now();
-        self.purge_expired(&mut guard, now);
 
-        if !guard.contains_key(key) && guard.len() >= MAX_TRACKED_KEYS {
-            // Reclaim a slot instead of permanently denying new clients when the
-            // map was filled by one-shot scan traffic that aged out of the window.
-            Self::evict_lru_key(&mut guard, now);
-            if !guard.contains_key(key) && guard.len() >= MAX_TRACKED_KEYS {
-                return false;
-            }
-        }
-        {
-            let entries = guard.entry(key.to_string()).or_default();
-            entries.retain(|t| now.duration_since(*t) < self.window);
+        if let Some(entries) = guard.get_mut(key) {
+            entries.retain(|t| {
+                now.checked_duration_since(*t)
+                    .map_or(true, |age| age < self.window)
+            });
             if entries.len() >= max_requests {
                 return false;
             }
-            entries.push(now);
+            if !entries.is_empty() {
+                entries.push(now);
+                return true;
+            }
+            guard.remove(key);
         }
-        guard.retain(|_, v| !v.is_empty());
+
+        if guard.len() >= MAX_TRACKED_KEYS {
+            self.purge_expired(&mut guard, now);
+            if guard.len() >= MAX_TRACKED_KEYS {
+                return false;
+            }
+        }
+
+        guard.insert(key.to_string(), vec![now]);
         true
     }
 }
@@ -159,14 +159,19 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_makes_room_when_map_is_at_capacity() {
+    fn active_clients_are_not_evicted_when_map_is_at_capacity() {
         let limiter = RateLimiter::new(Vec::new());
         let max = 120;
         let now = Instant::now();
+        let limited_key = "198.51.100.0:api";
 
         {
             let mut guard = limiter.inner.lock();
-            for i in 0..MAX_TRACKED_KEYS {
+            guard.insert(
+                limited_key.to_string(),
+                vec![now - Duration::from_secs(30); max],
+            );
+            for i in 1..MAX_TRACKED_KEYS {
                 guard.insert(
                     format!("198.51.100.{i}:api"),
                     vec![now - Duration::from_secs(30)],
@@ -175,11 +180,14 @@ mod tests {
         }
 
         assert!(
-            limiter.check("203.0.113.9:api", max),
-            "LRU eviction should admit a new client when the map is full"
+            !limiter.check("203.0.113.9:api", max),
+            "full active map should reject new clients instead of evicting active buckets"
         );
         assert_eq!(limiter.inner.lock().len(), MAX_TRACKED_KEYS);
-        assert!(limiter.inner.lock().contains_key("203.0.113.9:api"));
+        assert!(
+            !limiter.check(limited_key, max),
+            "eviction must not reset an active client's bucket"
+        );
     }
 
     #[test]
