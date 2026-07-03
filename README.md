@@ -138,7 +138,7 @@ The API token is generated on first startup, stored in the SQLite database, and 
 # RTMP listener address (always active, regardless of TLS_ENABLED)
 RTMP_BIND=0.0.0.0:1935
 
-# Maximum concurrent RTMP connections (applied per listener)
+# Maximum concurrent RTMP/RTMPS connections across all listeners combined
 RTMP_MAX_CONNECTIONS=100
 
 # RTMPS (TLS) - disabled by default.
@@ -215,7 +215,17 @@ Each stream has **three unique, auto-generated keys**:
 |--------|----------|------|
 | GET | `/api/v1/health` | None |
 
-`/api/v1/health` responds with `{"status", "timestamp", "rtmp_port", "rtmps_enabled", "rtmps_port"}`.
+`/api/v1/health` returns a JSON object like:
+
+```json
+{
+  "status": "ok",
+  "timestamp": 1720000000,
+  "rtmp_port": 1935,
+  "rtmps_enabled": true,
+  "rtmps_port": 1936
+}
+```
 
 ### API (Bearer token required)
 
