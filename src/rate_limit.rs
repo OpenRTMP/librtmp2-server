@@ -29,13 +29,15 @@ impl RateLimiter {
         }
     }
 
+    fn timestamp_in_window(&self, now: Instant, timestamp: Instant) -> bool {
+        now.checked_duration_since(timestamp)
+            .is_none_or(|age| age < self.window)
+    }
+
     /// Drop client keys whose sliding window has fully expired.
     fn purge_expired(&self, guard: &mut HashMap<String, Vec<Instant>>, now: Instant) {
         guard.retain(|_, entries| {
-            entries.retain(|t| {
-                now.checked_duration_since(*t)
-                    .map_or(true, |age| age < self.window)
-            });
+            entries.retain(|t| self.timestamp_in_window(now, *t));
             !entries.is_empty()
         });
     }
@@ -49,10 +51,7 @@ impl RateLimiter {
         let now = Instant::now();
 
         if let Some(entries) = guard.get_mut(key) {
-            entries.retain(|t| {
-                now.checked_duration_since(*t)
-                    .map_or(true, |age| age < self.window)
-            });
+            entries.retain(|t| self.timestamp_in_window(now, *t));
             if entries.len() >= max_requests {
                 return false;
             }
