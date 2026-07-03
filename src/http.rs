@@ -177,6 +177,11 @@ pub struct KeyQuery {
 }
 
 fn is_valid_stream_key_part(value: &str) -> bool {
+    is_valid_access_key(value)
+}
+
+/// Publish/play/stats keys and RTMP URL path segments: safe ASCII, no slashes.
+fn is_valid_access_key(value: &str) -> bool {
     if value.is_empty() || value.len() > 63 {
         return false;
     }
@@ -186,6 +191,40 @@ fn is_valid_stream_key_part(value: &str) -> bool {
     };
     first.is_ascii_alphanumeric()
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn trim_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+enum AccessKeyFieldError {
+    Invalid,
+    GenerationFailed,
+}
+
+fn resolve_or_generate_access_key(
+    provided: Option<String>,
+    prefix: &str,
+) -> Result<String, AccessKeyFieldError> {
+    match trim_optional_string(provided) {
+        Some(key) => {
+            if !is_valid_access_key(&key) {
+                return Err(AccessKeyFieldError::Invalid);
+            }
+            Ok(key)
+        }
+        None => keygen_stream_key(prefix)
+            .map_err(|_| AccessKeyFieldError::GenerationFailed),
+    }
+}
+
+const ACCESS_KEY_VALIDATION_MSG: &str = "Key must be 1-63 characters and use only letters, numbers, dots, underscores, or hyphens";
+
+fn access_keys_must_be_unique(keys: &[&str]) -> bool {
+    let mut seen = HashSet::with_capacity(keys.len());
+    keys.iter().all(|k| seen.insert(*k))
 }
 
 fn is_valid_display_name(value: &str) -> bool {
@@ -488,6 +527,9 @@ struct CreateStreamRequest {
     id: Option<String>,
     name: Option<String>,
     app: Option<String>,
+    publish_key: Option<String>,
+    play_key: Option<String>,
+    stats_key: Option<String>,
 }
 
 async fn handle_stream_create(
@@ -551,11 +593,20 @@ async fn handle_stream_create(
         );
     }
 
-    // Cryptographically unpredictable keys — never derive from stream id/time.
-    let publish_key = match keygen_stream_key(crate::keygen::PREFIX_PUBLISH_KEY) {
+    let publish_key = match resolve_or_generate_access_key(
+        req.publish_key,
+        crate::keygen::PREFIX_PUBLISH_KEY,
+    ) {
         Ok(k) => k,
-        Err(e) => {
-            crate::log_error!("publish key generation failed: {e}");
+        Err(AccessKeyFieldError::Invalid) => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                &format!("publish_key: {ACCESS_KEY_VALIDATION_MSG}"),
+            );
+        }
+        Err(AccessKeyFieldError::GenerationFailed) => {
+            crate::log_error!("publish key generation failed");
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -563,10 +614,20 @@ async fn handle_stream_create(
             );
         }
     };
-    let play_key = match keygen_stream_key(crate::keygen::PREFIX_PLAY_KEY) {
+    let play_key = match resolve_or_generate_access_key(
+        req.play_key,
+        crate::keygen::PREFIX_PLAY_KEY,
+    ) {
         Ok(k) => k,
-        Err(e) => {
-            crate::log_error!("play key generation failed: {e}");
+        Err(AccessKeyFieldError::Invalid) => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                &format!("play_key: {ACCESS_KEY_VALIDATION_MSG}"),
+            );
+        }
+        Err(AccessKeyFieldError::GenerationFailed) => {
+            crate::log_error!("play key generation failed");
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -574,10 +635,20 @@ async fn handle_stream_create(
             );
         }
     };
-    let stats_key = match keygen_stream_key(crate::keygen::PREFIX_STATS_KEY) {
+    let stats_key = match resolve_or_generate_access_key(
+        req.stats_key,
+        crate::keygen::PREFIX_STATS_KEY,
+    ) {
         Ok(k) => k,
-        Err(e) => {
-            crate::log_error!("stats key generation failed: {e}");
+        Err(AccessKeyFieldError::Invalid) => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                &format!("stats_key: {ACCESS_KEY_VALIDATION_MSG}"),
+            );
+        }
+        Err(AccessKeyFieldError::GenerationFailed) => {
+            crate::log_error!("stats key generation failed");
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -585,6 +656,13 @@ async fn handle_stream_create(
             );
         }
     };
+    if !access_keys_must_be_unique(&[&publish_key, &play_key, &stats_key]) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "publish_key, play_key, and stats_key must be distinct",
+        );
+    }
     let s = Stream {
         id: id.clone(),
         name,
@@ -599,7 +677,11 @@ async fn handle_stream_create(
     match state.db.stream_add(&s) {
         Ok(()) => {}
         Err(StreamAddError::Duplicate) => {
-            return err_json(StatusCode::CONFLICT, "CONFLICT", "Stream ID already exists");
+            return err_json(
+                StatusCode::CONFLICT,
+                "CONFLICT",
+                "Stream ID or access key already exists",
+            );
         }
         Err(StreamAddError::Db) => {
             return err_json(
@@ -734,6 +816,7 @@ async fn handle_stream_players_list(
 #[derive(Deserialize, Default)]
 struct CreatePlayerRequest {
     name: Option<String>,
+    play_key: Option<String>,
 }
 
 async fn handle_stream_player_create(
@@ -781,10 +864,20 @@ async fn handle_stream_player_create(
         );
     }
 
-    let play_key = match keygen_stream_key(crate::keygen::PREFIX_PLAY_KEY) {
+    let play_key = match resolve_or_generate_access_key(
+        req.play_key,
+        crate::keygen::PREFIX_PLAY_KEY,
+    ) {
         Ok(k) => k,
-        Err(e) => {
-            crate::log_error!("play key generation failed: {e}");
+        Err(AccessKeyFieldError::Invalid) => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                &format!("play_key: {ACCESS_KEY_VALIDATION_MSG}"),
+            );
+        }
+        Err(AccessKeyFieldError::GenerationFailed) => {
+            crate::log_error!("play key generation failed");
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -792,6 +885,21 @@ async fn handle_stream_player_create(
             );
         }
     };
+    if play_key == stream.publish_key
+        || play_key == stream.stats_key
+        || play_key == stream.play_key
+        || state
+            .db
+            .viewer_list(&id)
+            .iter()
+            .any(|v| v.play_key == play_key)
+    {
+        return err_json(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "play_key already in use for this stream or conflicts with publish_key/stats_key",
+        );
+    }
     let Some(viewer) = create_viewer_row(&stream.id, &name, &play_key, now_ts()) else {
         crate::log_error!("viewer id generation failed");
         return err_json(
@@ -985,15 +1093,22 @@ mod tests {
 
     #[test]
     fn stream_create_validation_helpers_reject_unsafe_values() {
+        assert!(is_valid_access_key("live.main_1"));
+        assert!(is_valid_access_key("custom_pub_key_1"));
+        assert!(is_valid_access_key(&"a".repeat(63)));
+        assert!(!is_valid_access_key(""));
+        assert!(!is_valid_access_key("-starts-with-hyphen"));
+        assert!(!is_valid_access_key("bad/id"));
+        assert!(!is_valid_access_key(&"a".repeat(64)));
+
         assert!(is_valid_stream_key_part("live.main_1"));
-        assert!(is_valid_stream_key_part(&"a".repeat(63)));
-        assert!(!is_valid_stream_key_part(""));
-        assert!(!is_valid_stream_key_part("-starts-with-hyphen"));
         assert!(!is_valid_stream_key_part("bad/id"));
-        assert!(!is_valid_stream_key_part(&"a".repeat(64)));
 
         assert!(is_valid_display_name("Main Stream"));
         assert!(!is_valid_display_name("bad\nname"));
+
+        assert!(access_keys_must_be_unique(&["a", "b", "c"]));
+        assert!(!access_keys_must_be_unique(&["a", "a"]));
     }
 
     #[tokio::test]
@@ -1100,6 +1215,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_stream_accepts_custom_keys() {
+        let app = router(test_state("a-strong-random-secret-value"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"customkeys","publish_key":"my_pub_key","play_key":"my_play_key","stats_key":"my_stats_key"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["publish_key"], "my_pub_key");
+        assert_eq!(json["play_key"], "my_play_key");
+        assert_eq!(json["stats_key"], "my_stats_key");
+    }
+
+    #[tokio::test]
+    async fn create_stream_rejects_duplicate_custom_keys() {
+        let app = router(test_state("a-strong-random-secret-value"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"dupkeys","publish_key":"same_key","play_key":"same_key"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_stream_rejects_invalid_custom_key() {
+        let app = router(test_state("a-strong-random-secret-value"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"id":"badkey","publish_key":"bad/key"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_player_accepts_custom_play_key() {
+        let state = test_state("a-strong-random-secret-value");
+        let app = router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"id":"playerkeys"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams/playerkeys/players")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Guest","play_key":"guest_play_key"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["play_key"], "guest_play_key");
     }
 
     #[tokio::test]
