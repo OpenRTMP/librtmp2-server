@@ -41,13 +41,7 @@ impl RateLimiter {
     fn evict_lru_key(guard: &mut HashMap<String, Vec<Instant>>) {
         let Some(lru_key) = guard
             .iter()
-            .min_by_key(|(_, entries)| {
-                entries
-                    .iter()
-                    .max()
-                    .copied()
-                    .unwrap_or_else(Instant::now)
-            })
+            .min_by_key(|(_, entries)| entries.iter().max().copied().unwrap_or_else(Instant::now))
             .map(|(key, _)| key.clone())
         else {
             return;
