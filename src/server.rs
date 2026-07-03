@@ -437,11 +437,17 @@ impl ServerApp {
                     crate::log_warn!("RTMP polling stopped: {e}");
                     break;
                 }
+                // A failure here must not take down the plaintext listener —
+                // RTMP is meant to stay available even if RTMPS breaks.
+                let mut tls_poll_failed = false;
                 if let Some(ref mut s) = tls_server
                     && let Err(e) = s.poll(0)
                 {
-                    crate::log_warn!("RTMPS polling stopped: {e}");
-                    break;
+                    crate::log_warn!("RTMPS polling stopped: {e}; RTMP keeps running");
+                    tls_poll_failed = true;
+                }
+                if tls_poll_failed && let Some(mut s) = tls_server.take() {
+                    s.stop();
                 }
 
                 // Snapshot deleted stream IDs / revoked viewer IDs once per

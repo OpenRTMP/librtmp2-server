@@ -84,9 +84,19 @@ impl ServerConfig {
 }
 
 /// Extract the port number from a "host:port" (or "[ipv6]:port") string.
+///
+/// A bracketed IPv6 host is handled specially: the port must immediately
+/// follow the closing `]`. Naively taking the text after the *last* `:`
+/// would misparse a portless literal like `"[::1]"` (whose last `:` sits
+/// inside the brackets) as having some port.
 fn port_of(bind: &str) -> u16 {
-    bind.rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok())
+    let port_str: Option<&str> = if let Some(bracket_end) = bind.rfind(']') {
+        bind[bracket_end + 1..].strip_prefix(':')
+    } else {
+        bind.rsplit_once(':').map(|(_, port)| port)
+    };
+    port_str
+        .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or(0)
 }
 
@@ -459,5 +469,15 @@ mod tests {
         };
         assert_eq!(config.rtmp_port(), 1935);
         assert_eq!(config.rtmps_port(), 1936);
+    }
+
+    #[test]
+    fn port_of_handles_bracketed_ipv6() {
+        assert_eq!(port_of("[::1]:1935"), 1935);
+        assert_eq!(port_of("[2001:db8::1]:8080"), 8080);
+        // Portless bracketed IPv6 must not misparse the literal's own colons
+        // as a "host:port" split — there is no port here.
+        assert_eq!(port_of("[::1]"), 0);
+        assert_eq!(port_of("not-a-bind"), 0);
     }
 }
