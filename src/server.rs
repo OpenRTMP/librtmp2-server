@@ -19,6 +19,37 @@ static RTMP_BRIDGE: OnceLock<Arc<DbRtmpBridge>> = OnceLock::new();
 /// How often the poll loop wakes up to service the RTMP/RTMPS listener(s).
 const POLL_INTERVAL_MS: u64 = 50;
 
+/// Normalize a bind string so passing it to librtmp2 cannot fall back to the
+/// RTMP library default port. In particular, RTMPS host-only binds such as
+/// `0.0.0.0`, `::1`, or `[::1]` must be listened on 1936, not librtmp2's
+/// generic RTMP default of 1935.
+fn bind_with_default_port(bind: &str, default_port: u16) -> String {
+    let bind = bind.trim();
+
+    if let Some(bracket_end) = bind.rfind(']') {
+        let suffix = &bind[bracket_end + 1..];
+        if suffix
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_some()
+        {
+            return bind.to_string();
+        }
+        return format!("{}:{default_port}", &bind[..=bracket_end]);
+    }
+
+    let colon_count = bind.chars().filter(|&c| c == ':').count();
+    match colon_count {
+        0 => format!("{bind}:{default_port}"),
+        1 => match bind.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => format!("{host}:{port}"),
+            Some((host, _)) => format!("{host}:{default_port}"),
+            None => format!("{bind}:{default_port}"),
+        },
+        _ => format!("[{bind}]:{default_port}"),
+    }
+}
+
 fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
     RTMP_BRIDGE
         .get()
@@ -321,7 +352,8 @@ impl ServerApp {
         // vice versa) and RTMP_MAX_CONNECTIONS / the memory limits apply once,
         // across both listeners combined, rather than doubling per listener.
         let rtmp_bind = self.config.rtmp_bind.clone();
-        let rtmps_bind = self.config.rtmps_bind.clone();
+        let rtmps_bind = bind_with_default_port(&self.config.rtmps_bind, self.config.rtmps_port());
+        let rtmps_log_bind = rtmps_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
         let rtmp_resource_limits = self.config.rtmp_resource_limits();
         let rtmp_tls_enabled = self.config.tls_enabled;
@@ -457,7 +489,7 @@ impl ServerApp {
             self.config.http_bind,
             self.config.rtmp_bind,
             if self.config.tls_enabled {
-                format!(", RTMPS: {}", self.config.rtmps_bind)
+                format!(", RTMPS: {rtmps_log_bind}")
             } else {
                 String::new()
             }
@@ -501,5 +533,23 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_with_default_port;
+
+    #[test]
+    fn bind_with_default_port_leaves_explicit_ports() {
+        assert_eq!(bind_with_default_port("0.0.0.0:1936", 1936), "0.0.0.0:1936");
+        assert_eq!(bind_with_default_port("[::1]:1936", 1936), "[::1]:1936");
+    }
+
+    #[test]
+    fn bind_with_default_port_normalizes_host_only_binds() {
+        assert_eq!(bind_with_default_port("0.0.0.0", 1936), "0.0.0.0:1936");
+        assert_eq!(bind_with_default_port("::1", 1936), "[::1]:1936");
+        assert_eq!(bind_with_default_port("[::1]", 1936), "[::1]:1936");
     }
 }
