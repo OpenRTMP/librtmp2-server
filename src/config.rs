@@ -72,39 +72,43 @@ impl ServerConfig {
         }
     }
 
-    /// Port parsed from `rtmp_bind` ("host:port"), or 0 if unparsable.
+    /// Port `rtmp_bind` actually binds to (parsed from "host:port", or the
+    /// RTMP default 1935 when the bind string carries no port of its own).
     pub fn rtmp_port(&self) -> u16 {
-        port_of(&self.rtmp_bind)
+        port_of(&self.rtmp_bind, 1935)
     }
 
-    /// Port parsed from `rtmps_bind` ("host:port"), or 0 if unparsable.
+    /// Port `rtmps_bind` actually binds to (parsed from "host:port", or the
+    /// RTMPS default 1936 when the bind string carries no port of its own).
     pub fn rtmps_port(&self) -> u16 {
-        port_of(&self.rtmps_bind)
+        port_of(&self.rtmps_bind, 1936)
     }
 }
 
-/// Extract the port number from a "host:port" string, mirroring how
-/// `librtmp2::net::split_host_port` (the actual bind-time parser) tells a
-/// port apart from a bare IPv6 host:
-/// - `"[v6addr]:port"` / `"[v6addr]"` — bracketed IPv6; port must immediately
-///   follow the closing `]`, or there is none.
-/// - exactly one `:` — `"host:port"`.
-/// - zero or 2+ `:` with no brackets — no port (a bare IPv6 literal like
-///   `"::1"` has 2+ colons and *no* port of its own; naively splitting on the
-///   last `:` would misparse its final hextet as a port).
-fn port_of(bind: &str) -> u16 {
+/// Extract the port number a "host:port" string resolves to, mirroring
+/// `librtmp2::net::split_host_port` (the actual bind-time parser): whenever
+/// the input carries no port of its own, the *default* port is what's
+/// actually bound, not 0. Ways a bind string can carry no port:
+/// - `"[v6addr]"` — bracketed IPv6 with nothing after the closing `]`.
+/// - zero `:` — a bare host/IPv4 literal with no port, e.g. `"127.0.0.1"`.
+/// - 2+ `:` with no brackets — a bare IPv6 literal with no port of its own,
+///   e.g. `"::1"` (naively splitting on the last `:` would misparse its
+///   final hextet as a port).
+/// The only case with an explicit port is `"[v6addr]:port"` or exactly one
+/// unbracketed `:` (`"host:port"`).
+fn port_of(bind: &str, default: u16) -> u16 {
     if let Some(bracket_end) = bind.rfind(']') {
         return bind[bracket_end + 1..]
             .strip_prefix(':')
             .and_then(|port| port.parse::<u16>().ok())
-            .unwrap_or(0);
+            .unwrap_or(default);
     }
     if bind.chars().filter(|&c| c == ':').count() != 1 {
-        return 0;
+        return default;
     }
     bind.rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
-        .unwrap_or(0)
+        .unwrap_or(default)
 }
 
 fn mb_to_bytes(mb: u32) -> usize {
@@ -480,22 +484,32 @@ mod tests {
 
     #[test]
     fn port_of_handles_bracketed_ipv6() {
-        assert_eq!(port_of("[::1]:1935"), 1935);
-        assert_eq!(port_of("[2001:db8::1]:8080"), 8080);
+        assert_eq!(port_of("[::1]:1935", 9999), 1935);
+        assert_eq!(port_of("[2001:db8::1]:8080", 9999), 8080);
         // Portless bracketed IPv6 must not misparse the literal's own colons
-        // as a "host:port" split — there is no port here.
-        assert_eq!(port_of("[::1]"), 0);
-        assert_eq!(port_of("not-a-bind"), 0);
+        // as a "host:port" split — there is no explicit port, so this binds
+        // (and must report) the default, just like split_host_port.
+        assert_eq!(port_of("[::1]", 9999), 9999);
+        assert_eq!(port_of("not-a-bind", 9999), 9999);
     }
 
     #[test]
-    fn port_of_treats_bare_unbracketed_ipv6_as_portless() {
+    fn port_of_falls_back_to_default_for_bare_unbracketed_ipv6() {
         // Matches librtmp2::net::split_host_port: an unbracketed literal with
         // 2+ colons is a bare IPv6 host with no port of its own, not
         // "host:port". Naively splitting on the last ':' would misparse the
-        // literal's final hextet ("1") as the port.
-        assert_eq!(port_of("::1"), 0);
-        assert_eq!(port_of("fe80::1"), 0);
-        assert_eq!(port_of("2001:db8::1"), 0);
+        // literal's final hextet ("1") as the port. No explicit port means
+        // the default is what actually gets bound.
+        assert_eq!(port_of("::1", 9999), 9999);
+        assert_eq!(port_of("fe80::1", 9999), 9999);
+        assert_eq!(port_of("2001:db8::1", 9999), 9999);
+    }
+
+    #[test]
+    fn port_of_falls_back_to_default_for_host_only_bind() {
+        // RTMP_BIND=127.0.0.1 (no port) still binds the default RTMP port —
+        // the health endpoint must report that, not 0.
+        assert_eq!(port_of("127.0.0.1", 1935), 1935);
+        assert_eq!(port_of("my-host.example.com", 1936), 1936);
     }
 }
