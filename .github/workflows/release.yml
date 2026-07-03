@@ -59,9 +59,13 @@ jobs:
 
       - name: Stage install tree
         run: |
-          mkdir -p dist/librtmp2-server-${{ steps.ver.outputs.version }}
-          cp target/release/librtmp2-server dist/librtmp2-server-${{ steps.ver.outputs.version }}/
-          cp config.example.json dist/librtmp2-server-${{ steps.ver.outputs.version }}/config.json
+          DIST="dist/librtmp2-server-${{ steps.ver.outputs.version }}"
+          mkdir -p "$DIST"
+          test -f target/release/librtmp2-server
+          test -f config.example.env
+          cp target/release/librtmp2-server "$DIST/"
+          cp config.example.env "$DIST/config.env"
+          cp README.md LICENSE "$DIST/"
 
       - name: Create binary tarball
         run: |
