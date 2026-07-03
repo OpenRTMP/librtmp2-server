@@ -11,10 +11,17 @@ services:
       - LRTMP2_RTMP_BIND=0.0.0.0:1935
       - LRTMP2_LOG_LEVEL=2
       - LRTMP2_DB=/data/server.db
+      # Uncomment to also accept RTMPS (TLS) alongside plaintext RTMP:
+      # - LRTMP2_TLS_ENABLED=true
+      # - LRTMP2_TLS_CERT_FILE=/certs/fullchain.pem
+      # - LRTMP2_TLS_KEY_FILE=/certs/privkey.pem
+      # - LRTMP2_RTMPS_BIND=0.0.0.0:1936
     volumes:
       - server-data:/data
+      # - ./certs:/certs:ro   # needed when RTMPS is enabled
     ports:
       - "1935:1935"   # RTMP ingest/play
+      # - "1936:1936" # RTMPS ingest/play — uncomment when RTMPS is enabled
       - "8080:8080"   # HTTP API + health
     networks:
       - openrtmp

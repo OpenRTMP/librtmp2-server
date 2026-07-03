@@ -1,8 +1,8 @@
 //! Server application lifecycle: wires together the database, the HTTP API,
-//! and the RTMP listener, then runs until a shutdown signal arrives.
+//! and the RTMP listener(s), then runs until a shutdown signal arrives.
 
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
@@ -15,6 +15,40 @@ use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
 static RTMP_BRIDGE: OnceLock<Arc<DbRtmpBridge>> = OnceLock::new();
+
+/// How often the poll loop wakes up to service the RTMP/RTMPS listener(s).
+const POLL_INTERVAL_MS: u64 = 50;
+
+/// Normalize a bind string so passing it to librtmp2 cannot fall back to the
+/// RTMP library default port. In particular, RTMPS host-only binds such as
+/// `0.0.0.0`, `::1`, or `[::1]` must be listened on 1936, not librtmp2's
+/// generic RTMP default of 1935.
+fn bind_with_default_port(bind: &str, default_port: u16) -> String {
+    let bind = bind.trim();
+
+    if let Some(bracket_end) = bind.rfind(']') {
+        let suffix = &bind[bracket_end + 1..];
+        if suffix
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_some()
+        {
+            return bind.to_string();
+        }
+        return format!("{}:{default_port}", &bind[..=bracket_end]);
+    }
+
+    let colon_count = bind.chars().filter(|&c| c == ':').count();
+    match colon_count {
+        0 => format!("{bind}:{default_port}"),
+        1 => match bind.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => format!("{host}:{port}"),
+            Some((host, _)) => format!("{host}:{default_port}"),
+            None => format!("{bind}:{default_port}"),
+        },
+        _ => format!("[{bind}]:{default_port}"),
+    }
+}
 
 fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
     RTMP_BRIDGE
@@ -48,6 +82,168 @@ fn rtmp_media_cb(
         codec: codec.unwrap_or("").to_string(),
     };
     bridge.on_frame(conn_id, &frame)
+}
+
+/// Per-connection bookkeeping the RTMP poll loop keeps for the lifetime of
+/// each connection.
+#[derive(Default)]
+struct TrackedConn {
+    connected: bool,
+    publishing: bool,
+    playing: bool,
+    /// DB stream id, set after publish/play is fully enabled.
+    stream_id: String,
+    /// Last detected video codec string from the protocol layer.
+    video_codec: String,
+    /// Last detected audio codec string from the protocol layer.
+    audio_codec: String,
+}
+
+/// Drive one poll cycle's worth of connection bookkeeping: authorize new
+/// publish/play commands, reject connections the bridge doesn't own, kick
+/// connections whose stream/play-key was revoked, and flush stats. Returns
+/// the conn_ids seen this cycle so the caller can detect connections that
+/// disappeared entirely (closed by the peer, rather than rejected here).
+///
+/// `server` is a single `librtmp2::server::Server` that may have multiple
+/// listeners bound (plaintext RTMP and, when TLS is enabled, RTMPS) — they
+/// share one `connections` list, so a publisher on one listener is relayed
+/// to players on any other listener by the library itself; this function
+/// doesn't need to know which listener a given connection came in on.
+fn process_server_connections(
+    server: &mut librtmp2::server::Server,
+    tracked: &mut HashMap<u64, TrackedConn>,
+    rtmp_bridge: &Arc<DbRtmpBridge>,
+    deleted_now: &HashSet<String>,
+    revoked_now: &HashSet<String>,
+) -> HashSet<u64> {
+    let mut current_ids = HashSet::new();
+    let mut reject_indices = Vec::new();
+
+    for (idx, conn) in server.connections.iter_mut().enumerate() {
+        if conn.client_fd < 0 {
+            continue;
+        }
+        let conn_id = conn.conn_id;
+        current_ids.insert(conn_id);
+        let entry = tracked.entry(conn_id).or_default();
+        if !entry.connected {
+            rtmp_bridge.on_connect(conn_id);
+            entry.connected = true;
+        }
+
+        let Some(stream) = conn.current_stream.as_ref() else {
+            continue;
+        };
+
+        if stream.is_publishing && !entry.publishing {
+            if !rtmp_bridge.has_publisher(conn_id) {
+                crate::log_warn!(
+                    "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
+                    conn.app
+                );
+                reject_indices.push(idx);
+                continue;
+            }
+            crate::log_info!("RTMP: publisher connected from {}", conn.remote_addr);
+            entry.publishing = true;
+            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            conn.relay_key = entry.stream_id.clone();
+            conn.relay_enabled = true;
+        }
+
+        if stream.is_playing && !entry.playing {
+            if !rtmp_bridge.has_player(conn_id) {
+                crate::log_warn!(
+                    "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
+                    conn.app
+                );
+                reject_indices.push(idx);
+                continue;
+            }
+            crate::log_info!("RTMP: player connected from {}", conn.remote_addr);
+            entry.playing = true;
+            if entry.stream_id.is_empty() {
+                entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            }
+            conn.relay_key = entry.stream_id.clone();
+            conn.relay_enabled = true;
+        }
+
+        // Kick connections whose stream was deleted.
+        if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
+            crate::log_info!(
+                "RTMP: kicking conn={conn_id} — stream '{}' was deleted",
+                entry.stream_id
+            );
+            reject_indices.push(idx);
+            continue;
+        }
+
+        let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
+        if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
+            crate::log_info!("RTMP: kicking conn={conn_id} — play key '{viewer_id}' was revoked");
+            reject_indices.push(idx);
+            continue;
+        }
+
+        // Publisher stats: media bytes only (excludes RTMP control overhead).
+        if stream.is_publishing {
+            let new_video = conn
+                .detected_video_codec
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            let new_audio = conn
+                .detected_audio_codec
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+
+            if !new_video.is_empty() && new_video != entry.video_codec {
+                entry.video_codec = new_video;
+            }
+            if !new_audio.is_empty() && new_audio != entry.audio_codec {
+                entry.audio_codec = new_audio;
+            }
+
+            rtmp_bridge.update_publisher_stats(
+                conn_id,
+                conn.media_bytes_received,
+                &entry.video_codec,
+                &entry.audio_codec,
+            );
+        }
+
+        if stream.is_playing {
+            rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
+        }
+    }
+
+    for conn in server.connections.iter() {
+        if conn.client_fd < 0 {
+            continue;
+        }
+        rtmp_bridge.update_rtt(conn.conn_id, conn.rtt_ms);
+    }
+
+    reject_indices.sort_unstable();
+    reject_indices.dedup();
+    for idx in reject_indices.into_iter().rev() {
+        if let Some(conn) = server.connections.get_mut(idx)
+            && conn.client_fd >= 0
+        {
+            let conn_id = conn.conn_id;
+            conn.relay_enabled = false;
+            conn.relay_key.clear();
+            conn.pending_relay.clear();
+            tracked.remove(&conn_id);
+            rtmp_bridge.on_close(conn_id);
+        }
+        server.connections.remove(idx);
+    }
+
+    current_ids
 }
 
 pub struct ServerApp {
@@ -125,7 +321,10 @@ impl ServerApp {
             if self.config.tls_cert_file.is_empty() || self.config.tls_key_file.is_empty() {
                 return Err("TLS enabled but tls.cert_file / tls.key_file not configured".into());
             }
-            crate::log_info!("RTMPS enabled (cert={})", self.config.tls_cert_file);
+            crate::log_info!(
+                "RTMPS enabled (cert={}) — RTMP and RTMPS will both accept connections",
+                self.config.tls_cert_file
+            );
         } else {
             crate::log_info!("RTMPS disabled (plaintext RTMP only)");
         }
@@ -144,9 +343,17 @@ impl ServerApp {
             .map_err(|e| format!("Failed to bind HTTP on {}: {e}", self.config.http_bind))?;
         crate::log_info!("HTTP listening on {}", self.config.http_bind);
 
-        // Start the RTMP listener in a background thread. librtmp2's Server
+        // Start the RTMP listener(s) in a background thread. librtmp2's Server
         // uses a blocking poll loop, so it lives outside the Tokio runtime.
+        // One Server binds both the always-on plaintext listener and, when TLS
+        // is enabled, an additional RTMPS listener — they share one
+        // connections list, so publish/play work across either listener
+        // interchangeably (a publisher on RTMP can be watched over RTMPS and
+        // vice versa) and RTMP_MAX_CONNECTIONS / the memory limits apply once,
+        // across both listeners combined, rather than doubling per listener.
         let rtmp_bind = self.config.rtmp_bind.clone();
+        let rtmps_bind = bind_with_default_port(&self.config.rtmps_bind, self.config.rtmps_port());
+        let rtmps_log_bind = rtmps_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
         let rtmp_resource_limits = self.config.rtmp_resource_limits();
         let rtmp_tls_enabled = self.config.tls_enabled;
@@ -162,38 +369,13 @@ impl ServerApp {
         let rtmp_thread = std::thread::spawn(move || {
             use librtmp2::server::Server as RtmpServer;
             use librtmp2::types::ServerConfig as RtmpConfig;
-            use std::collections::HashMap;
-
-            #[derive(Default)]
-            struct TrackedConn {
-                connected: bool,
-                publishing: bool,
-                playing: bool,
-                /// DB stream id, set after publish/play is fully enabled.
-                stream_id: String,
-                /// Last detected video codec string from the protocol layer.
-                video_codec: String,
-                /// Last detected audio codec string from the protocol layer.
-                audio_codec: String,
-            }
-
-            // Build CStrings inside the thread so the pointers remain valid
-            // for the duration of RtmpServer::new().
-            let cert_cstr = std::ffi::CString::new(rtmp_tls_cert).ok();
-            let key_cstr = std::ffi::CString::new(rtmp_tls_key).ok();
 
             let cfg = RtmpConfig {
                 max_connections: rtmp_max_conn,
                 chunk_size: 4096,
-                tls_enabled: if rtmp_tls_enabled { 1 } else { 0 },
-                tls_cert_file: cert_cstr
-                    .as_ref()
-                    .map(|s| s.as_ptr() as *const u8)
-                    .unwrap_or(std::ptr::null()),
-                tls_key_file: key_cstr
-                    .as_ref()
-                    .map(|s| s.as_ptr() as *const u8)
-                    .unwrap_or(std::ptr::null()),
+                tls_enabled: 0,
+                tls_cert_file: std::ptr::null(),
+                tls_key_file: std::ptr::null(),
                 tls_ca_file: std::ptr::null(),
                 tls_insecure: 0,
             };
@@ -209,6 +391,8 @@ impl ServerApp {
             server.resource_limits = rtmp_resource_limits;
             server.defer_media_relay = true;
             server.on_media_cb = Some(rtmp_media_cb);
+            server.on_publish_cb = Some(rtmp_publish_cb);
+            server.on_play_cb = Some(rtmp_play_cb);
             if let Err(e) = server.listen(&rtmp_bind) {
                 let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
                 crate::log_warn!("{msg}");
@@ -216,11 +400,19 @@ impl ServerApp {
                 return;
             }
             crate::log_info!("RTMP listening on {rtmp_bind}");
-            let _ = rtmp_ready_tx.send(Ok(()));
 
+            if rtmp_tls_enabled {
+                if let Err(e) = server.listen_tls(&rtmps_bind, &rtmp_tls_cert, &rtmp_tls_key) {
+                    let msg = format!("RTMPS bind on {rtmps_bind} failed: {e}");
+                    crate::log_warn!("{msg}");
+                    let _ = rtmp_ready_tx.send(Err(msg));
+                    return;
+                }
+                crate::log_info!("RTMPS listening on {rtmps_bind}");
+            }
+
+            let _ = rtmp_ready_tx.send(Ok(()));
             let _ = RTMP_BRIDGE.set(Arc::clone(&rtmp_bridge));
-            server.on_publish_cb = Some(rtmp_publish_cb);
-            server.on_play_cb = Some(rtmp_play_cb);
 
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
@@ -230,145 +422,25 @@ impl ServerApp {
                     break;
                 }
 
-                if let Err(e) = server.poll(50) {
+                if let Err(e) = server.poll(0) {
                     crate::log_warn!("RTMP polling stopped: {e}");
                     break;
                 }
 
-                let mut current_ids = std::collections::HashSet::new();
-                let mut reject_indices = Vec::new();
+                let deleted_now: HashSet<String> = deleted_streams.lock().iter().cloned().collect();
+                let revoked_now: HashSet<String> = revoked_viewers.lock().iter().cloned().collect();
 
-                // Snapshot deleted stream IDs once per poll cycle.
-                let deleted_now: std::collections::HashSet<String> =
-                    deleted_streams.lock().iter().cloned().collect();
-                let revoked_now: std::collections::HashSet<String> =
-                    revoked_viewers.lock().iter().cloned().collect();
+                let current_ids = process_server_connections(
+                    &mut server,
+                    &mut tracked,
+                    &rtmp_bridge,
+                    &deleted_now,
+                    &revoked_now,
+                );
 
-                for (idx, conn) in server.connections.iter_mut().enumerate() {
-                    if conn.client_fd < 0 {
-                        continue;
-                    }
-                    let conn_id = conn.conn_id;
-                    current_ids.insert(conn_id);
-                    let entry = tracked.entry(conn_id).or_default();
-                    if !entry.connected {
-                        rtmp_bridge.on_connect(conn_id);
-                        entry.connected = true;
-                    }
-
-                    let Some(stream) = conn.current_stream.as_ref() else {
-                        continue;
-                    };
-
-                    if stream.is_publishing && !entry.publishing {
-                        if !rtmp_bridge.has_publisher(conn_id) {
-                            crate::log_warn!(
-                                "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
-                                conn.app
-                            );
-                            reject_indices.push(idx);
-                            continue;
-                        }
-                        crate::log_info!("RTMP: publisher connected from {}", conn.remote_addr);
-                        entry.publishing = true;
-                        entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
-                        conn.relay_key = entry.stream_id.clone();
-                        conn.relay_enabled = true;
-                    }
-
-                    if stream.is_playing && !entry.playing {
-                        if !rtmp_bridge.has_player(conn_id) {
-                            crate::log_warn!(
-                                "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
-                                conn.app
-                            );
-                            reject_indices.push(idx);
-                            continue;
-                        }
-                        crate::log_info!("RTMP: player connected from {}", conn.remote_addr);
-                        entry.playing = true;
-                        if entry.stream_id.is_empty() {
-                            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
-                        }
-                        conn.relay_key = entry.stream_id.clone();
-                        conn.relay_enabled = true;
-                    }
-
-                    // Kick connections whose stream was deleted.
-                    if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
-                        crate::log_info!(
-                            "RTMP: kicking conn={conn_id} — stream '{}' was deleted",
-                            entry.stream_id
-                        );
-                        reject_indices.push(idx);
-                        continue;
-                    }
-
-                    let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
-                    if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
-                        crate::log_info!(
-                            "RTMP: kicking conn={conn_id} — play key '{viewer_id}' was revoked"
-                        );
-                        reject_indices.push(idx);
-                        continue;
-                    }
-
-                    // Publisher stats: media bytes only (excludes RTMP control overhead).
-                    if stream.is_publishing {
-                        let new_video = conn
-                            .detected_video_codec
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_string();
-                        let new_audio = conn
-                            .detected_audio_codec
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_string();
-
-                        if !new_video.is_empty() && new_video != entry.video_codec {
-                            entry.video_codec = new_video;
-                        }
-                        if !new_audio.is_empty() && new_audio != entry.audio_codec {
-                            entry.audio_codec = new_audio;
-                        }
-
-                        rtmp_bridge.update_publisher_stats(
-                            conn_id,
-                            conn.media_bytes_received,
-                            &entry.video_codec,
-                            &entry.audio_codec,
-                        );
-                    }
-
-                    if stream.is_playing {
-                        rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
-                    }
-                }
-
-                for conn in server.connections.iter() {
-                    if conn.client_fd < 0 {
-                        continue;
-                    }
-                    rtmp_bridge.update_rtt(conn.conn_id, conn.rtt_ms);
-                }
-
-                reject_indices.sort_unstable();
-                reject_indices.dedup();
-                for idx in reject_indices.into_iter().rev() {
-                    if let Some(conn) = server.connections.get_mut(idx)
-                        && conn.client_fd >= 0
-                    {
-                        let conn_id = conn.conn_id;
-                        conn.relay_enabled = false;
-                        conn.relay_key.clear();
-                        conn.pending_relay.clear();
-                        tracked.remove(&conn_id);
-                        rtmp_bridge.on_close(conn_id);
-                    }
-                    server.connections.remove(idx);
-                }
-
+                // A conn_id still in `tracked` but absent this cycle was
+                // closed by the peer (rather than rejected above) — notify
+                // the bridge.
                 let closed_ids: Vec<u64> = tracked
                     .keys()
                     .copied()
@@ -379,8 +451,8 @@ impl ServerApp {
                     rtmp_bridge.on_close(conn_id);
                 }
 
-                // Drain deletion markers that no live connection still references.
-                let live_stream_ids: std::collections::HashSet<String> = tracked
+                // Drain deletion/revocation markers no live connection still references.
+                let live_stream_ids: HashSet<String> = tracked
                     .values()
                     .filter(|c| !c.stream_id.is_empty())
                     .map(|c| c.stream_id.clone())
@@ -389,7 +461,7 @@ impl ServerApp {
                     .lock()
                     .retain(|id| live_stream_ids.contains(id));
 
-                let live_viewer_ids: std::collections::HashSet<String> = tracked
+                let live_viewer_ids: HashSet<String> = tracked
                     .keys()
                     .copied()
                     .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
@@ -398,6 +470,8 @@ impl ServerApp {
                 revoked_viewers
                     .lock()
                     .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+
+                std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             }
 
             // Notify the bridge about connections that never got an explicit close event.
@@ -411,9 +485,14 @@ impl ServerApp {
             .map_err(|_| "RTMP startup thread exited before reporting readiness".to_string())??;
 
         crate::log_info!(
-            "Server ready — HTTP: {}, RTMP: {}",
+            "Server ready — HTTP: {}, RTMP: {}{}",
             self.config.http_bind,
-            self.config.rtmp_bind
+            self.config.rtmp_bind,
+            if self.config.tls_enabled {
+                format!(", RTMPS: {rtmps_log_bind}")
+            } else {
+                String::new()
+            }
         );
 
         let http_result = axum::serve(
@@ -454,5 +533,23 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_with_default_port;
+
+    #[test]
+    fn bind_with_default_port_leaves_explicit_ports() {
+        assert_eq!(bind_with_default_port("0.0.0.0:1936", 1936), "0.0.0.0:1936");
+        assert_eq!(bind_with_default_port("[::1]:1936", 1936), "[::1]:1936");
+    }
+
+    #[test]
+    fn bind_with_default_port_normalizes_host_only_binds() {
+        assert_eq!(bind_with_default_port("0.0.0.0", 1936), "0.0.0.0:1936");
+        assert_eq!(bind_with_default_port("::1", 1936), "[::1]:1936");
+        assert_eq!(bind_with_default_port("[::1]", 1936), "[::1]:1936");
     }
 }

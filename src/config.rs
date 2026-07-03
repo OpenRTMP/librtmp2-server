@@ -4,7 +4,7 @@ use std::net::IpAddr;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// RTMP listener, e.g. "0.0.0.0:1935"
+    /// RTMP listener, e.g. "0.0.0.0:1935". Always active.
     pub rtmp_bind: String,
     pub rtmp_max_conn: i32,
 
@@ -15,10 +15,14 @@ pub struct ServerConfig {
     /// Per-publisher relay queue cap (megabytes).
     pub rtmp_max_relay_queue_mb: u32,
 
-    /// RTMPS (TLS) — off by default.
+    /// RTMPS (TLS) — off by default. When enabled, a second RTMPS listener
+    /// is started on `rtmps_bind` *alongside* the plaintext `rtmp_bind`
+    /// listener — both accept connections at the same time.
     pub tls_enabled: bool,
     pub tls_cert_file: String,
     pub tls_key_file: String,
+    /// RTMPS listener, e.g. "0.0.0.0:1936". Only bound when `tls_enabled`.
+    pub rtmps_bind: String,
 
     /// HTTP API + UI, e.g. "0.0.0.0:8080"
     pub http_bind: String,
@@ -47,6 +51,7 @@ impl Default for ServerConfig {
             tls_enabled: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
+            rtmps_bind: "0.0.0.0:1936".to_string(),
             http_bind: "0.0.0.0:8080".to_string(),
             http_trusted_proxies: Vec::new(),
             api_token: String::new(),
@@ -66,6 +71,45 @@ impl ServerConfig {
             max_pending_relay_bytes: mb_to_bytes(self.rtmp_max_relay_queue_mb),
         }
     }
+
+    /// Port `rtmp_bind` actually binds to (parsed from "host:port", or the
+    /// RTMP default 1935 when the bind string carries no port of its own).
+    pub fn rtmp_port(&self) -> u16 {
+        port_of(&self.rtmp_bind, 1935)
+    }
+
+    /// Port `rtmps_bind` actually binds to (parsed from "host:port", or the
+    /// RTMPS default 1936 when the bind string carries no port of its own).
+    pub fn rtmps_port(&self) -> u16 {
+        port_of(&self.rtmps_bind, 1936)
+    }
+}
+
+/// Extract the port number a "host:port" string resolves to, mirroring
+/// `librtmp2::net::split_host_port` (the actual bind-time parser): whenever
+/// the input carries no port of its own, the *default* port is what's
+/// actually bound, not 0. Ways a bind string can carry no port:
+/// - `"[v6addr]"` — bracketed IPv6 with nothing after the closing `]`.
+/// - zero `:` — a bare host/IPv4 literal with no port, e.g. `"127.0.0.1"`.
+/// - 2+ `:` with no brackets — a bare IPv6 literal with no port of its own,
+///   e.g. `"::1"` (naively splitting on the last `:` would misparse its
+///   final hextet as a port).
+///
+/// The only case with an explicit port is `"[v6addr]:port"` or exactly one
+/// unbracketed `:` (`"host:port"`).
+fn port_of(bind: &str, default: u16) -> u16 {
+    if let Some(bracket_end) = bind.rfind(']') {
+        return bind[bracket_end + 1..]
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(default);
+    }
+    if bind.chars().filter(|&c| c == ':').count() != 1 {
+        return default;
+    }
+    bind.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .unwrap_or(default)
 }
 
 fn mb_to_bytes(mb: u32) -> usize {
@@ -158,6 +202,7 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         },
         "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
         "TLS_KEY_FILE" => config.tls_key_file = val.to_string(),
+        "RTMPS_BIND" => config.rtmps_bind = val.to_string(),
         "HTTP_BIND" => config.http_bind = val.to_string(),
         "HTTP_TRUSTED_PROXIES" => config.http_trusted_proxies = parse_ip_list(val),
         "LOG_LEVEL" => match val.parse::<i32>() {
@@ -264,6 +309,12 @@ where
         config.tls_key_file = v;
     }
 
+    if let Some(v) = get("LRTMP2_RTMPS_BIND")
+        && !v.is_empty()
+    {
+        config.rtmps_bind = v;
+    }
+
     if let Some(v) = get("LRTMP2_HTTP_TRUSTED_PROXIES")
         && !v.is_empty()
     {
@@ -296,6 +347,7 @@ mod tests {
         assert!(!config.tls_enabled);
         assert!(config.tls_cert_file.is_empty());
         assert!(config.tls_key_file.is_empty());
+        assert_eq!(config.rtmps_bind, "0.0.0.0:1936");
         assert!(config.http_trusted_proxies.is_empty());
     }
 
@@ -314,6 +366,7 @@ mod tests {
              TLS_ENABLED=true\n\
              TLS_CERT_FILE=/etc/ssl/cert.pem\n\
              TLS_KEY_FILE=/etc/ssl/key.pem\n\
+             RTMPS_BIND=127.0.0.1:1937\n\
              HTTP_BIND=127.0.0.1:8081\n\
              HTTP_TRUSTED_PROXIES=127.0.0.1,10.0.0.1\n\
              LOG_LEVEL=3\n",
@@ -335,6 +388,7 @@ mod tests {
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/etc/ssl/cert.pem");
         assert_eq!(config.tls_key_file, "/etc/ssl/key.pem");
+        assert_eq!(config.rtmps_bind, "127.0.0.1:1937");
         assert_eq!(config.http_trusted_proxies.len(), 2);
     }
 
@@ -389,6 +443,7 @@ mod tests {
             ("LRTMP2_TLS_ENABLED", "1"),
             ("LRTMP2_TLS_CERT_FILE", "/env/cert.pem"),
             ("LRTMP2_TLS_KEY_FILE", "/env/key.pem"),
+            ("LRTMP2_RTMPS_BIND", "0.0.0.0:9443"),
         ]);
 
         let mut config = ServerConfig::default();
@@ -397,6 +452,7 @@ mod tests {
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/env/cert.pem");
         assert_eq!(config.tls_key_file, "/env/key.pem");
+        assert_eq!(config.rtmps_bind, "0.0.0.0:9443");
 
         let env = HashMap::from([("LRTMP2_TLS_ENABLED", "yesplease")]);
         let mut config = ServerConfig {
@@ -414,5 +470,47 @@ mod tests {
     fn max_connections_are_clamped() {
         assert_eq!(parse_max_connections("0"), 1);
         assert_eq!(parse_max_connections("99999"), 10_000);
+    }
+
+    #[test]
+    fn port_helpers_parse_bind_strings() {
+        let config = ServerConfig {
+            rtmp_bind: "0.0.0.0:1935".to_string(),
+            rtmps_bind: "0.0.0.0:1936".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.rtmp_port(), 1935);
+        assert_eq!(config.rtmps_port(), 1936);
+    }
+
+    #[test]
+    fn port_of_handles_bracketed_ipv6() {
+        assert_eq!(port_of("[::1]:1935", 9999), 1935);
+        assert_eq!(port_of("[2001:db8::1]:8080", 9999), 8080);
+        // Portless bracketed IPv6 must not misparse the literal's own colons
+        // as a "host:port" split — there is no explicit port, so this binds
+        // (and must report) the default, just like split_host_port.
+        assert_eq!(port_of("[::1]", 9999), 9999);
+        assert_eq!(port_of("not-a-bind", 9999), 9999);
+    }
+
+    #[test]
+    fn port_of_falls_back_to_default_for_bare_unbracketed_ipv6() {
+        // Matches librtmp2::net::split_host_port: an unbracketed literal with
+        // 2+ colons is a bare IPv6 host with no port of its own, not
+        // "host:port". Naively splitting on the last ':' would misparse the
+        // literal's final hextet ("1") as the port. No explicit port means
+        // the default is what actually gets bound.
+        assert_eq!(port_of("::1", 9999), 9999);
+        assert_eq!(port_of("fe80::1", 9999), 9999);
+        assert_eq!(port_of("2001:db8::1", 9999), 9999);
+    }
+
+    #[test]
+    fn port_of_falls_back_to_default_for_host_only_bind() {
+        // RTMP_BIND=127.0.0.1 (no port) still binds the default RTMP port —
+        // the health endpoint must report that, not 0.
+        assert_eq!(port_of("127.0.0.1", 1935), 1935);
+        assert_eq!(port_of("my-host.example.com", 1936), 1936);
     }
 }
