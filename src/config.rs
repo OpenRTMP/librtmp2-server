@@ -4,7 +4,7 @@ use std::net::IpAddr;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// RTMP listener, e.g. "0.0.0.0:1935"
+    /// RTMP listener, e.g. "0.0.0.0:1935". Always active.
     pub rtmp_bind: String,
     pub rtmp_max_conn: i32,
 
@@ -15,10 +15,14 @@ pub struct ServerConfig {
     /// Per-publisher relay queue cap (megabytes).
     pub rtmp_max_relay_queue_mb: u32,
 
-    /// RTMPS (TLS) — off by default.
+    /// RTMPS (TLS) — off by default. When enabled, a second RTMPS listener
+    /// is started on `rtmps_bind` *alongside* the plaintext `rtmp_bind`
+    /// listener — both accept connections at the same time.
     pub tls_enabled: bool,
     pub tls_cert_file: String,
     pub tls_key_file: String,
+    /// RTMPS listener, e.g. "0.0.0.0:1936". Only bound when `tls_enabled`.
+    pub rtmps_bind: String,
 
     /// HTTP API + UI, e.g. "0.0.0.0:8080"
     pub http_bind: String,
@@ -47,6 +51,7 @@ impl Default for ServerConfig {
             tls_enabled: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
+            rtmps_bind: "0.0.0.0:1936".to_string(),
             http_bind: "0.0.0.0:8080".to_string(),
             http_trusted_proxies: Vec::new(),
             api_token: String::new(),
@@ -66,6 +71,23 @@ impl ServerConfig {
             max_pending_relay_bytes: mb_to_bytes(self.rtmp_max_relay_queue_mb),
         }
     }
+
+    /// Port parsed from `rtmp_bind` ("host:port"), or 0 if unparsable.
+    pub fn rtmp_port(&self) -> u16 {
+        port_of(&self.rtmp_bind)
+    }
+
+    /// Port parsed from `rtmps_bind` ("host:port"), or 0 if unparsable.
+    pub fn rtmps_port(&self) -> u16 {
+        port_of(&self.rtmps_bind)
+    }
+}
+
+/// Extract the port number from a "host:port" (or "[ipv6]:port") string.
+fn port_of(bind: &str) -> u16 {
+    bind.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .unwrap_or(0)
 }
 
 fn mb_to_bytes(mb: u32) -> usize {
@@ -158,6 +180,7 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         },
         "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
         "TLS_KEY_FILE" => config.tls_key_file = val.to_string(),
+        "RTMPS_BIND" => config.rtmps_bind = val.to_string(),
         "HTTP_BIND" => config.http_bind = val.to_string(),
         "HTTP_TRUSTED_PROXIES" => config.http_trusted_proxies = parse_ip_list(val),
         "LOG_LEVEL" => match val.parse::<i32>() {
@@ -264,6 +287,12 @@ where
         config.tls_key_file = v;
     }
 
+    if let Some(v) = get("LRTMP2_RTMPS_BIND")
+        && !v.is_empty()
+    {
+        config.rtmps_bind = v;
+    }
+
     if let Some(v) = get("LRTMP2_HTTP_TRUSTED_PROXIES")
         && !v.is_empty()
     {
@@ -296,6 +325,7 @@ mod tests {
         assert!(!config.tls_enabled);
         assert!(config.tls_cert_file.is_empty());
         assert!(config.tls_key_file.is_empty());
+        assert_eq!(config.rtmps_bind, "0.0.0.0:1936");
         assert!(config.http_trusted_proxies.is_empty());
     }
 
@@ -314,6 +344,7 @@ mod tests {
              TLS_ENABLED=true\n\
              TLS_CERT_FILE=/etc/ssl/cert.pem\n\
              TLS_KEY_FILE=/etc/ssl/key.pem\n\
+             RTMPS_BIND=127.0.0.1:1937\n\
              HTTP_BIND=127.0.0.1:8081\n\
              HTTP_TRUSTED_PROXIES=127.0.0.1,10.0.0.1\n\
              LOG_LEVEL=3\n",
@@ -335,6 +366,7 @@ mod tests {
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/etc/ssl/cert.pem");
         assert_eq!(config.tls_key_file, "/etc/ssl/key.pem");
+        assert_eq!(config.rtmps_bind, "127.0.0.1:1937");
         assert_eq!(config.http_trusted_proxies.len(), 2);
     }
 
@@ -389,6 +421,7 @@ mod tests {
             ("LRTMP2_TLS_ENABLED", "1"),
             ("LRTMP2_TLS_CERT_FILE", "/env/cert.pem"),
             ("LRTMP2_TLS_KEY_FILE", "/env/key.pem"),
+            ("LRTMP2_RTMPS_BIND", "0.0.0.0:9443"),
         ]);
 
         let mut config = ServerConfig::default();
@@ -397,6 +430,7 @@ mod tests {
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/env/cert.pem");
         assert_eq!(config.tls_key_file, "/env/key.pem");
+        assert_eq!(config.rtmps_bind, "0.0.0.0:9443");
 
         let env = HashMap::from([("LRTMP2_TLS_ENABLED", "yesplease")]);
         let mut config = ServerConfig {
@@ -414,5 +448,16 @@ mod tests {
     fn max_connections_are_clamped() {
         assert_eq!(parse_max_connections("0"), 1);
         assert_eq!(parse_max_connections("99999"), 10_000);
+    }
+
+    #[test]
+    fn port_helpers_parse_bind_strings() {
+        let config = ServerConfig {
+            rtmp_bind: "0.0.0.0:1935".to_string(),
+            rtmps_bind: "0.0.0.0:1936".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.rtmp_port(), 1935);
+        assert_eq!(config.rtmps_port(), 1936);
     }
 }
