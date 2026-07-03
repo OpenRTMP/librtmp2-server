@@ -29,21 +29,47 @@ impl RateLimiter {
         }
     }
 
+    fn timestamp_in_window(&self, now: Instant, timestamp: Instant) -> bool {
+        now.checked_duration_since(timestamp)
+            .is_none_or(|age| age < self.window)
+    }
+
+    /// Drop client keys whose sliding window has fully expired.
+    fn purge_expired(&self, guard: &mut HashMap<String, Vec<Instant>>, now: Instant) {
+        guard.retain(|_, entries| {
+            entries.retain(|t| self.timestamp_in_window(now, *t));
+            !entries.is_empty()
+        });
+    }
+
     fn check(&self, key: &str, max_requests: usize) -> bool {
-        let now = Instant::now();
-        let mut guard = self.inner.lock();
-        if !guard.contains_key(key) && guard.len() >= MAX_TRACKED_KEYS {
+        if max_requests == 0 {
             return false;
         }
-        {
-            let entries = guard.entry(key.to_string()).or_default();
-            entries.retain(|t| now.duration_since(*t) < self.window);
+
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+
+        if let Some(entries) = guard.get_mut(key) {
+            entries.retain(|t| self.timestamp_in_window(now, *t));
             if entries.len() >= max_requests {
                 return false;
             }
-            entries.push(now);
+            if !entries.is_empty() {
+                entries.push(now);
+                return true;
+            }
+            guard.remove(key);
         }
-        guard.retain(|_, v| !v.is_empty());
+
+        if guard.len() >= MAX_TRACKED_KEYS {
+            self.purge_expired(&mut guard, now);
+            if guard.len() >= MAX_TRACKED_KEYS {
+                return false;
+            }
+        }
+
+        guard.insert(key.to_string(), vec![now]);
         true
     }
 }
@@ -97,4 +123,87 @@ pub async fn middleware(
             .into_response();
     }
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn expired_one_shot_clients_do_not_permanently_fill_tracking_map() {
+        let limiter = RateLimiter::new(Vec::new());
+        let max = 120;
+
+        for i in 0..MAX_TRACKED_KEYS {
+            let key = format!("10.{}.{}:api", i / 256, i % 256);
+            assert!(limiter.check(&key, max), "seed request {i} should succeed");
+        }
+        assert_eq!(limiter.inner.lock().len(), MAX_TRACKED_KEYS);
+
+        {
+            let mut guard = limiter.inner.lock();
+            let stale = Instant::now() - Duration::from_secs(61);
+            for entries in guard.values_mut() {
+                entries.clear();
+                entries.push(stale);
+            }
+        }
+
+        assert!(
+            limiter.check("203.0.113.1:api", max),
+            "new client must be admitted after stale entries age out"
+        );
+        assert!(limiter.inner.lock().len() <= MAX_TRACKED_KEYS);
+    }
+
+    #[test]
+    fn active_clients_are_not_evicted_when_map_is_at_capacity() {
+        let limiter = RateLimiter::new(Vec::new());
+        let max = 120;
+        let now = Instant::now();
+        let limited_key = "198.51.100.0:api";
+
+        {
+            let mut guard = limiter.inner.lock();
+            guard.insert(
+                limited_key.to_string(),
+                vec![now - Duration::from_secs(30); max],
+            );
+            for i in 1..MAX_TRACKED_KEYS {
+                guard.insert(
+                    format!("198.51.100.{i}:api"),
+                    vec![now - Duration::from_secs(30)],
+                );
+            }
+        }
+
+        assert!(
+            !limiter.check("203.0.113.9:api", max),
+            "full active map should reject new clients instead of evicting active buckets"
+        );
+        assert_eq!(limiter.inner.lock().len(), MAX_TRACKED_KEYS);
+        assert!(
+            !limiter.check(limited_key, max),
+            "eviction must not reset an active client's bucket"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_uses_x_forwarded_for() {
+        use axum::body::Body;
+
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut request = Request::builder()
+            .uri("/api/v1/health")
+            .header("X-Forwarded-For", "203.0.113.5, 10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 12345))));
+
+        let ip = client_ip(&request, &[proxy]);
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+    }
 }
