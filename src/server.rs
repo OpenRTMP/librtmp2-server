@@ -158,9 +158,7 @@ fn process_server_connections(
 
         let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
         if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
-            crate::log_info!(
-                "RTMP: kicking conn={conn_id} — play key '{viewer_id}' was revoked"
-            );
+            crate::log_info!("RTMP: kicking conn={conn_id} — play key '{viewer_id}' was revoked");
             reject_indices.push(idx);
             continue;
         }
@@ -448,10 +446,8 @@ impl ServerApp {
 
                 // Snapshot deleted stream IDs / revoked viewer IDs once per
                 // poll cycle, shared across both listeners this iteration.
-                let deleted_now: HashSet<String> =
-                    deleted_streams.lock().iter().cloned().collect();
-                let revoked_now: HashSet<String> =
-                    revoked_viewers.lock().iter().cloned().collect();
+                let deleted_now: HashSet<String> = deleted_streams.lock().iter().cloned().collect();
+                let revoked_now: HashSet<String> = revoked_viewers.lock().iter().cloned().collect();
                 let mut current_ids: HashSet<u64> = HashSet::new();
 
                 process_server_connections(
