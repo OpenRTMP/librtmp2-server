@@ -17,6 +17,7 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 Implemented in this repository:
 
 - **Integrated RTMP listener** — listens on the configured `RTMP_BIND` address through the Rust `librtmp2` server implementation
+- **RTMPS listener** — when `TLS_ENABLED=true`, a second listener on `RTMPS_BIND` accepts RTMPS *alongside* the plaintext RTMP listener
 - **OBS / FFmpeg publishing path** — publish requests are routed through the DB-backed stream-key validation layer
 - **Play / publish authentication** — separate `publish_key` and `play_key` validation
 - **SQLite persistence** — streams, publishers, players, and stats are stored in a database
@@ -41,6 +42,7 @@ The server is not intended to be presented as a drop-in production replacement f
 ## Features
 
 - **Integrated RTMP listener** — built on the Rust `librtmp2` implementation
+- **RTMP + RTMPS at the same time** — RTMPS is an additional listener, not a mode switch; plaintext RTMP keeps working when TLS is enabled
 - **SQLite persistence** — Streams, publishers, players, stats all in a DB
 - **Unique keys per stream** — `publish_key`, `play_key`, `stats_key`
 - **Privacy by design** — No one can see streams/stats without the exact key
@@ -61,9 +63,11 @@ and stats.
 
 The RTMP protocol layer is provided by the Rust
 [`librtmp2`](https://github.com/OpenRTMP/librtmp2) crate and is integrated into
-this server's listener. `src/server.rs` starts the RTMP listener, polls active
-connections, and forwards connect/publish/play/close events into the DB-backed
-[`RtmpEventHandler`](src/rtmp_bridge.rs) bridge while also updating codec/stats data.
+this server's listener. `src/server.rs` starts the RTMP listener(s) — one
+plaintext, plus a second RTMPS listener when TLS is enabled — polls active
+connections on both, and forwards connect/publish/play/close events into the
+DB-backed [`RtmpEventHandler`](src/rtmp_bridge.rs) bridge while also updating
+codec/stats data.
 
 Both `librtmp2-server` and `librtmp2` are under active development and should be
 considered Alpha software.
@@ -73,7 +77,8 @@ OBS / FFmpeg / App
         │
         ▼
   librtmp2-server (Rust)
-  ├── RTMP Listener (port 1935)      ← integrated via librtmp2 (Alpha)
+  ├── RTMP Listener (port 1935)      ← integrated via librtmp2 (Alpha), always on
+  ├── RTMPS Listener (port 1936)     ← alongside RTMP, only when TLS_ENABLED=true
   ├── SQLite (streams, publishers, players, stats)
   ├── HTTP API     (port 8080, axum)
   │   ├── /api/v1/streams    CRUD
@@ -130,16 +135,18 @@ The API token is generated on first startup, stored in the SQLite database, and 
 `LRTMP2_DB` or `LRTMP2_DB_PATH` must point to the SQLite database file. Listener and logging settings live in `config.env`:
 
 ```env
-# RTMP listener address
+# RTMP listener address (always active, regardless of TLS_ENABLED)
 RTMP_BIND=0.0.0.0:1935
 
-# Maximum concurrent RTMP connections
+# Maximum concurrent RTMP connections (applied per listener)
 RTMP_MAX_CONNECTIONS=100
 
-# RTMPS (TLS) - disabled by default
+# RTMPS (TLS) - disabled by default.
+# When enabled, RTMPS_BIND runs *alongside* RTMP_BIND rather than replacing it.
 TLS_ENABLED=false
 TLS_CERT_FILE=/etc/librtmp2-server/fullchain.pem
 TLS_KEY_FILE=/etc/librtmp2-server/privkey.pem
+RTMPS_BIND=0.0.0.0:1936
 
 # HTTP API and UI listener address
 HTTP_BIND=0.0.0.0:8080
@@ -156,18 +163,28 @@ LOG_FILE=
 ## RTMPS (TLS)
 
 The RTMP listener is implemented through the integrated Rust `librtmp2` server.
-TLS/RTMPS configuration options already exist and are validated during startup:
-enabling TLS without both a cert and key file configured is refused with a clear
-error.
+Setting `TLS_ENABLED=true` starts a **second** listener on `RTMPS_BIND` that
+speaks RTMPS — the plaintext RTMP listener on `RTMP_BIND` keeps running
+unchanged, so existing publishers/players are unaffected. Both listeners share
+the same stream-key database, connection tracking, and stats.
 
-RTMPS support should still be considered experimental while the protocol layer
-and server integration are being hardened.
+Enabling TLS without both a cert and key file configured is refused with a
+clear error at startup.
 
 ```env
 TLS_ENABLED=true
 TLS_CERT_FILE=/path/fullchain.pem
 TLS_KEY_FILE=/path/privkey.pem
+RTMPS_BIND=0.0.0.0:1936
 ```
+
+`GET /api/v1/health` reports whether RTMPS is currently enabled and which
+ports the RTMP/RTMPS listeners are bound to (`rtmp_port`, `rtmps_enabled`,
+`rtmps_port`), so integrations like `librtmp2-server-panel` can show RTMPS
+URLs only when they'll actually work.
+
+RTMPS support should still be considered experimental while the protocol layer
+and server integration are being hardened.
 
 ---
 
@@ -192,6 +209,8 @@ Each stream has **three unique, auto-generated keys**:
 | Method | Endpoint | Auth |
 |--------|----------|------|
 | GET | `/api/v1/health` | None |
+
+`/api/v1/health` responds with `{"status", "timestamp", "rtmp_port", "rtmps_enabled", "rtmps_port"}`.
 
 ### API (Bearer token required)
 
@@ -285,7 +304,7 @@ docker compose up -d
 librtmp2-server/
 ├── src/
 │   ├── main.rs           CLI entry point & arg parsing (clap)
-│   ├── server.rs         App lifecycle, HTTP+RTMP wiring
+│   ├── server.rs         App lifecycle, HTTP+RTMP(S) wiring
 │   ├── config.rs         .env config loader
 │   ├── db.rs             SQLite persistence (rusqlite)
 │   ├── http.rs           HTTP API (axum)
