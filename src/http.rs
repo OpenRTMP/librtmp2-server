@@ -425,8 +425,15 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
 
 // ---------- handlers ----------
 
-async fn handle_health() -> Response {
-    Json(json!({"status": "ok", "timestamp": now_ts()})).into_response()
+async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
+    Json(json!({
+        "status": "ok",
+        "timestamp": now_ts(),
+        "rtmp_port": state.config.rtmp_port(),
+        "rtmps_enabled": state.config.tls_enabled,
+        "rtmps_port": state.config.rtmps_port(),
+    }))
+    .into_response()
 }
 
 async fn handle_stats_json(
@@ -1002,6 +1009,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_reports_rtmps_capability() {
+        let config = ServerConfig {
+            api_token: "a-strong-random-secret-value".to_string(),
+            rtmp_bind: "0.0.0.0:1935".to_string(),
+            tls_enabled: true,
+            rtmps_bind: "0.0.0.0:1936".to_string(),
+            ..Default::default()
+        };
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
+        let rtmp_bridge = Arc::new(DbRtmpBridge::new(
+            Arc::clone(&db),
+            Arc::clone(&deleted_streams),
+        ));
+        let state = Arc::new(AppState {
+            db,
+            config,
+            rtmp_bridge,
+            deleted_streams,
+            revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
+        });
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["rtmp_port"], 1935);
+        assert_eq!(json["rtmps_enabled"], true);
+        assert_eq!(json["rtmps_port"], 1936);
     }
 
     #[tokio::test]
