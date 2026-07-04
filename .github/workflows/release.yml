@@ -62,9 +62,9 @@ jobs:
           DIST="dist/librtmp2-server-${{ steps.ver.outputs.version }}"
           mkdir -p "$DIST"
           test -f target/release/librtmp2-server
-          test -f config.example.env
+          test -f .env.example
           cp target/release/librtmp2-server "$DIST/"
-          cp config.example.env "$DIST/config.env"
+          cp .env.example "$DIST/.env"
           cp README.md LICENSE "$DIST/"
 
       - name: Create binary tarball

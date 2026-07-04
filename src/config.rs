@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn load_from_env_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.env");
+        let path = dir.path().join(".env");
         std::fs::write(
             &path,
             "# test config\n\
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn api_token_ignored_in_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.env");
+        let path = dir.path().join(".env");
         std::fs::write(&path, "API_TOKEN=should-be-ignored\n").unwrap();
         let config = config_load(path.to_str().unwrap()).unwrap();
         assert!(

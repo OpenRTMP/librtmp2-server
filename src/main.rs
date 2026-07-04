@@ -8,7 +8,7 @@ use clap::Parser;
 #[command(name = "librtmp2-server", disable_help_flag = true)]
 struct Cli {
     /// Config file path
-    #[arg(short = 'c', default_value = "config.env")]
+    #[arg(short = 'c', default_value = ".env")]
     config: String,
 
     /// RTMP port (overrides config)
