@@ -54,7 +54,11 @@ pub(crate) fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool
     RTMP_BRIDGE
         .lock()
         .ok()
-        .and_then(|guard| guard.as_ref().map(|b| b.authorize_publish(conn_id, app, stream_key).is_ok()))
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
+        })
         .unwrap_or(false)
 }
 
@@ -62,7 +66,11 @@ pub(crate) fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
     RTMP_BRIDGE
         .lock()
         .ok()
-        .and_then(|guard| guard.as_ref().map(|b| b.authorize_play(conn_id, app, play_key).is_ok()))
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|b| b.authorize_play(conn_id, app, play_key).is_ok())
+        })
         .unwrap_or(false)
 }
 

@@ -40,7 +40,12 @@ async fn create_stream_via_http(server: &TestServer, stream_id: &str) -> serde_j
         .send()
         .await
         .expect("create stream request");
-    assert_eq!(resp.status(), 201, "stream create failed: {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        201,
+        "stream create failed: {}",
+        resp.status()
+    );
     resp.json().await.expect("create stream json")
 }
 
@@ -81,7 +86,10 @@ async fn http_create_stream_then_rtmp_publish_and_play() {
 
         thread::sleep(Duration::from_millis(150));
 
-        let data = [0x17u8, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let data = [
+            0x17u8, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
         let frame = Frame {
             frame_type: FrameType::Video,
             timestamp: 0,
@@ -125,7 +133,9 @@ async fn rtmp_publish_rejected_for_unknown_key() {
     let rtmp_port = server.rtmp_port;
     let publish_result = thread::spawn(move || {
         let mut publisher = Client::new();
-        publisher.connect(&format!("rtmp://127.0.0.1:{rtmp_port}/live/unknown_key_with_sufficient_len_x"))?;
+        publisher.connect(&format!(
+            "rtmp://127.0.0.1:{rtmp_port}/live/unknown_key_with_sufficient_len_x"
+        ))?;
         publisher.publish()
     })
     .join()

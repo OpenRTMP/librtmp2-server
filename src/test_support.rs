@@ -14,10 +14,10 @@ use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
 use crate::logger;
-use crate::rtmp_bridge::DbRtmpBridge;
+use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 use crate::server::{
-    process_server_connections, rtmp_media_cb, rtmp_play_cb, rtmp_publish_cb, TrackedConn,
-    POLL_INTERVAL_MS, RTMP_BRIDGE,
+    POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn, process_server_connections, rtmp_media_cb,
+    rtmp_play_cb, rtmp_publish_cb,
 };
 
 static TEST_RUNTIME: OnceLock<Runtime> = OnceLock::new();
