@@ -26,6 +26,9 @@ rand = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12"
 
+[features]
+test-support = []
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
@@ -36,6 +39,12 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "http_api"
 harness = false
+required-features = ["test-support"]
+
+[[test]]
+name = "rtmp_http_e2e"
+path = "tests/rtmp_http_e2e.rs"
+required-features = ["test-support"]
 
 [profile.release]
 opt-level = 3

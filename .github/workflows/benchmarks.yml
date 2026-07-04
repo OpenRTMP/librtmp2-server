@@ -23,7 +23,7 @@ jobs:
 
       - name: Run HTTP API benchmarks
         run: |
-          cargo bench --bench http_api -- --sample-size 20 --test-threads 1 --noplot 2>&1 | tee bench-http-api.txt
+          cargo bench --features test-support --bench http_api -- --sample-size 20 --test-threads 1 --noplot 2>&1 | tee bench-http-api.txt
 
       - name: Upload benchmark output
         uses: actions/upload-artifact@v4

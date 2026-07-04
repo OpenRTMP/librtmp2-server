@@ -22,4 +22,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run E2E integration tests
-        run: cargo test --verbose --test rtmp_http_e2e -- --test-threads=1
+        run: cargo test --verbose --features test-support --test rtmp_http_e2e -- --test-threads=1
