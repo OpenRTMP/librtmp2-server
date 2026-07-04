@@ -609,8 +609,8 @@ mod tests {
             config_file: String::new(),
             ..Default::default()
         };
-        let app = ServerApp::bootstrap(config, db_path_str, Some(token))
-            .expect("ServerApp::bootstrap");
+        let app =
+            ServerApp::bootstrap(config, db_path_str, Some(token)).expect("ServerApp::bootstrap");
 
         let db = crate::db::Db::open(db_path_str).expect("reopen db");
         assert_eq!(db.token_get().unwrap().as_deref(), Some(token));
