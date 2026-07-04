@@ -5,18 +5,20 @@ WORKDIR /build
 COPY . .
 RUN cargo build --release
 
-# Runtime stage
-FROM alpine:latest
+# Runtime stage (glibc — matches the rust:latest builder; Alpine/musl cannot run this binary)
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache libgcc
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 wget \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/
 COPY --from=builder /build/config.example.env /etc/librtmp2-server/config.env
 
 # Create non-root user and data directory
-RUN adduser -D -H -s /sbin/nologin openrtmp && \
-    mkdir -p /data && \
-    chown openrtmp:openrtmp /data
+RUN useradd -r -s /usr/sbin/nologin -d /nonexistent -M openrtmp \
+    && mkdir -p /data \
+    && chown openrtmp:openrtmp /data
 
 ENV LRTMP2_DB=/data/server.db
 
