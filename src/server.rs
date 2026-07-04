@@ -567,7 +567,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::bind_with_default_port;
+    use super::{ServerApp, bind_with_default_port};
+    use crate::config::ServerConfig;
 
     #[test]
     fn bind_with_default_port_leaves_explicit_ports() {
