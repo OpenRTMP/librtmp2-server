@@ -116,8 +116,8 @@ cargo build --release
 ### Run
 
 ```bash
-cp config.example.env config.env
-LRTMP2_DB=./server.db ./target/release/librtmp2-server -c config.env
+cp .env.example .env
+LRTMP2_DB=./server.db ./target/release/librtmp2-server
 ```
 
 Or with CLI port/log-level flags:
@@ -132,7 +132,7 @@ The API token is generated on first startup, stored in the SQLite database, and 
 
 ## Configuration
 
-`LRTMP2_DB` or `LRTMP2_DB_PATH` must point to the SQLite database file. Listener and logging settings live in `config.env`:
+`LRTMP2_DB` or `LRTMP2_DB_PATH` must point to the SQLite database file. Listener and logging settings live in `.env` (loaded by default, or pass `-c <path>`):
 
 ```env
 # RTMP listener address (always active, regardless of TLS_ENABLED)
@@ -329,7 +329,7 @@ librtmp2-server/
 ├── Cargo.toml
 ├── Dockerfile
 ├── docker-compose.yml
-└── config.example.env
+└── .env.example
 ```
 
 ---

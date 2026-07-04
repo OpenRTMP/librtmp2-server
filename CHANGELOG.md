@@ -13,6 +13,11 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- Standardized the config file name on `.env` (was `config.env`); the example
+  template is now `.env.example`. The server loads `.env` by default, and the
+  Docker image starts without an explicit `-c` path.
+
 ## [0.1.0] — 2026-07-04
 
 First tagged pre-release. `librtmp2-server` is a Rust crate built on `axum`
@@ -34,7 +39,7 @@ plaintext RTMP and RTMPS.
 - Key-based access control (`publish_key`, `play_key`, `stats_key`), including
   optional operator-supplied custom keys
 - JSON and Nginx-compatible XML stats endpoints
-- Configuration file support (`config.example.env`)
+- Configuration file support (`.env.example`)
 - CLI interface (`./librtmp2-server`) for quick starts
 - Docker image (`rust:1-alpine` → `alpine:latest` multi-stage build)
 - Unit tests covering config, db, HTTP API, keygen, rate limiting, and the
