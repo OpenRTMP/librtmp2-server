@@ -41,14 +41,19 @@ plaintext RTMP and RTMPS.
   RTMP bridge
 
 ### Security
-- Input validation for HTTP requests
+- Input validation and rate limiting for HTTP requests
 - Secure configuration handling with environment variables
 - Constant-time Bearer token comparison
 - Weak/placeholder API token rejection
-- Per-key connection caps and rate limiting for publish/play
+- Per-key connection caps for RTMP publish/play (the RTMP auth path itself is
+  not rate-limited, so operator-supplied custom keys have an enforced minimum
+  length to resist brute-forcing)
 
 ### Documentation
 - `README.md` updated for the Rust build/run/architecture
 
 ### Planned
 - REST API enhancements for server management
+
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/OpenRTMP/librtmp2-server/releases/tag/v0.1.0
