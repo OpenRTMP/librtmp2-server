@@ -29,8 +29,13 @@ parking_lot = "0.12"
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serial_test = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "http_api"
+harness = false
 
 [profile.release]
 opt-level = 3
