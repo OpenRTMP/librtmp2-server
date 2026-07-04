@@ -273,15 +273,23 @@ impl ServerApp {
     /// Opens the database, loads or auto-generates the API token, and wires
     /// together all server components. Returns an error if the database cannot
     /// be opened or the token cannot be persisted.
-    pub fn create(mut config: ServerConfig) -> Result<ServerApp, String> {
+    pub fn create(config: ServerConfig) -> Result<ServerApp, String> {
         let db_path = std::env::var("LRTMP2_DB")
             .or_else(|_| std::env::var("LRTMP2_DB_PATH"))
             .ok()
             .filter(|v| !v.is_empty())
             .ok_or("LRTMP2_DB or LRTMP2_DB_PATH environment variable must be set to the SQLite database path")?;
 
+        Self::bootstrap(config, &db_path, None)
+    }
+
+    pub(crate) fn bootstrap(
+        mut config: ServerConfig,
+        db_path: &str,
+        api_token_override: Option<&str>,
+    ) -> Result<ServerApp, String> {
         let db = Arc::new(
-            Db::open(&db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
+            Db::open(db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
         );
 
         // The API token lives exclusively in the database. On first startup it
@@ -290,20 +298,27 @@ impl ServerApp {
         config.api_token = match db.token_get()? {
             Some(t) => t,
             None => {
-                let from_env = std::env::var("LRTMP2_API_TOKEN")
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
+                let from_env = api_token_override
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        std::env::var("LRTMP2_API_TOKEN")
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    });
                 let candidate = match from_env {
                     Some(t) => t,
                     None => crate::keygen::keygen_api_token()?,
                 };
                 if db.token_set(&candidate)? {
-                    if std::env::var("LRTMP2_API_TOKEN")
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .is_none()
+                    if api_token_override.is_none()
+                        && std::env::var("LRTMP2_API_TOKEN")
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .is_none()
                     {
                         // We inserted the token — print it once so the operator
                         // can use the API.
@@ -587,22 +602,18 @@ mod tests {
     fn create_persists_env_api_token_on_first_start() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("token.db");
-        let db_path_str = db_path.to_str().unwrap().to_string();
+        let db_path_str = db_path.to_str().unwrap();
         let token = "env_api_token_for_first_start_tests_only_value_0123456789ab";
-
-        std::env::set_var("LRTMP2_DB", &db_path_str);
-        std::env::set_var("LRTMP2_API_TOKEN", token);
 
         let config = ServerConfig {
             config_file: String::new(),
             ..Default::default()
         };
-        let _app = ServerApp::create(config).expect("ServerApp::create");
+        let app = ServerApp::bootstrap(config, db_path_str, Some(token))
+            .expect("ServerApp::bootstrap");
 
-        let db = crate::db::Db::open(&db_path_str).expect("reopen db");
+        let db = crate::db::Db::open(db_path_str).expect("reopen db");
         assert_eq!(db.token_get().unwrap().as_deref(), Some(token));
-
-        std::env::remove_var("LRTMP2_DB");
-        std::env::remove_var("LRTMP2_API_TOKEN");
+        assert_eq!(app.config.api_token, token);
     }
 }

@@ -140,7 +140,15 @@ fn rtmp_publish_rejected_for_unknown_key() {
 
     assert!(
         publish_result.is_err(),
-        "publish with unknown key should be rejected"
+        "publish with unknown key should be rejected: {publish_result:?}"
+    );
+    assert!(
+        server
+            .db
+            .publisher_list(Some("auth-stream"))
+            .iter()
+            .all(|publisher| !publisher.active),
+        "unknown publish key must not activate a publisher row"
     );
 }
 
