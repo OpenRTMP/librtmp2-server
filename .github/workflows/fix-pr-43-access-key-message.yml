@@ -1,0 +1,46 @@
+name: Fix PR 43 access-key message
+
+on:
+  push:
+    branches:
+      - cursor/ci-autofix-automation-9699
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cursor/ci-autofix-automation-9699
+          fetch-depth: 0
+
+      - name: Patch access-key validation message
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/http.rs")
+          old = '''const ACCESS_KEY_VALIDATION_MSG: &str =
+              "Key must be 32-63 characters and use only letters, numbers, dots, underscores, or hyphens";'''
+          new = '''const ACCESS_KEY_VALIDATION_MSG: &str =
+              "Key must be 32-63 characters, start with a letter or number, and use only letters, numbers, dots, underscores, or hyphens";'''
+
+          text = path.read_text()
+          if old not in text:
+              raise SystemExit("target validation message not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          rm -f .github/workflows/fix-pr-43-access-key-message.yml
+
+      - name: Commit and push fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/http.rs .github/workflows/fix-pr-43-access-key-message.yml
+          git commit -m "Clarify access key validation message"
+          git push origin HEAD:cursor/ci-autofix-automation-9699
