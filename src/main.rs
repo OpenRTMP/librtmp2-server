@@ -1,15 +1,8 @@
-mod config;
-mod db;
-mod http;
-mod keygen;
-mod logger;
-mod rate_limit;
-mod rtmp_bridge;
-mod server;
+use librtmp2_server::config::{ServerConfig, config_apply_env, config_load};
+use librtmp2_server::logger;
+use librtmp2_server::server::ServerApp;
 
 use clap::Parser;
-use config::{ServerConfig, config_apply_env, config_load};
-use server::ServerApp;
 
 #[derive(Parser, Debug)]
 #[command(name = "librtmp2-server", disable_help_flag = true)]
@@ -48,10 +41,8 @@ fn run() -> Result<(), String> {
         }
     };
 
-    // Environment variables override config file values.
     config_apply_env(&mut config);
 
-    // CLI flags take highest priority.
     if let Some(port) = cli.rtmp_port {
         config.rtmp_bind = format!("0.0.0.0:{port}");
     }
@@ -66,7 +57,6 @@ fn run() -> Result<(), String> {
     logger::init(config.log_level, &config.log_file);
 
     let result = (|| -> Result<(), String> {
-        // ServerApp::create opens the database and resolves the API token.
         let app = ServerApp::create(config)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

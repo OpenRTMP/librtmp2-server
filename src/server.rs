@@ -4,7 +4,7 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
@@ -14,10 +14,10 @@ use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
 
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
-static RTMP_BRIDGE: OnceLock<Arc<DbRtmpBridge>> = OnceLock::new();
+pub(crate) static RTMP_BRIDGE: StdMutex<Option<Arc<DbRtmpBridge>>> = StdMutex::new(None);
 
 /// How often the poll loop wakes up to service the RTMP/RTMPS listener(s).
-const POLL_INTERVAL_MS: u64 = 50;
+pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 
 /// Normalize a bind string so passing it to librtmp2 cannot fall back to the
 /// RTMP library default port. In particular, RTMPS host-only binds such as
@@ -50,24 +50,28 @@ fn bind_with_default_port(bind: &str, default_port: u16) -> String {
     }
 }
 
-fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
+pub(crate) fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
     RTMP_BRIDGE
-        .get()
-        .is_some_and(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|b| b.authorize_publish(conn_id, app, stream_key).is_ok()))
+        .unwrap_or(false)
 }
 
-fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
+pub(crate) fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
     RTMP_BRIDGE
-        .get()
-        .is_some_and(|b| b.authorize_play(conn_id, app, play_key).is_ok())
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|b| b.authorize_play(conn_id, app, play_key).is_ok()))
+        .unwrap_or(false)
 }
 
-fn rtmp_media_cb(
+pub(crate) fn rtmp_media_cb(
     conn_id: u64,
     frame_type: librtmp2::types::FrameType,
     codec: Option<&str>,
 ) -> bool {
-    let Some(bridge) = RTMP_BRIDGE.get() else {
+    let Some(bridge) = RTMP_BRIDGE.lock().ok().and_then(|g| g.clone()) else {
         return true;
     };
     let kind = match frame_type {
@@ -87,7 +91,7 @@ fn rtmp_media_cb(
 /// Per-connection bookkeeping the RTMP poll loop keeps for the lifetime of
 /// each connection.
 #[derive(Default)]
-struct TrackedConn {
+pub(crate) struct TrackedConn {
     connected: bool,
     publishing: bool,
     playing: bool,
@@ -110,7 +114,7 @@ struct TrackedConn {
 /// share one `connections` list, so a publisher on one listener is relayed
 /// to players on any other listener by the library itself; this function
 /// doesn't need to know which listener a given connection came in on.
-fn process_server_connections(
+pub(crate) fn process_server_connections(
     server: &mut librtmp2::server::Server,
     tracked: &mut HashMap<u64, TrackedConn>,
     rtmp_bridge: &Arc<DbRtmpBridge>,
@@ -273,20 +277,35 @@ impl ServerApp {
         );
 
         // The API token lives exclusively in the database. On first startup it
-        // is generated here; afterwards it is loaded from the settings table.
+        // is taken from LRTMP2_API_TOKEN when set, otherwise generated here;
+        // afterwards it is loaded from the settings table.
         config.api_token = match db.token_get()? {
             Some(t) => t,
             None => {
-                let candidate = crate::keygen::keygen_api_token()?;
+                let from_env = std::env::var("LRTMP2_API_TOKEN")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let candidate = match from_env {
+                    Some(t) => t,
+                    None => crate::keygen::keygen_api_token()?,
+                };
                 if db.token_set(&candidate)? {
-                    // We inserted the token — print it once so the operator
-                    // can use the API.
-                    eprintln!(
-                        "============================================================\n\
-                         Generated API token (stored in database {db_path}):\n\
-                         {candidate}\n\
-                         ============================================================"
-                    );
+                    if std::env::var("LRTMP2_API_TOKEN")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        // We inserted the token — print it once so the operator
+                        // can use the API.
+                        eprintln!(
+                            "============================================================\n\
+                             Generated API token (stored in database {db_path}):\n\
+                             {candidate}\n\
+                             ============================================================"
+                        );
+                    }
                     candidate
                 } else {
                     // Another process inserted first; read back the winner's token.
@@ -412,7 +431,9 @@ impl ServerApp {
             }
 
             let _ = rtmp_ready_tx.send(Ok(()));
-            let _ = RTMP_BRIDGE.set(Arc::clone(&rtmp_bridge));
+            if let Ok(mut guard) = RTMP_BRIDGE.lock() {
+                *guard = Some(Arc::clone(&rtmp_bridge));
+            }
 
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
@@ -551,5 +572,28 @@ mod tests {
         assert_eq!(bind_with_default_port("0.0.0.0", 1936), "0.0.0.0:1936");
         assert_eq!(bind_with_default_port("::1", 1936), "[::1]:1936");
         assert_eq!(bind_with_default_port("[::1]", 1936), "[::1]:1936");
+    }
+
+    #[test]
+    fn create_persists_env_api_token_on_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("token.db");
+        let db_path_str = db_path.to_str().unwrap().to_string();
+        let token = "env_api_token_for_first_start_tests_only_value_0123456789ab";
+
+        std::env::set_var("LRTMP2_DB", &db_path_str);
+        std::env::set_var("LRTMP2_API_TOKEN", token);
+
+        let config = ServerConfig {
+            config_file: String::new(),
+            ..Default::default()
+        };
+        let _app = ServerApp::create(config).expect("ServerApp::create");
+
+        let db = crate::db::Db::open(&db_path_str).expect("reopen db");
+        assert_eq!(db.token_get().unwrap().as_deref(), Some(token));
+
+        std::env::remove_var("LRTMP2_DB");
+        std::env::remove_var("LRTMP2_API_TOKEN");
     }
 }

@@ -33,4 +33,7 @@ jobs:
       run: cargo build --verbose
 
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --verbose -- --test-threads=1
+
+    - name: Run E2E integration tests
+      run: cargo test --verbose --test rtmp_http_e2e -- --test-threads=1
