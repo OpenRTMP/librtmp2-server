@@ -62,8 +62,8 @@ impl TestServer {
             db: Arc::clone(&db),
             config,
             rtmp_bridge: Arc::clone(&rtmp_bridge),
-            deleted_streams,
-            revoked_viewers,
+            deleted_streams: Arc::clone(&deleted_streams),
+            revoked_viewers: Arc::clone(&revoked_viewers),
         });
 
         let app = http::router(state);
