@@ -232,7 +232,7 @@ fn resolve_or_generate_access_key(
 }
 
 const ACCESS_KEY_VALIDATION_MSG: &str =
-    "Key must be 32-63 characters and use only letters, numbers, dots, underscores, or hyphens";
+    "Key must be 32-63 characters, start with a letter or number, and use only letters, numbers, dots, underscores, or hyphens";
 
 fn access_keys_must_be_unique(keys: &[&str]) -> bool {
     let mut seen = HashSet::with_capacity(keys.len());
