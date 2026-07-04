@@ -48,9 +48,11 @@ pub trait RtmpEventHandler: Send + Sync {
     fn on_connect(&self, conn: ConnId);
     /// Atomically authorize a publish (DB slot + per-connection state).
     /// Called from the RTMP publish callback before media relay is enabled.
+    #[allow(clippy::result_unit_err)]
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
     /// Atomically authorize a play (DB slot + per-connection state).
     /// Called from the RTMP play callback before `Play.Start` is sent.
+    #[allow(clippy::result_unit_err)]
     fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()>;
     /// Optional per-frame hook for debug logging; always accepts media.
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool;

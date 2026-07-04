@@ -24,8 +24,8 @@ fn on_player_frame(frame: &Frame) {
     }
 }
 
-async fn create_stream_via_http(server: &TestServer, stream_id: &str) -> serde_json::Value {
-    let client = reqwest::Client::new();
+fn create_stream_via_http(server: &TestServer, stream_id: &str) -> serde_json::Value {
+    let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("{}/api/v1/streams", server.http_base))
         .header("Authorization", format!("Bearer {}", server.api_token))
@@ -38,7 +38,6 @@ async fn create_stream_via_http(server: &TestServer, stream_id: &str) -> serde_j
             "stats_key": STATS_KEY,
         }))
         .send()
-        .await
         .expect("create stream request");
     assert_eq!(
         resp.status(),
@@ -46,32 +45,30 @@ async fn create_stream_via_http(server: &TestServer, stream_id: &str) -> serde_j
         "stream create failed: {}",
         resp.status()
     );
-    resp.json().await.expect("create stream json")
+    resp.json().expect("create stream json")
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn health_endpoint_reports_rtmp_port() {
+fn health_endpoint_reports_rtmp_port() {
     let server = TestServer::start(RTMP_PORT, API_TOKEN);
-    let client = reqwest::Client::new();
+    let client = reqwest::blocking::Client::new();
     let health: serde_json::Value = client
         .get(format!("{}/api/v1/health", server.http_base))
         .send()
-        .await
         .unwrap()
         .json()
-        .await
         .unwrap();
     assert_eq!(health["rtmp_port"], RTMP_PORT);
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn http_create_stream_then_rtmp_publish_and_play() {
+fn http_create_stream_then_rtmp_publish_and_play() {
     PLAYER_FRAMES.store(0, Ordering::SeqCst);
 
     let server = TestServer::start(RTMP_PORT, API_TOKEN);
-    create_stream_via_http(&server, "e2e-stream").await;
+    create_stream_via_http(&server, "e2e-stream");
 
     let rtmp_port = server.rtmp_port;
     let client_result = thread::spawn(move || {
@@ -124,11 +121,11 @@ async fn http_create_stream_then_rtmp_publish_and_play() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn rtmp_publish_rejected_for_unknown_key() {
+fn rtmp_publish_rejected_for_unknown_key() {
     let server = TestServer::start(RTMP_PORT + 1, API_TOKEN);
-    create_stream_via_http(&server, "auth-stream").await;
+    create_stream_via_http(&server, "auth-stream");
 
     let rtmp_port = server.rtmp_port;
     let publish_result = thread::spawn(move || {
@@ -147,18 +144,17 @@ async fn rtmp_publish_rejected_for_unknown_key() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn delete_stream_via_http_then_list_excludes_it() {
+fn delete_stream_via_http_then_list_excludes_it() {
     let server = TestServer::start(RTMP_PORT + 2, API_TOKEN);
-    create_stream_via_http(&server, "delete-me").await;
+    create_stream_via_http(&server, "delete-me");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::blocking::Client::new();
     let del = client
         .delete(format!("{}/api/v1/streams/delete-me", server.http_base))
         .header("Authorization", format!("Bearer {}", server.api_token))
         .send()
-        .await
         .unwrap();
     assert_eq!(del.status(), 200);
 
@@ -166,10 +162,8 @@ async fn delete_stream_via_http_then_list_excludes_it() {
         .get(format!("{}/api/v1/streams", server.http_base))
         .header("Authorization", format!("Bearer {}", server.api_token))
         .send()
-        .await
         .unwrap()
         .json()
-        .await
         .unwrap();
 
     assert!(
@@ -178,20 +172,19 @@ async fn delete_stream_via_http_then_list_excludes_it() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn public_stats_json_offline_before_publish() {
+fn public_stats_json_offline_before_publish() {
     let server = TestServer::start(RTMP_PORT + 3, API_TOKEN);
-    create_stream_via_http(&server, "stats-stream").await;
+    create_stream_via_http(&server, "stats-stream");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::blocking::Client::new();
     let resp = client
         .get(format!("{}/stats", server.http_base))
         .query(&[("key", STATS_KEY)])
         .send()
-        .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let body = resp.text().await.unwrap();
+    let body = resp.text().unwrap();
     assert_eq!(body, "Stream offline");
 }
