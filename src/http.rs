@@ -177,12 +177,24 @@ pub struct KeyQuery {
 }
 
 fn is_valid_stream_key_part(value: &str) -> bool {
-    is_valid_access_key(value)
+    if value.is_empty() || value.len() > 63 {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Publish/play/stats keys and RTMP URL path segments: safe ASCII, no slashes.
+/// Minimum length for operator-supplied publish/play/stats keys. Shorter custom
+/// keys are trivially brute-forced over the unrate-limited RTMP auth path.
+const MIN_ACCESS_KEY_LEN: usize = 32;
+
+/// Publish/play/stats keys: safe ASCII, no slashes, minimum entropy via length.
 fn is_valid_access_key(value: &str) -> bool {
-    if value.is_empty() || value.len() > 63 {
+    if value.len() < MIN_ACCESS_KEY_LEN || value.len() > 63 {
         return false;
     }
     let mut chars = value.chars();
@@ -220,7 +232,7 @@ fn resolve_or_generate_access_key(
 }
 
 const ACCESS_KEY_VALIDATION_MSG: &str =
-    "Key must be 1-63 characters and use only letters, numbers, dots, underscores, or hyphens";
+    "Key must be 32-63 characters and use only letters, numbers, dots, underscores, or hyphens";
 
 fn access_keys_must_be_unique(keys: &[&str]) -> bool {
     let mut seen = HashSet::with_capacity(keys.len());
@@ -354,18 +366,22 @@ fn build_public_json_stats(db: &Db, stream_id: &str) -> Option<Value> {
 
 // ---------- XML stats (nginx-rtmp compatible) ----------
 
-fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
+fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -> String {
     let (pubs, players) = match stream_id {
         Some(id) => (db.publisher_list(Some(id)), db.player_list(Some(id))),
         None => (db.publisher_list_all(), db.player_list_all()),
     };
 
     let now = now_ts();
-    let app_name = pubs
-        .first()
-        .map(|p| p.app.as_str())
-        .or_else(|| players.first().map(|pl| pl.app.as_str()))
-        .unwrap_or("live");
+    let app_name = if redact_identifiers {
+        "live"
+    } else {
+        pubs
+            .first()
+            .map(|p| p.app.as_str())
+            .or_else(|| players.first().map(|pl| pl.app.as_str()))
+            .unwrap_or("live")
+    };
     let mut out = String::with_capacity(8192);
     out.push_str(&format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rtmp>\n  <server>\n\
@@ -376,6 +392,11 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
     for p in &pubs {
         let uptime_ms = (now - p.connected_at).max(0) * 1000;
         let bw_in = (p.bitrate_kbps * 1000.0) as i64;
+        let stream_label = if redact_identifiers {
+            "stream"
+        } else {
+            p.stream_name.as_str()
+        };
         out.push_str(&format!(
             "        <stream>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
@@ -384,7 +405,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
              \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>{}</bytes_in>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>0</bw_out>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>0</bytes_out>\n",
-            xml_escape(&p.stream_name),
+            xml_escape(stream_label),
             p.bytes_in,
         ));
 
@@ -432,6 +453,11 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
     for pl in &players {
         let uptime_ms = (now - pl.connected_at).max(0) * 1000;
         let bw_out = (pl.bitrate_kbps * 1000.0) as i64;
+        let stream_label = if redact_identifiers {
+            "stream"
+        } else {
+            pl.stream_name.as_str()
+        };
         out.push_str(&format!(
             "        <stream>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
@@ -449,7 +475,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>) -> String {
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<active>1</active>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<publisher>0</publisher>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20</client>\n        </stream>\n",
-            xml_escape(&pl.stream_name),
+            xml_escape(stream_label),
             pl.bytes_out,
         ));
     }
@@ -501,7 +527,10 @@ async fn handle_stats_nginx(
     let DbLookup::Ok(s) = state.db.stream_find_by_stats_key(&q.key) else {
         return err_xml(StatusCode::FORBIDDEN, "Invalid stats key");
     };
-    xml_response(StatusCode::OK, build_nginx_xml(&state.db, Some(&s.id)))
+    xml_response(
+        StatusCode::OK,
+        build_nginx_xml(&state.db, Some(&s.id), true),
+    )
 }
 
 async fn handle_streams_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1085,11 +1114,12 @@ mod tests {
 
     #[test]
     fn stream_create_validation_helpers_reject_unsafe_values() {
-        assert!(is_valid_access_key("live.main_1"));
-        assert!(is_valid_access_key("custom_pub_key_1"));
+        assert!(is_valid_access_key("live.main_1_with_sufficient_length_ok"));
+        assert!(is_valid_access_key("custom_pub_key_with_enough_chars"));
         assert!(is_valid_access_key(&"a".repeat(63)));
         assert!(!is_valid_access_key(""));
-        assert!(!is_valid_access_key("-starts-with-hyphen"));
+        assert!(!is_valid_access_key("too_short"));
+        assert!(!is_valid_access_key("-starts-with-hyphen-but-long-enough-here"));
         assert!(!is_valid_access_key("bad/id"));
         assert!(!is_valid_access_key(&"a".repeat(64)));
 
@@ -1221,7 +1251,7 @@ mod tests {
                     .header("Authorization", "Bearer a-strong-random-secret-value")
                     .header("Content-Type", "application/json")
                     .body(Body::from(
-                        r#"{"id":"customkeys","publish_key":"my_pub_key","play_key":"my_play_key","stats_key":"my_stats_key"}"#,
+                        r#"{"id":"customkeys","publish_key":"my_pub_key_with_sufficient_length_01","play_key":"my_play_key_with_sufficient_length_01","stats_key":"my_stats_key_with_sufficient_length_01"}"#,
                     ))
                     .unwrap(),
             )
@@ -1233,9 +1263,9 @@ mod tests {
             .await
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["publish_key"], "my_pub_key");
-        assert_eq!(json["play_key"], "my_play_key");
-        assert_eq!(json["stats_key"], "my_stats_key");
+        assert_eq!(json["publish_key"], "my_pub_key_with_sufficient_length_01");
+        assert_eq!(json["play_key"], "my_play_key_with_sufficient_length_01");
+        assert_eq!(json["stats_key"], "my_stats_key_with_sufficient_length_01");
     }
 
     #[tokio::test]
@@ -1250,7 +1280,7 @@ mod tests {
                     .header("Authorization", "Bearer a-strong-random-secret-value")
                     .header("Content-Type", "application/json")
                     .body(Body::from(
-                        r#"{"id":"dupkeys","publish_key":"same_key","play_key":"same_key"}"#,
+                        r#"{"id":"dupkeys","publish_key":"same_key_with_sufficient_length_here","play_key":"same_key_with_sufficient_length_here"}"#,
                     ))
                     .unwrap(),
             )
@@ -1306,7 +1336,7 @@ mod tests {
                     .header("Authorization", "Bearer a-strong-random-secret-value")
                     .header("Content-Type", "application/json")
                     .body(Body::from(
-                        r#"{"name":"Guest","play_key":"guest_play_key"}"#,
+                        r#"{"name":"Guest","play_key":"guest_play_key_with_sufficient_len01"}"#,
                     ))
                     .unwrap(),
             )
@@ -1318,7 +1348,7 @@ mod tests {
             .await
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["play_key"], "guest_play_key");
+        assert_eq!(json["play_key"], "guest_play_key_with_sufficient_len01");
     }
 
     #[tokio::test]
@@ -1355,7 +1385,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_stats_live_json_omits_identifiers() {
+    async fn create_stream_rejects_short_custom_key() {
+        let app = router(test_state("a-strong-random-secret-value"));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"id":"shortkey","publish_key":"tiny"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_omits_identifiers() {
         use crate::db::Publisher;
 
         let state = test_state("a-strong-random-secret-value");
@@ -1363,9 +1412,9 @@ mod tests {
             id: "pubstream".to_string(),
             name: "Secret Name".to_string(),
             app: "live".to_string(),
-            publish_key: "pub_test".to_string(),
-            play_key: "play_test".to_string(),
-            stats_key: "st_test".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
             enabled: true,
             created_at: now_ts(),
         };
@@ -1384,7 +1433,53 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/stats?key=st_test")
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!xml.contains("Secret Name"));
+        assert!(xml.contains("<name>stream</name>"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_live_json_omits_identifiers() {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats?key=st_test_key_with_sufficient_length_here")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1412,9 +1507,9 @@ mod tests {
             id: "offstream".to_string(),
             name: "Offline".to_string(),
             app: "live".to_string(),
-            publish_key: "pub_off".to_string(),
-            play_key: "play_off".to_string(),
-            stats_key: "st_off".to_string(),
+            publish_key: "pub_off_key_with_sufficient_length_here".to_string(),
+            play_key: "play_off_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_off_key_with_sufficient_length_here".to_string(),
             enabled: true,
             created_at: now_ts(),
         };
@@ -1426,7 +1521,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/stats?key=st_off")
+                    .uri("/stats?key=st_off_key_with_sufficient_length_here")
                     .body(Body::empty())
                     .unwrap(),
             )
