@@ -376,8 +376,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
     let app_name = if redact_identifiers {
         "live"
     } else {
-        pubs
-            .first()
+        pubs.first()
             .map(|p| p.app.as_str())
             .or_else(|| players.first().map(|pl| pl.app.as_str()))
             .unwrap_or("live")
@@ -1119,7 +1118,9 @@ mod tests {
         assert!(is_valid_access_key(&"a".repeat(63)));
         assert!(!is_valid_access_key(""));
         assert!(!is_valid_access_key("too_short"));
-        assert!(!is_valid_access_key("-starts-with-hyphen-but-long-enough-here"));
+        assert!(!is_valid_access_key(
+            "-starts-with-hyphen-but-long-enough-here"
+        ));
         assert!(!is_valid_access_key("bad/id"));
         assert!(!is_valid_access_key(&"a".repeat(64)));
 
