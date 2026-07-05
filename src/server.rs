@@ -446,7 +446,8 @@ impl ServerApp {
         let rtmps_bind = bind_with_default_port(&self.config.rtmps_bind, self.config.rtmps_port());
         let rtmps_log_bind = rtmps_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
-        let rtmp_idle_timeout = Duration::from_secs(self.config.rtmp_idle_timeout_secs.clamp(5, 600));
+        let idle_timeout_secs = self.config.rtmp_idle_timeout_secs.clamp(5, 600);
+        let rtmp_idle_timeout = Duration::from_secs(idle_timeout_secs);
         let rtmp_resource_limits = self.config.rtmp_resource_limits();
         let rtmp_tls_enabled = self.config.tls_enabled;
         let rtmp_tls_cert = self.config.tls_cert_file.clone();
