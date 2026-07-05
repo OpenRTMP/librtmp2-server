@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 use crate::config::ServerConfig;
@@ -98,17 +99,51 @@ pub(crate) fn rtmp_media_cb(
 
 /// Per-connection bookkeeping the RTMP poll loop keeps for the lifetime of
 /// each connection.
-#[derive(Default)]
 pub(crate) struct TrackedConn {
     connected: bool,
     publishing: bool,
     playing: bool,
+    /// When this connection was first observed (used for pre-auth idle eviction).
+    first_seen_at: Option<Instant>,
     /// DB stream id, set after publish/play is fully enabled.
     stream_id: String,
     /// Last detected video codec string from the protocol layer.
     video_codec: String,
     /// Last detected audio codec string from the protocol layer.
     audio_codec: String,
+}
+
+impl Default for TrackedConn {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            publishing: false,
+            playing: false,
+            first_seen_at: None,
+            stream_id: String::new(),
+            video_codec: String::new(),
+            audio_codec: String::new(),
+        }
+    }
+}
+
+/// Returns true when a connection has no authorized publish/play session and
+/// has exceeded the configured pre-auth idle window.
+fn should_evict_idle_conn(
+    entry: &TrackedConn,
+    conn_id: u64,
+    rtmp_bridge: &DbRtmpBridge,
+    idle_timeout: Duration,
+) -> bool {
+    if entry.publishing || entry.playing {
+        return false;
+    }
+    if rtmp_bridge.has_publisher(conn_id) || rtmp_bridge.has_player(conn_id) {
+        return false;
+    }
+    entry
+        .first_seen_at
+        .is_some_and(|at| at.elapsed() >= idle_timeout)
 }
 
 /// Drive one poll cycle's worth of connection bookkeeping: authorize new
@@ -128,6 +163,7 @@ pub(crate) fn process_server_connections(
     rtmp_bridge: &Arc<DbRtmpBridge>,
     deleted_now: &HashSet<String>,
     revoked_now: &HashSet<String>,
+    idle_timeout: Duration,
 ) -> HashSet<u64> {
     let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
@@ -142,6 +178,19 @@ pub(crate) fn process_server_connections(
         if !entry.connected {
             rtmp_bridge.on_connect(conn_id);
             entry.connected = true;
+            entry.first_seen_at = Some(Instant::now());
+        } else if entry.first_seen_at.is_none() {
+            entry.first_seen_at = Some(Instant::now());
+        }
+
+        if should_evict_idle_conn(entry, conn_id, rtmp_bridge, idle_timeout) {
+            crate::log_info!(
+                "RTMP: closing idle conn={conn_id} from {} (no publish/play within {}s)",
+                conn.remote_addr,
+                idle_timeout.as_secs()
+            );
+            reject_indices.push(idx);
+            continue;
         }
 
         let Some(stream) = conn.current_stream.as_ref() else {
@@ -397,6 +446,8 @@ impl ServerApp {
         let rtmps_bind = bind_with_default_port(&self.config.rtmps_bind, self.config.rtmps_port());
         let rtmps_log_bind = rtmps_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
+        let rtmp_idle_timeout =
+            Duration::from_secs(self.config.rtmp_idle_timeout_secs.max(1));
         let rtmp_resource_limits = self.config.rtmp_resource_limits();
         let rtmp_tls_enabled = self.config.tls_enabled;
         let rtmp_tls_cert = self.config.tls_cert_file.clone();
@@ -480,6 +531,7 @@ impl ServerApp {
                     &rtmp_bridge,
                     &deleted_now,
                     &revoked_now,
+                    rtmp_idle_timeout,
                 );
 
                 // A conn_id still in `tracked` but absent this cycle was
@@ -582,8 +634,64 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerApp, bind_with_default_port};
+    use super::{
+        ServerApp, TrackedConn, bind_with_default_port, should_evict_idle_conn,
+    };
     use crate::config::ServerConfig;
+    use crate::db::Db;
+    use crate::rtmp_bridge::DbRtmpBridge;
+    use parking_lot::Mutex;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_eviction_skips_authorized_sessions() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.stream_add(&crate::db::Stream {
+            id: "s1".to_string(),
+            name: "s1".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_key_with_sufficient_length_here01".to_string(),
+            play_key: "play_key_with_sufficient_length_here01".to_string(),
+            stats_key: "st_key_with_sufficient_length_here001".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        })
+        .unwrap();
+        let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::new(Mutex::new(HashSet::new())));
+        bridge.on_connect(1);
+        assert!(bridge
+            .authorize_publish(1, "live", "pub_key_with_sufficient_length_here01")
+            .is_ok());
+
+        let entry = TrackedConn {
+            first_seen_at: Some(Instant::now() - Duration::from_secs(120)),
+            ..Default::default()
+        };
+        assert!(!should_evict_idle_conn(
+            &entry,
+            1,
+            &bridge,
+            Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn idle_eviction_targets_stale_pre_auth_connections() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = DbRtmpBridge::new(db, Arc::new(Mutex::new(HashSet::new())));
+        let entry = TrackedConn {
+            first_seen_at: Some(Instant::now() - Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert!(should_evict_idle_conn(
+            &entry,
+            1,
+            &bridge,
+            Duration::from_secs(30)
+        ));
+    }
 
     #[test]
     fn bind_with_default_port_leaves_explicit_ports() {
