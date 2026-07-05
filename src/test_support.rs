@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -154,6 +155,7 @@ impl TestServer {
                     &rtmp_bridge,
                     &deleted_now,
                     &revoked_now,
+                    Duration::from_secs(30),
                 );
 
                 let closed_ids: Vec<u64> = tracked

@@ -7,6 +7,8 @@ pub struct ServerConfig {
     /// RTMP listener, e.g. "0.0.0.0:1935". Always active.
     pub rtmp_bind: String,
     pub rtmp_max_conn: i32,
+    /// Drop RTMP peers that never complete publish/play auth within this window.
+    pub rtmp_idle_timeout_secs: u64,
 
     /// Per-connection reassembly buffer cap (megabytes).
     pub rtmp_max_reassembly_mb: u32,
@@ -45,6 +47,7 @@ impl Default for ServerConfig {
         ServerConfig {
             rtmp_bind: "0.0.0.0:1935".to_string(),
             rtmp_max_conn: 100,
+            rtmp_idle_timeout_secs: 30,
             rtmp_max_reassembly_mb: 32,
             rtmp_max_cache_mb: 64,
             rtmp_max_relay_queue_mb: 8,
@@ -130,6 +133,16 @@ fn parse_mb(val: &str, default: u32, min: u32, max: u32, key: &str) -> u32 {
     }
 }
 
+fn parse_idle_timeout_secs(val: &str) -> u64 {
+    match val.parse::<u64>() {
+        Ok(v) => v.clamp(5, 600),
+        Err(_) => {
+            eprintln!("Config: ignoring invalid RTMP_IDLE_TIMEOUT_SECS value '{val}'");
+            30
+        }
+    }
+}
+
 fn parse_max_connections(val: &str) -> i32 {
     match val.parse::<i32>() {
         Ok(v) => v.clamp(1, 10_000),
@@ -184,6 +197,9 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
     match key {
         "RTMP_BIND" => config.rtmp_bind = val.to_string(),
         "RTMP_MAX_CONNECTIONS" => config.rtmp_max_conn = parse_max_connections(val),
+        "RTMP_IDLE_TIMEOUT_SECS" => {
+            config.rtmp_idle_timeout_secs = parse_idle_timeout_secs(val);
+        }
         "RTMP_MAX_REASSEMBLY_MB" => {
             config.rtmp_max_reassembly_mb = parse_mb(val, 32, 1, 256, key);
         }
@@ -267,6 +283,12 @@ where
         config.rtmp_max_conn = parse_max_connections(&v);
     }
 
+    if let Some(v) = get("LRTMP2_RTMP_IDLE_TIMEOUT_SECS")
+        && !v.is_empty()
+    {
+        config.rtmp_idle_timeout_secs = parse_idle_timeout_secs(&v);
+    }
+
     if let Some(v) = get("LRTMP2_RTMP_MAX_REASSEMBLY_MB")
         && !v.is_empty()
     {
@@ -340,6 +362,7 @@ mod tests {
         assert_eq!(config.rtmp_bind, "0.0.0.0:1935");
         assert_eq!(config.http_bind, "0.0.0.0:8080");
         assert_eq!(config.rtmp_max_conn, 100);
+        assert_eq!(config.rtmp_idle_timeout_secs, 30);
         assert_eq!(config.rtmp_max_reassembly_mb, 32);
         assert_eq!(config.rtmp_max_cache_mb, 64);
         assert_eq!(config.rtmp_max_relay_queue_mb, 8);
@@ -470,6 +493,17 @@ mod tests {
     fn max_connections_are_clamped() {
         assert_eq!(parse_max_connections("0"), 1);
         assert_eq!(parse_max_connections("99999"), 10_000);
+    }
+
+    #[test]
+    fn idle_timeout_secs_are_clamped_and_invalid_falls_back_to_default() {
+        assert_eq!(parse_idle_timeout_secs("0"), 5);
+        assert_eq!(parse_idle_timeout_secs("4"), 5);
+        assert_eq!(parse_idle_timeout_secs("5"), 5);
+        assert_eq!(parse_idle_timeout_secs("30"), 30);
+        assert_eq!(parse_idle_timeout_secs("600"), 600);
+        assert_eq!(parse_idle_timeout_secs("601"), 600);
+        assert_eq!(parse_idle_timeout_secs("not-a-number"), 30);
     }
 
     #[test]
