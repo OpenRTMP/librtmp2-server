@@ -118,19 +118,16 @@ pub(crate) struct TrackedConn {
 /// has exceeded the configured pre-auth idle window.
 fn should_evict_idle_conn(
     entry: &TrackedConn,
-    conn_id: u64,
-    rtmp_bridge: &DbRtmpBridge,
+    has_authorized_session: bool,
+    now: Instant,
     idle_timeout: Duration,
 ) -> bool {
-    if entry.publishing || entry.playing {
-        return false;
-    }
-    if rtmp_bridge.has_publisher(conn_id) || rtmp_bridge.has_player(conn_id) {
+    if entry.publishing || entry.playing || has_authorized_session {
         return false;
     }
     entry
         .first_seen_at
-        .is_some_and(|at| at.elapsed() >= idle_timeout)
+        .is_some_and(|at| now.duration_since(at) >= idle_timeout)
 }
 
 /// Drive one poll cycle's worth of connection bookkeeping: authorize new
@@ -170,7 +167,9 @@ pub(crate) fn process_server_connections(
             entry.first_seen_at = Some(Instant::now());
         }
 
-        if should_evict_idle_conn(entry, conn_id, rtmp_bridge, idle_timeout) {
+        let has_authorized_session =
+            rtmp_bridge.has_publisher(conn_id) || rtmp_bridge.has_player(conn_id);
+        if should_evict_idle_conn(entry, has_authorized_session, Instant::now(), idle_timeout) {
             crate::log_info!(
                 "RTMP: closing idle conn={conn_id} from {} (no publish/play within {}s)",
                 conn.remote_addr,
@@ -623,59 +622,50 @@ async fn shutdown_signal() {
 mod tests {
     use super::{ServerApp, TrackedConn, bind_with_default_port, should_evict_idle_conn};
     use crate::config::ServerConfig;
-    use crate::db::Db;
-    use crate::rtmp_bridge::DbRtmpBridge;
-    use parking_lot::Mutex;
-    use std::collections::HashSet;
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn stale_first_seen(now: Instant) -> Option<Instant> {
+        now.checked_sub(Duration::from_secs(120))
+    }
 
     #[test]
     fn idle_eviction_skips_authorized_sessions() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.stream_add(&crate::db::Stream {
-            id: "s1".to_string(),
-            name: "s1".to_string(),
-            app: "live".to_string(),
-            publish_key: "pub_key_with_sufficient_length_here01".to_string(),
-            play_key: "play_key_with_sufficient_length_here01".to_string(),
-            stats_key: "st_key_with_sufficient_length_here001".to_string(),
-            enabled: true,
-            created_at: crate::db::now_ts(),
-        })
-        .unwrap();
-        let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::new(Mutex::new(HashSet::new())));
-        bridge.on_connect(1);
-        assert!(
-            bridge
-                .authorize_publish(1, "live", "pub_key_with_sufficient_length_here01")
-                .is_ok()
-        );
-
+        let now = Instant::now();
         let entry = TrackedConn {
-            first_seen_at: Some(Instant::now() - Duration::from_secs(120)),
+            first_seen_at: stale_first_seen(now),
             ..Default::default()
         };
         assert!(!should_evict_idle_conn(
             &entry,
-            1,
-            &bridge,
+            true,
+            now,
+            Duration::from_secs(30)
+        ));
+
+        let publishing_entry = TrackedConn {
+            publishing: true,
+            first_seen_at: stale_first_seen(now),
+            ..Default::default()
+        };
+        assert!(!should_evict_idle_conn(
+            &publishing_entry,
+            false,
+            now,
             Duration::from_secs(30)
         ));
     }
 
     #[test]
     fn idle_eviction_targets_stale_pre_auth_connections() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        let bridge = DbRtmpBridge::new(db, Arc::new(Mutex::new(HashSet::new())));
+        let now = Instant::now();
         let entry = TrackedConn {
-            first_seen_at: Some(Instant::now() - Duration::from_secs(60)),
+            first_seen_at: stale_first_seen(now),
             ..Default::default()
         };
         assert!(should_evict_idle_conn(
             &entry,
-            1,
-            &bridge,
+            false,
+            now,
             Duration::from_secs(30)
         ));
     }
