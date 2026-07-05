@@ -99,6 +99,7 @@ pub(crate) fn rtmp_media_cb(
 
 /// Per-connection bookkeeping the RTMP poll loop keeps for the lifetime of
 /// each connection.
+#[derive(Default)]
 pub(crate) struct TrackedConn {
     connected: bool,
     publishing: bool,
@@ -111,20 +112,6 @@ pub(crate) struct TrackedConn {
     video_codec: String,
     /// Last detected audio codec string from the protocol layer.
     audio_codec: String,
-}
-
-impl Default for TrackedConn {
-    fn default() -> Self {
-        Self {
-            connected: false,
-            publishing: false,
-            playing: false,
-            first_seen_at: None,
-            stream_id: String::new(),
-            video_codec: String::new(),
-            audio_codec: String::new(),
-        }
-    }
 }
 
 /// Returns true when a connection has no authorized publish/play session and
