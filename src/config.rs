@@ -496,6 +496,17 @@ mod tests {
     }
 
     #[test]
+    fn idle_timeout_secs_are_clamped_and_invalid_falls_back_to_default() {
+        assert_eq!(parse_idle_timeout_secs("0"), 5);
+        assert_eq!(parse_idle_timeout_secs("4"), 5);
+        assert_eq!(parse_idle_timeout_secs("5"), 5);
+        assert_eq!(parse_idle_timeout_secs("30"), 30);
+        assert_eq!(parse_idle_timeout_secs("600"), 600);
+        assert_eq!(parse_idle_timeout_secs("601"), 600);
+        assert_eq!(parse_idle_timeout_secs("not-a-number"), 30);
+    }
+
+    #[test]
     fn port_helpers_parse_bind_strings() {
         let config = ServerConfig {
             rtmp_bind: "0.0.0.0:1935".to_string(),
