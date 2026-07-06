@@ -26,7 +26,7 @@ jobs:
           cargo bench --features test-support --bench http_api -- --sample-size 20 --test-threads 1 --noplot 2>&1 | tee bench-http-api.txt
 
       - name: Upload benchmark output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: librtmp2-server-benchmarks
           path: bench-*.txt
