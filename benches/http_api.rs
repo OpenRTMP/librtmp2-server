@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use librtmp2_server::test_support::TestServer;
 
 const BENCH_TOKEN: &str = "bench_api_token_with_sufficient_length_for_http_tests01";
