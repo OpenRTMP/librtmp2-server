@@ -10,9 +10,9 @@ RUN cargo build --release
 # Runtime stage
 FROM alpine:latest
 
-RUN apk add --no-cache libgcc
+RUN apk add --no-cache libgcc wget
 
-COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/
+COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/librtmp2-server
 COPY --from=builder /build/.env.example /etc/librtmp2-server/.env
 
 # Create non-root user and data directory
@@ -21,6 +21,8 @@ RUN adduser -D -H -s /sbin/nologin openrtmp && \
     chown openrtmp:openrtmp /data
 
 ENV LRTMP2_DB=/data/server.db
+
+WORKDIR /etc/librtmp2-server
 
 # Drop privileges
 USER openrtmp
