@@ -1,5 +1,7 @@
 # Build stage
-FROM rust:alpine AS builder
+FROM alpine:latest AS builder
+
+RUN apk add --no-cache build-base rust cargo git openssl openssl-dev pkgconf sqlite-dev ca-certificates
 
 WORKDIR /build
 COPY . .
@@ -19,9 +21,6 @@ RUN adduser -D -H -s /sbin/nologin openrtmp && \
     chown openrtmp:openrtmp /data
 
 ENV LRTMP2_DB=/data/server.db
-
-# Run from the config directory so the server loads ./.env by default
-WORKDIR /etc/librtmp2-server
 
 # Drop privileges
 USER openrtmp
