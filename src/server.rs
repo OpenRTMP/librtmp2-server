@@ -315,14 +315,10 @@ impl ServerApp {
             .filter(|v| !v.is_empty())
             .ok_or("LRTMP2_DB or LRTMP2_DB_PATH environment variable must be set to the SQLite database path")?;
 
-        Self::bootstrap(config, &db_path, None)
+        Self::bootstrap(config, &db_path)
     }
 
-    pub(crate) fn bootstrap(
-        mut config: ServerConfig,
-        db_path: &str,
-        api_token_override: Option<&str>,
-    ) -> Result<ServerApp, String> {
+    pub(crate) fn bootstrap(mut config: ServerConfig, db_path: &str) -> Result<ServerApp, String> {
         let db = Arc::new(
             Db::open(db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
         );
@@ -332,7 +328,6 @@ impl ServerApp {
         config.api_token = match db.token_get()? {
             Some(t) => t,
             None => {
-                let _ = api_token_override;
                 let candidate = crate::keygen::keygen_api_token()?;
 
                 if db.token_set(&candidate)? {
@@ -670,12 +665,10 @@ mod tests {
             config_file: String::new(),
             ..Default::default()
         };
-        let app = ServerApp::bootstrap(config, db_path_str, Some("manual_token"))
-            .expect("ServerApp::bootstrap");
+        let app = ServerApp::bootstrap(config, db_path_str).expect("ServerApp::bootstrap");
 
         let db = crate::db::Db::open(db_path_str).expect("reopen db");
         let stored = db.token_get().unwrap().expect("token should be stored");
-        assert_ne!(stored, "manual_token", "override must be ignored");
         assert_eq!(stored.len(), 64, "generated token must be 64 hex chars");
         assert!(
             stored.chars().all(|c| c.is_ascii_hexdigit()),
