@@ -67,11 +67,9 @@ pub fn is_valid_api_token(token: &str) -> bool {
     if token.len() < MIN_API_TOKEN_LEN {
         return false;
     }
-    let lower = token.to_ascii_lowercase();
     !WEAK_API_TOKEN_PLACEHOLDERS
         .iter()
-        .any(|placeholder| lower == *placeholder)
-}
+        .any(|placeholder| token.eq_ignore_ascii_case(placeholder))
 
 pub fn api_token_validation_error() -> String {
     format!(
