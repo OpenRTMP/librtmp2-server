@@ -372,7 +372,7 @@ impl ServerApp {
                         } else {
                             eprintln!(
                                 "Generated API token stored in database {db_path}. \
-                                 Retrieve it with: sqlite3 {db_path} \"SELECT val FROM settings WHERE key='api_token';\""
+                                 Retrieve it with: sqlite3 \"{db_path}\" \"SELECT val FROM settings WHERE key='api_token';\""
                             );
                         }
                     }
