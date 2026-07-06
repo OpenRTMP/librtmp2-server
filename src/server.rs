@@ -315,58 +315,30 @@ impl ServerApp {
             .filter(|v| !v.is_empty())
             .ok_or("LRTMP2_DB or LRTMP2_DB_PATH environment variable must be set to the SQLite database path")?;
 
-        Self::bootstrap(config, &db_path, None)
+        Self::bootstrap(config, &db_path)
     }
 
-    pub(crate) fn bootstrap(
-        mut config: ServerConfig,
-        db_path: &str,
-        api_token_override: Option<&str>,
-    ) -> Result<ServerApp, String> {
+    pub(crate) fn bootstrap(mut config: ServerConfig, db_path: &str) -> Result<ServerApp, String> {
         let db = Arc::new(
             Db::open(db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
         );
 
-        // The API token lives exclusively in the database. On first startup it
-        // is taken from LRTMP2_API_TOKEN when set, otherwise generated here;
-        // afterwards it is loaded from the settings table.
+        // The API token lives exclusively in the database. On first startup it is
+        // always generated here; afterwards it is loaded from the settings table.
         config.api_token = match db.token_get()? {
             Some(t) => t,
             None => {
-                let from_env = api_token_override
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        std::env::var("LRTMP2_API_TOKEN")
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                    });
-                let candidate = match from_env {
-                    Some(t) => t,
-                    None => crate::keygen::keygen_api_token()?,
-                };
+                let candidate = crate::keygen::keygen_api_token()?;
+
                 if db.token_set(&candidate)? {
-                    if api_token_override.is_none()
-                        && std::env::var("LRTMP2_API_TOKEN")
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .is_none()
-                    {
-                        // We inserted the token — print it once so the operator
-                        // can use the API.
-                        eprintln!(
-                            "============================================================\n\
-                             Generated API token (stored in database {db_path}):\n\
-                             {candidate}\n\
-                             ============================================================"
-                        );
-                    }
+                    eprintln!(
+                        "============================================================\n\
+                         Generated API token (stored in database {db_path}):\n\
+                         {candidate}\n\
+                         ============================================================"
+                    );
                     candidate
                 } else {
-                    // Another process inserted first; read back the winner's token.
                     db.token_get()?
                         .ok_or("API token missing after concurrent insert")?
                 }
@@ -684,21 +656,24 @@ mod tests {
     }
 
     #[test]
-    fn create_persists_env_api_token_on_first_start() {
+    fn create_generates_api_token_on_first_start() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("token.db");
         let db_path_str = db_path.to_str().unwrap();
-        let token = "env_api_token_for_first_start_tests_only_value_0123456789ab";
 
         let config = ServerConfig {
             config_file: String::new(),
             ..Default::default()
         };
-        let app =
-            ServerApp::bootstrap(config, db_path_str, Some(token)).expect("ServerApp::bootstrap");
+        let app = ServerApp::bootstrap(config, db_path_str).expect("ServerApp::bootstrap");
 
         let db = crate::db::Db::open(db_path_str).expect("reopen db");
-        assert_eq!(db.token_get().unwrap().as_deref(), Some(token));
-        assert_eq!(app.config.api_token, token);
+        let stored = db.token_get().unwrap().expect("token should be stored");
+        assert_eq!(stored.len(), 64, "generated token must be 64 hex chars");
+        assert!(
+            stored.chars().all(|c| c.is_ascii_hexdigit()),
+            "token must be hex"
+        );
+        assert_eq!(app.config.api_token, stored);
     }
 }
