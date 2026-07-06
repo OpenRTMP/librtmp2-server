@@ -10,7 +10,7 @@ RUN cargo build --release
 # Runtime stage
 FROM alpine:latest
 
-RUN apk add --no-cache libgcc wget
+RUN apk add --no-cache libgcc libstdc++ openssl ca-certificates wget
 
 COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/librtmp2-server
 COPY --from=builder /build/.env.example /etc/librtmp2-server/.env
