@@ -344,7 +344,12 @@ impl ServerApp {
                             .filter(|s| !s.is_empty())
                     });
                 let candidate = match from_env {
-                    Some(t) => t,
+                    Some(t) => {
+                        if !crate::keygen::is_valid_api_token(&t) {
+                            return Err(crate::keygen::api_token_validation_error());
+                        }
+                        t
+                    }
                     None => crate::keygen::keygen_api_token()?,
                 };
                 if db.token_set(&candidate)? {
@@ -355,14 +360,21 @@ impl ServerApp {
                             .filter(|s| !s.is_empty())
                             .is_none()
                     {
-                        // We inserted the token — print it once so the operator
-                        // can use the API.
-                        eprintln!(
-                            "============================================================\n\
-                             Generated API token (stored in database {db_path}):\n\
-                             {candidate}\n\
-                             ============================================================"
-                        );
+                        // Print the token only for interactive terminals so
+                        // container log collectors do not retain admin secrets.
+                        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                            eprintln!(
+                                "============================================================\n\
+                                 Generated API token (stored in database {db_path}):\n\
+                                 {candidate}\n\
+                                 ============================================================"
+                            );
+                        } else {
+                            eprintln!(
+                                "Generated API token stored in database {db_path}. \
+                                 Retrieve it with: sqlite3 {db_path} \"SELECT val FROM settings WHERE key='api_token';\""
+                            );
+                        }
                     }
                     candidate
                 } else {
@@ -700,5 +712,22 @@ mod tests {
         let db = crate::db::Db::open(db_path_str).expect("reopen db");
         assert_eq!(db.token_get().unwrap().as_deref(), Some(token));
         assert_eq!(app.config.api_token, token);
+    }
+
+    #[test]
+    fn bootstrap_rejects_weak_env_api_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("weak-token.db");
+        let db_path_str = db_path.to_str().unwrap();
+        let config = ServerConfig {
+            config_file: String::new(),
+            ..Default::default()
+        };
+
+        let err = match ServerApp::bootstrap(config, db_path_str, Some("admin")) {
+            Ok(_) => panic!("weak API token must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("LRTMP2_API_TOKEN"));
     }
 }
