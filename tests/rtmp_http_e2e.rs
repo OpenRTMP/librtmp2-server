@@ -53,8 +53,18 @@ fn create_stream_via_http(server: &TestServer, stream_id: &str) -> serde_json::V
 fn health_endpoint_reports_rtmp_port() {
     let server = TestServer::start(RTMP_PORT, API_TOKEN);
     let client = reqwest::blocking::Client::new();
+    let public: serde_json::Value = client
+        .get(format!("{}/api/v1/health", server.http_base))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(public["status"], "ok");
+    assert!(public.get("rtmp_port").is_none());
+
     let health: serde_json::Value = client
         .get(format!("{}/api/v1/health", server.http_base))
+        .header("Authorization", format!("Bearer {API_TOKEN}"))
         .send()
         .unwrap()
         .json()

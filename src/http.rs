@@ -1,7 +1,7 @@
 //! HTTP server (axum) — REST API + stats endpoints.
 //!
 //! Endpoints:
-//!   GET    /api/v1/health                       no auth
+//!   GET    /api/v1/health                       public `status`; details with Bearer
 //!   GET    /api/v1/streams                      Bearer token (includes keys)
 //!   POST   /api/v1/streams                      Bearer token, returns keys
 //!   DELETE /api/v1/streams/:id                   Bearer token
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
 use crate::db::{Db, DbLookup, Stream, StreamAddError, StreamViewer};
@@ -160,14 +160,27 @@ fn bearer_ok(state: &AppState, headers: &HeaderMap) -> bool {
     ct_str_eq(tok.trim(), &state.config.api_token)
 }
 
-fn stats_key_ok(state: &AppState, key: &str, stream_id: Option<&str>) -> bool {
+fn stats_key_lookup(
+    state: &AppState,
+    key: &str,
+    stream_id: Option<&str>,
+) -> Option<crate::db::Stream> {
     if key.is_empty() {
-        return false;
+        return None;
     }
     match state.db.stream_find_by_stats_key(key) {
-        DbLookup::Ok(s) => stream_id.is_none_or(|id| s.id == id),
-        DbLookup::Missing | DbLookup::Failed => false,
+        DbLookup::Ok(s) if stream_id.is_none_or(|id| s.id == id) => Some(s),
+        DbLookup::Ok(_) | DbLookup::Missing | DbLookup::Failed => None,
     }
+}
+
+const STATS_MIN_RESPONSE: Duration = Duration::from_millis(50);
+
+async fn pace_public_stats(start: Instant, response: Response) -> Response {
+    if let Some(remaining) = STATS_MIN_RESPONSE.checked_sub(start.elapsed()) {
+        tokio::time::sleep(remaining).await;
+    }
+    response
 }
 
 #[derive(Deserialize, Default)]
@@ -488,47 +501,66 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
 
 // ---------- handlers ----------
 
-async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
-    Json(json!({
-        "status": "ok",
-        "timestamp": now_ts(),
-        "rtmp_port": state.config.rtmp_port(),
-        "rtmps_enabled": state.config.tls_enabled,
-        "rtmps_port": state.config.rtmps_port(),
-    }))
-    .into_response()
+async fn handle_health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if bearer_ok(&state, &headers) {
+        return Json(json!({
+            "status": "ok",
+            "timestamp": now_ts(),
+            "rtmp_port": state.config.rtmp_port(),
+            "rtmps_enabled": state.config.tls_enabled,
+            "rtmps_port": state.config.rtmps_port(),
+        }))
+        .into_response();
+    }
+    Json(json!({"status": "ok"})).into_response()
 }
 
 async fn handle_stats_json(
     State(state): State<Arc<AppState>>,
     Query(q): Query<KeyQuery>,
 ) -> Response {
+    let start = Instant::now();
     if q.key.is_empty() {
-        return public_stats_text(StatusCode::UNAUTHORIZED, "stats_key required");
+        return pace_public_stats(
+            start,
+            public_stats_text(StatusCode::UNAUTHORIZED, "stats_key required"),
+        )
+        .await;
     }
-    let DbLookup::Ok(s) = state.db.stream_find_by_stats_key(&q.key) else {
-        return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
+    let Some(s) = stats_key_lookup(&state, &q.key, None) else {
+        return pace_public_stats(
+            start,
+            public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key"),
+        )
+        .await;
     };
-    match build_public_json_stats(&state.db, &s.id) {
+    let response = match build_public_json_stats(&state.db, &s.id) {
         Some(body) => Json(body).into_response(),
         None => public_stats_text(StatusCode::OK, "Stream offline"),
-    }
+    };
+    pace_public_stats(start, response).await
 }
 
 async fn handle_stats_nginx(
     State(state): State<Arc<AppState>>,
     Query(q): Query<KeyQuery>,
 ) -> Response {
+    let start = Instant::now();
     if q.key.is_empty() {
-        return err_xml(StatusCode::UNAUTHORIZED, "Missing stats key");
+        return pace_public_stats(
+            start,
+            err_xml(StatusCode::UNAUTHORIZED, "Missing stats key"),
+        )
+        .await;
     }
-    let DbLookup::Ok(s) = state.db.stream_find_by_stats_key(&q.key) else {
-        return err_xml(StatusCode::FORBIDDEN, "Invalid stats key");
+    let Some(s) = stats_key_lookup(&state, &q.key, None) else {
+        return pace_public_stats(start, err_xml(StatusCode::FORBIDDEN, "Invalid stats key")).await;
     };
-    xml_response(
+    let response = xml_response(
         StatusCode::OK,
         build_nginx_xml(&state.db, Some(&s.id), true),
-    )
+    );
+    pace_public_stats(start, response).await
 }
 
 async fn handle_streams_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -718,6 +750,40 @@ async fn handle_stream_create(
     (StatusCode::CREATED, Json(stream_to_json(&state.db, &s))).into_response()
 }
 
+async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), ()> {
+    match state.db.stream_delete(id) {
+        Some(true) => {
+            crate::log_info!("Stream deleted: {id}");
+            state.deleted_streams.lock().remove(id);
+            Ok(())
+        }
+        Some(false) => {
+            let _ = state.db.stream_set_enabled(id, true);
+            state.deleted_streams.lock().remove(id);
+            Err(())
+        }
+        None => {
+            let _ = state.db.stream_set_enabled(id, true);
+            state.deleted_streams.lock().remove(id);
+            Err(())
+        }
+    }
+}
+
+async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
+        if std::time::Instant::now() >= deadline {
+            let _ = state.db.stream_set_enabled(&id, true);
+            state.deleted_streams.lock().remove(&id);
+            crate::log_warn!("Timed out deleting stream '{id}' — active RTMP sessions remained");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let _ = finalize_stream_delete(&state, &id).await;
+}
+
 async fn handle_stream_delete(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -760,41 +826,23 @@ async fn handle_stream_delete(
         );
     }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
-        if std::time::Instant::now() >= deadline {
-            let _ = state.db.stream_set_enabled(&id, true);
-            state.deleted_streams.lock().remove(&id);
-            return err_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "UNAVAILABLE",
-                "Timed out waiting for active RTMP sessions to close",
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    match state.db.stream_delete(&id) {
-        Some(true) => {
-            crate::log_info!("Stream deleted: {id}");
-            state.deleted_streams.lock().remove(&id);
-            Json(json!({"status": "deleted"})).into_response()
-        }
-        Some(false) => {
-            let _ = state.db.stream_set_enabled(&id, true);
-            state.deleted_streams.lock().remove(&id);
-            err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found")
-        }
-        None => {
-            let _ = state.db.stream_set_enabled(&id, true);
-            state.deleted_streams.lock().remove(&id);
-            err_json(
+    if state.rtmp_bridge.live_conn_count_for_stream(&id) == 0 {
+        return match finalize_stream_delete(&state, &id).await {
+            Ok(()) => Json(json!({"status": "deleted"})).into_response(),
+            Err(()) => err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 "Failed to delete stream",
-            )
-        }
+            ),
+        };
     }
+
+    let state_bg = Arc::clone(&state);
+    let id_bg = id.clone();
+    tokio::spawn(async move {
+        wait_and_finalize_stream_delete(state_bg, id_bg).await;
+    });
+    (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response()
 }
 
 async fn handle_stream_players_list(
@@ -991,9 +1039,9 @@ async fn handle_stream_player_delete(
             "Cannot delete the last play key for a stream",
         );
     }
-    state.revoked_viewers.lock().insert(player_id.clone());
     match state.db.viewer_delete(&id, &player_id) {
         Some(true) => {
+            state.revoked_viewers.lock().insert(player_id.clone());
             state.db.players_deactivate_for_viewer(&player_id);
             Json(json!({"status": "deleted"})).into_response()
         }
@@ -1034,13 +1082,19 @@ async fn handle_stream_stats(
             }
         }
     }
-    if !stats_key_ok(&state, &q.key, Some(&id)) {
-        return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
+    let start = Instant::now();
+    if stats_key_lookup(&state, &q.key, Some(&id)).is_none() {
+        return pace_public_stats(
+            start,
+            public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key"),
+        )
+        .await;
     }
-    match build_public_json_stats(&state.db, &id) {
+    let response = match build_public_json_stats(&state.db, &id) {
         Some(body) => Json(body).into_response(),
         None => public_stats_text(StatusCode::OK, "Stream offline"),
-    }
+    };
+    pace_public_stats(start, response).await
 }
 
 #[cfg(test)]
@@ -1149,7 +1203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_rtmps_capability() {
+    async fn health_reports_rtmps_capability_with_bearer() {
         let config = ServerConfig {
             api_token: "a-strong-random-secret-value".to_string(),
             rtmp_bind: "0.0.0.0:1935".to_string(),
@@ -1175,6 +1229,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/health")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1188,6 +1243,27 @@ mod tests {
         assert_eq!(json["rtmp_port"], 1935);
         assert_eq!(json["rtmps_enabled"], true);
         assert_eq!(json["rtmps_port"], 1936);
+    }
+
+    #[tokio::test]
+    async fn health_public_response_is_minimal() {
+        let app = router(test_state("a-strong-random-secret-value"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("rtmp_port").is_none());
     }
 
     #[tokio::test]
