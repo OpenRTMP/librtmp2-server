@@ -453,6 +453,22 @@ impl Db {
         self.stream_find_by("publish_key", key)
     }
 
+    /// Like `stream_find_by_publish_key`, but does not filter on `enabled` —
+    /// used to distinguish a truly unknown/invalid key from one that
+    /// belongs to a disabled/pending-delete stream, so the RTMP auth-failure
+    /// rate limiter only counts the former as a credential mismatch.
+    pub fn stream_find_by_publish_key_any(&self, key: &str) -> DbLookup<Stream> {
+        let conn = self.conn.lock();
+        map_optional(conn.query_row(
+            &format!(
+                "SELECT {} FROM streams WHERE publish_key=?",
+                Self::STREAM_COLS
+            ),
+            params![key],
+            Self::load_stream_row,
+        ))
+    }
+
     pub fn stream_find_by_stats_key(&self, key: &str) -> DbLookup<Stream> {
         self.stream_find_by("stats_key", key)
     }

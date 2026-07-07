@@ -459,10 +459,21 @@ impl DbRtmpBridge {
     ) -> Result<(), AuthFailureKind> {
         crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
 
-        let DbLookup::Ok(stream) = self.db.stream_find_by_publish_key(stream_key) else {
+        // Look up ignoring `enabled` so a valid key for a disabled/pending-delete
+        // stream is classified as an operational rejection below, not a
+        // credential mismatch — otherwise a publisher retrying against its own
+        // just-disabled stream would burn the shared per-IP auth-failure budget.
+        let DbLookup::Ok(stream) = self.db.stream_find_by_publish_key_any(stream_key) else {
             crate::log_warn!("RTMP: publish rejected — invalid publish_key for app='{app}'");
             return Err(AuthFailureKind::Credential);
         };
+        if !stream.enabled {
+            crate::log_warn!(
+                "RTMP: publish rejected — stream '{}' is disabled",
+                stream.id
+            );
+            return Err(AuthFailureKind::Operational);
+        }
         if self.deleted_streams.lock().contains(&stream.id) {
             crate::log_warn!(
                 "RTMP: publish rejected — stream '{}' is being deleted",
@@ -843,6 +854,27 @@ mod tests {
                 .authorize_publish(next_conn + 1, "live", "bogus")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn publish_with_valid_key_for_disabled_stream_does_not_burn_auth_budget() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        assert!(db.stream_disable("s1").unwrap());
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.8:1935";
+
+        // A valid key for a disabled/pending-delete stream must be rejected
+        // as an operational failure, not a credential mismatch — otherwise
+        // it would consume the shared per-IP auth-failure budget just like
+        // a brute-force guess would.
+        for conn in 0..(RTMP_AUTH_MAX_FAILURES as u64 + 2) {
+            bridge.on_connect(conn, ip);
+            assert!(bridge.authorize_publish(conn, "live", "pub_k").is_err());
+            bridge.on_close(conn);
+        }
+
+        assert!(!bridge.is_auth_rate_limited(&remote_ip_of(ip)));
     }
 
     #[test]
