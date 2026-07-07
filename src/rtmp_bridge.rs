@@ -23,6 +23,20 @@ use crate::keygen::{self, PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY};
 
 const RTMP_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const RTMP_AUTH_MAX_FAILURES: usize = 10;
+/// Cap tracked auth-failure buckets so a scan from many distinct IPs cannot
+/// grow `auth_failures` without bound, mirroring `rate_limit::MAX_TRACKED_KEYS`.
+const MAX_TRACKED_AUTH_FAILURE_KEYS: usize = 10_000;
+
+/// Distinguishes a brute-forceable credential/app mismatch from a rejection
+/// that has nothing to do with guessing a valid key (deleted/disabled
+/// stream, connection-limit, DB or keygen error). Only the former should
+/// count against the auth-failure rate limit — counting the latter lets
+/// unrelated operational failures throttle a legitimate client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFailureKind {
+    Credential,
+    Operational,
+}
 
 /// Opaque per-connection identifier assigned by the RTMP layer. The original
 /// C code keyed connection state off the `lrtmp2_conn_t*` pointer; any stable,
@@ -150,9 +164,40 @@ impl DbRtmpBridge {
         entries.len() >= RTMP_AUTH_MAX_FAILURES
     }
 
+    /// Drop every tracked IP whose failure window has fully expired, so
+    /// one-off failures from many distinct IPs don't accumulate forever.
+    fn purge_expired_auth_failures(guard: &mut HashMap<String, Vec<Instant>>, now: Instant) {
+        guard.retain(|_, entries| {
+            entries.retain(|t| {
+                now.checked_duration_since(*t)
+                    .is_none_or(|age| age < RTMP_AUTH_FAILURE_WINDOW)
+            });
+            !entries.is_empty()
+        });
+    }
+
+    /// Remove the least-recently-active IP bucket when still at capacity
+    /// after purging expired entries.
+    fn evict_oldest_auth_failure_bucket(guard: &mut HashMap<String, Vec<Instant>>) {
+        let Some(oldest_key) = guard
+            .iter()
+            .min_by_key(|(_, entries)| entries.last().copied().unwrap_or_else(Instant::now))
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        guard.remove(&oldest_key);
+    }
+
     fn record_auth_failure(&self, remote_ip: &str) {
         let mut guard = self.auth_failures.lock();
         let now = Instant::now();
+        if !guard.contains_key(remote_ip) && guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS {
+            Self::purge_expired_auth_failures(&mut guard, now);
+            if guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS {
+                Self::evict_oldest_auth_failure_bucket(&mut guard);
+            }
+        }
         let entries = guard.entry(remote_ip.to_string()).or_default();
         entries.retain(|t| {
             now.checked_duration_since(*t)
@@ -406,33 +451,38 @@ impl DbRtmpBridge {
         }
     }
 
-    fn try_authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
+    fn try_authorize_publish(
+        &self,
+        conn: ConnId,
+        app: &str,
+        stream_key: &str,
+    ) -> Result<(), AuthFailureKind> {
         crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
 
         let DbLookup::Ok(stream) = self.db.stream_find_by_publish_key(stream_key) else {
             crate::log_warn!("RTMP: publish rejected — invalid publish_key for app='{app}'");
-            return Err(());
+            return Err(AuthFailureKind::Credential);
         };
         if self.deleted_streams.lock().contains(&stream.id) {
             crate::log_warn!(
                 "RTMP: publish rejected — stream '{}' is being deleted",
                 stream.id
             );
-            return Err(());
+            return Err(AuthFailureKind::Operational);
         }
         if stream.app != app {
             crate::log_warn!(
                 "RTMP: publish rejected — key belongs to app='{}', requested app='{app}'",
                 stream.app
             );
-            return Err(());
+            return Err(AuthFailureKind::Credential);
         }
 
         let pub_id = match keygen::keygen_stream_key(PREFIX_PUBLISH_KEY) {
             Ok(id) => id,
             Err(e) => {
                 crate::log_warn!("RTMP: publish rejected — session id generation failed: {e}");
-                return Err(());
+                return Err(AuthFailureKind::Operational);
             }
         };
 
@@ -458,7 +508,7 @@ impl DbRtmpBridge {
                 crate::log_warn!(
                     "RTMP: publish rejected — failed to deactivate prior publisher row"
                 );
-                return Err(());
+                return Err(AuthFailureKind::Operational);
             }
         }
 
@@ -474,7 +524,7 @@ impl DbRtmpBridge {
                 "RTMP: publish rejected — stream '{}' already has an active publisher",
                 stream.id
             );
-            return Err(());
+            return Err(AuthFailureKind::Operational);
         }
 
         let stream_id = stream.id.clone();
@@ -497,41 +547,46 @@ impl DbRtmpBridge {
         Ok(())
     }
 
-    fn try_authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
+    fn try_authorize_play(
+        &self,
+        conn: ConnId,
+        app: &str,
+        stream_key: &str,
+    ) -> Result<(), AuthFailureKind> {
         crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
 
         let DbLookup::Ok(viewer) = self.db.viewer_find_by_play_key(stream_key) else {
             crate::log_warn!("RTMP: play rejected — invalid play_key for app='{app}'");
-            return Err(());
+            return Err(AuthFailureKind::Credential);
         };
         let DbLookup::Ok(stream) = self.db.stream_get(&viewer.stream_id) else {
             crate::log_warn!("RTMP: play rejected — stream missing for play_key");
-            return Err(());
+            return Err(AuthFailureKind::Operational);
         };
         if self.deleted_streams.lock().contains(&stream.id) {
             crate::log_warn!(
                 "RTMP: play rejected — stream '{}' is being deleted",
                 stream.id
             );
-            return Err(());
+            return Err(AuthFailureKind::Operational);
         }
         if !stream.enabled {
             crate::log_warn!("RTMP: play rejected — stream '{}' is disabled", stream.id);
-            return Err(());
+            return Err(AuthFailureKind::Operational);
         }
         if stream.app != app {
             crate::log_warn!(
                 "RTMP: play rejected — key belongs to app='{}', requested app='{app}'",
                 stream.app
             );
-            return Err(());
+            return Err(AuthFailureKind::Credential);
         }
 
         let player_id = match keygen::keygen_stream_key(PREFIX_PLAY_KEY) {
             Ok(id) => id,
             Err(e) => {
                 crate::log_warn!("RTMP: play rejected — session id generation failed: {e}");
-                return Err(());
+                return Err(AuthFailureKind::Operational);
             }
         };
 
@@ -555,7 +610,7 @@ impl DbRtmpBridge {
             let prior_id = prior.id.clone();
             if !self.db.player_update(&prior_id, &prior) {
                 crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
-                return Err(());
+                return Err(AuthFailureKind::Operational);
             }
         }
 
@@ -569,7 +624,7 @@ impl DbRtmpBridge {
                 "RTMP: play rejected — connection limit ({}) reached for play key",
                 crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
             );
-            return Err(());
+            return Err(AuthFailureKind::Operational);
         }
 
         let player_id = player_row.id.clone();
@@ -619,17 +674,30 @@ impl RtmpEventHandler for DbRtmpBridge {
             .get(&conn)
             .map(|cs| cs.remote_ip.clone())
             .unwrap_or_default();
-        if self.is_auth_rate_limited(&remote_ip) {
+        // Auth throttling needs a real per-client key. If authorize_publish
+        // runs before on_connect has populated ConnState (supported by the
+        // same-tick race noted in on_connect), remote_ip is empty — skip
+        // throttling entirely rather than share a "" bucket across unrelated
+        // connections, which would let one attacker lock out everyone else.
+        let ip_known = !remote_ip.is_empty();
+        if ip_known && self.is_auth_rate_limited(&remote_ip) {
             crate::log_warn!("RTMP: publish rejected — auth rate limit exceeded conn={conn}");
             return Err(());
         }
-        let result = self.try_authorize_publish(conn, app, stream_key);
-        if result.is_ok() {
-            self.clear_auth_failures(&remote_ip);
-        } else {
-            self.record_auth_failure(&remote_ip);
+        match self.try_authorize_publish(conn, app, stream_key) {
+            Ok(()) => {
+                if ip_known {
+                    self.clear_auth_failures(&remote_ip);
+                }
+                Ok(())
+            }
+            Err(kind) => {
+                if ip_known && kind == AuthFailureKind::Credential {
+                    self.record_auth_failure(&remote_ip);
+                }
+                Err(())
+            }
         }
-        result
     }
 
     fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
@@ -639,17 +707,25 @@ impl RtmpEventHandler for DbRtmpBridge {
             .get(&conn)
             .map(|cs| cs.remote_ip.clone())
             .unwrap_or_default();
-        if self.is_auth_rate_limited(&remote_ip) {
+        let ip_known = !remote_ip.is_empty();
+        if ip_known && self.is_auth_rate_limited(&remote_ip) {
             crate::log_warn!("RTMP: play rejected — auth rate limit exceeded conn={conn}");
             return Err(());
         }
-        let result = self.try_authorize_play(conn, app, stream_key);
-        if result.is_ok() {
-            self.clear_auth_failures(&remote_ip);
-        } else {
-            self.record_auth_failure(&remote_ip);
+        match self.try_authorize_play(conn, app, stream_key) {
+            Ok(()) => {
+                if ip_known {
+                    self.clear_auth_failures(&remote_ip);
+                }
+                Ok(())
+            }
+            Err(kind) => {
+                if ip_known && kind == AuthFailureKind::Credential {
+                    self.record_auth_failure(&remote_ip);
+                }
+                Err(())
+            }
         }
-        result
     }
 
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool {
@@ -747,8 +823,11 @@ mod tests {
 
         // A fresh connection from the same IP must still be throttled — the
         // window must not reset just because each prior connection closed.
+        // Assert the throttle directly (not just an Err from a bogus key,
+        // which would fail either way) to actually prove rate limiting.
         let next_conn = RTMP_AUTH_MAX_FAILURES as u64;
         bridge.on_connect(next_conn, ip);
+        assert!(bridge.is_auth_rate_limited(&remote_ip_of(ip)));
         assert!(
             bridge
                 .authorize_publish(next_conn, "live", "bogus")
@@ -756,7 +835,9 @@ mod tests {
         );
 
         // A different client IP is unaffected.
-        bridge.on_connect(next_conn + 1, "198.51.100.1:1935");
+        let other_ip = "198.51.100.1:1935";
+        bridge.on_connect(next_conn + 1, other_ip);
+        assert!(!bridge.is_auth_rate_limited(&remote_ip_of(other_ip)));
         assert!(
             bridge
                 .authorize_publish(next_conn + 1, "live", "bogus")

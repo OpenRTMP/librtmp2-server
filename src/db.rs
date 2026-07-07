@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS streams (
   play_key TEXT UNIQUE NOT NULL,
   stats_key TEXT UNIQUE NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  pending_delete INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS publishers (
@@ -262,6 +263,18 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Migrate pre-existing databases created before `pending_delete` was
+        // added to the `streams` table (CREATE TABLE IF NOT EXISTS above is a
+        // no-op on an already-existing table). Ignore the "duplicate column"
+        // error on databases that already have it.
+        match conn.execute(
+            "ALTER TABLE streams ADD COLUMN pending_delete INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
         let stale = conn
             .execute("UPDATE publishers SET active=0 WHERE active=1", [])
             .unwrap_or(0)
@@ -444,12 +457,17 @@ impl Db {
         self.stream_find_by("stats_key", key)
     }
 
-    /// Disable a stream so new publish/play attempts are rejected while RTMP
-    /// sessions drain. Returns `Some(true)` if updated, `Some(false)` if not
-    /// found, `None` on DB error.
+    /// Disable a stream and mark it as pending deletion, so new publish/play
+    /// attempts are rejected while RTMP sessions drain and a crash before the
+    /// delete finishes can be recovered on the next startup (see
+    /// `stream_ids_pending_delete`). Returns `Some(true)` if updated,
+    /// `Some(false)` if not found, `None` on DB error.
     pub fn stream_disable(&self, id: &str) -> Option<bool> {
         let conn = self.conn.lock();
-        match conn.execute("UPDATE streams SET enabled=0 WHERE id=?", params![id]) {
+        match conn.execute(
+            "UPDATE streams SET enabled=0, pending_delete=1 WHERE id=?",
+            params![id],
+        ) {
             Ok(rows) => Some(rows > 0),
             Err(e) => {
                 crate::log_error!("stream_disable error for {id}: {e}");
@@ -458,15 +476,39 @@ impl Db {
         }
     }
 
-    /// Re-enable a stream after a failed delete rollback.
+    /// Re-enable a stream after a failed delete rollback, clearing the
+    /// pending-delete marker set by `stream_disable`.
     pub fn stream_set_enabled(&self, id: &str, enabled: bool) -> bool {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE streams SET enabled=? WHERE id=?",
+            "UPDATE streams SET enabled=?, pending_delete=0 WHERE id=?",
             params![enabled, id],
         )
         .map(|rows| rows > 0)
         .unwrap_or(false)
+    }
+
+    /// Stream ids left mid-delete (`pending_delete=1`) by a prior process
+    /// that crashed or was redeployed before finishing an async delete — see
+    /// `handle_stream_delete`'s `202` path in `http.rs`. Distinct from
+    /// `enabled=0`, which may also mark a stream an operator disabled
+    /// without deleting it.
+    pub fn stream_ids_pending_delete(&self) -> Vec<String> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare("SELECT id FROM streams WHERE pending_delete=1") {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("stream_ids_pending_delete: prepare failed: {e}");
+                return Vec::new();
+            }
+        };
+        match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(e) => {
+                crate::log_error!("stream_ids_pending_delete: query failed: {e}");
+                Vec::new()
+            }
+        }
     }
 
     #[allow(dead_code)]

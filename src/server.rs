@@ -306,30 +306,22 @@ fn mask_api_token(token: &str) -> String {
     format!("{}...{}", &token[..8], &token[token.len() - 4..])
 }
 
-/// Finish any stream deletes that were left half-done (`enabled=0`, row still
-/// present) by a prior process that crashed or was redeployed mid-delete —
-/// see `handle_stream_delete`'s async `202` path in `http.rs`. A fresh
-/// process start has no surviving RTMP sessions from before, so it's always
-/// safe to finalize these immediately rather than leave them disabled
-/// forever.
+/// Finish any stream deletes that were left half-done (`pending_delete=1`,
+/// row still present) by a prior process that crashed or was redeployed
+/// mid-delete — see `handle_stream_delete`'s async `202` path in `http.rs`.
+/// A fresh process start has no surviving RTMP sessions from before, so it's
+/// always safe to finalize these immediately rather than leave them disabled
+/// forever. Deliberately keyed on `pending_delete`, not `enabled=0` — a
+/// stream can be administratively disabled without being deleted.
 fn recover_pending_stream_deletes(db: &Db) {
-    for stream in db.stream_list() {
-        if stream.enabled {
-            continue;
-        }
-        match db.stream_delete(&stream.id) {
+    for id in db.stream_ids_pending_delete() {
+        match db.stream_delete(&id) {
             Some(true) => {
-                crate::log_warn!(
-                    "Recovered abandoned delete for stream '{}' from a prior run",
-                    stream.id
-                );
+                crate::log_warn!("Recovered abandoned delete for stream '{id}' from a prior run");
             }
             Some(false) => {}
             None => {
-                crate::log_error!(
-                    "Failed to recover abandoned delete for stream '{}'",
-                    stream.id
-                );
+                crate::log_error!("Failed to recover abandoned delete for stream '{id}'");
             }
         }
     }
