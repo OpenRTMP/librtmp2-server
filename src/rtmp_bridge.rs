@@ -48,7 +48,7 @@ pub struct FrameInfo {
 /// `on_connect` / `on_publish` / `authorize_play` / `on_frame` / `on_close` hook shape.
 pub trait RtmpEventHandler: Send + Sync {
     /// Called immediately after a new TCP connection is accepted.
-    fn on_connect(&self, conn: ConnId);
+    fn on_connect(&self, conn: ConnId, remote_addr: &str);
     /// Atomically authorize a publish (DB slot + per-connection state).
     /// Called from the RTMP publish callback before media relay is enabled.
     #[allow(clippy::result_unit_err)]
@@ -65,6 +65,9 @@ pub trait RtmpEventHandler: Send + Sync {
 
 #[derive(Default)]
 struct ConnState {
+    /// Client IP (no port) this connection was accepted from, used to key
+    /// auth-failure rate limiting by a stable identity instead of `ConnId`.
+    remote_ip: String,
     publisher: Option<Publisher>,
     player: Option<Player>,
     /// Configured play-key row id for the active viewer session.
@@ -99,7 +102,24 @@ pub struct DbRtmpBridge {
     db: Arc<Db>,
     conns: Mutex<HashMap<ConnId, ConnState>>,
     deleted_streams: Arc<Mutex<HashSet<String>>>,
-    auth_failures: Mutex<HashMap<ConnId, Vec<Instant>>>,
+    /// Failed publish/play auth attempts keyed by client IP (not `ConnId`) so
+    /// reconnecting on a fresh TCP connection does not reset the window —
+    /// see `is_auth_rate_limited`.
+    auth_failures: Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+/// Strip the port from a `host:port` / `[host]:port` remote address string,
+/// leaving a stable per-client identity to key auth-failure tracking by.
+fn remote_ip_of(remote_addr: &str) -> String {
+    if let Some(rest) = remote_addr.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[..end].to_string();
+    }
+    match remote_addr.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
+        _ => remote_addr.to_string(),
+    }
 }
 
 impl DbRtmpBridge {
@@ -113,10 +133,10 @@ impl DbRtmpBridge {
         }
     }
 
-    fn is_auth_rate_limited(&self, conn: ConnId) -> bool {
+    fn is_auth_rate_limited(&self, remote_ip: &str) -> bool {
         let mut guard = self.auth_failures.lock();
         let now = Instant::now();
-        let Some(entries) = guard.get_mut(&conn) else {
+        let Some(entries) = guard.get_mut(remote_ip) else {
             return false;
         };
         entries.retain(|t| {
@@ -124,16 +144,16 @@ impl DbRtmpBridge {
                 .is_none_or(|age| age < RTMP_AUTH_FAILURE_WINDOW)
         });
         if entries.is_empty() {
-            guard.remove(&conn);
+            guard.remove(remote_ip);
             return false;
         }
         entries.len() >= RTMP_AUTH_MAX_FAILURES
     }
 
-    fn record_auth_failure(&self, conn: ConnId) {
+    fn record_auth_failure(&self, remote_ip: &str) {
         let mut guard = self.auth_failures.lock();
         let now = Instant::now();
-        let entries = guard.entry(conn).or_default();
+        let entries = guard.entry(remote_ip.to_string()).or_default();
         entries.retain(|t| {
             now.checked_duration_since(*t)
                 .is_none_or(|age| age < RTMP_AUTH_FAILURE_WINDOW)
@@ -141,8 +161,8 @@ impl DbRtmpBridge {
         entries.push(now);
     }
 
-    fn clear_auth_failures(&self, conn: ConnId) {
-        self.auth_failures.lock().remove(&conn);
+    fn clear_auth_failures(&self, remote_ip: &str) {
+        self.auth_failures.lock().remove(remote_ip);
     }
 
     /// Active RTMP connections still tied to a stream (publisher and/or player).
@@ -581,38 +601,53 @@ impl DbRtmpBridge {
 }
 
 impl RtmpEventHandler for DbRtmpBridge {
-    fn on_connect(&self, conn: ConnId) {
+    fn on_connect(&self, conn: ConnId, remote_addr: &str) {
         // Use entry(...).or_default() so a publish/play callback that already ran
         // during the same poll() tick keeps its ConnState — insert() would wipe
         // an authorized publisher/player and leave a ghost active row in the DB.
-        self.conns.lock().entry(conn).or_default();
+        let mut conns = self.conns.lock();
+        let cs = conns.entry(conn).or_default();
+        cs.remote_ip = remote_ip_of(remote_addr);
+        drop(conns);
         crate::log_debug!("RTMP: new connection {conn}");
     }
 
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
-        if self.is_auth_rate_limited(conn) {
+        let remote_ip = self
+            .conns
+            .lock()
+            .get(&conn)
+            .map(|cs| cs.remote_ip.clone())
+            .unwrap_or_default();
+        if self.is_auth_rate_limited(&remote_ip) {
             crate::log_warn!("RTMP: publish rejected — auth rate limit exceeded conn={conn}");
             return Err(());
         }
         let result = self.try_authorize_publish(conn, app, stream_key);
         if result.is_ok() {
-            self.clear_auth_failures(conn);
+            self.clear_auth_failures(&remote_ip);
         } else {
-            self.record_auth_failure(conn);
+            self.record_auth_failure(&remote_ip);
         }
         result
     }
 
     fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
-        if self.is_auth_rate_limited(conn) {
+        let remote_ip = self
+            .conns
+            .lock()
+            .get(&conn)
+            .map(|cs| cs.remote_ip.clone())
+            .unwrap_or_default();
+        if self.is_auth_rate_limited(&remote_ip) {
             crate::log_warn!("RTMP: play rejected — auth rate limit exceeded conn={conn}");
             return Err(());
         }
         let result = self.try_authorize_play(conn, app, stream_key);
         if result.is_ok() {
-            self.clear_auth_failures(conn);
+            self.clear_auth_failures(&remote_ip);
         } else {
-            self.record_auth_failure(conn);
+            self.record_auth_failure(&remote_ip);
         }
         result
     }
@@ -637,7 +672,10 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn on_close(&self, conn: ConnId) {
-        self.clear_auth_failures(conn);
+        // Deliberately do NOT clear auth_failures here: it is keyed by remote
+        // IP (not ConnId) precisely so a client can't reset the brute-force
+        // window by reconnecting. Entries expire naturally via the sliding
+        // window in is_auth_rate_limited/record_auth_failure.
         let cs = self.conns.lock().remove(&conn);
         let Some(cs) = cs else {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");
@@ -694,10 +732,43 @@ mod tests {
     }
 
     #[test]
+    fn auth_rate_limit_survives_reconnect_from_same_ip() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.7:1935";
+
+        // Exhaust the failure budget across many short-lived connections from
+        // the same client IP, each closed after its failed attempt.
+        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
+            bridge.on_connect(conn, ip);
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+            bridge.on_close(conn);
+        }
+
+        // A fresh connection from the same IP must still be throttled — the
+        // window must not reset just because each prior connection closed.
+        let next_conn = RTMP_AUTH_MAX_FAILURES as u64;
+        bridge.on_connect(next_conn, ip);
+        assert!(
+            bridge
+                .authorize_publish(next_conn, "live", "bogus")
+                .is_err()
+        );
+
+        // A different client IP is unaffected.
+        bridge.on_connect(next_conn + 1, "198.51.100.1:1935");
+        assert!(
+            bridge
+                .authorize_publish(next_conn + 1, "live", "bogus")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn publish_rejects_unknown_key() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = test_bridge(db);
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "bogus").is_err());
     }
 
@@ -707,7 +778,7 @@ mod tests {
         add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "other", "pub_k").is_err());
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
     }
@@ -718,7 +789,7 @@ mod tests {
         add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_play(1, "other", "pl_k").is_err());
         assert_eq!(db.player_list(Some("s1")).len(), 0);
     }
@@ -729,7 +800,7 @@ mod tests {
         add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
         assert_eq!(db.publisher_list(Some("s1")).len(), 1);
 
@@ -744,8 +815,8 @@ mod tests {
         add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
-        bridge.on_connect(2);
+        bridge.on_connect(1, "127.0.0.1:1000");
+        bridge.on_connect(2, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
         assert!(bridge.authorize_publish(2, "live", "pub_k2").is_ok());
 
@@ -760,10 +831,10 @@ mod tests {
         add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
 
-        bridge.on_connect(2);
+        bridge.on_connect(2, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(2, "live", "pub_k").is_err());
     }
 
@@ -775,7 +846,7 @@ mod tests {
 
         // publish callback can run during poll() before the poll-loop on_connect.
         assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
 
         assert!(bridge.has_publisher(1));
         assert_eq!(db.publisher_list(Some("s1")).len(), 1);
@@ -788,7 +859,7 @@ mod tests {
         add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
         assert!(bridge.authorize_publish(1, "live", "pub_k2").is_ok());
 
@@ -803,8 +874,8 @@ mod tests {
         add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
-        bridge.on_connect(2);
+        bridge.on_connect(1, "127.0.0.1:1000");
+        bridge.on_connect(2, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
         assert!(bridge.authorize_publish(2, "live", "pub_k2").is_ok());
 
@@ -822,7 +893,7 @@ mod tests {
         add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
         assert!(bridge.authorize_play(1, "live", "pl_k2").is_ok());
 
@@ -840,7 +911,7 @@ mod tests {
         add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
         assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
         bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a");
@@ -868,7 +939,7 @@ mod tests {
         add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
-        bridge.on_connect(1);
+        bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_play(1, "live", "pl_k").is_ok());
         bridge.update_player_stats(1, 4096);
 
@@ -887,11 +958,11 @@ mod tests {
         };
 
         for conn in 1..=crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64 {
-            bridge.on_connect(conn);
+            bridge.on_connect(conn, "127.0.0.1:1000");
             assert!(bridge.authorize_play(conn, "live", "pl_k").is_ok());
         }
 
-        bridge.on_connect(99);
+        bridge.on_connect(99, "127.0.0.1:1000");
         assert!(bridge.authorize_play(99, "live", "pl_k").is_err());
         assert_eq!(
             db.player_list(Some(&viewer.stream_id))

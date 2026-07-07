@@ -157,7 +157,7 @@ pub(crate) fn process_server_connections(
         current_ids.insert(conn_id);
         let entry = tracked.entry(conn_id).or_default();
         if !entry.connected {
-            rtmp_bridge.on_connect(conn_id);
+            rtmp_bridge.on_connect(conn_id, &conn.remote_addr);
             entry.connected = true;
             entry.first_seen_at = Some(Instant::now());
         } else if entry.first_seen_at.is_none() {
@@ -306,6 +306,35 @@ fn mask_api_token(token: &str) -> String {
     format!("{}...{}", &token[..8], &token[token.len() - 4..])
 }
 
+/// Finish any stream deletes that were left half-done (`enabled=0`, row still
+/// present) by a prior process that crashed or was redeployed mid-delete —
+/// see `handle_stream_delete`'s async `202` path in `http.rs`. A fresh
+/// process start has no surviving RTMP sessions from before, so it's always
+/// safe to finalize these immediately rather than leave them disabled
+/// forever.
+fn recover_pending_stream_deletes(db: &Db) {
+    for stream in db.stream_list() {
+        if stream.enabled {
+            continue;
+        }
+        match db.stream_delete(&stream.id) {
+            Some(true) => {
+                crate::log_warn!(
+                    "Recovered abandoned delete for stream '{}' from a prior run",
+                    stream.id
+                );
+            }
+            Some(false) => {}
+            None => {
+                crate::log_error!(
+                    "Failed to recover abandoned delete for stream '{}'",
+                    stream.id
+                );
+            }
+        }
+    }
+}
+
 /// Load the API bearer token from the database, seeding it from `LRTMP2_API_TOKEN`
 /// or generating a new value on first startup.
 fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
@@ -326,7 +355,10 @@ fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
         let env_token = env_token.trim();
         if !env_token.is_empty() {
             if !is_valid_env_api_token(env_token) {
-                return Err("LRTMP2_API_TOKEN must be 32-256 ASCII alphanumeric characters".into());
+                return Err(
+                    "LRTMP2_API_TOKEN must be 32-256 ASCII alphanumeric characters, '-' or '_'"
+                        .into(),
+                );
             }
             if db.token_set(env_token)? {
                 crate::log_info!(
@@ -347,7 +379,7 @@ fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
              {}\n\
              Set LRTMP2_API_TOKEN in the panel .env to this value.\n\
              ============================================================",
-            mask_api_token(&candidate)
+            candidate
         );
         Ok(candidate)
     } else {
@@ -387,6 +419,7 @@ impl ServerApp {
         );
 
         config.api_token = resolve_api_token(&db, db_path)?;
+        recover_pending_stream_deletes(&db);
 
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));

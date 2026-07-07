@@ -46,7 +46,7 @@ impl RateLimiter {
     fn evict_oldest_client(&self, guard: &mut HashMap<String, Vec<Instant>>) {
         let Some(oldest_key) = guard
             .iter()
-            .min_by_key(|(_, entries)| entries.first().copied().unwrap_or(Instant::now()))
+            .min_by_key(|(_, entries)| entries.last().copied().unwrap_or(Instant::now()))
             .map(|(key, _)| key.clone())
         else {
             return;
@@ -180,7 +180,7 @@ mod tests {
             let mut guard = limiter.inner.lock();
             guard.insert(
                 limited_key.to_string(),
-                vec![now - Duration::from_secs(30); max],
+                vec![now - Duration::from_secs(1); max],
             );
             for i in 1..MAX_TRACKED_KEYS {
                 guard.insert(
