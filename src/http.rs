@@ -160,8 +160,8 @@ fn bearer_ok(state: &AppState, headers: &HeaderMap) -> bool {
     ct_str_eq(tok.trim(), &state.config.api_token)
 }
 
-fn stats_key_lookup<'a>(
-    state: &'a AppState,
+fn stats_key_lookup(
+    state: &AppState,
     key: &str,
     stream_id: Option<&str>,
 ) -> Option<crate::db::Stream> {

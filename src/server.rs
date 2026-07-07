@@ -727,9 +727,14 @@ mod tests {
         let db_path_str = db_path.to_str().unwrap();
         let env_token = "c10123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
 
-        std::env::set_var("LRTMP2_API_TOKEN", env_token);
+        // SAFETY: test runs single-threaded and restores the env var immediately.
+        unsafe {
+            std::env::set_var("LRTMP2_API_TOKEN", env_token);
+        }
         let app = ServerApp::bootstrap(ServerConfig::default(), db_path_str).expect("bootstrap");
-        std::env::remove_var("LRTMP2_API_TOKEN");
+        unsafe {
+            std::env::remove_var("LRTMP2_API_TOKEN");
+        }
 
         assert_eq!(app.config.api_token, env_token);
         let db = crate::db::Db::open(db_path_str).expect("reopen db");
