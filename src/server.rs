@@ -56,7 +56,7 @@ where
     F: FnOnce(&DbRtmpBridge) -> R,
 {
     match RTMP_BRIDGE.lock() {
-        Ok(guard) => guard.as_ref().map(f),
+        Ok(guard) => guard.as_ref().map(|bridge| f(bridge.as_ref())),
         Err(e) => {
             crate::log_error!("RTMP_BRIDGE lock poisoned; rejecting RTMP callback: {e}");
             None
@@ -65,8 +65,7 @@ where
 }
 
 pub(crate) fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
-    with_rtmp_bridge(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
-        .unwrap_or(false)
+    with_rtmp_bridge(|b| b.authorize_publish(conn_id, app, stream_key).is_ok()).unwrap_or(false)
 }
 
 pub(crate) fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
@@ -327,9 +326,7 @@ fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
         let env_token = env_token.trim();
         if !env_token.is_empty() {
             if !is_valid_env_api_token(env_token) {
-                return Err(
-                    "LRTMP2_API_TOKEN must be 32-256 ASCII alphanumeric characters".into(),
-                );
+                return Err("LRTMP2_API_TOKEN must be 32-256 ASCII alphanumeric characters".into());
             }
             if db.token_set(env_token)? {
                 crate::log_info!(

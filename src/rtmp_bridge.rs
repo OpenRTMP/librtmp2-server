@@ -385,30 +385,6 @@ impl DbRtmpBridge {
             self.db.player_update(&player_id, &row);
         }
     }
-}
-
-impl RtmpEventHandler for DbRtmpBridge {
-    fn on_connect(&self, conn: ConnId) {
-        // Use entry(...).or_default() so a publish/play callback that already ran
-        // during the same poll() tick keeps its ConnState — insert() would wipe
-        // an authorized publisher/player and leave a ghost active row in the DB.
-        self.conns.lock().entry(conn).or_default();
-        crate::log_debug!("RTMP: new connection {conn}");
-    }
-
-    fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
-        if self.is_auth_rate_limited(conn) {
-            crate::log_warn!("RTMP: publish rejected — auth rate limit exceeded conn={conn}");
-            return Err(());
-        }
-        let result = self.try_authorize_publish(conn, app, stream_key);
-        if result.is_ok() {
-            self.clear_auth_failures(conn);
-        } else {
-            self.record_auth_failure(conn);
-        }
-        result
-    }
 
     fn try_authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
@@ -499,20 +475,6 @@ impl RtmpEventHandler for DbRtmpBridge {
             cs.publisher.as_ref().map(|p| p.id.as_str()).unwrap_or("")
         );
         Ok(())
-    }
-
-    fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
-        if self.is_auth_rate_limited(conn) {
-            crate::log_warn!("RTMP: play rejected — auth rate limit exceeded conn={conn}");
-            return Err(());
-        }
-        let result = self.try_authorize_play(conn, app, stream_key);
-        if result.is_ok() {
-            self.clear_auth_failures(conn);
-        } else {
-            self.record_auth_failure(conn);
-        }
-        result
     }
 
     fn try_authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
@@ -615,6 +577,44 @@ impl RtmpEventHandler for DbRtmpBridge {
             stream.id
         );
         Ok(())
+    }
+}
+
+impl RtmpEventHandler for DbRtmpBridge {
+    fn on_connect(&self, conn: ConnId) {
+        // Use entry(...).or_default() so a publish/play callback that already ran
+        // during the same poll() tick keeps its ConnState — insert() would wipe
+        // an authorized publisher/player and leave a ghost active row in the DB.
+        self.conns.lock().entry(conn).or_default();
+        crate::log_debug!("RTMP: new connection {conn}");
+    }
+
+    fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
+        if self.is_auth_rate_limited(conn) {
+            crate::log_warn!("RTMP: publish rejected — auth rate limit exceeded conn={conn}");
+            return Err(());
+        }
+        let result = self.try_authorize_publish(conn, app, stream_key);
+        if result.is_ok() {
+            self.clear_auth_failures(conn);
+        } else {
+            self.record_auth_failure(conn);
+        }
+        result
+    }
+
+    fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
+        if self.is_auth_rate_limited(conn) {
+            crate::log_warn!("RTMP: play rejected — auth rate limit exceeded conn={conn}");
+            return Err(());
+        }
+        let result = self.try_authorize_play(conn, app, stream_key);
+        if result.is_ok() {
+            self.clear_auth_failures(conn);
+        } else {
+            self.record_auth_failure(conn);
+        }
+        result
     }
 
     fn on_frame(&self, conn: ConnId, frame: &FrameInfo) -> bool {

@@ -501,10 +501,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
 
 // ---------- handlers ----------
 
-async fn handle_health(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if bearer_ok(&state, &headers) {
         return Json(json!({
             "status": "ok",
@@ -550,8 +547,11 @@ async fn handle_stats_nginx(
 ) -> Response {
     let start = Instant::now();
     if q.key.is_empty() {
-        return pace_public_stats(start, err_xml(StatusCode::UNAUTHORIZED, "Missing stats key"))
-            .await;
+        return pace_public_stats(
+            start,
+            err_xml(StatusCode::UNAUTHORIZED, "Missing stats key"),
+        )
+        .await;
     }
     let Some(s) = stats_key_lookup(&state, &q.key, None) else {
         return pace_public_stats(start, err_xml(StatusCode::FORBIDDEN, "Invalid stats key")).await;
@@ -776,9 +776,7 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
         if std::time::Instant::now() >= deadline {
             let _ = state.db.stream_set_enabled(&id, true);
             state.deleted_streams.lock().remove(&id);
-            crate::log_warn!(
-                "Timed out deleting stream '{id}' — active RTMP sessions remained"
-            );
+            crate::log_warn!("Timed out deleting stream '{id}' — active RTMP sessions remained");
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -844,11 +842,7 @@ async fn handle_stream_delete(
     tokio::spawn(async move {
         wait_and_finalize_stream_delete(state_bg, id_bg).await;
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"status": "deleting"})),
-    )
-        .into_response()
+    (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response()
 }
 
 async fn handle_stream_players_list(
