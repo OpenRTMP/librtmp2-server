@@ -16,10 +16,13 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::db::{Db, DbLookup, Player, Publisher};
 use crate::keygen::{self, PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY};
+
+const RTMP_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const RTMP_AUTH_MAX_FAILURES: usize = 10;
 
 /// Opaque per-connection identifier assigned by the RTMP layer. The original
 /// C code keyed connection state off the `lrtmp2_conn_t*` pointer; any stable,
@@ -96,6 +99,7 @@ pub struct DbRtmpBridge {
     db: Arc<Db>,
     conns: Mutex<HashMap<ConnId, ConnState>>,
     deleted_streams: Arc<Mutex<HashSet<String>>>,
+    auth_failures: Mutex<HashMap<ConnId, Vec<Instant>>>,
 }
 
 impl DbRtmpBridge {
@@ -105,7 +109,40 @@ impl DbRtmpBridge {
             db,
             conns: Mutex::new(HashMap::new()),
             deleted_streams,
+            auth_failures: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn is_auth_rate_limited(&self, conn: ConnId) -> bool {
+        let mut guard = self.auth_failures.lock();
+        let now = Instant::now();
+        let Some(entries) = guard.get_mut(&conn) else {
+            return false;
+        };
+        entries.retain(|t| {
+            now.checked_duration_since(*t)
+                .is_none_or(|age| age < RTMP_AUTH_FAILURE_WINDOW)
+        });
+        if entries.is_empty() {
+            guard.remove(&conn);
+            return false;
+        }
+        entries.len() >= RTMP_AUTH_MAX_FAILURES
+    }
+
+    fn record_auth_failure(&self, conn: ConnId) {
+        let mut guard = self.auth_failures.lock();
+        let now = Instant::now();
+        let entries = guard.entry(conn).or_default();
+        entries.retain(|t| {
+            now.checked_duration_since(*t)
+                .is_none_or(|age| age < RTMP_AUTH_FAILURE_WINDOW)
+        });
+        entries.push(now);
+    }
+
+    fn clear_auth_failures(&self, conn: ConnId) {
+        self.auth_failures.lock().remove(&conn);
     }
 
     /// Active RTMP connections still tied to a stream (publisher and/or player).
@@ -360,6 +397,20 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
+        if self.is_auth_rate_limited(conn) {
+            crate::log_warn!("RTMP: publish rejected — auth rate limit exceeded conn={conn}");
+            return Err(());
+        }
+        let result = self.try_authorize_publish(conn, app, stream_key);
+        if result.is_ok() {
+            self.clear_auth_failures(conn);
+        } else {
+            self.record_auth_failure(conn);
+        }
+        result
+    }
+
+    fn try_authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
 
         let DbLookup::Ok(stream) = self.db.stream_find_by_publish_key(stream_key) else {
@@ -451,6 +502,20 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
+        if self.is_auth_rate_limited(conn) {
+            crate::log_warn!("RTMP: play rejected — auth rate limit exceeded conn={conn}");
+            return Err(());
+        }
+        let result = self.try_authorize_play(conn, app, stream_key);
+        if result.is_ok() {
+            self.clear_auth_failures(conn);
+        } else {
+            self.record_auth_failure(conn);
+        }
+        result
+    }
+
+    fn try_authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
 
         let DbLookup::Ok(viewer) = self.db.viewer_find_by_play_key(stream_key) else {
@@ -572,6 +637,7 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn on_close(&self, conn: ConnId) {
+        self.clear_auth_failures(conn);
         let cs = self.conns.lock().remove(&conn);
         let Some(cs) = cs else {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");

@@ -648,13 +648,17 @@ impl Db {
                 return false;
             }
         };
-        let active: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1",
-                params![p.stream_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(1);
+        let active: i64 = match tx.query_row(
+            "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1",
+            params![p.stream_id],
+            |row| row.get(0),
+        ) {
+            Ok(count) => count,
+            Err(e) => {
+                crate::log_error!("publisher_try_acquire: count query failed: {e}");
+                return false;
+            }
+        };
         if active > 0 {
             return false;
         }

@@ -51,28 +51,26 @@ fn bind_with_default_port(bind: &str, default_port: u16) -> String {
     }
 }
 
+fn with_rtmp_bridge<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&DbRtmpBridge) -> R,
+{
+    match RTMP_BRIDGE.lock() {
+        Ok(guard) => guard.as_ref().map(f),
+        Err(e) => {
+            crate::log_error!("RTMP_BRIDGE lock poisoned; rejecting RTMP callback: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
-    RTMP_BRIDGE
-        .lock()
-        .ok()
-        .and_then(|guard| {
-            guard
-                .as_ref()
-                .map(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
-        })
+    with_rtmp_bridge(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
         .unwrap_or(false)
 }
 
 pub(crate) fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
-    RTMP_BRIDGE
-        .lock()
-        .ok()
-        .and_then(|guard| {
-            guard
-                .as_ref()
-                .map(|b| b.authorize_play(conn_id, app, play_key).is_ok())
-        })
-        .unwrap_or(false)
+    with_rtmp_bridge(|b| b.authorize_play(conn_id, app, play_key).is_ok()).unwrap_or(false)
 }
 
 pub(crate) fn rtmp_media_cb(
@@ -80,21 +78,21 @@ pub(crate) fn rtmp_media_cb(
     frame_type: librtmp2::types::FrameType,
     codec: Option<&str>,
 ) -> bool {
-    let Some(bridge) = RTMP_BRIDGE.lock().ok().and_then(|g| g.clone()) else {
-        return true;
-    };
-    let kind = match frame_type {
-        librtmp2::types::FrameType::Video => FrameKind::Video,
-        librtmp2::types::FrameType::Audio => FrameKind::Audio,
-        _ => return true,
-    };
-    let frame = FrameInfo {
-        kind,
-        timestamp: 0,
-        size: 0,
-        codec: codec.unwrap_or("").to_string(),
-    };
-    bridge.on_frame(conn_id, &frame)
+    with_rtmp_bridge(|bridge| {
+        let kind = match frame_type {
+            librtmp2::types::FrameType::Video => FrameKind::Video,
+            librtmp2::types::FrameType::Audio => FrameKind::Audio,
+            _ => return true,
+        };
+        let frame = FrameInfo {
+            kind,
+            timestamp: 0,
+            size: 0,
+            codec: codec.unwrap_or("").to_string(),
+        };
+        bridge.on_frame(conn_id, &frame)
+    })
+    .unwrap_or(true)
 }
 
 /// Per-connection bookkeeping the RTMP poll loop keeps for the lifetime of
@@ -293,6 +291,74 @@ pub(crate) fn process_server_connections(
     current_ids
 }
 
+fn is_valid_env_api_token(token: &str) -> bool {
+    let token = token.trim();
+    token.len() >= 32
+        && token.len() <= 256
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn mask_api_token(token: &str) -> String {
+    if token.len() <= 12 {
+        return "***".to_string();
+    }
+    format!("{}...{}", &token[..8], &token[token.len() - 4..])
+}
+
+/// Load the API bearer token from the database, seeding it from `LRTMP2_API_TOKEN`
+/// or generating a new value on first startup.
+fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
+    if let Some(stored) = db.token_get()? {
+        if let Ok(env_token) = std::env::var("LRTMP2_API_TOKEN") {
+            let env_token = env_token.trim();
+            if !env_token.is_empty() && env_token != stored {
+                crate::log_warn!(
+                    "LRTMP2_API_TOKEN env differs from database value; using database token ({})",
+                    mask_api_token(&stored)
+                );
+            }
+        }
+        return Ok(stored);
+    }
+
+    if let Ok(env_token) = std::env::var("LRTMP2_API_TOKEN") {
+        let env_token = env_token.trim();
+        if !env_token.is_empty() {
+            if !is_valid_env_api_token(env_token) {
+                return Err(
+                    "LRTMP2_API_TOKEN must be 32-256 ASCII alphanumeric characters".into(),
+                );
+            }
+            if db.token_set(env_token)? {
+                crate::log_info!(
+                    "API token loaded from LRTMP2_API_TOKEN (stored in database {db_path})"
+                );
+            }
+            return db
+                .token_get()?
+                .ok_or_else(|| "API token missing after env seed".to_string());
+        }
+    }
+
+    let candidate = crate::keygen::keygen_api_token()?;
+    if db.token_set(&candidate)? {
+        eprintln!(
+            "============================================================\n\
+             Generated API token (stored in database {db_path}):\n\
+             {}\n\
+             Set LRTMP2_API_TOKEN in the panel .env to this value.\n\
+             ============================================================",
+            mask_api_token(&candidate)
+        );
+        Ok(candidate)
+    } else {
+        db.token_get()?
+            .ok_or_else(|| "API token missing after concurrent insert".to_string())
+    }
+}
+
 pub struct ServerApp {
     config: ServerConfig,
     db: Arc<Db>,
@@ -323,27 +389,7 @@ impl ServerApp {
             Db::open(db_path).map_err(|e| format!("Failed to open database {db_path}: {e}"))?,
         );
 
-        // The API token lives exclusively in the database. On first startup it is
-        // always generated here; afterwards it is loaded from the settings table.
-        config.api_token = match db.token_get()? {
-            Some(t) => t,
-            None => {
-                let candidate = crate::keygen::keygen_api_token()?;
-
-                if db.token_set(&candidate)? {
-                    eprintln!(
-                        "============================================================\n\
-                         Generated API token (stored in database {db_path}):\n\
-                         {candidate}\n\
-                         ============================================================"
-                    );
-                    candidate
-                } else {
-                    db.token_get()?
-                        .ok_or("API token missing after concurrent insert")?
-                }
-            }
-        };
+        config.api_token = resolve_api_token(&db, db_path)?;
 
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
@@ -675,5 +721,21 @@ mod tests {
             "token must be hex"
         );
         assert_eq!(app.config.api_token, stored);
+    }
+
+    #[test]
+    fn bootstrap_seeds_api_token_from_env_on_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("env-token.db");
+        let db_path_str = db_path.to_str().unwrap();
+        let env_token = "c10123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+
+        std::env::set_var("LRTMP2_API_TOKEN", env_token);
+        let app = ServerApp::bootstrap(ServerConfig::default(), db_path_str).expect("bootstrap");
+        std::env::remove_var("LRTMP2_API_TOKEN");
+
+        assert_eq!(app.config.api_token, env_token);
+        let db = crate::db::Db::open(db_path_str).expect("reopen db");
+        assert_eq!(db.token_get().unwrap().as_deref(), Some(env_token));
     }
 }

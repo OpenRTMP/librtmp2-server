@@ -42,6 +42,18 @@ impl RateLimiter {
         });
     }
 
+    /// Remove the least-recently-seen client bucket when the map is still full.
+    fn evict_oldest_client(&self, guard: &mut HashMap<String, Vec<Instant>>) {
+        let Some(oldest_key) = guard
+            .iter()
+            .min_by_key(|(_, entries)| entries.first().copied().unwrap_or(Instant::now()))
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        guard.remove(&oldest_key);
+    }
+
     fn check(&self, key: &str, max_requests: usize) -> bool {
         if max_requests == 0 {
             return false;
@@ -65,7 +77,7 @@ impl RateLimiter {
         if guard.len() >= MAX_TRACKED_KEYS {
             self.purge_expired(&mut guard, now);
             if guard.len() >= MAX_TRACKED_KEYS {
-                return false;
+                self.evict_oldest_client(&mut guard);
             }
         }
 
@@ -158,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn active_clients_are_not_evicted_when_map_is_at_capacity() {
+    fn active_clients_are_evicted_via_lru_when_map_is_at_capacity() {
         let limiter = RateLimiter::new(Vec::new());
         let max = 120;
         let now = Instant::now();
@@ -179,13 +191,13 @@ mod tests {
         }
 
         assert!(
-            !limiter.check("203.0.113.9:api", max),
-            "full active map should reject new clients instead of evicting active buckets"
+            limiter.check("203.0.113.9:api", max),
+            "full map should evict the oldest bucket and admit a new client"
         );
         assert_eq!(limiter.inner.lock().len(), MAX_TRACKED_KEYS);
         assert!(
             !limiter.check(limited_key, max),
-            "eviction must not reset an active client's bucket"
+            "evicted client's bucket must not be reset"
         );
     }
 

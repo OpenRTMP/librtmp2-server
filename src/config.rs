@@ -191,8 +191,8 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
 }
 
 /// Apply a key/value pair from the config file to `config`.
-/// `API_TOKEN` is intentionally not handled here; the token is managed
-/// exclusively by the database layer and cannot be set via the config file.
+/// `API_TOKEN` / `LRTMP2_API_TOKEN` are intentionally not handled here; the token
+/// is managed by the database layer and may be seeded from `LRTMP2_API_TOKEN` at bootstrap.
 fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
     match key {
         "RTMP_BIND" => config.rtmp_bind = val.to_string(),
@@ -255,8 +255,8 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
 }
 
 /// Environment variables override config file values.
-/// The API token is managed exclusively by the database layer and cannot be
-/// set via environment or config file.
+/// `LRTMP2_API_TOKEN` is read during server bootstrap (see `ServerApp::bootstrap`),
+/// not here — it is persisted to the database on first startup when the DB is empty.
 pub fn config_apply_env(config: &mut ServerConfig) {
     config_apply_env_from(config, |key| std::env::var(key).ok());
 }
