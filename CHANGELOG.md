@@ -13,12 +13,7 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
-### Changed
-- Standardized the config file name on `.env` (was `config.env`); the example
-  template is now `.env.example`. The server loads `.env` by default, and the
-  Docker image starts without an explicit `-c` path.
-
-## [0.1.0] — 2026-07-04
+## [0.1.0] — 2026-07-08
 
 First tagged pre-release. `librtmp2-server` is a Rust crate built on `axum`
 (HTTP API) and `rusqlite` (SQLite persistence). The RTMP/E-RTMP protocol
@@ -44,6 +39,18 @@ plaintext RTMP and RTMPS.
 - Docker image (`rust:1-alpine` → `alpine:latest` multi-stage build)
 - Unit tests covering config, db, HTTP API, keygen, rate limiting, and the
   RTMP bridge
+
+### Changed
+- Standardized the config file name on `.env` (was `config.env`); the example
+  template is now `.env.example`. The server loads `.env` by default, and the
+  Docker image starts without an explicit `-c` path.
+
+### Fixed
+- Avoid redundant `on_connect` re-registration on every publish/play callback
+  for an already-registered connection
+- Register the client's `remote_addr` inside publish/play callbacks during
+  `poll()` so per-IP auth failure tracking applies before the first
+  publish/play attempt, closing a rate-limit bypass race
 
 ### Security
 - Input validation and rate limiting for HTTP requests
