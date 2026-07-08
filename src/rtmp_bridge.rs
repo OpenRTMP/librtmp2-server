@@ -819,6 +819,38 @@ mod tests {
     }
 
     #[test]
+    fn publish_failures_count_toward_auth_rate_limit_when_remote_ip_known() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.7:1935";
+
+        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
+            bridge.on_connect(conn, ip);
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+        }
+
+        bridge.on_connect(RTMP_AUTH_MAX_FAILURES as u64, ip);
+        assert!(bridge.is_auth_rate_limited(&remote_ip_of(ip)));
+    }
+
+    #[test]
+    fn publish_before_on_connect_skips_auth_failure_tracking() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.7:1935";
+
+        for conn in 0..(RTMP_AUTH_MAX_FAILURES as u64 + 2) {
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+            bridge.on_connect(conn, ip);
+        }
+
+        assert!(
+            !bridge.is_auth_rate_limited(&remote_ip_of(ip)),
+            "failed publish attempts before on_connect must not consume the per-IP auth budget"
+        );
+    }
+
+    #[test]
     fn auth_rate_limit_survives_reconnect_from_same_ip() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = test_bridge(db);

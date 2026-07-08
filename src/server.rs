@@ -2,6 +2,7 @@
 //! and the RTMP listener(s), then runs until a shutdown signal arrives.
 
 use parking_lot::Mutex;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -16,6 +17,22 @@ use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
 pub(crate) static RTMP_BRIDGE: StdMutex<Option<Arc<DbRtmpBridge>>> = StdMutex::new(None);
+
+thread_local! {
+    static RTMP_POLL_SERVER: Cell<Option<*mut librtmp2::server::Server>> = const {
+        Cell::new(None)
+    };
+}
+
+/// Pin the active RTMP server for the duration of `poll()` so publish/play
+/// callbacks can resolve `remote_addr` before auth rate limiting.
+pub(crate) fn set_rtmp_poll_server(server: *mut librtmp2::server::Server) {
+    RTMP_POLL_SERVER.with(|cell| cell.set(Some(server)));
+}
+
+pub(crate) fn clear_rtmp_poll_server() {
+    RTMP_POLL_SERVER.with(|cell| cell.set(None));
+}
 
 /// How often the poll loop wakes up to service the RTMP/RTMPS listener(s).
 pub(crate) const POLL_INTERVAL_MS: u64 = 50;
@@ -64,11 +81,39 @@ where
     }
 }
 
+/// Register the client IP on the bridge before publish/play auth runs. During
+/// `server.poll()` the publish/play callbacks can fire before
+/// `process_server_connections` reaches `on_connect`, which would otherwise
+/// skip per-IP auth-failure tracking and rate limiting.
+fn ensure_conn_registered_for_auth(conn_id: u64) {
+    RTMP_POLL_SERVER.with(|cell| {
+        let Some(server_ptr) = cell.get() else {
+            return;
+        };
+        if server_ptr.is_null() {
+            return;
+        }
+        // SAFETY: `RTMP_POLL_SERVER` is set only on the RTMP thread for the
+        // duration of `server.poll()`, which exclusively owns `server`.
+        let server = unsafe { &*server_ptr };
+        let Some(conn) = server
+            .connections
+            .iter()
+            .find(|c| c.conn_id == conn_id && c.client_fd >= 0)
+        else {
+            return;
+        };
+        with_rtmp_bridge(|bridge| bridge.on_connect(conn_id, &conn.remote_addr));
+    });
+}
+
 pub(crate) fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
+    ensure_conn_registered_for_auth(conn_id);
     with_rtmp_bridge(|b| b.authorize_publish(conn_id, app, stream_key).is_ok()).unwrap_or(false)
 }
 
 pub(crate) fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
+    ensure_conn_registered_for_auth(conn_id);
     with_rtmp_bridge(|b| b.authorize_play(conn_id, app, play_key).is_ok()).unwrap_or(false)
 }
 
@@ -543,7 +588,10 @@ impl ServerApp {
                     break;
                 }
 
-                if let Err(e) = server.poll(0) {
+                set_rtmp_poll_server(&mut server);
+                let poll_result = server.poll(0);
+                clear_rtmp_poll_server();
+                if let Err(e) = poll_result {
                     crate::log_warn!("RTMP polling stopped: {e}");
                     break;
                 }
