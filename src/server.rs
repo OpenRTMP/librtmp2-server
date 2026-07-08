@@ -86,6 +86,15 @@ where
 /// `process_server_connections` reaches `on_connect`, which would otherwise
 /// skip per-IP auth-failure tracking and rate limiting.
 fn ensure_conn_registered_for_auth(conn_id: u64) {
+    // Skip the pointer walk entirely once the normal `on_connect` pass (or an
+    // earlier call from this same function) has already registered the
+    // remote IP. Without this check every publish/play attempt on an
+    // already-registered connection re-ran `on_connect` and its "new
+    // connection" log line, which was both misleading and needless lock
+    // contention on the hot path.
+    if with_rtmp_bridge(|bridge| bridge.is_registered(conn_id)).unwrap_or(true) {
+        return;
+    }
     RTMP_POLL_SERVER.with(|cell| {
         let Some(server_ptr) = cell.get() else {
             return;
