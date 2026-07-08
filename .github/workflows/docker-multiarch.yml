@@ -38,13 +38,19 @@ jobs:
 
       - name: Compute image tags
         id: tags
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
+          if [ -n "$VERSION" ] && ! echo "$VERSION" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid version input '$VERSION' (allowed: [a-zA-Z0-9._-])"
+            exit 1
+          fi
           TAGS="ghcr.io/openrtmp/librtmp2-server:latest
           ghcr.io/openrtmp/librtmp2-server:beta
           ghcr.io/openrtmp/librtmp2-server:alpha"
-          if [ -n "${{ inputs.version }}" ]; then
+          if [ -n "$VERSION" ]; then
             TAGS="$TAGS
-          ghcr.io/openrtmp/librtmp2-server:${{ inputs.version }}"
+          ghcr.io/openrtmp/librtmp2-server:$VERSION"
           fi
           {
             echo "tags<<EOF"
