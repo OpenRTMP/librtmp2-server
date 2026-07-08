@@ -5,7 +5,7 @@ RTMP / E-RTMP media server built on [librtmp2](https://github.com/OpenRTMP/librt
 Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
 [![License](https://img.shields.io/github/license/OpenRTMP/librtmp2-server)](LICENSE)
-![Version](https://img.shields.io/badge/version-alpha-red)
+![Version](https://img.shields.io/badge/version-v0.1.0-orange)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
 
 ---
