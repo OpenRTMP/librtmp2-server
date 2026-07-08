@@ -147,6 +147,17 @@ impl DbRtmpBridge {
         }
     }
 
+    /// True once `on_connect` has recorded a remote IP for `conn`. Lets
+    /// callers that may need to register a connection mid-poll (before the
+    /// normal `on_connect` pass runs) skip the redundant re-registration and
+    /// its log line on every subsequent publish/play attempt.
+    pub(crate) fn is_registered(&self, conn: ConnId) -> bool {
+        self.conns
+            .lock()
+            .get(&conn)
+            .is_some_and(|cs| !cs.remote_ip.is_empty())
+    }
+
     fn is_auth_rate_limited(&self, remote_ip: &str) -> bool {
         let mut guard = self.auth_failures.lock();
         let now = Instant::now();
@@ -819,6 +830,38 @@ mod tests {
     }
 
     #[test]
+    fn publish_failures_count_toward_auth_rate_limit_when_remote_ip_known() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.7:1935";
+
+        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
+            bridge.on_connect(conn, ip);
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+        }
+
+        bridge.on_connect(RTMP_AUTH_MAX_FAILURES as u64, ip);
+        assert!(bridge.is_auth_rate_limited(&remote_ip_of(ip)));
+    }
+
+    #[test]
+    fn publish_before_on_connect_skips_auth_failure_tracking() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.7:1935";
+
+        for conn in 0..(RTMP_AUTH_MAX_FAILURES as u64 + 2) {
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+            bridge.on_connect(conn, ip);
+        }
+
+        assert!(
+            !bridge.is_auth_rate_limited(&remote_ip_of(ip)),
+            "failed publish attempts before on_connect must not consume the per-IP auth budget"
+        );
+    }
+
+    #[test]
     fn auth_rate_limit_survives_reconnect_from_same_ip() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = test_bridge(db);
@@ -963,6 +1006,16 @@ mod tests {
 
         assert!(bridge.has_publisher(1));
         assert_eq!(db.publisher_list(Some("s1")).len(), 1);
+    }
+
+    #[test]
+    fn is_registered_reflects_on_connect_state() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+
+        assert!(!bridge.is_registered(7));
+        bridge.on_connect(7, "127.0.0.1:1000");
+        assert!(bridge.is_registered(7));
     }
 
     #[test]
