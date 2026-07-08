@@ -2,6 +2,10 @@ name: Docker Multi-Platform Build
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to publish alongside latest/beta/alpha (e.g. 0.1.0)'
+        required: false
 
 jobs:
   build:
@@ -32,13 +36,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          TAGS="ghcr.io/openrtmp/librtmp2-server:latest
+          ghcr.io/openrtmp/librtmp2-server:beta
+          ghcr.io/openrtmp/librtmp2-server:alpha"
+          if [ -n "${{ inputs.version }}" ]; then
+            TAGS="$TAGS
+          ghcr.io/openrtmp/librtmp2-server:${{ inputs.version }}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64/v8,linux/riscv64
           push: true
-          tags: |
-            ghcr.io/openrtmp/librtmp2-server:latest
-            ghcr.io/openrtmp/librtmp2-server:beta
-            ghcr.io/openrtmp/librtmp2-server:alpha
+          tags: ${{ steps.tags.outputs.tags }}
