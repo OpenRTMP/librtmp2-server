@@ -26,6 +26,14 @@ begin at `1.0.0`.
   no extra page chrome, just the stats table.
 
 ### Fixed
+- `/stats-nginx`'s `<meta>` element now always emits both `<video>` and
+  `<audio>` children — as an empty self-closing element if that codec
+  wasn't detected (e.g. a video-only publisher). NOALBS's `Nginx` provider
+  models `meta` as requiring both children (neither is optional in its
+  Rust struct); a `<meta>` with only one of them failed to deserialize
+  there, and NOALBS treated the whole stream as unreachable/offline even
+  though it was live. Verified against NOALBS's actual `quick_xml`
+  deserialization code.
 - `/stats-nginx` now emits stream-level `bw_audio`/`bw_video` and self-closing
   `active`/`publishing` markers, matching real `nginx-rtmp-module` output.
   Tools that consume nginx-rtmp XML — e.g. [NOALBS](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching)'s

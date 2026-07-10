@@ -530,6 +530,12 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
         }
 
         if g.video.is_some() || g.audio.is_some() {
+            // NOALBS's Nginx provider models <meta> as requiring both <video>
+            // and <audio> children (neither is optional in its Rust struct),
+            // so a <meta> with only one of them fails to deserialize and the
+            // whole stream reads as unparseable — i.e. offline. Always emit
+            // both; an empty self-closing element is valid since every field
+            // inside Video/Audio on the NOALBS side is itself optional.
             out.push_str("          <meta>\n");
 
             if let Some((width, height, fps, codec)) = &g.video {
@@ -544,6 +550,8 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
                      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</video>\n",
                     xml_escape(codec),
                 ));
+            } else {
+                out.push_str("            <video/>\n");
             }
 
             if let Some(codec) = &g.audio {
@@ -555,6 +563,8 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
                      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
                     xml_escape(codec),
                 ));
+            } else {
+                out.push_str("            <audio/>\n");
             }
 
             out.push_str("          </meta>\n");
@@ -1805,6 +1815,65 @@ mod tests {
         assert_eq!(xml.matches("<stream>").count(), 1);
         assert!(xml.contains("<bw_video>2500000</bw_video>"));
         assert_eq!(xml.matches("<client>").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_meta_always_has_both_video_and_audio_siblings() {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        // Video-only publisher: audio_codec is never set (e.g. no audio
+        // track, or the codec hasn't been detected yet).
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            video_codec: "h264".to_string(),
+            video_width: 1920,
+            video_height: 1080,
+            fps: 60.0,
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        // NOALBS's Nginx provider models <meta> as requiring both <video>
+        // and <audio> children — a <meta> with only <video> fails to
+        // deserialize there and the whole stream reads as offline. Both
+        // must be present, even if <audio/> carries no data.
+        assert!(xml.contains("<meta>"));
+        assert!(xml.contains("<video>"));
+        assert!(xml.contains("<audio/>"));
     }
 
     #[tokio::test]
