@@ -417,7 +417,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
         bytes_out: u64,
         publishing: bool,
         video: Option<(u32, u32, f64, String)>,
-        audio: Option<String>,
+        audio: Option<(String, u32, u32)>,
         clients: String,
     }
 
@@ -462,7 +462,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
             group.video = Some((p.video_width, p.video_height, p.fps, p.video_codec.clone()));
         }
         if !p.audio_codec.is_empty() {
-            group.audio = Some(p.audio_codec.clone());
+            group.audio = Some((p.audio_codec.clone(), p.audio_sample_rate, p.audio_channels));
         }
         group.clients.push_str(&format!(
             "          <client>\n\
@@ -554,12 +554,12 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
                 out.push_str("            <video/>\n");
             }
 
-            if let Some(codec) = &g.audio {
+            if let Some((codec, sample_rate, channels)) = &g.audio {
                 out.push_str(&format!(
                     "            <audio>\n\
                      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
-                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>44100</sample_rate>\n\
-                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>2</channels>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>{sample_rate}</sample_rate>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>{channels}</channels>\n\
                      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
                     xml_escape(codec),
                 ));
@@ -1874,6 +1874,115 @@ mod tests {
         assert!(xml.contains("<meta>"));
         assert!(xml.contains("<video>"));
         assert!(xml.contains("<audio/>"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_emits_real_metadata_values() {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            video_codec: "h264".to_string(),
+            audio_codec: "aac".to_string(),
+            video_width: 1920,
+            video_height: 1080,
+            fps: 29.97,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(xml.contains("<width>1920</width>"));
+        assert!(xml.contains("<height>1080</height>"));
+        assert!(xml.contains("<frame_rate>30.0</frame_rate>"));
+        assert!(xml.contains("<sample_rate>48000</sample_rate>"));
+        assert!(xml.contains("<channels>2</channels>"));
+        assert!(!xml.contains("<sample_rate>44100</sample_rate>"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_missing_audio_metadata_defaults_to_zero() {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            video_codec: "h264".to_string(),
+            audio_codec: "aac".to_string(),
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(xml.contains("<sample_rate>0</sample_rate>"));
+        assert!(xml.contains("<channels>0</channels>"));
     }
 
     #[tokio::test]

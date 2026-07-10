@@ -43,6 +43,16 @@ enum AuthFailureKind {
 /// unique handle works here.
 pub type ConnId = u64;
 
+/// Stream metadata polled from a publisher `Conn` (onMetaData + codec detection).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublisherStreamMetadata {
+    pub video_width: Option<u32>,
+    pub video_height: Option<u32>,
+    pub framerate: Option<f64>,
+    pub audio_sample_rate: Option<u32>,
+    pub audio_channels: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
     Video,
@@ -133,6 +143,33 @@ fn remote_ip_of(remote_addr: &str) -> String {
     match remote_addr.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
         _ => remote_addr.to_string(),
+    }
+}
+
+fn apply_publisher_codecs(pub_row: &mut Publisher, video_codec: &str, audio_codec: &str) {
+    if !video_codec.is_empty() {
+        pub_row.video_codec = video_codec.to_string();
+    }
+    if !audio_codec.is_empty() {
+        pub_row.audio_codec = audio_codec.to_string();
+    }
+}
+
+fn apply_publisher_metadata(pub_row: &mut Publisher, metadata: PublisherStreamMetadata) {
+    if let Some(w) = metadata.video_width.filter(|v| *v > 0) {
+        pub_row.video_width = w;
+    }
+    if let Some(h) = metadata.video_height.filter(|v| *v > 0) {
+        pub_row.video_height = h;
+    }
+    if let Some(fps) = metadata.framerate.filter(|v| *v > 0.0 && v.is_finite()) {
+        pub_row.fps = fps;
+    }
+    if let Some(sr) = metadata.audio_sample_rate.filter(|v| *v > 0) {
+        pub_row.audio_sample_rate = sr;
+    }
+    if let Some(ch) = metadata.audio_channels.filter(|v| *v > 0) {
+        pub_row.audio_channels = ch;
     }
 }
 
@@ -296,6 +333,7 @@ impl DbRtmpBridge {
         media_bytes_received: u64,
         video_codec: &str,
         audio_codec: &str,
+        metadata: PublisherStreamMetadata,
     ) {
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -314,12 +352,8 @@ impl DbRtmpBridge {
 
             pub_row.bytes_in = 0;
             pub_row.bitrate_kbps = 0.0;
-            if !video_codec.is_empty() {
-                pub_row.video_codec = video_codec.to_string();
-            }
-            if !audio_codec.is_empty() {
-                pub_row.audio_codec = audio_codec.to_string();
-            }
+            apply_publisher_codecs(pub_row, video_codec, audio_codec);
+            apply_publisher_metadata(pub_row, metadata);
 
             let pub_id = pub_row.id.clone();
             let pub_row_clone = pub_row.clone();
@@ -348,12 +382,8 @@ impl DbRtmpBridge {
 
         pub_row.bytes_in = session_bytes;
         pub_row.bitrate_kbps = bitrate_kbps;
-        if !video_codec.is_empty() {
-            pub_row.video_codec = video_codec.to_string();
-        }
-        if !audio_codec.is_empty() {
-            pub_row.audio_codec = audio_codec.to_string();
-        }
+        apply_publisher_codecs(pub_row, video_codec, audio_codec);
+        apply_publisher_metadata(pub_row, metadata);
 
         cs.publisher_last_stats_at = Some(now);
         cs.publisher_bytes_at_last_stats = session_bytes;
@@ -1080,11 +1110,11 @@ mod tests {
         bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
         assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
-        bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a");
+        bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a", PublisherStreamMetadata::default());
         bridge.update_player_stats(1, 2_000);
 
         assert!(bridge.authorize_play(1, "live", "pl_k2").is_ok());
-        bridge.update_publisher_stats(1, 1_500, "avc1", "mp4a");
+        bridge.update_publisher_stats(1, 1_500, "avc1", "mp4a", PublisherStreamMetadata::default());
 
         {
             let guard = bridge.conns.lock();

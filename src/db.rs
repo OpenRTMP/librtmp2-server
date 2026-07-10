@@ -51,6 +51,8 @@ pub struct Publisher {
     pub video_width: u32,
     pub video_height: u32,
     pub fps: f64,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u32,
     pub bytes_in: u64,
     pub bitrate_kbps: f64,
     pub rtt_ms: f64,
@@ -150,6 +152,8 @@ CREATE TABLE IF NOT EXISTS publishers (
   video_width INTEGER NOT NULL DEFAULT 0,
   video_height INTEGER NOT NULL DEFAULT 0,
   fps REAL NOT NULL DEFAULT 0,
+  audio_sample_rate INTEGER NOT NULL DEFAULT 0,
+  audio_channels INTEGER NOT NULL DEFAULT 0,
   bytes_in INTEGER NOT NULL DEFAULT 0,
   bitrate_kbps REAL NOT NULL DEFAULT 0,
   rtt_ms REAL NOT NULL DEFAULT 0,
@@ -274,6 +278,16 @@ impl Db {
             Ok(_) => {}
             Err(e) if e.to_string().contains("duplicate column name") => {}
             Err(e) => return Err(e),
+        }
+        for sql in [
+            "ALTER TABLE publishers ADD COLUMN audio_sample_rate INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE publishers ADD COLUMN audio_channels INTEGER NOT NULL DEFAULT 0",
+        ] {
+            match conn.execute(sql, []) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
+                Err(e) => return Err(e),
+            }
         }
         let stale = conn
             .execute("UPDATE publishers SET active=0 WHERE active=1", [])
@@ -723,8 +737,8 @@ impl Db {
         if tx
             .execute(
                 "INSERT INTO publishers \
-                 (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                 (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
                 params![
                     p.id,
                     p.stream_id,
@@ -735,6 +749,8 @@ impl Db {
                     p.video_width,
                     p.video_height,
                     p.fps,
+                    p.audio_sample_rate,
+                    p.audio_channels,
                     bytes_in,
                     p.bitrate_kbps,
                     p.rtt_ms,
@@ -757,6 +773,7 @@ impl Db {
         match conn.execute(
             "UPDATE publishers SET stream_id=?,app=?,stream_name=?,\
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
+             audio_sample_rate=?,audio_channels=?,\
              bytes_in=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
             params![
                 p.stream_id,
@@ -767,6 +784,8 @@ impl Db {
                 p.video_width,
                 p.video_height,
                 p.fps,
+                p.audio_sample_rate,
+                p.audio_channels,
                 bytes_in,
                 p.bitrate_kbps,
                 p.rtt_ms,
@@ -804,21 +823,23 @@ impl Db {
             video_width: row.get(6)?,
             video_height: row.get(7)?,
             fps: row.get(8)?,
-            bytes_in: u64::try_from(row.get::<_, i64>(9)?).map_err(|_| {
+            audio_sample_rate: row.get(9)?,
+            audio_channels: row.get(10)?,
+            bytes_in: u64::try_from(row.get::<_, i64>(11)?).map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    9,
+                    11,
                     rusqlite::types::Type::Integer,
                     "negative bytes_in".into(),
                 )
             })?,
-            bitrate_kbps: row.get(10)?,
-            rtt_ms: row.get(11)?,
-            connected_at: row.get(12)?,
-            active: row.get(13)?,
+            bitrate_kbps: row.get(12)?,
+            rtt_ms: row.get(13)?,
+            connected_at: row.get(14)?,
+            active: row.get(15)?,
         })
     }
 
-    const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,bytes_in,bitrate_kbps,rtt_ms,connected_at,active";
+    const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active";
 
     pub fn publisher_list(&self, stream_id: Option<&str>) -> Vec<Publisher> {
         let conn = self.conn.lock();
@@ -1199,6 +1220,8 @@ mod tests {
             video_width: 1920,
             video_height: 1080,
             fps: 60.0,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
             bytes_in: 1024768,
             bitrate_kbps: 2500.0,
             connected_at: now_ts(),
