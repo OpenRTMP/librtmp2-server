@@ -13,6 +13,14 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- `/stats-nginx` now emits stream-level `bw_audio`/`bw_video` and self-closing
+  `active`/`publishing` markers, matching real `nginx-rtmp-module` output.
+  Tools that consume nginx-rtmp XML — e.g. [NOALBS](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching)'s
+  `Nginx` stream server — read `bw_video` for bitrate and stream-level
+  `active` for publish state; without these fields they always saw a
+  stalled/offline stream. No API shape change, only additional XML fields.
+
 ## [0.1.1] — 2026-07-10
 
 ### Changed
