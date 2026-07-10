@@ -631,7 +631,7 @@ const STAT_XSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   * { box-sizing: border-box; }
   body {
     background: #0d1117; color: #c9d1d9; margin: 1rem;
-    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: Roboto, -apple-system, "Segoe UI", sans-serif;
   }
   table { border-collapse: collapse; width: 100%; background: #161b22; border: 1px solid #21262d; }
   th, td { padding: 0.35rem 0.6rem; border-bottom: 1px solid #21262d; border-right: 1px solid #21262d; text-align: left; font-size: 0.85rem; }
