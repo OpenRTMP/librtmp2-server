@@ -13,6 +13,57 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- `GET /stat.xsl` — a dark-themed XSLT stylesheet for `/stats-nginx`. The
+  XML response now links it via an `<?xml-stylesheet?>` processing
+  instruction, so opening `/stats-nginx?key=<stats_key>` directly in a
+  browser renders a readable table instead of raw XML — the same mechanism
+  `nginx-rtmp-module`'s classic `stat.xsl` uses, just restyled for dark
+  mode. Layout mirrors the classic table: split video (codec/bits-per-
+  second/size/fps) and audio (codec/bits-per-second/freq/channels)
+  sub-columns, in/out bytes and bitrate, live/offline state, and
+  expandable per-client detail (publisher vs. player, dropped frames) —
+  no extra page chrome, just the stats table.
+
+### Fixed
+- `/stats-nginx`'s `<meta>` element now always emits both `<video>` and
+  `<audio>` children — as an empty self-closing element if that codec
+  wasn't detected (e.g. a video-only publisher). NOALBS's `Nginx` provider
+  models `meta` as requiring both children (neither is optional in its
+  Rust struct); a `<meta>` with only one of them failed to deserialize
+  there, and NOALBS treated the whole stream as unreachable/offline even
+  though it was live. Verified against NOALBS's actual `quick_xml`
+  deserialization code.
+- `/stats-nginx` now emits stream-level `bw_audio`/`bw_video` and self-closing
+  `active`/`publishing` markers, matching real `nginx-rtmp-module` output.
+  Tools that consume nginx-rtmp XML — e.g. [NOALBS](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching)'s
+  `Nginx` stream server — read `bw_video` for bitrate and stream-level
+  `active` for publish state; without these fields they always saw a
+  stalled/offline stream. No API shape change, only additional XML fields.
+- `build_nginx_xml()` now emits one `<stream>` element per stream name, with
+  one `<client>` child per connected session (publisher and players alike),
+  matching how `nginx-rtmp-module` structures its XML. Previously a
+  publisher and each of its players got separate `<stream>` blocks; once a
+  viewer connected, its player entry — sharing the same (possibly redacted)
+  stream name — could sort after the publisher's and shadow the real
+  bitrate with `bw_video=0` in consumers that pick the last matching
+  `<stream>`, such as NOALBS's `Nginx` stream server.
+- README's NOALBS example now documents that `/stats-nginx` always redacts
+  the application/stream name to `live`/`stream`, and that the NOALBS
+  `Nginx` provider's `application`/`key` config fields must be set to those
+  fixed values rather than the real stream name.
+- The merged `<stream>` element only carries `<active/>`/`<publishing/>`
+  while a publisher is actually live. A leftover player session with no
+  publisher (broadcaster dropped, viewer connection not yet torn down) no
+  longer gets marked `<active/>` with `bw_video=0` — NOALBS's `Nginx`
+  provider treats "active present + 0 bitrate" as "keep the previous
+  scene", not offline, so the stale marker was masking real disconnects.
+- Publisher `<video>`/`<audio>` blocks in `/stats-nginx` are now nested
+  inside a `<meta>` element, matching `nginx-rtmp-module`'s schema. NOALBS's
+  `Nginx` provider reads codec/resolution info from `stream/meta/video` and
+  `stream/meta/audio` for its `source_info()` chat command; without the
+  wrapper that data never matched and the command always came back empty.
+
 ## [0.1.1] — 2026-07-10
 
 ### Changed

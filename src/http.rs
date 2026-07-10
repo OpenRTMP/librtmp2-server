@@ -47,6 +47,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(handle_health))
         .route("/stats", get(handle_stats_json))
         .route("/stats-nginx", get(handle_stats_nginx))
+        .route("/stat.xsl", get(handle_stat_xsl))
         .route(
             "/api/v1/streams",
             get(handle_streams_list).post(handle_stream_create),
@@ -395,60 +396,75 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
     };
     let mut out = String::with_capacity(8192);
     out.push_str(&format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rtmp>\n  <server>\n\
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <?xml-stylesheet type=\"text/xsl\" href=\"/stat.xsl\"?>\n<rtmp>\n  <server>\n\
          \x20\x20\x20\x20<application>\n      <name>{}</name>\n      <live>\n",
         xml_escape(app_name),
     ));
 
+    // nginx-rtmp represents a stream as one <stream> element per stream name,
+    // with one <client> child per connected session (publisher and players
+    // alike). Emitting a separate <stream> per publisher/player — as this
+    // used to — makes a viewer session shadow the publisher's bitrate under
+    // the same (possibly redacted) name, since consumers like NOALBS match
+    // on stream name and take the last hit.
+    struct StreamGroup {
+        label: String,
+        uptime_ms: i64,
+        bw_in: i64,
+        bytes_in: u64,
+        bw_out: i64,
+        bytes_out: u64,
+        publishing: bool,
+        video: Option<(u32, u32, f64, String)>,
+        audio: Option<String>,
+        clients: String,
+    }
+
+    fn find_group<'g>(groups: &'g mut Vec<StreamGroup>, label: &str) -> &'g mut StreamGroup {
+        if !groups.iter().any(|g| g.label == label) {
+            groups.push(StreamGroup {
+                label: label.to_string(),
+                uptime_ms: 0,
+                bw_in: 0,
+                bytes_in: 0,
+                bw_out: 0,
+                bytes_out: 0,
+                publishing: false,
+                video: None,
+                audio: None,
+                clients: String::new(),
+            });
+        }
+        groups.iter_mut().find(|g| g.label == label).unwrap()
+    }
+
+    let mut groups: Vec<StreamGroup> = Vec::new();
+
     for p in &pubs {
         let uptime_ms = (now - p.connected_at).max(0) * 1000;
+        // librtmp2-server tracks one combined bitrate per publisher, not separate
+        // audio/video bandwidth like nginx-rtmp does, so bw_video mirrors bw_in —
+        // nginx-rtmp-compatible consumers (e.g. NOALBS) read bw_video for switching.
         let bw_in = (p.bitrate_kbps * 1000.0) as i64;
         let stream_label = if redact_identifiers {
             "stream"
         } else {
             p.stream_name.as_str()
         };
-        out.push_str(&format!(
-            "        <stream>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_in>{bw_in}</bw_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>{}</bytes_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>0</bw_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>0</bytes_out>\n",
-            xml_escape(stream_label),
-            p.bytes_in,
-        ));
 
+        let group = find_group(&mut groups, stream_label);
+        group.uptime_ms = uptime_ms;
+        group.bw_in = bw_in;
+        group.bytes_in = p.bytes_in;
+        group.publishing = true;
         if !p.video_codec.is_empty() {
-            out.push_str(&format!(
-                "          <video>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<width>{}</width>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<height>{}</height>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<frame_rate>{:.1}</frame_rate>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<profile>baseline</profile>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<level>3.1</level>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20</video>\n",
-                p.video_width,
-                p.video_height,
-                p.fps,
-                xml_escape(&p.video_codec),
-            ));
+            group.video = Some((p.video_width, p.video_height, p.fps, p.video_codec.clone()));
         }
-
         if !p.audio_codec.is_empty() {
-            out.push_str(&format!(
-                "          <audio>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>44100</sample_rate>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>2</channels>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
-                xml_escape(&p.audio_codec),
-            ));
+            group.audio = Some(p.audio_codec.clone());
         }
-
-        out.push_str(&format!(
+        group.clients.push_str(&format!(
             "          <client>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<flashver>FMLE/3.0</flashver>\n\
@@ -457,7 +473,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<timestamp>{uptime_ms}</timestamp>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<active>1</active>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<publisher>1</publisher>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n        </stream>\n",
+             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n",
         ));
     }
 
@@ -469,15 +485,15 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
         } else {
             pl.stream_name.as_str()
         };
-        out.push_str(&format!(
-            "        <stream>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_in>0</bw_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>0</bytes_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>{bw_out}</bw_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>{}</bytes_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<client>\n\
+
+        let group = find_group(&mut groups, stream_label);
+        if group.clients.is_empty() {
+            group.uptime_ms = uptime_ms;
+        }
+        group.bw_out += bw_out;
+        group.bytes_out += pl.bytes_out;
+        group.clients.push_str(&format!(
+            "          <client>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<flashver>FMLE/3.0</flashver>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<dropped>0</dropped>\n\
@@ -485,10 +501,77 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<timestamp>{uptime_ms}</timestamp>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<active>1</active>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<publisher>0</publisher>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n        </stream>\n",
-            xml_escape(stream_label),
-            pl.bytes_out,
+             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n",
         ));
+    }
+
+    for g in &groups {
+        out.push_str(&format!(
+            "        <stream>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<time>{}</time>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_in>{}</bw_in>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>{}</bytes_in>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>{}</bw_out>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>{}</bytes_out>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_audio>0</bw_audio>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_video>{}</bw_video>\n",
+            xml_escape(&g.label),
+            g.uptime_ms,
+            g.bw_in,
+            g.bytes_in,
+            g.bw_out,
+            g.bytes_out,
+            g.bw_in,
+        ));
+
+        if g.publishing {
+            out.push_str("        <publishing/>\n        <active/>\n");
+        }
+
+        if g.video.is_some() || g.audio.is_some() {
+            // NOALBS's Nginx provider models <meta> as requiring both <video>
+            // and <audio> children (neither is optional in its Rust struct),
+            // so a <meta> with only one of them fails to deserialize and the
+            // whole stream reads as unparseable — i.e. offline. Always emit
+            // both; an empty self-closing element is valid since every field
+            // inside Video/Audio on the NOALBS side is itself optional.
+            out.push_str("          <meta>\n");
+
+            if let Some((width, height, fps, codec)) = &g.video {
+                out.push_str(&format!(
+                    "            <video>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<width>{width}</width>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<height>{height}</height>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<frame_rate>{fps:.1}</frame_rate>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<profile>baseline</profile>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<level>3.1</level>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</video>\n",
+                    xml_escape(codec),
+                ));
+            } else {
+                out.push_str("            <video/>\n");
+            }
+
+            if let Some(codec) = &g.audio {
+                out.push_str(&format!(
+                    "            <audio>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>44100</sample_rate>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>2</channels>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
+                    xml_escape(codec),
+                ));
+            } else {
+                out.push_str("            <audio/>\n");
+            }
+
+            out.push_str("          </meta>\n");
+        }
+
+        out.push_str(&g.clients);
+        out.push_str("        </stream>\n");
     }
 
     out.push_str(&format!(
@@ -539,6 +622,152 @@ async fn handle_stats_json(
         None => public_stats_text(StatusCode::OK, "Stream offline"),
     };
     pace_public_stats(start, response).await
+}
+
+/// Dark-themed nginx-rtmp-compatible XSLT stylesheet for `/stats-nginx`. The
+/// XML response links here via an `<?xml-stylesheet?>` processing
+/// instruction, so browsers render the raw XML as an HTML table instead —
+/// same idea as `nginx-rtmp-module`'s classic `stat.xsl`, just dark.
+const STAT_XSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+<xsl:output method="html" encoding="utf-8" indent="yes" doctype-system="about:legacy-compat"/>
+<xsl:template match="/rtmp">
+<html>
+<head>
+<title>librtmp2-server stats</title>
+<meta charset="utf-8"/>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    background: #0d1117; color: #c9d1d9; margin: 1rem;
+    font-family: Roboto, -apple-system, "Segoe UI", sans-serif;
+  }
+  table { border-collapse: collapse; width: 100%; background: #161b22; border: 1px solid #21262d; }
+  th, td { padding: 0.35rem 0.6rem; border-bottom: 1px solid #21262d; border-right: 1px solid #21262d; text-align: left; font-size: 0.85rem; }
+  th:last-child, td:last-child { border-right: none; }
+  tr:last-child td { border-bottom: none; }
+  th { background: #0d1117; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  tbody tr:hover { background: #1c2128; }
+  .state-live { color: #3fb950; font-weight: 600; }
+  .state-off { color: #f85149; font-weight: 600; }
+  .section { background: #21262d; font-weight: 600; }
+  .clients { margin: 0; padding: 0.5rem 0.6rem 0.6rem; background: #0d1117; }
+  .clients table { background: transparent; border: none; }
+  .clients th, .clients td { font-size: 0.78rem; padding: 0.3rem 0.6rem; border-right: none; border-bottom: 1px solid #1c2128; }
+  details summary { cursor: pointer; color: #58a6ff; font-size: 0.8rem; list-style: none; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: "▸ "; }
+  details[open] summary::before { content: "▾ "; }
+  .empty { color: #484f58; font-style: italic; padding: 0.6rem; }
+</style>
+</head>
+<body>
+<xsl:for-each select="server/application">
+  <table>
+    <thead>
+      <tr>
+        <th rowspan="2">RTMP</th>
+        <th rowspan="2">#clients</th>
+        <th colspan="4">Video</th>
+        <th colspan="4">Audio</th>
+        <th rowspan="2">In bytes</th>
+        <th rowspan="2">Out bytes</th>
+        <th rowspan="2">In bits/s</th>
+        <th rowspan="2">Out bits/s</th>
+        <th rowspan="2">State</th>
+        <th rowspan="2">Time</th>
+      </tr>
+      <tr>
+        <th>codec</th><th>bits/s</th><th>size</th><th>fps</th>
+        <th>codec</th><th>bits/s</th><th>freq</th><th>chan</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td colspan="15">Accepted: <xsl:value-of select="live/nclients"/></td>
+      </tr>
+      <tr class="section">
+        <td colspan="15"><xsl:value-of select="name"/></td>
+      </tr>
+      <xsl:choose>
+        <xsl:when test="live/stream">
+          <xsl:for-each select="live/stream">
+          <tr>
+            <td><xsl:value-of select="name"/></td>
+            <td><xsl:value-of select="count(client)"/></td>
+            <td><xsl:value-of select="meta/video/codec"/></td>
+            <td><xsl:value-of select="round(bw_video div 1000)"/>K</td>
+            <td><xsl:value-of select="meta/video/width"/>x<xsl:value-of select="meta/video/height"/></td>
+            <td><xsl:value-of select="meta/video/frame_rate"/></td>
+            <td><xsl:value-of select="meta/audio/codec"/></td>
+            <td><xsl:value-of select="round(bw_audio div 1000)"/>K</td>
+            <td><xsl:value-of select="meta/audio/sample_rate"/></td>
+            <td><xsl:value-of select="meta/audio/channels"/></td>
+            <td><xsl:value-of select="bytes_in"/></td>
+            <td><xsl:value-of select="bytes_out"/></td>
+            <td><xsl:value-of select="round(bw_in div 1000)"/>Kb/s</td>
+            <td><xsl:value-of select="round(bw_out div 1000)"/>Kb/s</td>
+            <td>
+              <xsl:choose>
+                <xsl:when test="active"><span class="state-live">LIVE</span></xsl:when>
+                <xsl:otherwise><span class="state-off">OFFLINE</span></xsl:otherwise>
+              </xsl:choose>
+            </td>
+            <td><xsl:value-of select="round(time div 1000)"/>s</td>
+          </tr>
+          <tr>
+            <td colspan="16" style="padding: 0;">
+              <details>
+                <summary style="padding: 0.3rem 0.6rem;">
+                  <xsl:value-of select="count(client)"/> client(s)
+                </summary>
+                <div class="clients">
+                  <table>
+                    <thead>
+                      <tr><th>Role</th><th>Time</th><th>Dropped</th></tr>
+                    </thead>
+                    <tbody>
+                      <xsl:for-each select="client">
+                      <tr>
+                        <td>
+                          <xsl:choose>
+                            <xsl:when test="publisher = 1">publisher</xsl:when>
+                            <xsl:otherwise>player</xsl:otherwise>
+                          </xsl:choose>
+                        </td>
+                        <td><xsl:value-of select="round(time div 1000)"/>s</td>
+                        <td><xsl:value-of select="dropped"/></td>
+                      </tr>
+                      </xsl:for-each>
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            </td>
+          </tr>
+          </xsl:for-each>
+        </xsl:when>
+        <xsl:otherwise>
+          <tr><td colspan="16" class="empty">live streams: 0</td></tr>
+        </xsl:otherwise>
+      </xsl:choose>
+    </tbody>
+  </table>
+</xsl:for-each>
+</body>
+</html>
+</xsl:template>
+</xsl:stylesheet>
+"#;
+
+async fn handle_stat_xsl() -> Response {
+    (
+        StatusCode::OK,
+        [("Content-Type", "text/xsl; charset=utf-8")],
+        STAT_XSL,
+    )
+        .into_response()
 }
 
 async fn handle_stats_nginx(
@@ -1523,6 +1752,183 @@ mod tests {
         let xml = String::from_utf8(body.to_vec()).unwrap();
         assert!(!xml.contains("Secret Name"));
         assert!(xml.contains("<name>stream</name>"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_merges_publisher_and_player_into_one_stream() {
+        use crate::db::{Player, Publisher};
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            ..Default::default()
+        });
+        state.db.player_try_acquire(&Player {
+            id: "player_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            viewer_id: "viewer1".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        // A viewer session must not shadow the publisher's bitrate under the
+        // same (redacted) stream name — there must be exactly one <stream>
+        // block, carrying the publisher's bw_video, not 0.
+        assert_eq!(xml.matches("<stream>").count(), 1);
+        assert!(xml.contains("<bw_video>2500000</bw_video>"));
+        assert_eq!(xml.matches("<client>").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_meta_always_has_both_video_and_audio_siblings() {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        // Video-only publisher: audio_codec is never set (e.g. no audio
+        // track, or the codec hasn't been detected yet).
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            video_codec: "h264".to_string(),
+            video_width: 1920,
+            video_height: 1080,
+            fps: 60.0,
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        // NOALBS's Nginx provider models <meta> as requiring both <video>
+        // and <audio> children — a <meta> with only <video> fails to
+        // deserialize there and the whole stream reads as offline. Both
+        // must be present, even if <audio/> carries no data.
+        assert!(xml.contains("<meta>"));
+        assert!(xml.contains("<video>"));
+        assert!(xml.contains("<audio/>"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_player_without_publisher_is_not_marked_active() {
+        use crate::db::Player;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        // A lingering viewer with no active publisher — e.g. the broadcaster
+        // dropped but the player connection hasn't been torn down yet.
+        state.db.player_try_acquire(&Player {
+            id: "player_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            viewer_id: "viewer1".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        // Without an active publisher the stream-level <active/> marker must
+        // be absent, or nginx-rtmp-compatible consumers (e.g. NOALBS, which
+        // treats "active present + bw_video=0" as "keep the previous scene"
+        // rather than "offline") never notice the broadcaster is gone.
+        assert!(!xml.contains("<active/>"));
+        assert!(!xml.contains("<publishing/>"));
     }
 
     #[tokio::test]

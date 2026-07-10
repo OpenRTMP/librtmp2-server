@@ -301,7 +301,31 @@ curl "http://localhost:8080/stats?key=st_mystream_1719480002"
 curl "http://localhost:8080/stats-nginx?key=st_mystream_1719480002"
 ```
 
-Returns the same XML format as `nginx-rtmp-module`.
+Returns the same XML format as `nginx-rtmp-module`, including the
+`bw_video`/`bw_audio` and stream-level `active`/`publishing` markers that
+tools like [NOALBS](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching)
+expect. `/stats-nginx` always redacts the real application and stream name
+(to `live` and `stream`) since the key in the URL is a public, unauthenticated
+query parameter — so a NOALBS `Nginx` stream server config must use those
+fixed values, not your real app/stream name:
+
+```json
+{
+  "type": "Nginx",
+  "statsUrl": "http://<host>:8080/stats-nginx?key=<stats_key>",
+  "application": "live",
+  "key": "stream"
+}
+```
+
+The `key=<stats_key>` in `statsUrl` is the per-stream `stats_key` from
+`POST /api/v1/streams` — unrelated to NOALBS's own `key` field above, which
+must always be the literal string `stream`.
+
+Opening `/stats-nginx?key=<stats_key>` directly in a browser renders as an
+HTML table (dark-themed) instead of raw XML, via an `<?xml-stylesheet?>`
+processing instruction pointing at `/stat.xsl` — the same mechanism
+`nginx-rtmp-module`'s classic `stat.xsl` uses, just restyled.
 
 ---
 
