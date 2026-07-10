@@ -32,6 +32,12 @@ begin at `1.0.0`.
   the application/stream name to `live`/`stream`, and that the NOALBS
   `Nginx` provider's `application`/`key` config fields must be set to those
   fixed values rather than the real stream name.
+- The merged `<stream>` element only carries `<active/>`/`<publishing/>`
+  while a publisher is actually live. A leftover player session with no
+  publisher (broadcaster dropped, viewer connection not yet torn down) no
+  longer gets marked `<active/>` with `bw_video=0` — NOALBS's `Nginx`
+  provider treats "active present + 0 bitrate" as "keep the previous
+  scene", not offline, so the stale marker was masking real disconnects.
 
 ## [0.1.1] — 2026-07-10
 

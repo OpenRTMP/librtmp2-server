@@ -524,9 +524,8 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
         ));
 
         if g.publishing {
-            out.push_str("        <publishing/>\n");
+            out.push_str("        <publishing/>\n        <active/>\n");
         }
-        out.push_str("        <active/>\n");
 
         if let Some((width, height, fps, codec)) = &g.video {
             out.push_str(&format!(
@@ -1652,6 +1651,61 @@ mod tests {
         assert_eq!(xml.matches("<stream>").count(), 1);
         assert!(xml.contains("<bw_video>2500000</bw_video>"));
         assert_eq!(xml.matches("<client>").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_player_without_publisher_is_not_marked_active() {
+        use crate::db::Player;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        // A lingering viewer with no active publisher — e.g. the broadcaster
+        // dropped but the player connection hasn't been torn down yet.
+        state.db.player_try_acquire(&Player {
+            id: "player_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            viewer_id: "viewer1".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        // Without an active publisher the stream-level <active/> marker must
+        // be absent, or nginx-rtmp-compatible consumers (e.g. NOALBS, which
+        // treats "active present + bw_video=0" as "keep the previous scene"
+        // rather than "offline") never notice the broadcaster is gone.
+        assert!(!xml.contains("<active/>"));
+        assert!(!xml.contains("<publishing/>"));
     }
 
     #[tokio::test]
