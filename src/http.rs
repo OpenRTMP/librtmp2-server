@@ -400,6 +400,45 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
         xml_escape(app_name),
     ));
 
+    // nginx-rtmp represents a stream as one <stream> element per stream name,
+    // with one <client> child per connected session (publisher and players
+    // alike). Emitting a separate <stream> per publisher/player — as this
+    // used to — makes a viewer session shadow the publisher's bitrate under
+    // the same (possibly redacted) name, since consumers like NOALBS match
+    // on stream name and take the last hit.
+    struct StreamGroup {
+        label: String,
+        uptime_ms: i64,
+        bw_in: i64,
+        bytes_in: u64,
+        bw_out: i64,
+        bytes_out: u64,
+        publishing: bool,
+        video: Option<(u32, u32, f64, String)>,
+        audio: Option<String>,
+        clients: String,
+    }
+
+    fn find_group<'g>(groups: &'g mut Vec<StreamGroup>, label: &str) -> &'g mut StreamGroup {
+        if !groups.iter().any(|g| g.label == label) {
+            groups.push(StreamGroup {
+                label: label.to_string(),
+                uptime_ms: 0,
+                bw_in: 0,
+                bytes_in: 0,
+                bw_out: 0,
+                bytes_out: 0,
+                publishing: false,
+                video: None,
+                audio: None,
+                clients: String::new(),
+            });
+        }
+        groups.iter_mut().find(|g| g.label == label).unwrap()
+    }
+
+    let mut groups: Vec<StreamGroup> = Vec::new();
+
     for p in &pubs {
         let uptime_ms = (now - p.connected_at).max(0) * 1000;
         // librtmp2-server tracks one combined bitrate per publisher, not separate
@@ -411,51 +450,19 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
         } else {
             p.stream_name.as_str()
         };
-        out.push_str(&format!(
-            "        <stream>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_in>{bw_in}</bw_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>{}</bytes_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>0</bw_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>0</bytes_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_audio>0</bw_audio>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_video>{bw_in}</bw_video>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<publishing/>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<active/>\n",
-            xml_escape(stream_label),
-            p.bytes_in,
-        ));
 
+        let group = find_group(&mut groups, stream_label);
+        group.uptime_ms = uptime_ms;
+        group.bw_in = bw_in;
+        group.bytes_in = p.bytes_in;
+        group.publishing = true;
         if !p.video_codec.is_empty() {
-            out.push_str(&format!(
-                "          <video>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<width>{}</width>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<height>{}</height>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<frame_rate>{:.1}</frame_rate>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<profile>baseline</profile>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<level>3.1</level>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20</video>\n",
-                p.video_width,
-                p.video_height,
-                p.fps,
-                xml_escape(&p.video_codec),
-            ));
+            group.video = Some((p.video_width, p.video_height, p.fps, p.video_codec.clone()));
         }
-
         if !p.audio_codec.is_empty() {
-            out.push_str(&format!(
-                "          <audio>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>44100</sample_rate>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>2</channels>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
-                xml_escape(&p.audio_codec),
-            ));
+            group.audio = Some(p.audio_codec.clone());
         }
-
-        out.push_str(&format!(
+        group.clients.push_str(&format!(
             "          <client>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<flashver>FMLE/3.0</flashver>\n\
@@ -464,7 +471,7 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<timestamp>{uptime_ms}</timestamp>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<active>1</active>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<publisher>1</publisher>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n        </stream>\n",
+             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n",
         ));
     }
 
@@ -476,18 +483,15 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
         } else {
             pl.stream_name.as_str()
         };
-        out.push_str(&format!(
-            "        <stream>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_in>0</bw_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>0</bytes_in>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>{bw_out}</bw_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>{}</bytes_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_audio>0</bw_audio>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bw_video>0</bw_video>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<active/>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<client>\n\
+
+        let group = find_group(&mut groups, stream_label);
+        if group.clients.is_empty() {
+            group.uptime_ms = uptime_ms;
+        }
+        group.bw_out += bw_out;
+        group.bytes_out += pl.bytes_out;
+        group.clients.push_str(&format!(
+            "          <client>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<flashver>FMLE/3.0</flashver>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<dropped>0</dropped>\n\
@@ -495,10 +499,62 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<timestamp>{uptime_ms}</timestamp>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<active>1</active>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<publisher>0</publisher>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n        </stream>\n",
-            xml_escape(stream_label),
-            pl.bytes_out,
+             \x20\x20\x20\x20\x20\x20\x20\x20</client>\n",
         ));
+    }
+
+    for g in &groups {
+        out.push_str(&format!(
+            "        <stream>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<name>{}</name>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<time>{}</time>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_in>{}</bw_in>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>{}</bytes_in>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>{}</bw_out>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>{}</bytes_out>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_audio>0</bw_audio>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_video>{}</bw_video>\n",
+            xml_escape(&g.label),
+            g.uptime_ms,
+            g.bw_in,
+            g.bytes_in,
+            g.bw_out,
+            g.bytes_out,
+            g.bw_in,
+        ));
+
+        if g.publishing {
+            out.push_str("        <publishing/>\n");
+        }
+        out.push_str("        <active/>\n");
+
+        if let Some((width, height, fps, codec)) = &g.video {
+            out.push_str(&format!(
+                "          <video>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<width>{width}</width>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<height>{height}</height>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<frame_rate>{fps:.1}</frame_rate>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<profile>baseline</profile>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<level>3.1</level>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20</video>\n",
+                xml_escape(codec),
+            ));
+        }
+
+        if let Some(codec) = &g.audio {
+            out.push_str(&format!(
+                "          <audio>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>44100</sample_rate>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>2</channels>\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
+                xml_escape(codec),
+            ));
+        }
+
+        out.push_str(&g.clients);
+        out.push_str("        </stream>\n");
     }
 
     out.push_str(&format!(
@@ -1533,6 +1589,69 @@ mod tests {
         let xml = String::from_utf8(body.to_vec()).unwrap();
         assert!(!xml.contains("Secret Name"));
         assert!(xml.contains("<name>stream</name>"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_nginx_merges_publisher_and_player_into_one_stream() {
+        use crate::db::{Player, Publisher};
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            ..Default::default()
+        });
+        state.db.player_try_acquire(&Player {
+            id: "player_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            viewer_id: "viewer1".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bitrate_kbps: 2500.0,
+            ..Default::default()
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stats-nginx?key=st_test_key_with_sufficient_length_here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+
+        // A viewer session must not shadow the publisher's bitrate under the
+        // same (redacted) stream name — there must be exactly one <stream>
+        // block, carrying the publisher's bw_video, not 0.
+        assert_eq!(xml.matches("<stream>").count(), 1);
+        assert!(xml.contains("<bw_video>2500000</bw_video>"));
+        assert_eq!(xml.matches("<client>").count(), 2);
     }
 
     #[tokio::test]

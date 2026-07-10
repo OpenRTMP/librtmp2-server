@@ -20,6 +20,18 @@ begin at `1.0.0`.
   `Nginx` stream server — read `bw_video` for bitrate and stream-level
   `active` for publish state; without these fields they always saw a
   stalled/offline stream. No API shape change, only additional XML fields.
+- `build_nginx_xml()` now emits one `<stream>` element per stream name, with
+  one `<client>` child per connected session (publisher and players alike),
+  matching how `nginx-rtmp-module` structures its XML. Previously a
+  publisher and each of its players got separate `<stream>` blocks; once a
+  viewer connected, its player entry — sharing the same (possibly redacted)
+  stream name — could sort after the publisher's and shadow the real
+  bitrate with `bw_video=0` in consumers that pick the last matching
+  `<stream>`, such as NOALBS's `Nginx` stream server.
+- README's NOALBS example now documents that `/stats-nginx` always redacts
+  the application/stream name to `live`/`stream`, and that the NOALBS
+  `Nginx` provider's `application`/`key` config fields must be set to those
+  fixed values rather than the real stream name.
 
 ## [0.1.1] — 2026-07-10
 
