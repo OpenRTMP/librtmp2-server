@@ -13,12 +13,17 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-10
+
 ### Changed
-- Bump the pinned `librtmp2` dependency, pulling in RTMPS client hardening
-  (bounded TLS handshake timeout, write-readiness polling on read retries,
-  EINTR retry in transport polling), RTMP Aggregate message support, and the
-  client recv-budget / FFI `max_connections` security fixes described in
-  `librtmp2`'s own changelog
+- Bump the pinned `librtmp2` dependency to `0.2.0`, pulling in RTMPS client
+  hardening (bounded TLS handshake timeout, write-readiness polling on read
+  retries, EINTR retry in transport polling), RTMP Aggregate message
+  support, and the FFI/recv-path security fixes described in `librtmp2`'s
+  own changelog. No code changes were needed on this side: the connection
+  fields this crate reads off `librtmp2::session::conn::Conn` (`client_fd`,
+  `conn_id`, `remote_addr`, `relay_enabled`, `relay_key`, `pending_relay`,
+  `rtt_ms`) are unchanged.
 
 ## [0.1.0] — 2026-07-08
 
@@ -74,5 +79,6 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/OpenRTMP/librtmp2-server/releases/tag/v0.1.0
