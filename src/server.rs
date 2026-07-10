@@ -310,6 +310,11 @@ pub(crate) fn process_server_connections(
                 conn.media_bytes_received,
                 &entry.video_codec,
                 &entry.audio_codec,
+                conn.detected_video_width,
+                conn.detected_video_height,
+                conn.detected_video_framerate,
+                conn.detected_audio_sample_rate,
+                conn.detected_audio_channels,
             );
         }
 

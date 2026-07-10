@@ -296,6 +296,11 @@ impl DbRtmpBridge {
         media_bytes_received: u64,
         video_codec: &str,
         audio_codec: &str,
+        video_width: Option<u32>,
+        video_height: Option<u32>,
+        framerate: Option<f64>,
+        audio_sample_rate: Option<u32>,
+        audio_channels: Option<u32>,
     ) {
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -319,6 +324,21 @@ impl DbRtmpBridge {
             }
             if !audio_codec.is_empty() {
                 pub_row.audio_codec = audio_codec.to_string();
+            }
+            if let Some(w) = video_width.filter(|v| *v > 0) {
+                pub_row.video_width = w;
+            }
+            if let Some(h) = video_height.filter(|v| *v > 0) {
+                pub_row.video_height = h;
+            }
+            if let Some(fps) = framerate.filter(|v| *v > 0.0 && v.is_finite()) {
+                pub_row.fps = fps;
+            }
+            if let Some(sr) = audio_sample_rate.filter(|v| *v > 0) {
+                pub_row.audio_sample_rate = sr;
+            }
+            if let Some(ch) = audio_channels.filter(|v| *v > 0) {
+                pub_row.audio_channels = ch;
             }
 
             let pub_id = pub_row.id.clone();
@@ -353,6 +373,21 @@ impl DbRtmpBridge {
         }
         if !audio_codec.is_empty() {
             pub_row.audio_codec = audio_codec.to_string();
+        }
+        if let Some(w) = video_width.filter(|v| *v > 0) {
+            pub_row.video_width = w;
+        }
+        if let Some(h) = video_height.filter(|v| *v > 0) {
+            pub_row.video_height = h;
+        }
+        if let Some(fps) = framerate.filter(|v| *v > 0.0 && v.is_finite()) {
+            pub_row.fps = fps;
+        }
+        if let Some(sr) = audio_sample_rate.filter(|v| *v > 0) {
+            pub_row.audio_sample_rate = sr;
+        }
+        if let Some(ch) = audio_channels.filter(|v| *v > 0) {
+            pub_row.audio_channels = ch;
         }
 
         cs.publisher_last_stats_at = Some(now);
@@ -1080,11 +1115,11 @@ mod tests {
         bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
         assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
-        bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a");
+        bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a", None, None, None, None, None);
         bridge.update_player_stats(1, 2_000);
 
         assert!(bridge.authorize_play(1, "live", "pl_k2").is_ok());
-        bridge.update_publisher_stats(1, 1_500, "avc1", "mp4a");
+        bridge.update_publisher_stats(1, 1_500, "avc1", "mp4a", None, None, None, None, None);
 
         {
             let guard = bridge.conns.lock();
