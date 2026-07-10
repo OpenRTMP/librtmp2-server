@@ -50,6 +50,10 @@ jobs:
           ghcr.io/openrtmp/librtmp2-server:alpha"
           if [ -n "$VERSION" ]; then
             BARE_VERSION="${VERSION#v}"
+            if [ -z "$BARE_VERSION" ]; then
+              echo "::error::Invalid version input '$VERSION' (version cannot be empty after removing 'v')"
+              exit 1
+            fi
             TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server:$BARE_VERSION
           ghcr.io/openrtmp/librtmp2-server:v$BARE_VERSION"
