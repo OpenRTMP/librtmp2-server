@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-10
+
 ### Added
 - `GET /stat.xsl` — a dark-themed XSLT stylesheet for `/stats-nginx`. The
   XML response now links it via an `<?xml-stylesheet?>` processing
@@ -63,6 +65,16 @@ begin at `1.0.0`.
   `Nginx` provider reads codec/resolution info from `stream/meta/video` and
   `stream/meta/audio` for its `source_info()` chat command; without the
   wrapper that data never matched and the command always came back empty.
+
+### Changed
+- Bump the pinned `librtmp2` dependency to `0.2.1`, pulling in RTMPS client
+  hardening (bounded TLS handshake timeout, write-readiness polling on read
+  retries, EINTR retry in transport polling), RTMP Aggregate message
+  support, and the FFI/recv-path security fixes described in `librtmp2`'s
+  own changelog. No code changes were needed on this side: the connection
+  fields this crate reads off `librtmp2::session::conn::Conn` (`client_fd`,
+  `conn_id`, `remote_addr`, `relay_enabled`, `relay_key`, `pending_relay`,
+  `rtt_ms`) are unchanged.
 
 ## [0.1.1] — 2026-07-10
 
@@ -130,6 +142,7 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/OpenRTMP/librtmp2-server/releases/tag/v0.1.0
