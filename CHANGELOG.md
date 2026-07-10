@@ -17,10 +17,13 @@ begin at `1.0.0`.
 - `GET /stat.xsl` — a dark-themed XSLT stylesheet for `/stats-nginx`. The
   XML response now links it via an `<?xml-stylesheet?>` processing
   instruction, so opening `/stats-nginx?key=<stats_key>` directly in a
-  browser renders a readable table (stream name, clients, video/audio,
-  bitrate, live/offline state, expandable per-client details) instead of
-  raw XML — the same mechanism `nginx-rtmp-module`'s classic `stat.xsl`
-  uses, just restyled for dark mode.
+  browser renders a readable table instead of raw XML — the same mechanism
+  `nginx-rtmp-module`'s classic `stat.xsl` uses, just restyled for dark
+  mode. Layout mirrors the classic table: split video (codec/bits-per-
+  second/size/fps) and audio (codec/bits-per-second/freq/channels)
+  sub-columns, in/out bytes and bitrate, live/offline state, and
+  expandable per-client detail (publisher vs. player, dropped frames) —
+  no extra page chrome, just the stats table.
 
 ### Fixed
 - `/stats-nginx` now emits stream-level `bw_audio`/`bw_video` and self-closing

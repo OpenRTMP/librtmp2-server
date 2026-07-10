@@ -630,67 +630,74 @@ const STAT_XSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
-    background: #0d1117; color: #c9d1d9; margin: 2rem;
+    background: #0d1117; color: #c9d1d9; margin: 1rem;
     font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  h1 { color: #58a6ff; font-size: 1.15rem; font-weight: 600; margin: 0 0 1.25rem; }
-  h2 { color: #8b949e; font-size: 0.85rem; font-weight: 600; margin: 2rem 0 0.5rem; text-transform: uppercase; letter-spacing: 0.04em; }
-  table { border-collapse: collapse; width: 100%; background: #161b22; border: 1px solid #21262d; border-radius: 6px; overflow: hidden; }
-  th, td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #21262d; text-align: left; font-size: 0.85rem; }
-  th { background: #0d1117; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  table { border-collapse: collapse; width: 100%; background: #161b22; border: 1px solid #21262d; }
+  th, td { padding: 0.35rem 0.6rem; border-bottom: 1px solid #21262d; border-right: 1px solid #21262d; text-align: left; font-size: 0.85rem; }
+  th:last-child, td:last-child { border-right: none; }
   tr:last-child td { border-bottom: none; }
+  th { background: #0d1117; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
   tbody tr:hover { background: #1c2128; }
   .state-live { color: #3fb950; font-weight: 600; }
   .state-off { color: #f85149; font-weight: 600; }
-  .clients { margin: 0; padding: 0.5rem 0.75rem 0.75rem; background: #0d1117; }
+  .section { background: #21262d; font-weight: 600; }
+  .clients { margin: 0; padding: 0.5rem 0.6rem 0.6rem; background: #0d1117; }
   .clients table { background: transparent; border: none; }
-  .clients th, .clients td { font-size: 0.78rem; padding: 0.3rem 0.6rem; border-bottom: 1px solid #1c2128; }
+  .clients th, .clients td { font-size: 0.78rem; padding: 0.3rem 0.6rem; border-right: none; border-bottom: 1px solid #1c2128; }
   details summary { cursor: pointer; color: #58a6ff; font-size: 0.8rem; list-style: none; }
   details summary::-webkit-details-marker { display: none; }
   details summary::before { content: "▸ "; }
   details[open] summary::before { content: "▾ "; }
-  footer { margin-top: 2rem; color: #484f58; font-size: 0.75rem; }
-  footer a { color: #6e7681; }
-  .empty { color: #484f58; font-style: italic; padding: 1rem 0.75rem; }
+  .empty { color: #484f58; font-style: italic; padding: 0.6rem; }
 </style>
 </head>
 <body>
-<h1>librtmp2-server — RTMP stats</h1>
 <xsl:for-each select="server/application">
-  <h2>Application: <xsl:value-of select="name"/></h2>
-  <xsl:choose>
-    <xsl:when test="live/stream">
-      <table>
-        <thead>
-          <tr>
-            <th>Stream</th>
-            <th>#Clients</th>
-            <th>Video</th>
-            <th>Audio</th>
-            <th>In</th>
-            <th>Out</th>
-            <th>In kb/s</th>
-            <th>Out kb/s</th>
-            <th>State</th>
-            <th>Time</th>
-          </tr>
-        </thead>
-        <tbody>
+  <table>
+    <thead>
+      <tr>
+        <th rowspan="2">RTMP</th>
+        <th rowspan="2">#clients</th>
+        <th colspan="4">Video</th>
+        <th colspan="4">Audio</th>
+        <th rowspan="2">In bytes</th>
+        <th rowspan="2">Out bytes</th>
+        <th rowspan="2">In bits/s</th>
+        <th rowspan="2">Out bits/s</th>
+        <th rowspan="2">State</th>
+        <th rowspan="2">Time</th>
+      </tr>
+      <tr>
+        <th>codec</th><th>bits/s</th><th>size</th><th>fps</th>
+        <th>codec</th><th>bits/s</th><th>freq</th><th>chan</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td colspan="15">Accepted: <xsl:value-of select="live/nclients"/></td>
+      </tr>
+      <tr class="section">
+        <td colspan="15"><xsl:value-of select="name"/></td>
+      </tr>
+      <xsl:choose>
+        <xsl:when test="live/stream">
           <xsl:for-each select="live/stream">
           <tr>
             <td><xsl:value-of select="name"/></td>
             <td><xsl:value-of select="count(client)"/></td>
-            <td>
-              <xsl:if test="meta/video">
-                <xsl:value-of select="meta/video/codec"/><xsl:text> </xsl:text>
-                <xsl:value-of select="meta/video/width"/>x<xsl:value-of select="meta/video/height"/>
-              </xsl:if>
-            </td>
+            <td><xsl:value-of select="meta/video/codec"/></td>
+            <td><xsl:value-of select="round(bw_video div 1000)"/>K</td>
+            <td><xsl:value-of select="meta/video/width"/>x<xsl:value-of select="meta/video/height"/></td>
+            <td><xsl:value-of select="meta/video/frame_rate"/></td>
             <td><xsl:value-of select="meta/audio/codec"/></td>
+            <td><xsl:value-of select="round(bw_audio div 1000)"/>K</td>
+            <td><xsl:value-of select="meta/audio/sample_rate"/></td>
+            <td><xsl:value-of select="meta/audio/channels"/></td>
             <td><xsl:value-of select="bytes_in"/></td>
             <td><xsl:value-of select="bytes_out"/></td>
-            <td><xsl:value-of select="round(bw_in div 1000)"/></td>
-            <td><xsl:value-of select="round(bw_out div 1000)"/></td>
+            <td><xsl:value-of select="round(bw_in div 1000)"/>Kb/s</td>
+            <td><xsl:value-of select="round(bw_out div 1000)"/>Kb/s</td>
             <td>
               <xsl:choose>
                 <xsl:when test="active"><span class="state-live">LIVE</span></xsl:when>
@@ -700,9 +707,9 @@ const STAT_XSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
             <td><xsl:value-of select="round(time div 1000)"/>s</td>
           </tr>
           <tr>
-            <td colspan="10" style="padding: 0; border-bottom: 1px solid #21262d;">
+            <td colspan="16" style="padding: 0;">
               <details>
-                <summary style="padding: 0.3rem 0.75rem;">
+                <summary style="padding: 0.3rem 0.6rem;">
                   <xsl:value-of select="count(client)"/> client(s)
                 </summary>
                 <div class="clients">
@@ -730,15 +737,14 @@ const STAT_XSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
             </td>
           </tr>
           </xsl:for-each>
-        </tbody>
-      </table>
-    </xsl:when>
-    <xsl:otherwise>
-      <div class="empty">No live streams.</div>
-    </xsl:otherwise>
-  </xsl:choose>
+        </xsl:when>
+        <xsl:otherwise>
+          <tr><td colspan="16" class="empty">live streams: 0</td></tr>
+        </xsl:otherwise>
+      </xsl:choose>
+    </tbody>
+  </table>
 </xsl:for-each>
-<footer>Generated by librtmp2-server — nginx-rtmp-compatible stats</footer>
 </body>
 </html>
 </xsl:template>
