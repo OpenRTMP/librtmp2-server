@@ -13,6 +13,15 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- `GET /stat.xsl` — a dark-themed XSLT stylesheet for `/stats-nginx`. The
+  XML response now links it via an `<?xml-stylesheet?>` processing
+  instruction, so opening `/stats-nginx?key=<stats_key>` directly in a
+  browser renders a readable table (stream name, clients, video/audio,
+  bitrate, live/offline state, expandable per-client details) instead of
+  raw XML — the same mechanism `nginx-rtmp-module`'s classic `stat.xsl`
+  uses, just restyled for dark mode.
+
 ### Fixed
 - `/stats-nginx` now emits stream-level `bw_audio`/`bw_video` and self-closing
   `active`/`publishing` markers, matching real `nginx-rtmp-module` output.
@@ -38,6 +47,11 @@ begin at `1.0.0`.
   longer gets marked `<active/>` with `bw_video=0` — NOALBS's `Nginx`
   provider treats "active present + 0 bitrate" as "keep the previous
   scene", not offline, so the stale marker was masking real disconnects.
+- Publisher `<video>`/`<audio>` blocks in `/stats-nginx` are now nested
+  inside a `<meta>` element, matching `nginx-rtmp-module`'s schema. NOALBS's
+  `Nginx` provider reads codec/resolution info from `stream/meta/video` and
+  `stream/meta/audio` for its `source_info()` chat command; without the
+  wrapper that data never matched and the command always came back empty.
 
 ## [0.1.1] — 2026-07-10
 

@@ -322,6 +322,11 @@ The `key=<stats_key>` in `statsUrl` is the per-stream `stats_key` from
 `POST /api/v1/streams` — unrelated to NOALBS's own `key` field above, which
 must always be the literal string `stream`.
 
+Opening `/stats-nginx?key=<stats_key>` directly in a browser renders as an
+HTML table (dark-themed) instead of raw XML, via an `<?xml-stylesheet?>`
+processing instruction pointing at `/stat.xsl` — the same mechanism
+`nginx-rtmp-module`'s classic `stat.xsl` uses, just restyled.
+
 ---
 
 ## Docker

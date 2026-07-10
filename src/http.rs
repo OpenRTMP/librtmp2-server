@@ -47,6 +47,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(handle_health))
         .route("/stats", get(handle_stats_json))
         .route("/stats-nginx", get(handle_stats_nginx))
+        .route("/stat.xsl", get(handle_stat_xsl))
         .route(
             "/api/v1/streams",
             get(handle_streams_list).post(handle_stream_create),
@@ -395,7 +396,8 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
     };
     let mut out = String::with_capacity(8192);
     out.push_str(&format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rtmp>\n  <server>\n\
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <?xml-stylesheet type=\"text/xsl\" href=\"/stat.xsl\"?>\n<rtmp>\n  <server>\n\
          \x20\x20\x20\x20<application>\n      <name>{}</name>\n      <live>\n",
         xml_escape(app_name),
     ));
@@ -527,29 +529,35 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
             out.push_str("        <publishing/>\n        <active/>\n");
         }
 
-        if let Some((width, height, fps, codec)) = &g.video {
-            out.push_str(&format!(
-                "          <video>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<width>{width}</width>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<height>{height}</height>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<frame_rate>{fps:.1}</frame_rate>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<profile>baseline</profile>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<level>3.1</level>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20</video>\n",
-                xml_escape(codec),
-            ));
-        }
+        if g.video.is_some() || g.audio.is_some() {
+            out.push_str("          <meta>\n");
 
-        if let Some(codec) = &g.audio {
-            out.push_str(&format!(
-                "          <audio>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>44100</sample_rate>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>2</channels>\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
-                xml_escape(codec),
-            ));
+            if let Some((width, height, fps, codec)) = &g.video {
+                out.push_str(&format!(
+                    "            <video>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<width>{width}</width>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<height>{height}</height>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<frame_rate>{fps:.1}</frame_rate>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<profile>baseline</profile>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<level>3.1</level>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</video>\n",
+                    xml_escape(codec),
+                ));
+            }
+
+            if let Some(codec) = &g.audio {
+                out.push_str(&format!(
+                    "            <audio>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<codec>{}</codec>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<sample_rate>44100</sample_rate>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<channels>2</channels>\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</audio>\n",
+                    xml_escape(codec),
+                ));
+            }
+
+            out.push_str("          </meta>\n");
         }
 
         out.push_str(&g.clients);
@@ -604,6 +612,146 @@ async fn handle_stats_json(
         None => public_stats_text(StatusCode::OK, "Stream offline"),
     };
     pace_public_stats(start, response).await
+}
+
+/// Dark-themed nginx-rtmp-compatible XSLT stylesheet for `/stats-nginx`. The
+/// XML response links here via an `<?xml-stylesheet?>` processing
+/// instruction, so browsers render the raw XML as an HTML table instead —
+/// same idea as `nginx-rtmp-module`'s classic `stat.xsl`, just dark.
+const STAT_XSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+<xsl:output method="html" encoding="utf-8" indent="yes" doctype-system="about:legacy-compat"/>
+<xsl:template match="/rtmp">
+<html>
+<head>
+<title>librtmp2-server stats</title>
+<meta charset="utf-8"/>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    background: #0d1117; color: #c9d1d9; margin: 2rem;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { color: #58a6ff; font-size: 1.15rem; font-weight: 600; margin: 0 0 1.25rem; }
+  h2 { color: #8b949e; font-size: 0.85rem; font-weight: 600; margin: 2rem 0 0.5rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  table { border-collapse: collapse; width: 100%; background: #161b22; border: 1px solid #21262d; border-radius: 6px; overflow: hidden; }
+  th, td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #21262d; text-align: left; font-size: 0.85rem; }
+  th { background: #0d1117; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #1c2128; }
+  .state-live { color: #3fb950; font-weight: 600; }
+  .state-off { color: #f85149; font-weight: 600; }
+  .clients { margin: 0; padding: 0.5rem 0.75rem 0.75rem; background: #0d1117; }
+  .clients table { background: transparent; border: none; }
+  .clients th, .clients td { font-size: 0.78rem; padding: 0.3rem 0.6rem; border-bottom: 1px solid #1c2128; }
+  details summary { cursor: pointer; color: #58a6ff; font-size: 0.8rem; list-style: none; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: "▸ "; }
+  details[open] summary::before { content: "▾ "; }
+  footer { margin-top: 2rem; color: #484f58; font-size: 0.75rem; }
+  footer a { color: #6e7681; }
+  .empty { color: #484f58; font-style: italic; padding: 1rem 0.75rem; }
+</style>
+</head>
+<body>
+<h1>librtmp2-server — RTMP stats</h1>
+<xsl:for-each select="server/application">
+  <h2>Application: <xsl:value-of select="name"/></h2>
+  <xsl:choose>
+    <xsl:when test="live/stream">
+      <table>
+        <thead>
+          <tr>
+            <th>Stream</th>
+            <th>#Clients</th>
+            <th>Video</th>
+            <th>Audio</th>
+            <th>In</th>
+            <th>Out</th>
+            <th>In kb/s</th>
+            <th>Out kb/s</th>
+            <th>State</th>
+            <th>Time</th>
+          </tr>
+        </thead>
+        <tbody>
+          <xsl:for-each select="live/stream">
+          <tr>
+            <td><xsl:value-of select="name"/></td>
+            <td><xsl:value-of select="count(client)"/></td>
+            <td>
+              <xsl:if test="meta/video">
+                <xsl:value-of select="meta/video/codec"/><xsl:text> </xsl:text>
+                <xsl:value-of select="meta/video/width"/>x<xsl:value-of select="meta/video/height"/>
+              </xsl:if>
+            </td>
+            <td><xsl:value-of select="meta/audio/codec"/></td>
+            <td><xsl:value-of select="bytes_in"/></td>
+            <td><xsl:value-of select="bytes_out"/></td>
+            <td><xsl:value-of select="round(bw_in div 1000)"/></td>
+            <td><xsl:value-of select="round(bw_out div 1000)"/></td>
+            <td>
+              <xsl:choose>
+                <xsl:when test="active"><span class="state-live">LIVE</span></xsl:when>
+                <xsl:otherwise><span class="state-off">OFFLINE</span></xsl:otherwise>
+              </xsl:choose>
+            </td>
+            <td><xsl:value-of select="round(time div 1000)"/>s</td>
+          </tr>
+          <tr>
+            <td colspan="10" style="padding: 0; border-bottom: 1px solid #21262d;">
+              <details>
+                <summary style="padding: 0.3rem 0.75rem;">
+                  <xsl:value-of select="count(client)"/> client(s)
+                </summary>
+                <div class="clients">
+                  <table>
+                    <thead>
+                      <tr><th>Role</th><th>Time</th><th>Dropped</th></tr>
+                    </thead>
+                    <tbody>
+                      <xsl:for-each select="client">
+                      <tr>
+                        <td>
+                          <xsl:choose>
+                            <xsl:when test="publisher = 1">publisher</xsl:when>
+                            <xsl:otherwise>player</xsl:otherwise>
+                          </xsl:choose>
+                        </td>
+                        <td><xsl:value-of select="round(time div 1000)"/>s</td>
+                        <td><xsl:value-of select="dropped"/></td>
+                      </tr>
+                      </xsl:for-each>
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            </td>
+          </tr>
+          </xsl:for-each>
+        </tbody>
+      </table>
+    </xsl:when>
+    <xsl:otherwise>
+      <div class="empty">No live streams.</div>
+    </xsl:otherwise>
+  </xsl:choose>
+</xsl:for-each>
+<footer>Generated by librtmp2-server — nginx-rtmp-compatible stats</footer>
+</body>
+</html>
+</xsl:template>
+</xsl:stylesheet>
+"#;
+
+async fn handle_stat_xsl() -> Response {
+    (
+        StatusCode::OK,
+        [("Content-Type", "text/xsl; charset=utf-8")],
+        STAT_XSL,
+    )
+        .into_response()
 }
 
 async fn handle_stats_nginx(
