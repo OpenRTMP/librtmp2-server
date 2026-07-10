@@ -13,6 +13,13 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- Bump the pinned `librtmp2` dependency, pulling in RTMPS client hardening
+  (bounded TLS handshake timeout, write-readiness polling on read retries,
+  EINTR retry in transport polling), RTMP Aggregate message support, and the
+  client recv-budget / FFI `max_connections` security fixes described in
+  `librtmp2`'s own changelog
+
 ## [0.1.0] — 2026-07-08
 
 First tagged pre-release. `librtmp2-server` is a Rust crate built on `axum`
