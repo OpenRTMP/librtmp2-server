@@ -65,7 +65,12 @@ jobs:
             fi
             TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server:$BARE_VERSION"
-            if [ "$BARE_VERSION" != "$VERSION" ]; then
+            # Publish the v-prefixed alias too whenever this looks like a
+            # numeric release version (0.1.1 or v0.1.1 alike), so a single
+            # dispatch always produces both tags regardless of which form
+            # was typed. Non-numeric tags (e.g. "version1", "vprod") only
+            # get their own literal tag, not an invented alias.
+            if echo "$BARE_VERSION" | grep -qE '^[0-9]'; then
               TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server:v$BARE_VERSION"
             fi
