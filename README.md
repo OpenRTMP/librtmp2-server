@@ -301,7 +301,12 @@ curl "http://localhost:8080/stats?key=st_mystream_1719480002"
 curl "http://localhost:8080/stats-nginx?key=st_mystream_1719480002"
 ```
 
-Returns the same XML format as `nginx-rtmp-module`.
+Returns the same XML format as `nginx-rtmp-module`, including the
+`bw_video`/`bw_audio` and stream-level `active`/`publishing` markers that
+tools like [NOALBS](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching)
+expect. Point a NOALBS `Nginx` stream server at
+`http://<host>:8080/stats-nginx?key=<stats_key>` and it works with no changes
+on the NOALBS side.
 
 ---
 

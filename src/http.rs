@@ -402,6 +402,9 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
 
     for p in &pubs {
         let uptime_ms = (now - p.connected_at).max(0) * 1000;
+        // librtmp2-server tracks one combined bitrate per publisher, not separate
+        // audio/video bandwidth like nginx-rtmp does, so bw_video mirrors bw_in —
+        // nginx-rtmp-compatible consumers (e.g. NOALBS) read bw_video for switching.
         let bw_in = (p.bitrate_kbps * 1000.0) as i64;
         let stream_label = if redact_identifiers {
             "stream"
@@ -415,7 +418,11 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
              \x20\x20\x20\x20\x20\x20\x20\x20<bw_in>{bw_in}</bw_in>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>{}</bytes_in>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>0</bw_out>\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>0</bytes_out>\n",
+             \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>0</bytes_out>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_audio>0</bw_audio>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_video>{bw_in}</bw_video>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<publishing/>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<active/>\n",
             xml_escape(stream_label),
             p.bytes_in,
         ));
@@ -477,6 +484,9 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
              \x20\x20\x20\x20\x20\x20\x20\x20<bytes_in>0</bytes_in>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<bw_out>{bw_out}</bw_out>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<bytes_out>{}</bytes_out>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_audio>0</bw_audio>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<bw_video>0</bw_video>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20<active/>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<client>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<time>{uptime_ms}</time>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<flashver>FMLE/3.0</flashver>\n\
