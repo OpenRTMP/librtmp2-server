@@ -50,11 +50,12 @@ jobs:
           ghcr.io/openrtmp/librtmp2-server:alpha"
           if [ -n "$VERSION" ]; then
             # Only treat this as a "v"-prefixed release version (and mirror
-            # it under both the bare and v-prefixed tag) when a digit
-            # immediately follows the "v", e.g. v0.1.1 -> 0.1.1 + v0.1.1.
-            # Otherwise leave arbitrary tags like "version1" or "vprod"
-            # untouched instead of mis-stripping their leading character.
-            if echo "$VERSION" | grep -qE '^v[0-9]'; then
+            # it under both the bare and v-prefixed tag) when it actually
+            # has a semver-like "vX.Y" shape, e.g. v0.1.1 -> 0.1.1 + v0.1.1.
+            # Requiring the dot (not just a leading digit) avoids
+            # mis-stripping arbitrary tags like "version1", "vprod", or
+            # "v1prod" that merely start with "v<digit>".
+            if echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]'; then
               BARE_VERSION="${VERSION#v}"
             else
               BARE_VERSION="$VERSION"
@@ -66,11 +67,12 @@ jobs:
             TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server:$BARE_VERSION"
             # Publish the v-prefixed alias too whenever this looks like a
-            # numeric release version (0.1.1 or v0.1.1 alike), so a single
-            # dispatch always produces both tags regardless of which form
-            # was typed. Non-numeric tags (e.g. "version1", "vprod") only
-            # get their own literal tag, not an invented alias.
-            if echo "$BARE_VERSION" | grep -qE '^[0-9]'; then
+            # semver-shaped release version (0.1.1 or v0.1.1 alike), so a
+            # single dispatch always produces both tags regardless of which
+            # form was typed. Tags that don't match this shape (e.g.
+            # "version1", "vprod", "1prod") only get their own literal tag,
+            # not an invented alias.
+            if echo "$BARE_VERSION" | grep -qE '^[0-9]+\.[0-9]'; then
               TAGS="$TAGS
           ghcr.io/openrtmp/librtmp2-server:v$BARE_VERSION"
             fi
