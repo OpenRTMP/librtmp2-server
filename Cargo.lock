@@ -867,8 +867,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "librtmp2"
-version = "0.2.0"
-source = "git+https://github.com/OpenRTMP/librtmp2.git?branch=main#65c136d19a38212bcd65fe319de986ccbb61b020"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27819db6c08e8e4f0a9b1e938ef0e828c67990a34dc11903c686499c4ae734d4"
 dependencies = [
  "cc",
  "libc",
@@ -879,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "librtmp2-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "chrono",
