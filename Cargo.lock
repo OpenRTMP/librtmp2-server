@@ -867,8 +867,8 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "librtmp2"
-version = "0.1.1"
-source = "git+https://github.com/OpenRTMP/librtmp2.git?branch=main#1527e804fcb71c34437add3412ca2be17fe40055"
+version = "0.2.0"
+source = "git+https://github.com/OpenRTMP/librtmp2.git?branch=main#76ea74c98bdead63b56eb7116c225bf0a4505b36"
 dependencies = [
  "cc",
  "libc",
