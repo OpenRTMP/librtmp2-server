@@ -87,7 +87,7 @@ OBS / FFmpeg / App
   └── Config
         │
         ▼
-      librtmp2 (Rust, in progress)
+      librtmp2 (Rust)
       ├── Handshake
       ├── Chunking
       ├── AMF
@@ -260,9 +260,9 @@ Response:
   "id": "mystream",
   "name": "My Live Stream",
   "app": "live",
-  "publish_key": "pub_a1b2c3d4e5f6789012345678abcdef01",
-  "play_key": "pl_fedcba0987654321fedcba0987654321",
-  "stats_key": "st_0123456789abcdef0123456789abcdef",
+  "publish_key": "live_a1b2c3d4e5f6789012345678abcdef01",
+  "play_key": "play_fedcba0987654321fedcba0987654321",
+  "stats_key": "sts_0123456789abcdef0123456789abcdef",
   "enabled": true
 }
 ```
@@ -275,30 +275,45 @@ Response:
 ### View stats (JSON)
 
 ```bash
-curl "http://localhost:8080/stats?key=st_mystream_1719480002"
+curl "http://localhost:8080/stats?key=sts_0123456789abcdef0123456789abcdef"
 ```
 
 ```json
 {
   "streams": [{
+    "id": "mystream",
     "name": "My Live Stream",
     "app": "live",
     "uptime": 12345,
     "bitrate_kbps": 2450.5,
+    "rtt_ms": 24.0,
     "bytes_in": 1234567,
     "video": {"codec": "h264", "width": 1920, "height": 1080, "fps": 30.0},
-    "audio": {"codec": "aac"},
-    "client": {"address": "1.2.3.4:56789", "publisher": true}
+    "audio": {"codec": "aac"}
   }],
   "players": [],
   "summary": {"publishers": 1, "players": 0, "total_clients": 1}
 }
 ```
 
+Each entry in `players` (one per connected viewer, once any are watching) looks like:
+
+```json
+{
+  "id": "play_...",
+  "stream_name": "My Live Stream",
+  "app": "live",
+  "uptime": 12345,
+  "bitrate_kbps": 2450.5,
+  "rtt_ms": 24.0,
+  "bytes_out": 987654
+}
+```
+
 ### Stats nginx-rtmp XML
 
 ```bash
-curl "http://localhost:8080/stats-nginx?key=st_mystream_1719480002"
+curl "http://localhost:8080/stats-nginx?key=sts_0123456789abcdef0123456789abcdef"
 ```
 
 Returns the same XML format as `nginx-rtmp-module`, including the
@@ -326,6 +341,84 @@ Opening `/stats-nginx?key=<stats_key>` directly in a browser renders as an
 HTML table (dark-themed) instead of raw XML, via an `<?xml-stylesheet?>`
 processing instruction pointing at `/stat.xsl` — the same mechanism
 `nginx-rtmp-module`'s classic `stat.xsl` uses, just restyled.
+
+### Native NOALBS provider (`OpenRTMP`)
+
+NOALBS is adding a dedicated `OpenRTMP` stream server provider (a draft
+pull request against `NOALBS/nginx-obs-automatic-low-bitrate-switching`
+at the time of writing) that talks to `/stats` (the JSON endpoint) directly
+instead of the `nginx-rtmp`-compatible XML shim above, so you don't need
+the fixed `live`/`stream` placeholders. End-to-end setup once that PR
+lands:
+
+**1. Create a stream** (see [Example: Create a stream](#example-create-a-stream) above)
+to get its keys. If you'd rather not hand-craft `curl` calls,
+[librtmp2-server-panel](https://github.com/OpenRTMP/librtmp2-server-panel)
+is a web UI for this server — it can create/delete streams, one-click-copy
+the publish/play/stats URLs, and show the same live stats — so you can grab
+the `stats_key` for NOALBS straight from its overview instead:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/streams \
+  -H "Authorization: Bearer <generated-api-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"mystream","name":"My Live Stream","app":"live"}'
+```
+
+```json
+{
+  "id": "mystream",
+  "app": "live",
+  "publish_key": "live_a1b2c3d4e5f6789012345678abcdef01",
+  "play_key": "play_fedcba0987654321fedcba0987654321",
+  "stats_key": "sts_0123456789abcdef0123456789abcdef"
+}
+```
+
+**2. Publish with OBS** using the `publish_key` as the stream key (server
+`rtmp://your-server/live`) — see [Publish with OBS](#publish-with-obs) above.
+`play_key` is what viewers/players use to pull the stream; it's unrelated to
+NOALBS.
+
+**3. Point NOALBS at `/stats?key=<stats_key>`** using the `stats_key` from
+step 1 — this is the only key NOALBS needs. The provider entry itself only
+needs `statsUrl`; the bitrate/RTT thresholds live in NOALBS's top-level
+`switcher.triggers`, not inside the provider block:
+
+```json
+{
+  "switcher": {
+    "triggers": {
+      "low": 2500,
+      "offline": 500,
+      "rtt": 200,
+      "rttOffline": 2000
+    },
+    "streamServers": [
+      {
+        "name": "openrtmp",
+        "priority": 0,
+        "enabled": true,
+        "streamServer": {
+          "type": "OpenRTMP",
+          "statsUrl": "http://<host>:8080/stats?key=sts_0123456789abcdef0123456789abcdef"
+        }
+      }
+    ]
+  }
+}
+```
+
+Unlike the `Nginx` provider above, there's no separate `application`/`key`
+pair to fill in — the `stats_key` embedded in `statsUrl` is all the
+addressing NOALBS needs, since `/stats` returns the real app/stream name
+instead of the redacted `live`/`stream` placeholders. The provider reads
+`bitrate_kbps` and `rtt_ms` from the JSON response (see
+[View stats (JSON)](#view-stats-json) above) to drive those triggers:
+`low`/`offline` are `bitrate_kbps` floors (in kbps) — NOALBS switches once
+the stream drops to or below them — and `rtt`/`rttOffline` are `rtt_ms`
+ceilings (in milliseconds) that trigger once the RTT reaches or exceeds
+them.
 
 ---
 
