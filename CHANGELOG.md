@@ -13,6 +13,18 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-12
+
+### Changed
+- Bump the pinned `librtmp2` dependency to `0.3.0`, pulling in a fix for
+  `ServerConfig.tls_ca_file`/`ServerConfig.tls_insecure` being silently
+  ignored by `lrtmp2_client_create()` — the client previously always
+  verified `rtmps://` peers against only the system trust store regardless
+  of those fields. No code changes were needed on this side: the new
+  `Transport::connect_tls()` parameters (`ca_file`, `insecure`) are a
+  Rust-only API addition this crate doesn't call directly, and the FFI/ABI
+  surface (`tls_ca_file`, `tls_insecure` on `ServerConfig`) is unchanged.
+
 ## [0.1.2] — 2026-07-10
 
 ### Added
@@ -142,7 +154,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/OpenRTMP/librtmp2-server/releases/tag/v0.1.0
