@@ -87,7 +87,7 @@ OBS / FFmpeg / App
   └── Config
         │
         ▼
-      librtmp2 (Rust, in progress)
+      librtmp2 (Rust)
       ├── Handshake
       ├── Chunking
       ├── AMF
@@ -260,9 +260,9 @@ Response:
   "id": "mystream",
   "name": "My Live Stream",
   "app": "live",
-  "publish_key": "pub_a1b2c3d4e5f6789012345678abcdef01",
-  "play_key": "pl_fedcba0987654321fedcba0987654321",
-  "stats_key": "st_0123456789abcdef0123456789abcdef",
+  "publish_key": "live_a1b2c3d4e5f6789012345678abcdef01",
+  "play_key": "play_fedcba0987654321fedcba0987654321",
+  "stats_key": "sts_0123456789abcdef0123456789abcdef",
   "enabled": true
 }
 ```
@@ -275,30 +275,45 @@ Response:
 ### View stats (JSON)
 
 ```bash
-curl "http://localhost:8080/stats?key=st_mystream_1719480002"
+curl "http://localhost:8080/stats?key=sts_0123456789abcdef0123456789abcdef"
 ```
 
 ```json
 {
   "streams": [{
+    "id": "mystream",
     "name": "My Live Stream",
     "app": "live",
     "uptime": 12345,
     "bitrate_kbps": 2450.5,
+    "rtt_ms": 24.0,
     "bytes_in": 1234567,
     "video": {"codec": "h264", "width": 1920, "height": 1080, "fps": 30.0},
-    "audio": {"codec": "aac"},
-    "client": {"address": "1.2.3.4:56789", "publisher": true}
+    "audio": {"codec": "aac"}
   }],
   "players": [],
   "summary": {"publishers": 1, "players": 0, "total_clients": 1}
 }
 ```
 
+Each entry in `players` (one per connected viewer, once any are watching) looks like:
+
+```json
+{
+  "id": "play_...",
+  "stream_name": "My Live Stream",
+  "app": "live",
+  "uptime": 12345,
+  "bitrate_kbps": 2450.5,
+  "rtt_ms": 24.0,
+  "bytes_out": 987654
+}
+```
+
 ### Stats nginx-rtmp XML
 
 ```bash
-curl "http://localhost:8080/stats-nginx?key=st_mystream_1719480002"
+curl "http://localhost:8080/stats-nginx?key=sts_0123456789abcdef0123456789abcdef"
 ```
 
 Returns the same XML format as `nginx-rtmp-module`, including the
@@ -354,9 +369,9 @@ curl -X POST http://localhost:8080/api/v1/streams \
 {
   "id": "mystream",
   "app": "live",
-  "publish_key": "pub_a1b2c3d4e5f6789012345678abcdef01",
-  "play_key": "pl_fedcba0987654321fedcba0987654321",
-  "stats_key": "st_0123456789abcdef0123456789abcdef"
+  "publish_key": "live_a1b2c3d4e5f6789012345678abcdef01",
+  "play_key": "play_fedcba0987654321fedcba0987654321",
+  "stats_key": "sts_0123456789abcdef0123456789abcdef"
 }
 ```
 
@@ -386,7 +401,7 @@ needs `statsUrl`; the bitrate/RTT thresholds live in NOALBS's top-level
         "enabled": true,
         "streamServer": {
           "type": "OpenRTMP",
-          "statsUrl": "http://<host>:8080/stats?key=st_0123456789abcdef0123456789abcdef"
+          "statsUrl": "http://<host>:8080/stats?key=sts_0123456789abcdef0123456789abcdef"
         }
       }
     ]
