@@ -424,6 +424,24 @@ them.
 
 ## Docker
 
+Prebuilt multi-arch images (`amd64`/`arm64`/`riscv64`) are published to
+`ghcr.io/openrtmp/librtmp2-server` on every release — no local build needed:
+
+```bash
+docker run -d \
+  --name librtmp2-server \
+  -p 1935:1935 \
+  -p 8080:8080 \
+  -v librtmp2-server-data:/data \
+  ghcr.io/openrtmp/librtmp2-server:latest
+docker logs librtmp2-server   # copy the generated API token
+```
+
+Available tags: `latest`, `beta`, `alpha`, and pinned versions (e.g. `0.1.3` /
+`v0.1.3`).
+
+To build from source instead:
+
 ```bash
 docker compose up -d
 ```
