@@ -329,14 +329,19 @@ processing instruction pointing at `/stat.xsl` — the same mechanism
 
 ### Native NOALBS provider (`OpenRTMP`)
 
-NOALBS also ships a dedicated `OpenRTMP` stream server provider
-([nginx-obs-automatic-low-bitrate-switching#224](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching/pull/224))
-that talks to `/stats` (the JSON endpoint) directly instead of the
-`nginx-rtmp`-compatible XML shim above, so you don't need the fixed
-`live`/`stream` placeholders. End-to-end setup:
+NOALBS is adding a dedicated `OpenRTMP` stream server provider
+([nginx-obs-automatic-low-bitrate-switching#224](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching/pull/224),
+still a draft at the time of writing) that talks to `/stats` (the JSON
+endpoint) directly instead of the `nginx-rtmp`-compatible XML shim above,
+so you don't need the fixed `live`/`stream` placeholders. End-to-end setup
+once that PR lands:
 
 **1. Create a stream** (see [Example: Create a stream](#example-create-a-stream) above)
-to get its keys:
+to get its keys. If you'd rather not hand-craft `curl` calls,
+[librtmp2-server-panel](https://github.com/OpenRTMP/librtmp2-server-panel)
+is a web UI for this server — it can create/delete streams, one-click-copy
+the publish/play/stats URLs, and show the same live stats — so you can grab
+the `stats_key` for NOALBS straight from its overview instead:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/streams \
@@ -361,17 +366,25 @@ curl -X POST http://localhost:8080/api/v1/streams \
 NOALBS.
 
 **3. Point NOALBS at `/stats?key=<stats_key>`** using the `stats_key` from
-step 1 — this is the only key NOALBS needs:
+step 1 — this is the only key NOALBS needs. The provider entry itself only
+needs `statsUrl`; the bitrate/RTT thresholds live in NOALBS's top-level
+`switcher.triggers`, not inside the provider block:
 
 ```json
 {
-  "type": "OpenRTMP",
-  "statsUrl": "http://<host>:8080/stats?key=st_0123456789abcdef0123456789abcdef",
-  "triggers": {
-    "low": 2500,
-    "offline": 500,
-    "rtt": 200,
-    "rtt_offline": 2000
+  "switcher": {
+    "triggers": {
+      "low": 2500,
+      "offline": 500,
+      "rtt": 200,
+      "rttOffline": 2000
+    },
+    "streamServers": [
+      {
+        "type": "OpenRTMP",
+        "statsUrl": "http://<host>:8080/stats?key=st_0123456789abcdef0123456789abcdef"
+      }
+    ]
   }
 }
 ```
@@ -381,8 +394,11 @@ pair to fill in — the `stats_key` embedded in `statsUrl` is all the
 addressing NOALBS needs, since `/stats` returns the real app/stream name
 instead of the redacted `live`/`stream` placeholders. The provider reads
 `bitrate_kbps` and `rtt_ms` from the JSON response (see
-[View stats (JSON)](#view-stats-json) above) to drive NOALBS's
-`low`/`offline` bitrate and `rtt`/`rtt_offline` RTT triggers.
+[View stats (JSON)](#view-stats-json) above) to drive those triggers:
+`low`/`offline` are `bitrate_kbps` floors (in kbps) — NOALBS switches once
+the stream drops to or below them — and `rtt`/`rttOffline` are `rtt_ms`
+ceilings (in milliseconds) that trigger once the RTT reaches or exceeds
+them.
 
 ---
 
