@@ -329,12 +329,12 @@ processing instruction pointing at `/stat.xsl` — the same mechanism
 
 ### Native NOALBS provider (`OpenRTMP`)
 
-NOALBS is adding a dedicated `OpenRTMP` stream server provider
-([nginx-obs-automatic-low-bitrate-switching#224](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching/pull/224),
-still a draft at the time of writing) that talks to `/stats` (the JSON
-endpoint) directly instead of the `nginx-rtmp`-compatible XML shim above,
-so you don't need the fixed `live`/`stream` placeholders. End-to-end setup
-once that PR lands:
+NOALBS is adding a dedicated `OpenRTMP` stream server provider (a draft
+pull request against `NOALBS/nginx-obs-automatic-low-bitrate-switching`
+at the time of writing) that talks to `/stats` (the JSON endpoint) directly
+instead of the `nginx-rtmp`-compatible XML shim above, so you don't need
+the fixed `live`/`stream` placeholders. End-to-end setup once that PR
+lands:
 
 **1. Create a stream** (see [Example: Create a stream](#example-create-a-stream) above)
 to get its keys. If you'd rather not hand-craft `curl` calls,
@@ -381,8 +381,13 @@ needs `statsUrl`; the bitrate/RTT thresholds live in NOALBS's top-level
     },
     "streamServers": [
       {
-        "type": "OpenRTMP",
-        "statsUrl": "http://<host>:8080/stats?key=st_0123456789abcdef0123456789abcdef"
+        "name": "openrtmp",
+        "priority": 0,
+        "enabled": true,
+        "streamServer": {
+          "type": "OpenRTMP",
+          "statsUrl": "http://<host>:8080/stats?key=st_0123456789abcdef0123456789abcdef"
+        }
       }
     ]
   }
