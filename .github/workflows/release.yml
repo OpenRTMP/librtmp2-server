@@ -38,6 +38,8 @@ jobs:
     name: build & package
     needs: verify
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
 
@@ -101,3 +103,13 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+
+  docker:
+    name: build & push docker image
+    needs: package
+    uses: ./.github/workflows/docker-multiarch.yml
+    permissions:
+      packages: write
+      contents: read
+    with:
+      version: ${{ needs.package.outputs.version }}

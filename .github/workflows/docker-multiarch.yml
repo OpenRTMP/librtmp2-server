@@ -6,6 +6,12 @@ on:
       version:
         description: 'Version tag to publish alongside latest/beta/alpha (e.g. 0.1.0)'
         required: false
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version tag to publish alongside latest/beta/alpha (e.g. 0.1.0)'
+        type: string
+        required: false
 
 jobs:
   build:
