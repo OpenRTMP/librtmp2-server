@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   update-cargo-lock:
@@ -26,9 +27,11 @@ jobs:
         run: cargo generate-lockfile
 
       - name: Commit updated Cargo.lock
+        id: commit-lock
         run: |
           if git diff --quiet Cargo.lock; then
             echo "Cargo.lock is already up to date."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -37,3 +40,13 @@ jobs:
           git add Cargo.lock
           git commit -m "Update Cargo.lock"
           git push
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger downstream CI workflows
+        if: steps.commit-lock.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run tests.yml --ref "${{ github.ref_name }}"
+          gh workflow run e2e-tests.yml --ref "${{ github.ref_name }}"
+          gh workflow run benchmarks.yml --ref "${{ github.ref_name }}"
