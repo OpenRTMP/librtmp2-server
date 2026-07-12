@@ -327,6 +327,32 @@ HTML table (dark-themed) instead of raw XML, via an `<?xml-stylesheet?>`
 processing instruction pointing at `/stat.xsl` — the same mechanism
 `nginx-rtmp-module`'s classic `stat.xsl` uses, just restyled.
 
+### Native NOALBS provider (`OpenRTMP`)
+
+NOALBS also ships a dedicated `OpenRTMP` stream server provider
+([nginx-obs-automatic-low-bitrate-switching#224](https://github.com/NOALBS/nginx-obs-automatic-low-bitrate-switching/pull/224))
+that talks to `/stats` (the JSON endpoint) directly instead of the
+`nginx-rtmp`-compatible XML shim above, so you don't need the fixed
+`live`/`stream` placeholders:
+
+```json
+{
+  "type": "OpenRTMP",
+  "statsUrl": "http://<host>:8080/stats?key=<stats_key>",
+  "triggers": {
+    "low": 2500,
+    "offline": 500,
+    "rtt": 200,
+    "rtt_offline": 2000
+  }
+}
+```
+
+`statsUrl` uses your real per-stream `stats_key` from
+`POST /api/v1/streams` — same key as `/stats`, no app/stream redaction
+involved. The provider reads `bitrate_kbps` and `rtt_ms` from the JSON
+response to drive NOALBS's `low`/`offline` bitrate and RTT triggers.
+
 ---
 
 ## Docker
