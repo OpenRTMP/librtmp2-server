@@ -28,6 +28,11 @@ begin at `1.0.0`.
   such sessions.
 - `rtmp_media_cb` now fails closed (`unwrap_or(false)`) when the bridge
   lock is unavailable, instead of accepting media frames.
+- Auth-failure rate limiting now rejects untracked remote IPs when the
+  per-IP failure map is fully saturated, instead of silently allowing
+  further attempts.
+- Rate-limited auth-failure buckets are no longer evicted from the failure
+  map, so a saturated map cannot reset an IP's lockout window early.
 
 ## [0.1.3] — 2026-07-12
 
