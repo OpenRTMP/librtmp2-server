@@ -437,8 +437,8 @@ docker run -d \
 docker logs librtmp2-server   # copy the generated API token
 ```
 
-Available tags: `latest`, `beta`, `alpha`, and pinned versions (e.g. `0.1.3` /
-`v0.1.3`).
+Available tags: `latest`, `beta`, `alpha`, and pinned versions (e.g. `0.1.4` /
+`v0.1.4`).
 
 To build from source instead:
 

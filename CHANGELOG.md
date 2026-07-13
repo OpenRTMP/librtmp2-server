@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-07-13
+
 ### Fixed
 - Stream delete no longer re-enables publish/play keys when the 30-second
   wait for active RTMP sessions times out; the stream stays disabled
@@ -33,6 +35,15 @@ begin at `1.0.0`.
   further attempts.
 - Rate-limited auth-failure buckets are no longer evicted from the failure
   map, so a saturated map cannot reset an IP's lockout window early.
+
+### Changed
+- Bump the pinned `librtmp2` dependency to `0.3.1`, pulling in bounded DNS
+  resolution during client connect, nonblocking ping/pong handling during
+  publish and poll, server-side connect-setup and stale-ping timeouts, and
+  capped DNS worker queue depth. No code changes were needed on this side:
+  the connection fields this crate reads off `librtmp2::session::conn::Conn`
+  (`client_fd`, `conn_id`, `remote_addr`, `relay_enabled`, `relay_key`,
+  `pending_relay`, `rtt_ms`) are unchanged.
 
 ## [0.1.3] — 2026-07-12
 
@@ -175,7 +186,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.0...v0.1.1
