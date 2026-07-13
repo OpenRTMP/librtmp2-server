@@ -199,7 +199,15 @@ impl DbRtmpBridge {
         let mut guard = self.auth_failures.lock();
         let now = Instant::now();
         let Some(entries) = guard.get_mut(remote_ip) else {
-            return false;
+            // The map is full and every tracked bucket is actively
+            // throttled, so `record_auth_failure` cannot make room to track
+            // this new IP (see the eviction guard there). Treat it as
+            // rate-limited too rather than letting it bypass the
+            // auth-failure limit entirely while the map is saturated.
+            return guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS
+                && guard
+                    .values()
+                    .all(|e| Self::active_auth_failure_count(e, now) >= RTMP_AUTH_MAX_FAILURES);
         };
         entries.retain(|t| {
             now.checked_duration_since(*t)
@@ -919,6 +927,29 @@ mod tests {
             bridge.authorize_publish(10_000, "live", "bogus").is_err(),
             "rate-limited victim must not get a fresh brute-force window"
         );
+    }
+
+    #[test]
+    fn new_ip_is_rejected_when_auth_failure_map_is_fully_saturated_and_throttled() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        let now = Instant::now();
+
+        {
+            let mut guard = bridge.auth_failures.lock();
+            for i in 0..MAX_TRACKED_AUTH_FAILURE_KEYS {
+                guard.insert(format!("198.51.100.{i}"), vec![now; RTMP_AUTH_MAX_FAILURES]);
+            }
+        }
+
+        let overflow_ip = "203.0.113.200";
+        bridge.on_connect(9_999, &format!("{overflow_ip}:1935"));
+        assert!(
+            bridge.is_auth_rate_limited(overflow_ip),
+            "an untracked IP must be rejected, not silently let through, \
+             while every bucket in a full auth-failure map is actively throttled"
+        );
+        assert!(bridge.authorize_publish(9_999, "live", "bogus").is_err());
     }
 
     #[test]
