@@ -131,6 +131,7 @@ pub(crate) fn rtmp_media_cb(
     frame_type: librtmp2::types::FrameType,
     codec: Option<&str>,
 ) -> bool {
+    ensure_conn_registered_for_auth(conn_id);
     with_rtmp_bridge(|bridge| {
         let kind = match frame_type {
             librtmp2::types::FrameType::Video => FrameKind::Video,
@@ -145,7 +146,7 @@ pub(crate) fn rtmp_media_cb(
         };
         bridge.on_frame(conn_id, &frame)
     })
-    .unwrap_or(true)
+    .unwrap_or(false)
 }
 
 /// Per-connection bookkeeping the RTMP poll loop keeps for the lifetime of

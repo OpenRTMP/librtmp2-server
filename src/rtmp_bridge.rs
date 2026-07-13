@@ -195,6 +195,17 @@ impl DbRtmpBridge {
             .is_some_and(|cs| !cs.remote_ip.is_empty())
     }
 
+    fn auth_rate_key(conn: ConnId, remote_ip: &str) -> String {
+        if remote_ip.is_empty() {
+            // Per-connection bucket when on_connect has not run yet (unit tests
+            // calling the bridge directly) — avoids a shared "" bucket while
+            // still bounding brute-force attempts per TCP session.
+            format!("conn:{conn}")
+        } else {
+            remote_ip.to_string()
+        }
+    }
+
     fn is_auth_rate_limited(&self, remote_ip: &str) -> bool {
         let mut guard = self.auth_failures.lock();
         let now = Instant::now();
@@ -758,26 +769,19 @@ impl RtmpEventHandler for DbRtmpBridge {
             .get(&conn)
             .map(|cs| cs.remote_ip.clone())
             .unwrap_or_default();
-        // Auth throttling needs a real per-client key. If authorize_publish
-        // runs before on_connect has populated ConnState (supported by the
-        // same-tick race noted in on_connect), remote_ip is empty — skip
-        // throttling entirely rather than share a "" bucket across unrelated
-        // connections, which would let one attacker lock out everyone else.
-        let ip_known = !remote_ip.is_empty();
-        if ip_known && self.is_auth_rate_limited(&remote_ip) {
+        let rate_key = Self::auth_rate_key(conn, &remote_ip);
+        if self.is_auth_rate_limited(&rate_key) {
             crate::log_warn!("RTMP: publish rejected — auth rate limit exceeded conn={conn}");
             return Err(());
         }
         match self.try_authorize_publish(conn, app, stream_key) {
             Ok(()) => {
-                if ip_known {
-                    self.clear_auth_failures(&remote_ip);
-                }
+                self.clear_auth_failures(&rate_key);
                 Ok(())
             }
             Err(kind) => {
-                if ip_known && kind == AuthFailureKind::Credential {
-                    self.record_auth_failure(&remote_ip);
+                if kind == AuthFailureKind::Credential {
+                    self.record_auth_failure(&rate_key);
                 }
                 Err(())
             }
@@ -791,21 +795,19 @@ impl RtmpEventHandler for DbRtmpBridge {
             .get(&conn)
             .map(|cs| cs.remote_ip.clone())
             .unwrap_or_default();
-        let ip_known = !remote_ip.is_empty();
-        if ip_known && self.is_auth_rate_limited(&remote_ip) {
+        let rate_key = Self::auth_rate_key(conn, &remote_ip);
+        if self.is_auth_rate_limited(&rate_key) {
             crate::log_warn!("RTMP: play rejected — auth rate limit exceeded conn={conn}");
             return Err(());
         }
         match self.try_authorize_play(conn, app, stream_key) {
             Ok(()) => {
-                if ip_known {
-                    self.clear_auth_failures(&remote_ip);
-                }
+                self.clear_auth_failures(&rate_key);
                 Ok(())
             }
             Err(kind) => {
-                if ip_known && kind == AuthFailureKind::Credential {
-                    self.record_auth_failure(&remote_ip);
+                if kind == AuthFailureKind::Credential {
+                    self.record_auth_failure(&rate_key);
                 }
                 Err(())
             }
@@ -968,19 +970,35 @@ mod tests {
     }
 
     #[test]
-    fn publish_before_on_connect_skips_auth_failure_tracking() {
+    fn publish_before_on_connect_uses_per_conn_auth_rate_limit() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = test_bridge(db);
         let ip = "203.0.113.7:1935";
+        const CONN: ConnId = 1;
 
-        for conn in 0..(RTMP_AUTH_MAX_FAILURES as u64 + 2) {
-            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
-            bridge.on_connect(conn, ip);
+        for _ in 0..RTMP_AUTH_MAX_FAILURES {
+            assert!(
+                bridge.authorize_publish(CONN, "live", "bogus").is_err(),
+                "each failed attempt must reuse the same connection id"
+            );
         }
+        let conn_key = format!("conn:{CONN}");
+        assert!(
+            bridge.is_auth_rate_limited(&conn_key),
+            "a single connection must be throttled after exhausting its auth budget"
+        );
+        assert!(
+            bridge.authorize_publish(CONN, "live", "bogus").is_err(),
+            "rate-limited connection should be rejected"
+        );
 
+        // A different connection id still gets a fresh bucket before on_connect.
+        assert!(bridge.authorize_publish(2, "live", "bogus").is_err());
+        bridge.on_connect(CONN, ip);
+        bridge.on_connect(2, ip);
         assert!(
             !bridge.is_auth_rate_limited(&remote_ip_of(ip)),
-            "failed publish attempts before on_connect must not consume the per-IP auth budget"
+            "pre-on_connect per-conn buckets must not throttle the shared IP"
         );
     }
 
