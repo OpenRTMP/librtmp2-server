@@ -900,10 +900,7 @@ mod tests {
         {
             let mut guard = bridge.auth_failures.lock();
             for i in 0..MAX_TRACKED_AUTH_FAILURE_KEYS {
-                guard.insert(
-                    format!("198.51.100.{i}"),
-                    vec![stale],
-                );
+                guard.insert(format!("198.51.100.{i}"), vec![stale]);
             }
         }
 
