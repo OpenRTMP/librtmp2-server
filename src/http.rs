@@ -1003,9 +1003,14 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
         if std::time::Instant::now() >= deadline {
-            let _ = state.db.stream_set_enabled(&id, true);
+            // Leave the stream disabled (`pending_delete=1`) so a failed drain
+            // does not silently re-enable publish/play keys. Operators can
+            // retry the delete once RTMP sessions drop.
             state.deleted_streams.lock().remove(&id);
-            crate::log_warn!("Timed out deleting stream '{id}' — active RTMP sessions remained");
+            crate::log_warn!(
+                "Timed out deleting stream '{id}' — stream stays disabled; \
+                 active RTMP sessions remained"
+            );
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
