@@ -209,7 +209,7 @@ impl DbRtmpBridge {
             guard.remove(remote_ip);
             return false;
         }
-        entries.len() >= RTMP_AUTH_MAX_FAILURES
+        Self::active_auth_failure_count(entries, now) >= RTMP_AUTH_MAX_FAILURES
     }
 
     /// Drop every tracked IP whose failure window has fully expired, so
@@ -224,17 +224,37 @@ impl DbRtmpBridge {
         });
     }
 
+    fn active_auth_failure_count(entries: &[Instant], now: Instant) -> usize {
+        entries
+            .iter()
+            .copied()
+            .filter(|t| {
+                now.checked_duration_since(*t)
+                    .is_none_or(|age| age < RTMP_AUTH_FAILURE_WINDOW)
+            })
+            .count()
+    }
+
     /// Remove the least-recently-active IP bucket when still at capacity
-    /// after purging expired entries.
-    fn evict_oldest_auth_failure_bucket(guard: &mut HashMap<String, Vec<Instant>>) {
+    /// after purging expired entries. Actively rate-limited buckets are never
+    /// evicted — dropping one would reset its failure window and let a client
+    /// immediately resume brute-forcing publish/play keys.
+    fn evict_oldest_eligible_auth_failure_bucket(
+        guard: &mut HashMap<String, Vec<Instant>>,
+        now: Instant,
+    ) -> bool {
         let Some(oldest_key) = guard
             .iter()
+            .filter(|(_, entries)| {
+                Self::active_auth_failure_count(entries, now) < RTMP_AUTH_MAX_FAILURES
+            })
             .min_by_key(|(_, entries)| entries.last().copied().unwrap_or_else(Instant::now))
             .map(|(key, _)| key.clone())
         else {
-            return;
+            return false;
         };
         guard.remove(&oldest_key);
+        true
     }
 
     fn record_auth_failure(&self, remote_ip: &str) {
@@ -242,8 +262,12 @@ impl DbRtmpBridge {
         let now = Instant::now();
         if !guard.contains_key(remote_ip) && guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS {
             Self::purge_expired_auth_failures(&mut guard, now);
-            if guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS {
-                Self::evict_oldest_auth_failure_bucket(&mut guard);
+            if guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS
+                && !Self::evict_oldest_eligible_auth_failure_bucket(&mut guard, now)
+            {
+                // Every tracked IP is actively rate-limited; skip tracking this
+                // new source rather than freeing a throttled bucket.
+                return;
             }
         }
         let entries = guard.entry(remote_ip.to_string()).or_default();
@@ -857,6 +881,44 @@ mod tests {
     fn add_stream_with_player(db: &Db, id: &str, pub_key: &str, play_key: &str) {
         db.stream_add(&sample_stream(id, pub_key, play_key))
             .unwrap();
+    }
+
+    #[test]
+    fn auth_failure_map_saturation_does_not_reset_rate_limited_ip() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        let victim_ip = "203.0.113.9";
+
+        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
+            bridge.on_connect(conn, &format!("{victim_ip}:1935"));
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+        }
+        assert!(bridge.is_auth_rate_limited(victim_ip));
+
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(1);
+        {
+            let mut guard = bridge.auth_failures.lock();
+            for i in 0..MAX_TRACKED_AUTH_FAILURE_KEYS {
+                guard.insert(format!("198.51.100.{i}"), vec![stale]);
+            }
+        }
+
+        bridge.on_connect(9_999, "198.51.100.254:1935");
+        assert!(
+            bridge.authorize_publish(9_999, "live", "bogus").is_err(),
+            "new IP should still be rejected, but must not evict the victim bucket"
+        );
+
+        bridge.on_connect(10_000, &format!("{victim_ip}:1935"));
+        assert!(
+            bridge.is_auth_rate_limited(victim_ip),
+            "victim IP must stay throttled after auth-failure map saturation"
+        );
+        assert!(
+            bridge.authorize_publish(10_000, "live", "bogus").is_err(),
+            "rate-limited victim must not get a fresh brute-force window"
+        );
     }
 
     #[test]
