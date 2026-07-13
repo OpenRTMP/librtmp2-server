@@ -13,6 +13,22 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- Stream delete no longer re-enables publish/play keys when the 30-second
+  wait for active RTMP sessions times out; the stream stays disabled
+  (`pending_delete=1`) so operators can retry once sessions drop.
+
+### Security
+- RTMP publish/play/media callbacks now register the connection for auth
+  tracking before authorization runs, so per-IP auth-failure rate limits
+  apply even when `publish` arrives before `on_connect` processes the
+  session.
+- Auth-failure rate limiting uses a per-connection bucket when the remote
+  IP is not yet known, instead of sharing one empty-key bucket across all
+  such sessions.
+- `rtmp_media_cb` now fails closed (`unwrap_or(false)`) when the bridge
+  lock is unavailable, instead of accepting media frames.
+
 ## [0.1.3] — 2026-07-12
 
 ### Changed
