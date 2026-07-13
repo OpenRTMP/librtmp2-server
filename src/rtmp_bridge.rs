@@ -974,22 +974,27 @@ mod tests {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = test_bridge(db);
         let ip = "203.0.113.7:1935";
+        const CONN: ConnId = 1;
 
         for _ in 0..RTMP_AUTH_MAX_FAILURES {
-            assert!(bridge.authorize_publish(1, "live", "bogus").is_err());
+            assert!(
+                bridge.authorize_publish(CONN, "live", "bogus").is_err(),
+                "each failed attempt must reuse the same connection id"
+            );
         }
+        let conn_key = format!("conn:{CONN}");
         assert!(
-            bridge.is_auth_rate_limited("conn:1"),
+            bridge.is_auth_rate_limited(&conn_key),
             "a single connection must be throttled after exhausting its auth budget"
         );
         assert!(
-            bridge.authorize_publish(1, "live", "bogus").is_err(),
+            bridge.authorize_publish(CONN, "live", "bogus").is_err(),
             "rate-limited connection should be rejected"
         );
 
         // A different connection id still gets a fresh bucket before on_connect.
         assert!(bridge.authorize_publish(2, "live", "bogus").is_err());
-        bridge.on_connect(1, ip);
+        bridge.on_connect(CONN, ip);
         bridge.on_connect(2, ip);
         assert!(
             !bridge.is_auth_rate_limited(&remote_ip_of(ip)),
