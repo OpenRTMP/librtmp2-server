@@ -975,18 +975,25 @@ mod tests {
         let bridge = test_bridge(db);
         let ip = "203.0.113.7:1935";
 
-        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
-            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
-            bridge.on_connect(conn, ip);
+        for _ in 0..RTMP_AUTH_MAX_FAILURES {
+            assert!(bridge.authorize_publish(1, "live", "bogus").is_err());
         }
-
         assert!(
-            !bridge.is_auth_rate_limited(&remote_ip_of(ip)),
-            "pre-on_connect failures use per-conn buckets and must not throttle the IP yet"
+            bridge.is_auth_rate_limited("conn:1"),
+            "a single connection must be throttled after exhausting its auth budget"
         );
         assert!(
-            bridge.is_auth_rate_limited("conn:0"),
-            "a single connection must be throttled after exhausting its auth budget"
+            bridge.authorize_publish(1, "live", "bogus").is_err(),
+            "rate-limited connection should be rejected"
+        );
+
+        // A different connection id still gets a fresh bucket before on_connect.
+        assert!(bridge.authorize_publish(2, "live", "bogus").is_err());
+        bridge.on_connect(1, ip);
+        bridge.on_connect(2, ip);
+        assert!(
+            !bridge.is_auth_rate_limited(&remote_ip_of(ip)),
+            "pre-on_connect per-conn buckets must not throttle the shared IP"
         );
     }
 
