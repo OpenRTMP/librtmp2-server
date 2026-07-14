@@ -1338,9 +1338,9 @@ async fn handle_stream_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtmp_bridge::RtmpEventHandler;
     use axum::body::Body;
     use axum::http::Request;
-    use crate::rtmp_bridge::RtmpEventHandler;
     use tower::ServiceExt;
 
     fn test_state(api_token: &str) -> Arc<AppState> {
