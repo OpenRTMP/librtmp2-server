@@ -255,10 +255,7 @@ mod tests {
         {
             let mut guard = limiter.inner.lock();
             for i in 0..MAX_TRACKED_KEYS {
-                guard.insert(
-                    format!("203.0.113.{i}:api"),
-                    vec![now; max],
-                );
+                guard.insert(format!("203.0.113.{i}:api"), vec![now; max]);
             }
         }
 
