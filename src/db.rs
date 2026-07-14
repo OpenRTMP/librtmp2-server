@@ -1292,13 +1292,8 @@ mod tests {
     #[test]
     fn stream_set_enabled_clears_pending_delete() {
         let db = Db::open(":memory:").unwrap();
-        db.stream_add(&sample_stream(
-            "rollback",
-            "pub_roll",
-            "pl_roll",
-            "st_roll",
-        ))
-        .unwrap();
+        db.stream_add(&sample_stream("rollback", "pub_roll", "pl_roll", "st_roll"))
+            .unwrap();
         assert_eq!(db.stream_disable("rollback"), Some(true));
         assert!(db.stream_set_enabled("rollback", true));
 

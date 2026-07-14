@@ -2366,7 +2366,10 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "deleting");
         assert!(state.deleted_streams.lock().contains("busy"));
-        assert_eq!(state.db.stream_ids_pending_delete(), vec!["busy".to_string()]);
+        assert_eq!(
+            state.db.stream_ids_pending_delete(),
+            vec!["busy".to_string()]
+        );
         let DbLookup::Ok(st) = state.db.stream_get("busy") else {
             panic!("stream should remain until RTMP drain completes");
         };
