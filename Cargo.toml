@@ -15,9 +15,9 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-# Until librtmp2 0.4.0 is merged and published on crates.io, track the feature branch.
-# After release, replace with: librtmp2 = { version = "0.4.0", features = ["tls"] }
-librtmp2 = { version = "0.4.0", git = "https://github.com/OpenRTMP/librtmp2", branch = "feat/ertmp-v2-multitrack-0.4.0", features = ["tls"] }
+# Until librtmp2 0.4.0 is published on crates.io, pin the exact validated
+# commit from librtmp2 PR #128 so builds stay reproducible.
+librtmp2 = { version = "0.4.0", git = "https://github.com/OpenRTMP/librtmp2", rev = "ad021f97631cd2033abaee43e711bc406ca10c17", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
