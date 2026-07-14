@@ -1,6 +1,7 @@
 //! `.env`-style configuration file parsing.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -31,6 +32,17 @@ pub struct ServerConfig {
     /// When the TCP peer is one of these addresses, use `X-Forwarded-For` for rate limiting.
     pub http_trusted_proxies: Vec<IpAddr>,
 
+    /// HTTP rate-limit sliding window (seconds).
+    pub http_rate_limit_window_secs: u64,
+    /// Max requests per window for `/api/*` routes.
+    pub http_rate_limit_api: usize,
+    /// Max requests per window for `/stats*` routes.
+    pub http_rate_limit_stats: usize,
+    /// Max requests per window for all other HTTP routes.
+    pub http_rate_limit_default: usize,
+    /// Maximum accepted HTTP request body size (bytes).
+    pub http_max_body_bytes: usize,
+
     /// Populated at startup from the database, never from the config file.
     pub api_token: String,
 
@@ -57,6 +69,11 @@ impl Default for ServerConfig {
             rtmps_bind: "0.0.0.0:1936".to_string(),
             http_bind: "0.0.0.0:8080".to_string(),
             http_trusted_proxies: Vec::new(),
+            http_rate_limit_window_secs: 60,
+            http_rate_limit_api: 120,
+            http_rate_limit_stats: 30,
+            http_rate_limit_default: 60,
+            http_max_body_bytes: 64 * 1024,
             api_token: String::new(),
             config_file: String::new(),
             log_level: 2,
@@ -72,6 +89,16 @@ impl ServerConfig {
             max_stream_cache_bytes: mb_to_bytes(self.rtmp_max_cache_mb),
             max_reassembly_bytes: mb_to_bytes(self.rtmp_max_reassembly_mb),
             max_pending_relay_bytes: mb_to_bytes(self.rtmp_max_relay_queue_mb),
+        }
+    }
+
+    /// HTTP rate-limit settings for the Axum middleware.
+    pub fn http_rate_limit_config(&self) -> crate::rate_limit::HttpRateLimitConfig {
+        crate::rate_limit::HttpRateLimitConfig {
+            window: Duration::from_secs(self.http_rate_limit_window_secs),
+            api_max: self.http_rate_limit_api,
+            stats_max: self.http_rate_limit_stats,
+            default_max: self.http_rate_limit_default,
         }
     }
 
@@ -167,6 +194,36 @@ fn parse_ip_list(val: &str) -> Vec<IpAddr> {
         .collect()
 }
 
+fn parse_rate_limit_window_secs(val: &str) -> u64 {
+    match val.parse::<u64>() {
+        Ok(v) => v.clamp(1, 3600),
+        Err(_) => {
+            eprintln!("Config: ignoring invalid HTTP_RATE_LIMIT_WINDOW_SECS value '{val}'");
+            60
+        }
+    }
+}
+
+fn parse_rate_limit_count(val: &str, default: usize, max: usize, key: &str) -> usize {
+    match val.parse::<usize>() {
+        Ok(v) => v.clamp(1, max),
+        Err(_) => {
+            eprintln!("Config: ignoring invalid {key} value '{val}'");
+            default
+        }
+    }
+}
+
+fn parse_max_body_bytes(val: &str) -> usize {
+    match val.parse::<usize>() {
+        Ok(v) => v.clamp(1024, 16 * 1024 * 1024),
+        Err(_) => {
+            eprintln!("Config: ignoring invalid HTTP_MAX_BODY_BYTES value '{val}'");
+            64 * 1024
+        }
+    }
+}
+
 /// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
 fn parse_env_line(line: &str) -> Option<(String, String)> {
     let line = line.trim();
@@ -221,6 +278,22 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "RTMPS_BIND" => config.rtmps_bind = val.to_string(),
         "HTTP_BIND" => config.http_bind = val.to_string(),
         "HTTP_TRUSTED_PROXIES" => config.http_trusted_proxies = parse_ip_list(val),
+        "HTTP_RATE_LIMIT_WINDOW_SECS" => {
+            config.http_rate_limit_window_secs = parse_rate_limit_window_secs(val);
+        }
+        "HTTP_RATE_LIMIT_API" => {
+            config.http_rate_limit_api =
+                parse_rate_limit_count(val, 120, 10_000, "HTTP_RATE_LIMIT_API");
+        }
+        "HTTP_RATE_LIMIT_STATS" => {
+            config.http_rate_limit_stats =
+                parse_rate_limit_count(val, 30, 10_000, "HTTP_RATE_LIMIT_STATS");
+        }
+        "HTTP_RATE_LIMIT_DEFAULT" => {
+            config.http_rate_limit_default =
+                parse_rate_limit_count(val, 60, 10_000, "HTTP_RATE_LIMIT_DEFAULT");
+        }
+        "HTTP_MAX_BODY_BYTES" => config.http_max_body_bytes = parse_max_body_bytes(val),
         "LOG_LEVEL" => match val.parse::<i32>() {
             Ok(v) if (0..=3).contains(&v) => config.log_level = v,
             _ => eprintln!("Config: ignoring invalid LOG_LEVEL value '{val}' (expected 0-3)"),
@@ -343,6 +416,39 @@ where
         config.http_trusted_proxies = parse_ip_list(&v);
     }
 
+    if let Some(v) = get("LRTMP2_HTTP_RATE_LIMIT_WINDOW_SECS")
+        && !v.is_empty()
+    {
+        config.http_rate_limit_window_secs = parse_rate_limit_window_secs(&v);
+    }
+
+    if let Some(v) = get("LRTMP2_HTTP_RATE_LIMIT_API")
+        && !v.is_empty()
+    {
+        config.http_rate_limit_api =
+            parse_rate_limit_count(&v, 120, 10_000, "LRTMP2_HTTP_RATE_LIMIT_API");
+    }
+
+    if let Some(v) = get("LRTMP2_HTTP_RATE_LIMIT_STATS")
+        && !v.is_empty()
+    {
+        config.http_rate_limit_stats =
+            parse_rate_limit_count(&v, 30, 10_000, "LRTMP2_HTTP_RATE_LIMIT_STATS");
+    }
+
+    if let Some(v) = get("LRTMP2_HTTP_RATE_LIMIT_DEFAULT")
+        && !v.is_empty()
+    {
+        config.http_rate_limit_default =
+            parse_rate_limit_count(&v, 60, 10_000, "LRTMP2_HTTP_RATE_LIMIT_DEFAULT");
+    }
+
+    if let Some(v) = get("LRTMP2_HTTP_MAX_BODY_BYTES")
+        && !v.is_empty()
+    {
+        config.http_max_body_bytes = parse_max_body_bytes(&v);
+    }
+
     if let Some(v) = get("LRTMP2_LOG_LEVEL") {
         match v.parse::<i32>() {
             Ok(lvl) if (0..=3).contains(&lvl) => config.log_level = lvl,
@@ -372,6 +478,11 @@ mod tests {
         assert!(config.tls_key_file.is_empty());
         assert_eq!(config.rtmps_bind, "0.0.0.0:1936");
         assert!(config.http_trusted_proxies.is_empty());
+        assert_eq!(config.http_rate_limit_window_secs, 60);
+        assert_eq!(config.http_rate_limit_api, 120);
+        assert_eq!(config.http_rate_limit_stats, 30);
+        assert_eq!(config.http_rate_limit_default, 60);
+        assert_eq!(config.http_max_body_bytes, 64 * 1024);
     }
 
     #[test]
@@ -392,6 +503,11 @@ mod tests {
              RTMPS_BIND=127.0.0.1:1937\n\
              HTTP_BIND=127.0.0.1:8081\n\
              HTTP_TRUSTED_PROXIES=127.0.0.1,10.0.0.1\n\
+             HTTP_RATE_LIMIT_WINDOW_SECS=30\n\
+             HTTP_RATE_LIMIT_API=200\n\
+             HTTP_RATE_LIMIT_STATS=60\n\
+             HTTP_RATE_LIMIT_DEFAULT=90\n\
+             HTTP_MAX_BODY_BYTES=32768\n\
              LOG_LEVEL=3\n",
         )
         .unwrap();
@@ -413,6 +529,11 @@ mod tests {
         assert_eq!(config.tls_key_file, "/etc/ssl/key.pem");
         assert_eq!(config.rtmps_bind, "127.0.0.1:1937");
         assert_eq!(config.http_trusted_proxies.len(), 2);
+        assert_eq!(config.http_rate_limit_window_secs, 30);
+        assert_eq!(config.http_rate_limit_api, 200);
+        assert_eq!(config.http_rate_limit_stats, 60);
+        assert_eq!(config.http_rate_limit_default, 90);
+        assert_eq!(config.http_max_body_bytes, 32768);
     }
 
     #[test]

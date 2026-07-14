@@ -846,22 +846,36 @@ impl RtmpEventHandler for DbRtmpBridge {
 
         if let Some(mut pub_row) = cs.publisher {
             pub_row.active = false;
-            self.db.publisher_update(&pub_row.id, &pub_row);
-            crate::log_info!(
-                "RTMP: publisher disconnected: stream={} session={}",
-                pub_row.stream_id,
-                pub_row.id
-            );
+            if self.db.publisher_update(&pub_row.id, &pub_row) {
+                crate::log_info!(
+                    "RTMP: publisher disconnected: stream={} session={}",
+                    pub_row.stream_id,
+                    pub_row.id
+                );
+            } else {
+                crate::log_error!(
+                    "RTMP: failed to deactivate publisher on close: stream={} session={}",
+                    pub_row.stream_id,
+                    pub_row.id
+                );
+            }
         }
 
         if let Some(mut player_row) = cs.player {
             player_row.active = false;
-            self.db.player_update(&player_row.id, &player_row);
-            crate::log_info!(
-                "RTMP: player disconnected: stream={} session={}",
-                player_row.stream_id,
-                player_row.id
-            );
+            if self.db.player_update(&player_row.id, &player_row) {
+                crate::log_info!(
+                    "RTMP: player disconnected: stream={} session={}",
+                    player_row.stream_id,
+                    player_row.id
+                );
+            } else {
+                crate::log_error!(
+                    "RTMP: failed to deactivate player on close: stream={} session={}",
+                    player_row.stream_id,
+                    player_row.id
+                );
+            }
         }
     }
 }

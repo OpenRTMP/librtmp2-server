@@ -16,6 +16,12 @@ services:
       # - LRTMP2_TLS_CERT_FILE=/certs/fullchain.pem
       # - LRTMP2_TLS_KEY_FILE=/certs/privkey.pem
       # - LRTMP2_RTMPS_BIND=0.0.0.0:1936
+      # HTTP rate limiting (sliding window per client IP + route class):
+      # - LRTMP2_HTTP_RATE_LIMIT_WINDOW_SECS=60
+      # - LRTMP2_HTTP_RATE_LIMIT_STATS=30      # /stats, /stats-nginx
+      # - LRTMP2_HTTP_RATE_LIMIT_API=120       # /api/*
+      # - LRTMP2_HTTP_RATE_LIMIT_DEFAULT=60    # other HTTP routes
+      # - LRTMP2_HTTP_MAX_BODY_BYTES=65536
     volumes:
       - server-data:/data
       # - ./certs:/certs:ro   # needed when RTMPS is enabled

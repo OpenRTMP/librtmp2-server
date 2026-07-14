@@ -10,7 +10,7 @@
 //!   GET    /api/v1/streams/:id/stats            Bearer = full JSON; key = flat public JSON
 //!   GET    /stats-nginx?key=<stats_key>         XML (nginx-rtmp compatible)
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -42,7 +42,10 @@ pub struct AppState {
 
 /// Build the Axum router, wiring all HTTP handlers to the shared application state.
 pub fn router(state: Arc<AppState>) -> Router {
-    let limiter = RateLimiter::new(state.config.http_trusted_proxies.clone());
+    let limiter = RateLimiter::new(
+        state.config.http_rate_limit_config(),
+        state.config.http_trusted_proxies.clone(),
+    );
     Router::new()
         .route("/api/v1/health", get(handle_health))
         .route("/stats", get(handle_stats_json))
@@ -62,6 +65,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/streams/{id}/players/{player_id}",
             delete(handle_stream_player_delete),
         )
+        .layer(DefaultBodyLimit::max(state.config.http_max_body_bytes))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit::middleware,
