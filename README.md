@@ -29,10 +29,11 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
 ### Protocol behaviour inherited from librtmp2 (not reimplemented here)
 
-- Live H.264/AAC and Enhanced-RTMP **passthrough** ingest (HEVC/AV1 from FFmpeg/OBS)
-- Late player join gets cached **legacy** H.264/AAC sequence headers + last keyframe only — not Enhanced-RTMP sequence starts
-- Publisher `onMetaData` is parsed for stats; **not** forwarded to players
-- No VOD commands (`pause` / `seek`), no E-RTMP v2 session negotiation, no nginx-rtmp feature parity (HLS, exec, push relay, recording)
+- Live H.264/AAC and Enhanced-RTMP **passthrough** ingest (HEVC/AV1/Opus, multitrack when publishers send it)
+- Late player join gets cached codec sequence headers (legacy + Enhanced-RTMP) and last keyframe; `onMetaData` is replayed to late joiners
+- Legacy RTMP commands (`pause`, `seek`, `receiveAudio`/`receiveVideo`, `closeStream`) are handled in the protocol layer
+- E-RTMP v2 connect capability negotiation and multitrack relay live in `librtmp2`; this server does not expose per-track IDs in the HTTP API yet
+- No nginx-rtmp feature parity (HLS, exec, push relay, recording)
 
 Test your OBS/FFmpeg workflow before using this for critical streams. It is not a drop-in replacement for `nginx-rtmp`.
 

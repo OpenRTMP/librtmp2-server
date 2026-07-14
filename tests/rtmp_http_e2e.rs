@@ -100,18 +100,11 @@ fn http_create_stream_then_rtmp_publish_and_play() {
         let frame = Frame {
             frame_type: FrameType::Video,
             timestamp: 0,
-            composition_time: 0,
             size: data.len() as u32,
             data: data.as_ptr(),
-            audio_codec: Default::default(),
-            audio_sample_rate: 0,
-            audio_channels: 0,
-            audio_bit_depth: 0,
-            audio_fourcc: Default::default(),
             video_codec: VideoCodec::H264,
-            video_fourcc: Default::default(),
             video_frame_type: 1,
-            is_metadata: 0,
+            ..Default::default()
         };
         publisher.send_frame(&frame)?;
 
