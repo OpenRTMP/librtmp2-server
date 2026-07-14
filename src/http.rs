@@ -1340,6 +1340,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use crate::rtmp_bridge::RtmpEventHandler;
     use tower::ServiceExt;
 
     fn test_state(api_token: &str) -> Arc<AppState> {
