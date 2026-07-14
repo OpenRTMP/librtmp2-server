@@ -1343,10 +1343,13 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(api_token: &str) -> Arc<AppState> {
-        let config = ServerConfig {
+        test_state_with_config(ServerConfig {
             api_token: api_token.to_string(),
             ..Default::default()
-        };
+        })
+    }
+
+    fn test_state_with_config(config: ServerConfig) -> Arc<AppState> {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(
@@ -1360,6 +1363,10 @@ mod tests {
             deleted_streams,
             revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    fn bearer(token: &str) -> (&'static str, String) {
+        ("Authorization", format!("Bearer {token}"))
     }
 
     #[tokio::test]
@@ -2163,5 +2170,283 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "stats_key required");
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_denies_protected_routes() {
+        let app = router(test_state("correct-token-value-here"));
+        let (header, value) = bearer("wrong-token-value-here");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_rate_limit_returns_429_when_exceeded() {
+        let state = test_state_with_config(ServerConfig {
+            api_token: "token".to_string(),
+            http_rate_limit_api: 3,
+            ..Default::default()
+        });
+        let app = router(state);
+
+        for _ in 0..3 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn stats_rate_limit_returns_429_when_exceeded() {
+        let state = test_state_with_config(ServerConfig {
+            api_token: "token".to_string(),
+            http_rate_limit_stats: 2,
+            ..Default::default()
+        });
+        let stream = Stream {
+            id: "ratestream".to_string(),
+            name: "Rate".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_rate_key_with_sufficient_length_here".to_string(),
+            play_key: "play_rate_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_rate_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        let app = router(state);
+        let uri = "/stats?key=st_rate_key_with_sufficient_length_here";
+
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected() {
+        let state = test_state_with_config(ServerConfig {
+            api_token: "a-strong-random-secret-value".to_string(),
+            http_max_body_bytes: 1024,
+            ..Default::default()
+        });
+        let app = router(state);
+        let huge = "x".repeat(2048);
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header(header, value)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(format!(r#"{{"id":"big","name":"{huge}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn delete_stream_without_live_connections_removes_stream() {
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "gone".to_string(),
+            name: "Gone".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_gone_key_with_sufficient_length_here".to_string(),
+            play_key: "play_gone_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_gone_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        let app = router(state.clone());
+        let (header, value) = bearer("a-strong-random-secret-value");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/gone")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "deleted");
+        assert!(matches!(state.db.stream_get("gone"), DbLookup::Missing));
+        assert!(!state.deleted_streams.lock().contains("gone"));
+    }
+
+    #[tokio::test]
+    async fn delete_stream_with_live_connections_returns_accepted() {
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "busy".to_string(),
+            name: "Busy".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_busy_key_with_sufficient_length_here".to_string(),
+            play_key: "play_busy_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_busy_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.rtmp_bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            state
+                .rtmp_bridge
+                .authorize_publish(1, "live", "pub_busy_key_with_sufficient_length_here")
+                .is_ok()
+        );
+
+        let app = router(state.clone());
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/busy")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "deleting");
+        assert!(state.deleted_streams.lock().contains("busy"));
+        assert_eq!(state.db.stream_ids_pending_delete(), vec!["busy".to_string()]);
+        let DbLookup::Ok(st) = state.db.stream_get("busy") else {
+            panic!("stream should remain until RTMP drain completes");
+        };
+        assert!(!st.enabled);
+    }
+
+    #[tokio::test]
+    async fn delete_stream_finalizes_after_rtmp_disconnect() {
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "drain".to_string(),
+            name: "Drain".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_drain_key_with_sufficient_length_here".to_string(),
+            play_key: "play_drain_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_drain_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.rtmp_bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            state
+                .rtmp_bridge
+                .authorize_publish(1, "live", "pub_drain_key_with_sufficient_length_here")
+                .is_ok()
+        );
+
+        let app = router(state.clone());
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/drain")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        state.rtmp_bridge.on_close(1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(matches!(state.db.stream_get("drain"), DbLookup::Missing));
+        assert!(!state.deleted_streams.lock().contains("drain"));
+        assert!(state.db.stream_ids_pending_delete().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_stream_conflict_while_already_deleting() {
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pending".to_string(),
+            name: "Pending".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_pend_key_with_sufficient_length_here".to_string(),
+            play_key: "play_pend_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_pend_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.deleted_streams.lock().insert("pending".to_string());
+
+        let app = router(state);
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/pending")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 }

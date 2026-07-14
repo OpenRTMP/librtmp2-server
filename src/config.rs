@@ -668,4 +668,31 @@ mod tests {
         assert_eq!(port_of("127.0.0.1", 1935), 1935);
         assert_eq!(port_of("my-host.example.com", 1936), 1936);
     }
+
+    #[test]
+    fn env_overrides_http_rate_limits_and_body_size() {
+        let env = HashMap::from([
+            ("LRTMP2_HTTP_RATE_LIMIT_WINDOW_SECS", "120"),
+            ("LRTMP2_HTTP_RATE_LIMIT_API", "50"),
+            ("LRTMP2_HTTP_RATE_LIMIT_STATS", "15"),
+            ("LRTMP2_HTTP_RATE_LIMIT_DEFAULT", "25"),
+            ("LRTMP2_HTTP_MAX_BODY_BYTES", "2048"),
+        ]);
+
+        let mut config = ServerConfig::default();
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+
+        assert_eq!(config.http_rate_limit_window_secs, 120);
+        assert_eq!(config.http_rate_limit_api, 50);
+        assert_eq!(config.http_rate_limit_stats, 15);
+        assert_eq!(config.http_rate_limit_default, 25);
+        assert_eq!(config.http_max_body_bytes, 2048);
+    }
+
+    #[test]
+    fn parse_max_body_bytes_clamps_and_invalid_falls_back() {
+        assert_eq!(parse_max_body_bytes("500"), 1024);
+        assert_eq!(parse_max_body_bytes("99999999"), 16 * 1024 * 1024);
+        assert_eq!(parse_max_body_bytes("bad"), 64 * 1024);
+    }
 }

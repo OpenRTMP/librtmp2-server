@@ -1055,6 +1055,22 @@ mod tests {
     }
 
     #[test]
+    fn publish_and_play_reject_stream_marked_for_deletion() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let deleted = Arc::new(Mutex::new(HashSet::new()));
+        deleted.lock().insert("s1".to_string());
+        let bridge = DbRtmpBridge::new(db, deleted);
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", "pub_k").is_err());
+        bridge.on_close(1);
+
+        bridge.on_connect(2, "127.0.0.1:1000");
+        assert!(bridge.authorize_play(2, "live", "pl_k").is_err());
+    }
+
+    #[test]
     fn publish_with_valid_key_for_disabled_stream_does_not_burn_auth_budget() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         add_stream_with_player(&db, "s1", "pub_k", "pl_k");

@@ -1271,6 +1271,45 @@ mod tests {
     }
 
     #[test]
+    fn stream_disable_marks_pending_delete_and_disables() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "pending",
+            "pub_pending",
+            "pl_pending",
+            "st_pending",
+        ))
+        .unwrap();
+
+        assert_eq!(db.stream_disable("pending"), Some(true));
+        let DbLookup::Ok(stream) = db.stream_get("pending") else {
+            panic!("stream should still exist while pending delete");
+        };
+        assert!(!stream.enabled);
+        assert_eq!(db.stream_ids_pending_delete(), vec!["pending".to_string()]);
+    }
+
+    #[test]
+    fn stream_set_enabled_clears_pending_delete() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "rollback",
+            "pub_roll",
+            "pl_roll",
+            "st_roll",
+        ))
+        .unwrap();
+        assert_eq!(db.stream_disable("rollback"), Some(true));
+        assert!(db.stream_set_enabled("rollback", true));
+
+        let DbLookup::Ok(stream) = db.stream_get("rollback") else {
+            panic!("stream should remain after rollback");
+        };
+        assert!(stream.enabled);
+        assert!(db.stream_ids_pending_delete().is_empty());
+    }
+
+    #[test]
     fn stream_delete_cascades_active_publishers() {
         let db = Db::open(":memory:").unwrap();
         db.stream_add(&sample_stream(
