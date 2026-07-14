@@ -868,7 +868,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "librtmp2"
 version = "0.4.0"
-source = "git+https://github.com/OpenRTMP/librtmp2?rev=d0649380ba053b49bf7f1b189fc1d4d1a2d18ce4#d0649380ba053b49bf7f1b189fc1d4d1a2d18ce4"
+source = "git+https://github.com/OpenRTMP/librtmp2?branch=feat%2Fertmp-v2-multitrack-0.4.0#aae745baad3caf1b22e3568cc0530ca6e7d46a23"
 dependencies = [
  "cc",
  "libc",

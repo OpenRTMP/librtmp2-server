@@ -13,6 +13,15 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- Track `librtmp2` 0.4.0 from git branch `feat/ertmp-v2-multitrack-0.4.0` instead of
+  a fixed commit rev (follows ongoing librtmp2 PR work until release).
+
+> **After `librtmp2` 0.4.0 is merged and on crates.io:** in `Cargo.toml` remove the
+> `git` / `branch` keys and depend on the registry only, e.g.
+> `librtmp2 = { version = "0.4.0", features = ["tls"] }`, then run
+> `cargo update -p librtmp2` and commit the updated `Cargo.lock`.
+
 ## [0.1.5] — 2026-07-14
 
 ### Changed
