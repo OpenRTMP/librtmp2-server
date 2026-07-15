@@ -18,6 +18,38 @@ pub const PREFIX_STATS_KEY: &str = "sts_";
 /// Prefix for configured viewer-slot row ids (panel-managed play access).
 pub const PREFIX_VIEWER_ID: &str = "vi_";
 
+/// Minimum length for publish/play/stats keys used at runtime. Shorter keys stored
+/// in legacy databases are rejected on RTMP and public stats paths.
+pub const MIN_ACCESS_KEY_LEN: usize = 32;
+
+/// Publish/play/stats keys: safe ASCII, no slashes, minimum entropy via length.
+pub fn is_valid_access_key(value: &str) -> bool {
+    if value.len() < MIN_ACCESS_KEY_LEN || value.len() > 63 {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+pub const ACCESS_KEY_VALIDATION_MSG: &str =
+    "Key must be 32-63 characters, start with a letter or number, and use only letters, numbers, dots, underscores, or hyphens";
+
+#[cfg(test)]
+pub fn test_pad_access_key(value: &str) -> String {
+    if is_valid_access_key(value) {
+        return value.to_string();
+    }
+    let mut padded = value.to_string();
+    while padded.len() < MIN_ACCESS_KEY_LEN {
+        padded.push('x');
+    }
+    padded.chars().take(63).collect()
+}
+
 fn keygen_with_entropy(prefix: &str, entropy_bytes: usize) -> Result<String, String> {
     let mut rnd = vec![0u8; entropy_bytes];
     SysRng
@@ -64,5 +96,12 @@ mod tests {
         let token = keygen_api_token().unwrap();
         assert_eq!(token.len(), API_TOKEN_ENTROPY_BYTES * 2);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn access_key_validation_enforces_minimum_length() {
+        assert!(is_valid_access_key("live.main_1_with_sufficient_length_ok"));
+        assert!(!is_valid_access_key("too_short"));
+        assert!(!is_valid_access_key("a"));
     }
 }
