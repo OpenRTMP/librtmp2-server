@@ -103,13 +103,11 @@ OBS / FFmpeg / App
 
 ### Compile
 
-`librtmp2` 0.4.0 is not on crates.io yet. Until it is published, this repo pins the current commit `fea7e2e` from librtmp2 PR #128 (see `Cargo.toml`) so builds remain reproducible. After merge and crates.io release, change the dependency to a registry-only line:
+`librtmp2-server` uses the published `librtmp2` 0.4.0 release from crates.io:
 
 ```toml
 librtmp2 = { version = "0.4.0", features = ["tls"] }
 ```
-
-Then run `cargo update -p librtmp2` and commit the updated lockfile.
 
 ```bash
 git clone https://github.com/OpenRTMP/librtmp2-server.git

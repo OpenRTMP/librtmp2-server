@@ -16,11 +16,8 @@ begin at `1.0.0`.
 ## [0.1.5] — 2026-07-15
 
 ### Changed
-- Bump the pinned `librtmp2` dependency to **0.4.0** (E-RTMP v2 connect negotiation,
+- Bump the `librtmp2` dependency to the crates.io release **0.4.0** (E-RTMP v2 connect negotiation,
   multitrack relay, Enhanced-RTMP init-cache/onMetaData replay, legacy pause/seek).
-  Until `0.4.0` is on crates.io the lockfile resolves it from git
-  (`OpenRTMP/librtmp2` @ `fea7e2e`); switch back to a crates.io version pin after
-  release.
 - Update README protocol notes to match inherited `librtmp2` 0.4.0 behaviour.
 - Update the RTMP HTTP E2E test `Frame` initializer for the expanded 0.4.0
   `librtmp2::types::Frame` shape, including the optional multitrack `track_id`.
