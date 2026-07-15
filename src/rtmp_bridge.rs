@@ -894,17 +894,23 @@ mod tests {
             id: id.to_string(),
             name: format!("{id} name"),
             app: "live".to_string(),
-            publish_key: pub_key.to_string(),
-            play_key: play_key.to_string(),
-            stats_key: format!("st_{id}"),
+            publish_key: crate::keygen::test_pad_access_key(pub_key),
+            play_key: crate::keygen::test_pad_access_key(play_key),
+            stats_key: crate::keygen::test_pad_access_key(&format!("stats_{id}")),
             enabled: true,
             created_at: crate::db::now_ts(),
         }
     }
 
-    fn add_stream_with_player(db: &Db, id: &str, pub_key: &str, play_key: &str) {
-        db.stream_add(&sample_stream(id, pub_key, play_key))
-            .unwrap();
+    fn add_stream_with_player(
+        db: &Db,
+        id: &str,
+        pub_key: &str,
+        play_key: &str,
+    ) -> crate::db::Stream {
+        let s = sample_stream(id, pub_key, play_key);
+        db.stream_add(&s).unwrap();
+        s
     }
 
     #[test]
@@ -1057,23 +1063,23 @@ mod tests {
     #[test]
     fn publish_and_play_reject_stream_marked_for_deletion() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let deleted = Arc::new(Mutex::new(HashSet::new()));
         deleted.lock().insert("s1".to_string());
         let bridge = DbRtmpBridge::new(db, deleted);
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "live", "pub_k").is_err());
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_err());
         bridge.on_close(1);
 
         bridge.on_connect(2, "127.0.0.1:1000");
-        assert!(bridge.authorize_play(2, "live", "pl_k").is_err());
+        assert!(bridge.authorize_play(2, "live", &s.play_key).is_err());
     }
 
     #[test]
     fn publish_with_valid_key_for_disabled_stream_does_not_burn_auth_budget() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         assert!(db.stream_disable("s1").unwrap());
         let bridge = test_bridge(db);
         let ip = "203.0.113.8:1935";
@@ -1084,7 +1090,11 @@ mod tests {
         // a brute-force guess would.
         for conn in 0..(RTMP_AUTH_MAX_FAILURES as u64 + 2) {
             bridge.on_connect(conn, ip);
-            assert!(bridge.authorize_publish(conn, "live", "pub_k").is_err());
+            assert!(
+                bridge
+                    .authorize_publish(conn, "live", &s.publish_key)
+                    .is_err()
+            );
             bridge.on_close(conn);
         }
 
@@ -1102,33 +1112,37 @@ mod tests {
     #[test]
     fn publish_rejects_key_for_wrong_app() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "other", "pub_k").is_err());
+        assert!(
+            bridge
+                .authorize_publish(1, "other", &s.publish_key)
+                .is_err()
+        );
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
     }
 
     #[test]
     fn play_rejects_key_for_wrong_app() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_play(1, "other", "pl_k").is_err());
+        assert!(bridge.authorize_play(1, "other", &s.play_key).is_err());
         assert_eq!(db.player_list(Some("s1")).len(), 0);
     }
 
     #[test]
     fn publish_then_close_deactivates_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
         assert_eq!(db.publisher_list(Some("s1")).len(), 1);
 
         bridge.on_close(1);
@@ -1138,14 +1152,14 @@ mod tests {
     #[test]
     fn close_only_affects_its_own_connection() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
-        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        let s1 = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
         bridge.on_connect(2, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
-        assert!(bridge.authorize_publish(2, "live", "pub_k2").is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
+        assert!(bridge.authorize_publish(2, "live", &s2.publish_key).is_ok());
 
         bridge.on_close(1);
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
@@ -1155,24 +1169,24 @@ mod tests {
     #[test]
     fn authorize_publish_rejects_second_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
 
         bridge.on_connect(2, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(2, "live", "pub_k").is_err());
+        assert!(bridge.authorize_publish(2, "live", &s.publish_key).is_err());
     }
 
     #[test]
     fn on_connect_preserves_prior_authorize_publish_state() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
         // publish callback can run during poll() before the poll-loop on_connect.
-        assert!(bridge.authorize_publish(1, "live", "pub_k").is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
         bridge.on_connect(1, "127.0.0.1:1000");
 
         assert!(bridge.has_publisher(1));
@@ -1192,13 +1206,13 @@ mod tests {
     #[test]
     fn authorize_publish_switching_streams_deactivates_prior_publisher() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
-        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        let s1 = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
-        assert!(bridge.authorize_publish(1, "live", "pub_k2").is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s2.publish_key).is_ok());
 
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
         assert_eq!(db.publisher_list(Some("s2")).len(), 1);
@@ -1207,16 +1221,20 @@ mod tests {
     #[test]
     fn authorize_publish_failed_switch_keeps_prior_publisher_active() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
-        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        let s1 = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
         bridge.on_connect(2, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
-        assert!(bridge.authorize_publish(2, "live", "pub_k2").is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
+        assert!(bridge.authorize_publish(2, "live", &s2.publish_key).is_ok());
 
-        assert!(bridge.authorize_publish(1, "live", "pub_k2").is_err());
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &s2.publish_key)
+                .is_err()
+        );
 
         assert!(bridge.has_publisher(1));
         assert_eq!(db.publisher_list(Some("s1")).len(), 1);
@@ -1226,13 +1244,13 @@ mod tests {
     #[test]
     fn on_play_switching_streams_deactivates_prior_player() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
-        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        let s1 = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
-        assert!(bridge.authorize_play(1, "live", "pl_k2").is_ok());
+        assert!(bridge.authorize_play(1, "live", &s1.play_key).is_ok());
+        assert!(bridge.authorize_play(1, "live", &s2.play_key).is_ok());
 
         assert_eq!(db.player_list(Some("s1")).len(), 0);
         assert_eq!(db.player_list(Some("s2")).len(), 1);
@@ -1244,17 +1262,17 @@ mod tests {
     #[test]
     fn player_replacement_stats_reset_is_not_consumed_by_publisher_stats() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
-        add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        let s1 = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "live", "pub_k1").is_ok());
-        assert!(bridge.authorize_play(1, "live", "pl_k1").is_ok());
+        assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
+        assert!(bridge.authorize_play(1, "live", &s1.play_key).is_ok());
         bridge.update_publisher_stats(1, 1_000, "avc1", "mp4a", PublisherStreamMetadata::default());
         bridge.update_player_stats(1, 2_000);
 
-        assert!(bridge.authorize_play(1, "live", "pl_k2").is_ok());
+        assert!(bridge.authorize_play(1, "live", &s2.play_key).is_ok());
         bridge.update_publisher_stats(1, 1_500, "avc1", "mp4a", PublisherStreamMetadata::default());
 
         {
@@ -1273,11 +1291,11 @@ mod tests {
     #[test]
     fn update_player_stats_persists_bytes_out() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_play(1, "live", "pl_k").is_ok());
+        assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
         bridge.update_player_stats(1, 4096);
 
         let players = db.player_list(Some("s1"));
@@ -1288,19 +1306,19 @@ mod tests {
     #[test]
     fn play_rejects_when_connection_cap_reached() {
         let db = Arc::new(Db::open(":memory:").unwrap());
-        add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key("pl_k") else {
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
             panic!("viewer not found");
         };
 
         for conn in 1..=crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64 {
             bridge.on_connect(conn, "127.0.0.1:1000");
-            assert!(bridge.authorize_play(conn, "live", "pl_k").is_ok());
+            assert!(bridge.authorize_play(conn, "live", &s.play_key).is_ok());
         }
 
         bridge.on_connect(99, "127.0.0.1:1000");
-        assert!(bridge.authorize_play(99, "live", "pl_k").is_err());
+        assert!(bridge.authorize_play(99, "live", &s.play_key).is_err());
         assert_eq!(
             db.player_list(Some(&viewer.stream_id))
                 .iter()

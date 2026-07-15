@@ -452,6 +452,9 @@ impl Db {
             crate::log_error!("stream_find_by: rejected disallowed column '{column}'");
             return DbLookup::Failed;
         }
+        if !crate::keygen::is_valid_access_key(key) {
+            return DbLookup::Missing;
+        }
         let conn = self.conn.lock();
         map_optional(conn.query_row(
             &format!(
@@ -472,6 +475,9 @@ impl Db {
     /// belongs to a disabled/pending-delete stream, so the RTMP auth-failure
     /// rate limiter only counts the former as a credential mismatch.
     pub fn stream_find_by_publish_key_any(&self, key: &str) -> DbLookup<Stream> {
+        if !crate::keygen::is_valid_access_key(key) {
+            return DbLookup::Missing;
+        }
         let conn = self.conn.lock();
         map_optional(conn.query_row(
             &format!(
@@ -655,6 +661,9 @@ impl Db {
     }
 
     pub fn viewer_find_by_play_key(&self, key: &str) -> DbLookup<StreamViewer> {
+        if !crate::keygen::is_valid_access_key(key) {
+            return DbLookup::Missing;
+        }
         let conn = self.conn.lock();
         map_optional(conn.query_row(
             &format!(
@@ -1125,9 +1134,9 @@ mod tests {
             id: id.to_string(),
             name: format!("{id} name"),
             app: "live".to_string(),
-            publish_key: pub_key.to_string(),
-            play_key: play_key.to_string(),
-            stats_key: stats_key.to_string(),
+            publish_key: crate::keygen::test_pad_access_key(pub_key),
+            play_key: crate::keygen::test_pad_access_key(play_key),
+            stats_key: crate::keygen::test_pad_access_key(stats_key),
             enabled: true,
             created_at: now_ts(),
         }
@@ -1177,18 +1186,18 @@ mod tests {
         assert_eq!(got.name, "stream1 name");
 
         assert_eq!(
-            match db.stream_find_by_publish_key("pub_key_123") {
+            match db.stream_find_by_publish_key(&s.publish_key) {
                 DbLookup::Ok(s) => s.id,
                 _ => panic!("publish key lookup failed"),
             },
             "stream1"
         );
         assert!(matches!(
-            db.viewer_find_by_play_key("pl_key_456"),
+            db.viewer_find_by_play_key(&s.play_key),
             DbLookup::Ok(_)
         ));
         assert!(matches!(
-            db.stream_find_by_stats_key("st_key_789"),
+            db.stream_find_by_stats_key(&s.stats_key),
             DbLookup::Ok(_)
         ));
         assert!(matches!(
@@ -1202,13 +1211,8 @@ mod tests {
     #[test]
     fn publishers_players_and_stats() {
         let db = Db::open(":memory:").unwrap();
-        db.stream_add(&sample_stream(
-            "stream1",
-            "pub_key_123",
-            "pl_key_456",
-            "st_key_789",
-        ))
-        .unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
 
         let mut p = Publisher {
             id: "pub1".to_string(),
@@ -1231,7 +1235,7 @@ mod tests {
         assert!(db.publisher_try_acquire(&p));
         assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
 
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key("pl_key_456") else {
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
             panic!("viewer not found");
         };
         let player = Player {
@@ -1380,7 +1384,10 @@ mod tests {
         });
 
         // Simulate on_close for pub1: find by publish_key -> stream_id -> list.
-        let DbLookup::Ok(found) = db.stream_find_by_publish_key("pub_key_1") else {
+        let DbLookup::Ok(stream1) = db.stream_get("stream1") else {
+            panic!("stream not found");
+        };
+        let DbLookup::Ok(found) = db.stream_find_by_publish_key(&stream1.publish_key) else {
             panic!("publish key not found");
         };
         let mut pubs = db.publisher_list(Some(&found.id));
@@ -1401,14 +1408,9 @@ mod tests {
     #[test]
     fn player_try_acquire_enforces_per_key_connection_cap() {
         let db = Db::open(":memory:").unwrap();
-        db.stream_add(&sample_stream(
-            "stream1",
-            "pub_key_123",
-            "pl_key_456",
-            "st_key_789",
-        ))
-        .unwrap();
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key("pl_key_456") else {
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
             panic!("viewer not found");
         };
 
@@ -1433,5 +1435,35 @@ mod tests {
             ..Default::default()
         };
         assert!(!db.player_try_acquire(&overflow));
+    }
+
+    #[test]
+    fn legacy_short_access_keys_are_rejected_at_lookup() {
+        let db = Db::open(":memory:").unwrap();
+        let s = Stream {
+            id: "legacy".to_string(),
+            name: "Legacy".to_string(),
+            app: "live".to_string(),
+            publish_key: "a".to_string(),
+            play_key: "b".to_string(),
+            stats_key: "c".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert!(db.stream_add(&s).is_ok());
+
+        assert!(matches!(
+            db.stream_find_by_publish_key("a"),
+            DbLookup::Missing
+        ));
+        assert!(matches!(
+            db.stream_find_by_publish_key_any("a"),
+            DbLookup::Missing
+        ));
+        assert!(matches!(db.viewer_find_by_play_key("b"), DbLookup::Missing));
+        assert!(matches!(
+            db.stream_find_by_stats_key("c"),
+            DbLookup::Missing
+        ));
     }
 }

@@ -12,45 +12,45 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
 ## Project Status
 
-`librtmp2-server` is currently **Alpha** software.
+`librtmp2-server` is **alpha** software: the HTTP/API/DB layer is usable, but RTMP behaviour comes entirely from the embedded [`librtmp2`](https://github.com/OpenRTMP/librtmp2) crate — see that repo's [implementation status](https://github.com/OpenRTMP/librtmp2#implementation-status) for protocol details.
 
-Implemented in this repository:
+### Implemented in this repository
 
-- **Integrated RTMP listener** — listens on the configured `RTMP_BIND` address through the Rust `librtmp2` server implementation
-- **RTMPS listener** — when `TLS_ENABLED=true`, a second listener on `RTMPS_BIND` accepts RTMPS *alongside* the plaintext RTMP listener
-- **OBS / FFmpeg publishing path** — publish requests are routed through the DB-backed stream-key validation layer
-- **Play / publish authentication** — separate `publish_key` and `play_key` validation
-- **SQLite persistence** — streams, publishers, players, and stats are stored in a database
-- **Live publisher/player tracking** — connection state is mirrored into the database
-- **JSON stats** — `/stats?key=***` clean modern JSON
-- **Nginx-RTMP XML** — `/stats-nginx?key=***` for existing tools
-- **REST API** — Stream CRUD, Bearer token auth
-- **Docker-ready** — Lightweight Alpine container
+- **RTMP listener** on `RTMP_BIND` via `librtmp2`
+- **RTMPS listener** on `RTMPS_BIND` when `TLS_ENABLED=true` (alongside plaintext RTMP)
+- **OBS / FFmpeg publish path** with DB-backed `publish_key` validation
+- **Play authentication** via `play_key`
+- **Publisher → player relay** (same `(app, stream)` route)
+- **SQLite persistence** — streams, publishers, players, stats
+- **JSON stats** — `/stats?key=***`
+- **Nginx-RTMP XML** — `/stats-nginx?key=***`
+- **REST API** — stream CRUD, Bearer token auth
+- **Docker** — Alpine-based images on GHCR
 
-Still under active development:
+### Protocol behaviour inherited from librtmp2 (not reimplemented here)
 
-- RTMPS/TLS production readiness
-- Protocol completeness and compatibility hardening
-- Performance optimization
-- Production hardening
-- Additional E-RTMP functionality
+- Live H.264/AAC and Enhanced-RTMP **passthrough** ingest (HEVC/AV1/Opus, multitrack when publishers send it)
+- Late player join gets cached codec sequence headers (legacy + Enhanced-RTMP) and last keyframe; `onMetaData` is replayed to late joiners
+- Legacy RTMP commands (`pause`, `seek`, `receiveAudio`/`receiveVideo`, `closeStream`) are handled in the protocol layer
+- E-RTMP v2 connect capability negotiation and multitrack relay live in `librtmp2`; this server does not expose per-track IDs in the HTTP API yet
+- No nginx-rtmp feature parity (HLS, exec, push relay, recording)
 
-The server is not intended to be presented as a drop-in production replacement for `nginx-rtmp` yet. Test your OBS/FFmpeg workflow before using it for critical streams.
+Test your OBS/FFmpeg workflow before using this for critical streams. It is not a drop-in replacement for `nginx-rtmp`.
 
 ---
 
 ## Features
 
-- **Integrated RTMP listener** — built on the Rust `librtmp2` implementation
-- **RTMP + RTMPS at the same time** — RTMPS is an additional listener, not a mode switch; plaintext RTMP keeps working when TLS is enabled
-- **SQLite persistence** — Streams, publishers, players, stats all in a DB
+Everything below is implemented **in this repo**. Wire-protocol limits are defined by `librtmp2` (see link above).
+
+- **Integrated RTMP listener** — built on the `librtmp2` crate
+- **RTMP + RTMPS at the same time** — RTMPS is an additional listener, not a mode switch
+- **SQLite persistence** — streams, publishers, players, stats
 - **Unique keys per stream** — `publish_key`, `play_key`, `stats_key`
-- **Privacy by design** — No one can see streams/stats without the exact key
-- **JSON stats** — `/stats?key=***` clean modern JSON
-- **Nginx-RTMP XML** — `/stats-nginx?key=***` for existing tools
-- **REST API** — Stream CRUD, Bearer token auth
-- **Docker-ready** — Lightweight Alpine container
-- **Alpha quality** — Interfaces and implementation details may still change
+- **Privacy by design** — no public stream list without keys
+- **JSON + Nginx-compatible XML stats**
+- **REST API** — stream CRUD, Bearer token auth
+- **Docker-ready** — lightweight Alpine container
 
 ---
 
@@ -69,16 +69,15 @@ connections on both, and forwards connect/publish/play/close events into the
 DB-backed [`RtmpEventHandler`](src/rtmp_bridge.rs) bridge while also updating
 codec/stats data.
 
-Both `librtmp2-server` and `librtmp2` are under active development and should be
-considered Alpha software.
+Both `librtmp2-server` and `librtmp2` are alpha; API and protocol details may still change.
 
 ```text
 OBS / FFmpeg / App
         │
         ▼
   librtmp2-server (Rust)
-  ├── RTMP Listener (port 1935)      ← integrated via librtmp2 (Alpha), always on
-  ├── RTMPS Listener (port 1936)     ← alongside RTMP, only when TLS_ENABLED=true
+  ├── RTMP Listener (port 1935)      ← librtmp2, always on
+  ├── RTMPS Listener (port 1936)     ← librtmp2, when TLS_ENABLED=true
   ├── SQLite (streams, publishers, players, stats)
   ├── HTTP API     (port 8080, axum)
   │   ├── /api/v1/streams    CRUD
@@ -88,12 +87,9 @@ OBS / FFmpeg / App
         │
         ▼
       librtmp2 (Rust)
-      ├── Handshake
-      ├── Chunking
-      ├── AMF
-      ├── RTMP Commands
-      ├── E-RTMP v1
-      └── E-RTMP v2
+      ├── Live publish/play relay
+      ├── Legacy RTMP session core
+      └── E-RTMP passthrough + parser modules (see librtmp2 README)
 ```
 
 ---
@@ -106,6 +102,12 @@ OBS / FFmpeg / App
 - SQLite is vendored via rusqlite's `bundled` feature — no system SQLite3 needed
 
 ### Compile
+
+`librtmp2-server` uses the published `librtmp2` 0.4.0 release from crates.io:
+
+```toml
+librtmp2 = { version = "0.4.0", features = ["tls"] }
+```
 
 ```bash
 git clone https://github.com/OpenRTMP/librtmp2-server.git
