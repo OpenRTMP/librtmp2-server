@@ -15,7 +15,7 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-# Until librtmp2 0.4.0 is published on crates.io, pin the exact current PR #128 head.
+# Until librtmp2 0.4.0 is published on crates.io, pin the exact current PR #128 head for reproducible builds.
 librtmp2 = { version = "0.4.0", git = "https://github.com/OpenRTMP/librtmp2", rev = "fea7e2e9d472e651b14be23c9feb63ca47bb3a5b", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
