@@ -1211,12 +1211,7 @@ mod tests {
     #[test]
     fn publishers_players_and_stats() {
         let db = Db::open(":memory:").unwrap();
-        let s = sample_stream(
-            "stream1",
-            "pub_key_123",
-            "pl_key_456",
-            "st_key_789",
-        );
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
         db.stream_add(&s).unwrap();
 
         let mut p = Publisher {
@@ -1413,12 +1408,7 @@ mod tests {
     #[test]
     fn player_try_acquire_enforces_per_key_connection_cap() {
         let db = Db::open(":memory:").unwrap();
-        let s = sample_stream(
-            "stream1",
-            "pub_key_123",
-            "pl_key_456",
-            "st_key_789",
-        );
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
         db.stream_add(&s).unwrap();
         let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
             panic!("viewer not found");
@@ -1470,10 +1460,7 @@ mod tests {
             db.stream_find_by_publish_key_any("a"),
             DbLookup::Missing
         ));
-        assert!(matches!(
-            db.viewer_find_by_play_key("b"),
-            DbLookup::Missing
-        ));
+        assert!(matches!(db.viewer_find_by_play_key("b"), DbLookup::Missing));
         assert!(matches!(
             db.stream_find_by_stats_key("c"),
             DbLookup::Missing

@@ -902,7 +902,12 @@ mod tests {
         }
     }
 
-    fn add_stream_with_player(db: &Db, id: &str, pub_key: &str, play_key: &str) -> crate::db::Stream {
+    fn add_stream_with_player(
+        db: &Db,
+        id: &str,
+        pub_key: &str,
+        play_key: &str,
+    ) -> crate::db::Stream {
         let s = sample_stream(id, pub_key, play_key);
         db.stream_add(&s).unwrap();
         s
@@ -1085,7 +1090,11 @@ mod tests {
         // a brute-force guess would.
         for conn in 0..(RTMP_AUTH_MAX_FAILURES as u64 + 2) {
             bridge.on_connect(conn, ip);
-            assert!(bridge.authorize_publish(conn, "live", &s.publish_key).is_err());
+            assert!(
+                bridge
+                    .authorize_publish(conn, "live", &s.publish_key)
+                    .is_err()
+            );
             bridge.on_close(conn);
         }
 
@@ -1107,7 +1116,11 @@ mod tests {
         let bridge = test_bridge(Arc::clone(&db));
 
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(bridge.authorize_publish(1, "other", &s.publish_key).is_err());
+        assert!(
+            bridge
+                .authorize_publish(1, "other", &s.publish_key)
+                .is_err()
+        );
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
     }
 
@@ -1217,7 +1230,11 @@ mod tests {
         assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
         assert!(bridge.authorize_publish(2, "live", &s2.publish_key).is_ok());
 
-        assert!(bridge.authorize_publish(1, "live", &s2.publish_key).is_err());
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &s2.publish_key)
+                .is_err()
+        );
 
         assert!(bridge.has_publisher(1));
         assert_eq!(db.publisher_list(Some("s1")).len(), 1);

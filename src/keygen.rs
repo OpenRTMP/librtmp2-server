@@ -35,8 +35,7 @@ pub fn is_valid_access_key(value: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-pub const ACCESS_KEY_VALIDATION_MSG: &str =
-    "Key must be 32-63 characters, start with a letter or number, and use only letters, numbers, dots, underscores, or hyphens";
+pub const ACCESS_KEY_VALIDATION_MSG: &str = "Key must be 32-63 characters, start with a letter or number, and use only letters, numbers, dots, underscores, or hyphens";
 
 #[cfg(test)]
 pub fn test_pad_access_key(value: &str) -> String {
