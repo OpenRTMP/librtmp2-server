@@ -206,21 +206,9 @@ fn is_valid_stream_key_part(value: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Minimum length for operator-supplied publish/play/stats keys. Shorter custom
-/// keys are trivially brute-forced over the unrate-limited RTMP auth path.
-const MIN_ACCESS_KEY_LEN: usize = 32;
-
 /// Publish/play/stats keys: safe ASCII, no slashes, minimum entropy via length.
 fn is_valid_access_key(value: &str) -> bool {
-    if value.len() < MIN_ACCESS_KEY_LEN || value.len() > 63 {
-        return false;
-    }
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    first.is_ascii_alphanumeric()
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    crate::keygen::is_valid_access_key(value)
 }
 
 fn trim_optional_string(value: Option<String>) -> Option<String> {
@@ -249,7 +237,7 @@ fn resolve_or_generate_access_key(
     }
 }
 
-const ACCESS_KEY_VALIDATION_MSG: &str = "Key must be 32-63 characters, start with a letter or number, and use only letters, numbers, dots, underscores, or hyphens";
+const ACCESS_KEY_VALIDATION_MSG: &str = crate::keygen::ACCESS_KEY_VALIDATION_MSG;
 
 fn access_keys_must_be_unique(keys: &[&str]) -> bool {
     let mut seen = HashSet::with_capacity(keys.len());
