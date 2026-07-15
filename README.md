@@ -103,7 +103,7 @@ OBS / FFmpeg / App
 
 ### Compile
 
-`librtmp2` 0.4.0 is not on crates.io yet. Until it is published, this repo pins the validated commit `ad021f9` from librtmp2 PR #128 (see `Cargo.toml`) so builds remain reproducible. After merge and crates.io release, change the dependency to a registry-only line:
+`librtmp2` 0.4.0 is not on crates.io yet. Until it is published, this repo pins the current commit `fea7e2e` from librtmp2 PR #128 (see `Cargo.toml`) so builds remain reproducible. After merge and crates.io release, change the dependency to a registry-only line:
 
 ```toml
 librtmp2 = { version = "0.4.0", features = ["tls"] }
