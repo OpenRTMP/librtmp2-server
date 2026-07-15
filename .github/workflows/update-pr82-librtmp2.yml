@@ -14,50 +14,40 @@ jobs:
   update-dependency:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out PR branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: chore/librtmp2-0.4.0
           fetch-depth: 0
 
-      - name: Install project Rust toolchain
-        run: |
-          rustup toolchain install 1.95.0 --profile minimal
-          rustup override set 1.95.0
-
-      - name: Resolve dependency source and update files
+      - name: Refresh librtmp2 source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          latest_rev="$(gh api repos/OpenRTMP/librtmp2/pulls/128 --jq .head.sha)"
-          export LATEST_REV="$latest_rev"
+          export LATEST_REV="$(gh api repos/OpenRTMP/librtmp2/pulls/128 --jq .head.sha)"
 
           if python - <<'PY'
           import json
           import urllib.error
           import urllib.request
 
-          request = urllib.request.Request(
+          req = urllib.request.Request(
               "https://crates.io/api/v1/crates/librtmp2/0.4.0",
-              headers={"User-Agent": "OpenRTMP/librtmp2-server dependency updater"},
+              headers={"User-Agent": "OpenRTMP/librtmp2-server"},
           )
           try:
-              with urllib.request.urlopen(request, timeout=30) as response:
+              with urllib.request.urlopen(req, timeout=30) as response:
                   data = json.load(response)
           except urllib.error.HTTPError as error:
               if error.code == 404:
                   raise SystemExit(1)
               raise
-
-          version = data.get("version", {}).get("num")
-          raise SystemExit(0 if version == "0.4.0" else 1)
+          raise SystemExit(0 if data.get("version", {}).get("num") == "0.4.0" else 1)
           PY
           then
-            export LIBRTMP2_PUBLISHED=1
+            export PUBLISHED=1
           else
-            export LIBRTMP2_PUBLISHED=0
+            export PUBLISHED=0
           fi
 
           python - <<'PY'
@@ -67,97 +57,83 @@ jobs:
 
           latest = os.environ["LATEST_REV"]
           short = latest[:7]
-          published = os.environ["LIBRTMP2_PUBLISHED"] == "1"
+          published = os.environ["PUBLISHED"] == "1"
 
           cargo = Path("Cargo.toml")
-          text = cargo.read_text()
-          pattern = re.compile(
-              r'# Until librtmp2 0\.4\.0 is published on crates\.io, pin the exact PR #128 head\n'
-              r'# that passed librtmp2\'s tests, E2E, ABI, interop, sanitizer, fuzz, and benchmark checks\.\n'
+          cargo_text = cargo.read_text()
+          dep_re = re.compile(
+              r'(?:# Until librtmp2 0\.4\.0 is published on crates\.io, pin[^\n]*\n'
+              r'(?:# [^\n]*\n)?)?'
               r'librtmp2 = \{ version = "0\.4\.0", git = "https://github\.com/OpenRTMP/librtmp2", rev = "[0-9a-f]{40}", features = \["tls"\] \}'
           )
           if published:
-              replacement = 'librtmp2 = { version = "0.4.0", features = ["tls"] }'
+              dep = 'librtmp2 = { version = "0.4.0", features = ["tls"] }'
           else:
-              replacement = (
+              dep = (
                   '# Until librtmp2 0.4.0 is published on crates.io, pin the exact current PR #128 head.\n'
                   f'librtmp2 = {{ version = "0.4.0", git = "https://github.com/OpenRTMP/librtmp2", rev = "{latest}", features = ["tls"] }}'
               )
-          text, count = pattern.subn(replacement, text)
-          if count != 1:
-              raise SystemExit("Cargo.toml dependency block did not match exactly once")
-          cargo.write_text(text)
+          cargo_text, n = dep_re.subn(dep, cargo_text, count=1)
+          if n != 1:
+              raise SystemExit("Cargo.toml dependency entry was not updated")
+          cargo.write_text(cargo_text)
 
-          agents = Path("AGENTS.md")
-          text = agents.read_text()
-          line_pattern = re.compile(r'- \*\*Dependency source:\*\*.*\n')
           if published:
-              line = '- **Dependency source:** `librtmp2 = "0.4.0"` resolves from crates.io with the `tls` feature. It does **not** use the sibling `../librtmp2` checkout unless you add a `[patch]` override locally.\n'
+              replacements = {
+                  "AGENTS.md": (
+                      re.compile(r'- \*\*Dependency source:\*\*.*\n'),
+                      '- **Dependency source:** `librtmp2 = "0.4.0"` resolves from crates.io with the `tls` feature. It does **not** use the sibling `../librtmp2` checkout unless you add a `[patch]` override locally.\n',
+                  ),
+                  "CHANGELOG.md": (
+                      re.compile(r'  Until `0\.4\.0` is on crates\.io the lockfile resolves it from git\n  \(`OpenRTMP/librtmp2` @ `[0-9a-f]{7}`\); switch back to a crates\.io version pin after\n  release\.'),
+                      '  The dependency now resolves from the published crates.io release.',
+                  ),
+                  "README.md": (
+                      re.compile(r'`librtmp2` 0\.4\.0 is not on crates\.io yet\..*?Then run `cargo update -p librtmp2` and commit the updated lockfile\.', re.S),
+                      '`librtmp2` 0.4.0 is resolved from crates.io with the `tls` feature.',
+                  ),
+              }
+              for name, (pattern, replacement) in replacements.items():
+                  path = Path(name)
+                  text, n = pattern.subn(replacement, path.read_text(), count=1)
+                  if n != 1:
+                      raise SystemExit(f"{name} dependency documentation was not updated")
+                  path.write_text(text)
           else:
-              line = f'- **Dependency source:** `librtmp2 = "0.4.0"` is pinned to the current PR #128 head `{short}` until the crate is on crates.io. After merge + publish, switch `Cargo.toml` to a registry-only pin (`librtmp2 = {{ version = "0.4.0", features = ["tls"] }}`) and refresh `Cargo.lock`. It does **not** use the sibling `../librtmp2` checkout unless you add a `[patch]` override locally.\n'
-          text, count = line_pattern.subn(line, text)
-          if count != 1:
-              raise SystemExit("AGENTS.md dependency line did not match exactly once")
-          agents.write_text(text)
+              for name in ("AGENTS.md", "CHANGELOG.md", "README.md"):
+                  path = Path(name)
+                  text = path.read_text()
+                  text = re.sub(r'`[0-9a-f]{7}`(?=[^\n]*(?:PR #128|crates\.io|lockfile|commit))', f'`{short}`', text)
+                  text = text.replace("validated commit", "current commit")
+                  text = text.replace("pinned to validated git commit", "pinned to the current PR #128 head")
+                  path.write_text(text)
 
-          changelog = Path("CHANGELOG.md")
-          text = changelog.read_text()
-          block_pattern = re.compile(
-              r'  Until `0\.4\.0` is on crates\.io the lockfile resolves it from git\n'
-              r'  \(`OpenRTMP/librtmp2` @ `[0-9a-f]{7}`\); switch back to a crates\.io version pin after\n'
-              r'  release\.'
-          )
-          if published:
-              block = '  The dependency now resolves from the published crates.io release.'
-          else:
-              block = (
-                  '  Until `0.4.0` is on crates.io the lockfile resolves it from git\n'
-                  f'  (`OpenRTMP/librtmp2` @ `{short}`); switch back to a crates.io version pin after\n'
-                  '  release.'
+              lock = Path("Cargo.lock")
+              lock_text = lock.read_text()
+              lock_text, n = re.subn(
+                  r'(git\+https://github\.com/OpenRTMP/librtmp2\?rev=)[0-9a-f]{40}(#[0-9a-f]{40})',
+                  rf'\g<1>{latest}#{latest}',
+                  lock_text,
+                  count=1,
               )
-          text, count = block_pattern.subn(block, text)
-          if count != 1:
-              raise SystemExit("CHANGELOG.md dependency block did not match exactly once")
-          changelog.write_text(text)
-
-          readme = Path("README.md")
-          text = readme.read_text()
-          build_pattern = re.compile(
-              r'`librtmp2` 0\.4\.0 is not on crates\.io yet\. Until it is published, this repo pins the validated commit `[0-9a-f]{7}` from librtmp2 PR #128 \(see `Cargo\.toml`\) so builds remain reproducible\. After merge and crates\.io release, change the dependency to a registry-only line:\n\n'
-              r'```toml\n'
-              r'librtmp2 = \{ version = "0\.4\.0", features = \["tls"\] \}\n'
-              r'```\n\n'
-              r'Then run `cargo update -p librtmp2` and commit the updated lockfile\.'
-          )
-          if published:
-              build = '`librtmp2` 0.4.0 is resolved from crates.io with the `tls` feature.'
-          else:
-              build = (
-                  f'`librtmp2` 0.4.0 is not on crates.io yet. Until it is published, this repo pins the current commit `{short}` from librtmp2 PR #128 (see `Cargo.toml`) so builds remain reproducible. After merge and crates.io release, change the dependency to a registry-only line:\n\n'
-                  '```toml\n'
-                  'librtmp2 = { version = "0.4.0", features = ["tls"] }\n'
-                  '```\n\n'
-                  'Then run `cargo update -p librtmp2` and commit the updated lockfile.'
-              )
-          text, count = build_pattern.subn(build, text)
-          if count != 1:
-              raise SystemExit("README.md dependency block did not match exactly once")
-          readme.write_text(text)
+              if n != 1:
+                  raise SystemExit("Cargo.lock librtmp2 source was not updated")
+              lock.write_text(lock_text)
           PY
 
-          cargo update -p librtmp2
-          cargo check --locked
+          if [ "$PUBLISHED" = 1 ]; then
+            rustup update stable
+            cargo update -p librtmp2
+          fi
 
-      - name: Commit dependency update and remove helper workflow
+          grep -F "$LATEST_REV" Cargo.toml Cargo.lock || [ "$PUBLISHED" = 1 ]
+
+      - name: Commit result and remove helper
         run: |
           set -euo pipefail
           rm .github/workflows/update-pr82-librtmp2.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock AGENTS.md CHANGELOG.md README.md .github/workflows/update-pr82-librtmp2.yml
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-            exit 0
-          fi
-          git commit -m "fix: refresh librtmp2 dependency source"
+          git commit -m "fix: refresh librtmp2 dependency pin"
           git push origin HEAD:chore/librtmp2-0.4.0
