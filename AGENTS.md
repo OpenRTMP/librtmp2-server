@@ -7,7 +7,7 @@
 Non-obvious notes for this environment:
 
 - **Toolchain:** `Cargo.toml` sets `edition = "2024"`, `rust-version = "1.95"`. The VM snapshot ships stable Rust 1.97 as the default `rustup` toolchain; the older system Rust (1.83) will not compile this crate.
-- **Dependency source:** `librtmp2 = "0.4.0"` resolves from crates.io with the `tls` feature enabled. It does **not** use the sibling `../librtmp2` checkout unless you add a `[patch]` override locally.
+- **Dependency source:** `librtmp2 = { version = "0.4.0", features = ["tls"] }` resolves from crates.io. It does **not** use the sibling `../librtmp2` checkout unless you add a `[patch]` override locally.
 - **SQLite is bundled** via `rusqlite` `bundled` feature — no system SQLite needed.
 - **Running (dev):** `LRTMP2_DB=./server.db ./target/debug/librtmp2-server -v`. RTMP listens on `:1935`, HTTP API on `:8080`. Runtime files (`server.db*`) are untracked and must not be committed.
 - **API token:** generated once on first start and stored in SQLite (printed to stderr). To use a known token instead, export a real `LRTMP2_API_TOKEN` **process env var before first startup** — the `.env` loader deliberately ignores `LRTMP2_API_TOKEN` in the file. The token is only re-read from env while seeding a fresh DB, so delete `server.db*` to re-seed.
