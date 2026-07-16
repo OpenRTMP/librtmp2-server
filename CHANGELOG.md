@@ -13,6 +13,12 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- Docker startup logs now print an OpenRTMP ASCII banner followed by the
+  `librtmp2-server` name and running image version. Release builds embed the
+  workflow version, while local builds fall back to the package version from
+  `Cargo.toml`.
+
 ## [0.1.5] — 2026-07-15
 
 ### Changed
