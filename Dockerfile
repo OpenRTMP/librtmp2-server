@@ -23,8 +23,8 @@ RUN apk add --no-cache libgcc libstdc++ openssl ca-certificates wget
 COPY --from=builder /build/target/release/librtmp2-server /usr/local/bin/librtmp2-server
 COPY --from=builder /build/.env.example /etc/librtmp2-server/.env
 COPY --from=builder /build/VERSION /usr/local/share/openrtmp/VERSION
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 # Create non-root user and data directory
 RUN adduser -D -H -s /sbin/nologin openrtmp && \
@@ -44,5 +44,5 @@ EXPOSE 1935 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD wget -qO- http://localhost:8080/api/v1/health || exit 1
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["entrypoint.sh"]
 CMD ["librtmp2-server"]
