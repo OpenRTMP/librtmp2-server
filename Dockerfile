@@ -1,14 +1,14 @@
 # Build stage
 FROM alpine:latest AS builder
 
-ARG APP_VERSION=""
-
 RUN apk add --no-cache build-base rust cargo git openssl openssl-dev pkgconf sqlite-dev ca-certificates
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release && \
-    version="$APP_VERSION" && \
+RUN cargo build --release
+
+ARG APP_VERSION=""
+RUN version="$APP_VERSION" && \
     if [ -z "$version" ]; then \
         version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"; \
     fi && \
