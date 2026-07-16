@@ -21,8 +21,7 @@ cat <<'BANNER'
   \___/| .__/ \___|_| |_|_| \_\|_| |_|  |_|_|
        |_|
 BANNER
-printf '  Service: librtmp2-server\n'
-printf '  Version: %s\n\n' "$DISPLAY_VERSION"
+printf '  librtmp2-server %s\n\n' "$DISPLAY_VERSION"
 
 if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
     set -- librtmp2-server "$@"
