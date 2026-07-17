@@ -292,7 +292,7 @@ fn create_viewer_row(
 
 // ---------- JSON stats builder ----------
 
-fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
+fn build_json_stats(db: &Db, bridge: &DbRtmpBridge, stream_id: Option<&str>) -> Value {
     let (pubs, players) = match stream_id {
         Some(id) => (db.publisher_list(Some(id)), db.player_list(Some(id))),
         None => (db.publisher_list_all(), db.player_list_all()),
@@ -311,6 +311,8 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                 "bitrate_kbps": p.bitrate_kbps,
                 "rtt_ms": p.rtt_ms,
                 "bytes_in": p.bytes_in,
+                "buffer_bytes": p.buffer_bytes,
+                "latency_ms": p.latency_ms,
                 "video": {
                     "codec": p.video_codec,
                     "width": p.video_width,
@@ -333,6 +335,8 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
                 "bitrate_kbps": pl.bitrate_kbps,
                 "rtt_ms": pl.rtt_ms,
                 "bytes_out": pl.bytes_out,
+                "buffer_bytes": pl.buffer_bytes,
+                "latency_ms": pl.latency_ms,
             })
         })
         .collect();
@@ -344,6 +348,12 @@ fn build_json_stats(db: &Db, stream_id: Option<&str>) -> Value {
             "publishers": pubs.len(),
             "players": players.len(),
             "total_clients": pubs.len() + players.len(),
+            // Cumulative, server-wide: RTMP runs over TCP, so there is no
+            // per-stream packet loss to report here. This counts connections
+            // force-closed because their outbound send buffer filled up (see
+            // librtmp2::server::Server::backpressure_drops) -- the closest
+            // real analog, and the only meaningful drop signal at this layer.
+            "dropped_pkts": bridge.backpressure_drops(),
         },
     })
 }
@@ -359,6 +369,8 @@ fn build_public_json_stats(db: &Db, stream_id: &str) -> Option<Value> {
         "bitrate_kbps": p.bitrate_kbps,
         "rtt_ms": p.rtt_ms,
         "bytes_in": p.bytes_in,
+        "buffer_bytes": p.buffer_bytes,
+        "latency_ms": p.latency_ms,
         "video": {
             "codec": p.video_codec,
             "width": p.video_width,
@@ -1295,7 +1307,10 @@ async fn handle_stream_stats(
     }
     if bearer {
         match state.db.stream_get(&id) {
-            DbLookup::Ok(_) => return Json(build_json_stats(&state.db, Some(&id))).into_response(),
+            DbLookup::Ok(_) => {
+                return Json(build_json_stats(&state.db, &state.rtmp_bridge, Some(&id)))
+                    .into_response();
+            }
             DbLookup::Missing => {
                 return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
             }
@@ -2094,6 +2109,60 @@ mod tests {
         assert!(json.get("name").is_none());
         assert!(json.get("app").is_none());
         assert!(json.get("uptime").is_some());
+    }
+
+    #[tokio::test]
+    async fn bearer_stream_stats_includes_buffer_latency_and_dropped_pkts() {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pubstream".to_string(),
+            name: "Secret Name".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_test_key_with_sufficient_length_here".to_string(),
+            play_key: "play_test_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_test_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.db.publisher_try_acquire(&Publisher {
+            id: "pub_sess".to_string(),
+            stream_id: "pubstream".to_string(),
+            app: "live".to_string(),
+            stream_name: "Secret Name".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            buffer_bytes: 65536,
+            latency_ms: Some(7.5),
+            ..Default::default()
+        });
+        state.rtmp_bridge.set_backpressure_drops(3);
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams/pubstream/stats")
+                    .header(
+                        bearer("a-strong-random-secret-value").0,
+                        bearer("a-strong-random-secret-value").1,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["streams"][0]["buffer_bytes"], 65536);
+        assert_eq!(json["streams"][0]["latency_ms"], 7.5);
+        assert_eq!(json["summary"]["dropped_pkts"], 3);
     }
 
     #[tokio::test]

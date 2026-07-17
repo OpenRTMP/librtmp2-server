@@ -36,6 +36,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serial_test = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 
+# TEMPORARY: Conn::buffer_bytes()/latency_ms() and Server::backpressure_drops
+# aren't published to crates.io yet (pending OpenRTMP/librtmp2#136). Remove
+# this patch and bump the `librtmp2` version requirement above once that PR
+# merges and a new librtmp2 release is cut.
+[patch.crates-io]
+librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", branch = "claude/buffer-dropped-pkts-latenz-thwjix" }
+
 [[bench]]
 name = "http_api"
 harness = false

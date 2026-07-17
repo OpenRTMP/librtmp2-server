@@ -18,6 +18,17 @@ begin at `1.0.0`.
   `librtmp2-server` name and running image version. Release builds embed the
   workflow version, while local builds fall back to the package version from
   `Cargo.toml`.
+- `buffer_bytes` / `latency_ms` on each publisher/player in the Bearer
+  `/api/v1/streams/:id/stats` and public `/stats?key=...` JSON responses
+  (outbound send-buffer backlog and an estimated queuing latency derived from
+  it), and `summary.dropped_pkts` on the Bearer response (cumulative count of
+  connections force-closed for falling behind on outbound data — RTMP runs
+  over TCP, so this is the closest real analog to a dropped-packets counter).
+  Sourced from `librtmp2`'s new `Conn::buffer_bytes()`/`latency_ms()` and
+  `Server::backpressure_drops`.
+  **Requires a `librtmp2` release including OpenRTMP/librtmp2#136** — until
+  then this repo depends on that branch via a `[patch.crates-io]` override in
+  `Cargo.toml`.
 
 ## [0.1.5] — 2026-07-15
 

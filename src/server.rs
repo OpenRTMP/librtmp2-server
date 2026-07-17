@@ -331,7 +331,13 @@ pub(crate) fn process_server_connections(
             continue;
         }
         rtmp_bridge.update_rtt(conn.conn_id, conn.rtt_ms);
+        rtmp_bridge.update_buffer_and_latency(
+            conn.conn_id,
+            conn.buffer_bytes() as u64,
+            conn.latency_ms(),
+        );
     }
+    rtmp_bridge.set_backpressure_drops(server.backpressure_drops);
 
     reject_indices.sort_unstable();
     reject_indices.dedup();

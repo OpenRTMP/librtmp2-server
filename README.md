@@ -290,13 +290,22 @@ curl "http://localhost:8080/stats?key=sts_0123456789abcdef0123456789abcdef"
     "bitrate_kbps": 2450.5,
     "rtt_ms": 24.0,
     "bytes_in": 1234567,
+    "buffer_bytes": 4096,
+    "latency_ms": 13.4,
     "video": {"codec": "h264", "width": 1920, "height": 1080, "fps": 30.0},
     "audio": {"codec": "aac"}
   }],
   "players": [],
-  "summary": {"publishers": 1, "players": 0, "total_clients": 1}
+  "summary": {"publishers": 1, "players": 0, "total_clients": 1, "dropped_pkts": 0}
 }
 ```
+
+`buffer_bytes` is the outbound send-buffer backlog; `latency_ms` is an estimated
+queuing latency derived from it (`null` until a bitrate sample exists — e.g.
+right after a connection starts). `summary.dropped_pkts` is a cumulative,
+server-wide count of connections force-closed because their outbound buffer
+filled up — RTMP runs over TCP, so there's no per-packet loss to report; this
+is the closest real analog.
 
 Each entry in `players` (one per connected viewer, once any are watching) looks like:
 
@@ -308,7 +317,9 @@ Each entry in `players` (one per connected viewer, once any are watching) looks 
   "uptime": 12345,
   "bitrate_kbps": 2450.5,
   "rtt_ms": 24.0,
-  "bytes_out": 987654
+  "bytes_out": 987654,
+  "buffer_bytes": 0,
+  "latency_ms": null
 }
 ```
 

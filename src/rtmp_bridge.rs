@@ -16,6 +16,7 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::db::{Db, DbLookup, Player, Publisher};
@@ -116,6 +117,8 @@ struct ConnState {
     player_stats_reset_pending: bool,
     /// Timestamp of the last RTT flush to the DB.
     last_rtt_at: Option<Instant>,
+    /// Timestamp of the last buffer/latency flush to the DB.
+    last_buffer_stats_at: Option<Instant>,
 }
 
 /// DB-backed [`RtmpEventHandler`]. Each connection's role(s) and DB row(s)
@@ -130,6 +133,10 @@ pub struct DbRtmpBridge {
     /// reconnecting on a fresh TCP connection does not reset the window —
     /// see `is_auth_rate_limited`.
     auth_failures: Mutex<HashMap<String, Vec<Instant>>>,
+    /// Latest `librtmp2::server::Server::backpressure_drops` value, mirrored
+    /// here each poll tick so the HTTP layer can report it without needing a
+    /// reference to the (single-threaded, poll-loop-owned) `Server` itself.
+    backpressure_drops: AtomicU64,
 }
 
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
@@ -181,7 +188,22 @@ impl DbRtmpBridge {
             conns: Mutex::new(HashMap::new()),
             deleted_streams,
             auth_failures: Mutex::new(HashMap::new()),
+            backpressure_drops: AtomicU64::new(0),
         }
+    }
+
+    /// Mirror the server's cumulative backpressure-drop counter. Called once
+    /// per poll tick from `server.rs` with `Server::backpressure_drops`,
+    /// which only ever grows, so a plain store is enough (no read-modify-write
+    /// needed across callers).
+    pub fn set_backpressure_drops(&self, value: u64) {
+        self.backpressure_drops.store(value, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of connections force-closed because their outbound
+    /// send buffer filled up (see `librtmp2::server::Server::backpressure_drops`).
+    pub fn backpressure_drops(&self) -> u64 {
+        self.backpressure_drops.load(Ordering::Relaxed)
     }
 
     /// True once `on_connect` has recorded a remote IP for `conn`. Lets
@@ -528,6 +550,52 @@ impl DbRtmpBridge {
         if let Some(ref mut player_row) = cs.player {
             player_row.rtt_ms = rtt_ms;
             cs.last_rtt_at = Some(now);
+            let player_id = player_row.id.clone();
+            let row = player_row.clone();
+            drop(guard);
+            self.db.player_update(&player_id, &row);
+        }
+    }
+
+    /// Persist the outbound send-buffer backlog and estimated queuing
+    /// latency for this connection (see `Conn::buffer_bytes`/`latency_ms`).
+    /// Rate-limited the same way as `update_rtt` so a busy connection
+    /// doesn't spam the DB every poll tick.
+    pub fn update_buffer_and_latency(
+        &self,
+        conn: ConnId,
+        buffer_bytes: u64,
+        latency_ms: Option<f64>,
+    ) {
+        let mut guard = self.conns.lock();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+
+        let now = Instant::now();
+        let elapsed_secs = cs
+            .last_buffer_stats_at
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(f64::INFINITY);
+        if elapsed_secs < 1.0 && cs.last_buffer_stats_at.is_some() {
+            return;
+        }
+
+        if let Some(ref mut pub_row) = cs.publisher {
+            pub_row.buffer_bytes = buffer_bytes;
+            pub_row.latency_ms = latency_ms;
+            cs.last_buffer_stats_at = Some(now);
+            let pub_id = pub_row.id.clone();
+            let row = pub_row.clone();
+            drop(guard);
+            self.db.publisher_update(&pub_id, &row);
+            return;
+        }
+
+        if let Some(ref mut player_row) = cs.player {
+            player_row.buffer_bytes = buffer_bytes;
+            player_row.latency_ms = latency_ms;
+            cs.last_buffer_stats_at = Some(now);
             let player_id = player_row.id.clone();
             let row = player_row.clone();
             drop(guard);
@@ -1301,6 +1369,36 @@ mod tests {
         let players = db.player_list(Some("s1"));
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].bytes_out, 4096);
+    }
+
+    #[test]
+    fn update_buffer_and_latency_persists_to_player_row() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
+        bridge.update_buffer_and_latency(1, 8192, Some(4.5));
+
+        let players = db.player_list(Some("s1"));
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].buffer_bytes, 8192);
+        assert_eq!(players[0].latency_ms, Some(4.5));
+    }
+
+    #[test]
+    fn backpressure_drops_mirrors_latest_set_value() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+
+        assert_eq!(bridge.backpressure_drops(), 0);
+        bridge.set_backpressure_drops(5);
+        assert_eq!(bridge.backpressure_drops(), 5);
+        // Only ever grows on the real Server, but the mirror is a plain
+        // store: it must reflect whatever value it's given, not clamp.
+        bridge.set_backpressure_drops(2);
+        assert_eq!(bridge.backpressure_drops(), 2);
     }
 
     #[test]

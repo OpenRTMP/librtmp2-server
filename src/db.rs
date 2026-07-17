@@ -56,6 +56,11 @@ pub struct Publisher {
     pub bytes_in: u64,
     pub bitrate_kbps: f64,
     pub rtt_ms: f64,
+    /// Outbound send-buffer backlog, in bytes (see `librtmp2::session::conn::Conn::buffer_bytes`).
+    pub buffer_bytes: u64,
+    /// Estimated outbound queuing latency, in ms. `None` until a bitrate
+    /// sample exists (see `librtmp2::session::conn::Conn::latency_ms`).
+    pub latency_ms: Option<f64>,
     pub connected_at: i64,
     pub active: bool,
 }
@@ -71,6 +76,11 @@ pub struct Player {
     pub bytes_out: u64,
     pub bitrate_kbps: f64,
     pub rtt_ms: f64,
+    /// Outbound send-buffer backlog, in bytes.
+    pub buffer_bytes: u64,
+    /// Estimated outbound queuing latency, in ms. `None` until a bitrate
+    /// sample exists.
+    pub latency_ms: Option<f64>,
     pub connected_at: i64,
     pub active: bool,
 }
@@ -157,6 +167,8 @@ CREATE TABLE IF NOT EXISTS publishers (
   bytes_in INTEGER NOT NULL DEFAULT 0,
   bitrate_kbps REAL NOT NULL DEFAULT 0,
   rtt_ms REAL NOT NULL DEFAULT 0,
+  buffer_bytes INTEGER NOT NULL DEFAULT 0,
+  latency_ms REAL,
   connected_at INTEGER NOT NULL,
   active INTEGER NOT NULL DEFAULT 1
 );
@@ -169,6 +181,8 @@ CREATE TABLE IF NOT EXISTS players (
   bytes_out INTEGER NOT NULL DEFAULT 0,
   bitrate_kbps REAL NOT NULL DEFAULT 0,
   rtt_ms REAL NOT NULL DEFAULT 0,
+  buffer_bytes INTEGER NOT NULL DEFAULT 0,
+  latency_ms REAL,
   connected_at INTEGER NOT NULL,
   active INTEGER NOT NULL DEFAULT 1
 );
@@ -282,6 +296,10 @@ impl Db {
         for sql in [
             "ALTER TABLE publishers ADD COLUMN audio_sample_rate INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE publishers ADD COLUMN audio_channels INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE publishers ADD COLUMN buffer_bytes INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE publishers ADD COLUMN latency_ms REAL",
+            "ALTER TABLE players ADD COLUMN buffer_bytes INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE players ADD COLUMN latency_ms REAL",
         ] {
             match conn.execute(sql, []) {
                 Ok(_) => {}
@@ -721,6 +739,9 @@ impl Db {
             );
             return false;
         };
+        // Diagnostic-only field: clamp rather than reject the whole session
+        // over an unrealistically large backlog value.
+        let buffer_bytes = i64::try_from(p.buffer_bytes).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -746,8 +767,8 @@ impl Db {
         if tx
             .execute(
                 "INSERT INTO publishers \
-                 (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                 (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,buffer_bytes,latency_ms,connected_at,active) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
                 params![
                     p.id,
                     p.stream_id,
@@ -763,6 +784,8 @@ impl Db {
                     bytes_in,
                     p.bitrate_kbps,
                     p.rtt_ms,
+                    buffer_bytes,
+                    p.latency_ms,
                     p.connected_at
                 ],
             )
@@ -778,12 +801,13 @@ impl Db {
             crate::log_error!("publisher_update: bytes_in {} overflows i64", p.bytes_in);
             return false;
         };
+        let buffer_bytes = i64::try_from(p.buffer_bytes).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         match conn.execute(
             "UPDATE publishers SET stream_id=?,app=?,stream_name=?,\
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
              audio_sample_rate=?,audio_channels=?,\
-             bytes_in=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
+             bytes_in=?,bitrate_kbps=?,rtt_ms=?,buffer_bytes=?,latency_ms=?,active=? WHERE id=?",
             params![
                 p.stream_id,
                 p.app,
@@ -798,6 +822,8 @@ impl Db {
                 bytes_in,
                 p.bitrate_kbps,
                 p.rtt_ms,
+                buffer_bytes,
+                p.latency_ms,
                 p.active,
                 id
             ],
@@ -843,12 +869,20 @@ impl Db {
             })?,
             bitrate_kbps: row.get(12)?,
             rtt_ms: row.get(13)?,
-            connected_at: row.get(14)?,
-            active: row.get(15)?,
+            buffer_bytes: u64::try_from(row.get::<_, i64>(14)?).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Integer,
+                    "negative buffer_bytes".into(),
+                )
+            })?,
+            latency_ms: row.get(15)?,
+            connected_at: row.get(16)?,
+            active: row.get(17)?,
         })
     }
 
-    const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active";
+    const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,buffer_bytes,latency_ms,connected_at,active";
 
     pub fn publisher_list(&self, stream_id: Option<&str>) -> Vec<Publisher> {
         let conn = self.conn.lock();
@@ -905,6 +939,7 @@ impl Db {
             );
             return false;
         };
+        let buffer_bytes = i64::try_from(p.buffer_bytes).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -926,8 +961,8 @@ impl Db {
         if tx
             .execute(
                 "INSERT INTO players \
-                 (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
-                 VALUES (?,?,?,?,?,?,?,?,?,1)",
+                 (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,buffer_bytes,latency_ms,connected_at,active) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
                 params![
                     p.id,
                     p.stream_id,
@@ -937,6 +972,8 @@ impl Db {
                     bytes_out,
                     p.bitrate_kbps,
                     p.rtt_ms,
+                    buffer_bytes,
+                    p.latency_ms,
                     p.connected_at
                 ],
             )
@@ -957,10 +994,11 @@ impl Db {
             crate::log_error!("player_update: bytes_out {} overflows i64", p.bytes_out);
             return false;
         };
+        let buffer_bytes = i64::try_from(p.buffer_bytes).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         match conn.execute(
             "UPDATE players SET stream_id=?,viewer_id=?,app=?,stream_name=?,\
-             bytes_out=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
+             bytes_out=?,bitrate_kbps=?,rtt_ms=?,buffer_bytes=?,latency_ms=?,active=? WHERE id=?",
             params![
                 p.stream_id,
                 p.viewer_id,
@@ -969,6 +1007,8 @@ impl Db {
                 bytes_out,
                 p.bitrate_kbps,
                 p.rtt_ms,
+                buffer_bytes,
+                p.latency_ms,
                 p.active,
                 id
             ],
@@ -1008,13 +1048,20 @@ impl Db {
             })?,
             bitrate_kbps: row.get(6)?,
             rtt_ms: row.get(7)?,
-            connected_at: row.get(8)?,
-            active: row.get(9)?,
+            buffer_bytes: u64::try_from(row.get::<_, i64>(8)?).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Integer,
+                    "negative buffer_bytes".into(),
+                )
+            })?,
+            latency_ms: row.get(9)?,
+            connected_at: row.get(10)?,
+            active: row.get(11)?,
         })
     }
 
-    const PLAYER_COLS: &'static str =
-        "id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active";
+    const PLAYER_COLS: &'static str = "id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,buffer_bytes,latency_ms,connected_at,active";
 
     pub fn player_list(&self, stream_id: Option<&str>) -> Vec<Player> {
         let conn = self.conn.lock();
@@ -1272,6 +1319,52 @@ mod tests {
         p.active = false;
         assert!(db.publisher_update("pub1", &p));
         assert_eq!(db.publisher_list(Some("stream1")).len(), 0);
+    }
+
+    #[test]
+    fn publisher_and_player_buffer_and_latency_round_trip() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+
+        let mut p = Publisher {
+            id: "pub1".to_string(),
+            stream_id: "stream1".to_string(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&p));
+        // Freshly inserted: no bitrate sample taken yet, so latency is unknown.
+        let stored = db.publisher_list(Some("stream1"));
+        assert_eq!(stored[0].buffer_bytes, 0);
+        assert_eq!(stored[0].latency_ms, None);
+
+        p.buffer_bytes = 65536;
+        p.latency_ms = Some(12.5);
+        assert!(db.publisher_update("pub1", &p));
+        let stored = db.publisher_list(Some("stream1"));
+        assert_eq!(stored[0].buffer_bytes, 65536);
+        assert_eq!(stored[0].latency_ms, Some(12.5));
+
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        let mut player = Player {
+            id: "pl1".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id,
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&player));
+        player.buffer_bytes = 4096;
+        player.latency_ms = Some(3.25);
+        assert!(db.player_update("pl1", &player));
+        let stored = db.player_list(Some("stream1"));
+        assert_eq!(stored[0].buffer_bytes, 4096);
+        assert_eq!(stored[0].latency_ms, Some(3.25));
     }
 
     #[test]
