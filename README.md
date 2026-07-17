@@ -276,8 +276,40 @@ Response:
 
 ### View stats (JSON)
 
+`/stats?key=...` is the public, key-protected endpoint: it returns a flat
+object for the stream that key belongs to, with no stream/app identifiers
+(the key alone is the audience-facing "which stream" signal, since it's an
+unauthenticated query parameter).
+
 ```bash
 curl "http://localhost:8080/stats?key=sts_0123456789abcdef0123456789abcdef"
+```
+
+```json
+{
+  "uptime": 12345,
+  "bitrate_kbps": 2450.5,
+  "rtt_ms": 24.0,
+  "bytes_in": 1234567,
+  "buffer_bytes": 4096,
+  "latency_ms": 13.4,
+  "video": {"codec": "h264", "width": 1920, "height": 1080, "fps": 30.0},
+  "audio": {"codec": "aac"}
+}
+```
+
+`buffer_bytes` is the outbound send-buffer backlog; `latency_ms` is an estimated
+queuing latency derived from it (`null` until a bitrate sample exists — e.g.
+right after a connection starts). Returns the plain text `Stream offline` while
+no publisher is connected.
+
+The Bearer-authenticated `/api/v1/streams/:id/stats` endpoint returns the
+richer, wrapped shape instead — every publisher and player on that stream,
+plus a stream-management summary:
+
+```bash
+curl "http://localhost:8080/api/v1/streams/mystream/stats" \
+  -H "Authorization: Bearer <generated-api-token>"
 ```
 
 ```json
@@ -295,33 +327,24 @@ curl "http://localhost:8080/stats?key=sts_0123456789abcdef0123456789abcdef"
     "video": {"codec": "h264", "width": 1920, "height": 1080, "fps": 30.0},
     "audio": {"codec": "aac"}
   }],
-  "players": [],
-  "summary": {"publishers": 1, "players": 0, "total_clients": 1, "dropped_pkts": 0}
+  "players": [{
+    "id": "play_...",
+    "stream_name": "My Live Stream",
+    "app": "live",
+    "uptime": 12345,
+    "bitrate_kbps": 2450.5,
+    "rtt_ms": 24.0,
+    "bytes_out": 987654,
+    "buffer_bytes": 0,
+    "latency_ms": null
+  }],
+  "summary": {"publishers": 1, "players": 1, "total_clients": 2, "dropped_pkts": 0}
 }
 ```
 
-`buffer_bytes` is the outbound send-buffer backlog; `latency_ms` is an estimated
-queuing latency derived from it (`null` until a bitrate sample exists — e.g.
-right after a connection starts). `summary.dropped_pkts` is a cumulative,
-server-wide count of connections force-closed because their outbound buffer
-filled up — RTMP runs over TCP, so there's no per-packet loss to report; this
-is the closest real analog.
-
-Each entry in `players` (one per connected viewer, once any are watching) looks like:
-
-```json
-{
-  "id": "play_...",
-  "stream_name": "My Live Stream",
-  "app": "live",
-  "uptime": 12345,
-  "bitrate_kbps": 2450.5,
-  "rtt_ms": 24.0,
-  "bytes_out": 987654,
-  "buffer_bytes": 0,
-  "latency_ms": null
-}
-```
+`summary.dropped_pkts` is a cumulative, server-wide count of connections
+force-closed because their outbound buffer filled up — RTMP runs over TCP, so
+there's no per-packet loss to report; this is the closest real analog.
 
 ### Stats nginx-rtmp XML
 

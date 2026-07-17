@@ -868,7 +868,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "librtmp2"
 version = "0.4.0"
-source = "git+https://github.com/OpenRTMP/librtmp2?branch=claude%2Fbuffer-dropped-pkts-latenz-thwjix#04e999f531d17718413eb0c77c60b23033107655"
+source = "git+https://github.com/OpenRTMP/librtmp2?rev=04e999f531d17718413eb0c77c60b23033107655#04e999f531d17718413eb0c77c60b23033107655"
 dependencies = [
  "cc",
  "libc",

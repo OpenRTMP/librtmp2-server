@@ -37,11 +37,14 @@ serial_test = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 # TEMPORARY: Conn::buffer_bytes()/latency_ms() and Server::backpressure_drops
-# aren't published to crates.io yet (pending OpenRTMP/librtmp2#136). Remove
-# this patch and bump the `librtmp2` version requirement above once that PR
-# merges and a new librtmp2 release is cut.
+# aren't published to crates.io yet (pending OpenRTMP/librtmp2#136). Pinned to
+# an immutable commit (not a branch name) so this build stays reproducible
+# even if that branch moves. Remove this patch and bump the `librtmp2`
+# version requirement above once that PR merges and a new librtmp2 release is
+# cut -- this violates this repo's crates.io-only sourcing policy (see #82)
+# and must not outlive the librtmp2 release.
 [patch.crates-io]
-librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", branch = "claude/buffer-dropped-pkts-latenz-thwjix" }
+librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", rev = "04e999f531d17718413eb0c77c60b23033107655" }
 
 [[bench]]
 name = "http_api"
