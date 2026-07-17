@@ -30,8 +30,10 @@ pub struct ServerConfig {
     /// HTTP API + UI, e.g. "0.0.0.0:8080"
     pub http_bind: String,
     /// When the TCP peer is one of these addresses, derive the client IP from
-    /// `X-Real-IP` or the rightmost `X-Forwarded-For` hop (the address appended
-    /// by the immediate trusted proxy).
+    /// the rightmost `X-Forwarded-For` hop (the address appended by the
+    /// immediate trusted proxy). `X-Real-IP` is intentionally not trusted, as
+    /// proxies that don't set it themselves may pass a client-supplied value
+    /// through unmodified.
     pub http_trusted_proxies: Vec<IpAddr>,
 
     /// HTTP rate-limit sliding window (seconds).

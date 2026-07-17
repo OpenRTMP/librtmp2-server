@@ -145,37 +145,24 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
 
     if trusted_proxies.contains(&peer) {
-        // Prefer X-Real-IP when the trusted proxy sets it (e.g. nginx $remote_addr).
-        if let Some(real_ip_header) = request
-            .headers()
-            .get("X-Real-IP")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-        {
-            match real_ip_header.parse::<IpAddr>() {
-                Ok(real_ip) => return real_ip,
-                Err(_) => crate::log_warn!(
-                    "rate_limit: trusted proxy {peer} sent unparsable X-Real-IP '{real_ip_header}', falling back to X-Forwarded-For/peer"
-                ),
-            }
-        }
-
+        // Use the rightmost address: the one appended by the immediate trusted
+        // proxy ($proxy_add_x_forwarded_for), not client-controlled leftmost entries.
+        //
+        // X-Real-IP is deliberately NOT trusted here: unlike XFF, which the
+        // trusted proxy appends to, X-Real-IP is commonly just passed through
+        // unmodified by proxies that don't set it themselves, which would let
+        // a client pick an arbitrary rate-limit bucket by setting it directly.
         if let Some(xff) = request
             .headers()
             .get("X-Forwarded-For")
             .and_then(|v| v.to_str().ok())
+            && let Some(rightmost) = xff.split(',').map(str::trim).rfind(|part| !part.is_empty())
         {
-            // Use the rightmost address: the one appended by the immediate trusted
-            // proxy ($proxy_add_x_forwarded_for), not client-controlled leftmost entries.
-            if let Some(rightmost) = xff.split(',').map(str::trim).rfind(|part| !part.is_empty())
-            {
-                match rightmost.parse::<IpAddr>() {
-                    Ok(client) => return client,
-                    Err(_) => crate::log_warn!(
-                        "rate_limit: trusted proxy {peer} sent unparsable X-Forwarded-For hop '{rightmost}', falling back to peer IP"
-                    ),
-                }
+            match rightmost.parse::<IpAddr>() {
+                Ok(client) => return client,
+                Err(_) => crate::log_warn!(
+                    "rate_limit: trusted proxy {peer} sent unparsable X-Forwarded-For hop '{rightmost}', falling back to peer IP"
+                ),
             }
         }
     }
@@ -348,7 +335,10 @@ mod tests {
     }
 
     #[test]
-    fn trusted_proxy_prefers_x_real_ip() {
+    fn trusted_proxy_ignores_x_real_ip() {
+        // A proxy that only forwards X-Real-IP unmodified (rather than setting
+        // it itself) would let a client pick an arbitrary rate-limit bucket by
+        // sending this header directly, so it must never be trusted.
         use axum::body::Body;
 
         let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -363,6 +353,6 @@ mod tests {
             .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 12345))));
 
         let ip = client_ip(&request, &[proxy]);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     }
 }
