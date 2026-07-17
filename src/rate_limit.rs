@@ -144,15 +144,36 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
         .map(|info| info.0.ip())
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
 
-    if trusted_proxies.contains(&peer)
-        && let Some(xff) = request
+    if trusted_proxies.contains(&peer) {
+        // Prefer X-Real-IP when the trusted proxy sets it (e.g. nginx $remote_addr).
+        if let Some(real_ip) = request
+            .headers()
+            .get("X-Real-IP")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .and_then(|part| part.parse::<IpAddr>().ok())
+        {
+            return real_ip;
+        }
+
+        if let Some(xff) = request
             .headers()
             .get("X-Forwarded-For")
             .and_then(|v| v.to_str().ok())
-        && let Some(client) = xff.split(',').map(str::trim).find(|part| !part.is_empty())
-        && let Ok(ip) = client.parse::<IpAddr>()
-    {
-        return ip;
+        {
+            // Use the rightmost address: the one appended by the immediate trusted
+            // proxy ($proxy_add_x_forwarded_for), not client-controlled leftmost entries.
+            if let Some(client) = xff
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .next_back()
+                .and_then(|part| part.parse::<IpAddr>().ok())
+            {
+                return client;
+            }
+        }
     }
 
     peer
@@ -287,13 +308,50 @@ mod tests {
     }
 
     #[test]
-    fn trusted_proxy_uses_x_forwarded_for() {
+    fn trusted_proxy_uses_rightmost_x_forwarded_for() {
         use axum::body::Body;
 
         let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let mut request = Request::builder()
             .uri("/api/v1/health")
             .header("X-Forwarded-For", "203.0.113.5, 10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 12345))));
+
+        let ip = client_ip(&request, &[proxy]);
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn trusted_proxy_ignores_client_supplied_leftmost_xff() {
+        use axum::body::Body;
+
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut request = Request::builder()
+            .uri("/api/v1/health")
+            .header("X-Forwarded-For", "198.51.100.99, 203.0.113.5")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 12345))));
+
+        let ip = client_ip(&request, &[proxy]);
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+    }
+
+    #[test]
+    fn trusted_proxy_prefers_x_real_ip() {
+        use axum::body::Body;
+
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let mut request = Request::builder()
+            .uri("/api/v1/health")
+            .header("X-Real-IP", "203.0.113.5")
+            .header("X-Forwarded-For", "198.51.100.99, 10.0.0.1")
             .body(Body::empty())
             .unwrap();
         request
