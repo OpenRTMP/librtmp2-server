@@ -167,8 +167,7 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
             if let Some(client) = xff
                 .split(',')
                 .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .next_back()
+                .rfind(|part| !part.is_empty())
                 .and_then(|part| part.parse::<IpAddr>().ok())
             {
                 return client;
