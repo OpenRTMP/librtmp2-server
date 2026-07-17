@@ -146,15 +146,19 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
 
     if trusted_proxies.contains(&peer) {
         // Prefer X-Real-IP when the trusted proxy sets it (e.g. nginx $remote_addr).
-        if let Some(real_ip) = request
+        if let Some(real_ip_header) = request
             .headers()
             .get("X-Real-IP")
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|part| !part.is_empty())
-            .and_then(|part| part.parse::<IpAddr>().ok())
         {
-            return real_ip;
+            match real_ip_header.parse::<IpAddr>() {
+                Ok(real_ip) => return real_ip,
+                Err(_) => crate::log_warn!(
+                    "rate_limit: trusted proxy {peer} sent unparsable X-Real-IP '{real_ip_header}', falling back to X-Forwarded-For/peer"
+                ),
+            }
         }
 
         if let Some(xff) = request
@@ -164,13 +168,14 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
         {
             // Use the rightmost address: the one appended by the immediate trusted
             // proxy ($proxy_add_x_forwarded_for), not client-controlled leftmost entries.
-            if let Some(client) = xff
-                .split(',')
-                .map(str::trim)
-                .rfind(|part| !part.is_empty())
-                .and_then(|part| part.parse::<IpAddr>().ok())
+            if let Some(rightmost) = xff.split(',').map(str::trim).rfind(|part| !part.is_empty())
             {
-                return client;
+                match rightmost.parse::<IpAddr>() {
+                    Ok(client) => return client,
+                    Err(_) => crate::log_warn!(
+                        "rate_limit: trusted proxy {peer} sent unparsable X-Forwarded-For hop '{rightmost}', falling back to peer IP"
+                    ),
+                }
             }
         }
     }
