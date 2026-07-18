@@ -1391,7 +1391,7 @@ async fn handle_stream_stats(
             PATH,
             &peer,
             StatusCode::FORBIDDEN,
-            "invalid stats key",
+            "invalid stream id",
         );
         return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     }
