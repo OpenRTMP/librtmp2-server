@@ -241,41 +241,49 @@ pub(crate) fn process_server_connections(
         // without closing TCP (FCUnpublish / closeStream / role switch).
         if entry.publishing && !is_publishing {
             rtmp_bridge.release_publisher(conn_id);
-            entry.publishing = false;
-            // A future publish session on this connection should start
-            // codec detection fresh rather than reporting the just-ended
-            // stream's codecs until new detection overwrites them.
-            entry.video_codec.clear();
-            entry.audio_codec.clear();
-            if !is_playing {
-                entry.stream_id.clear();
-                conn.relay_key.clear();
-                conn.relay_enabled = false;
-                // No role survives this teardown -- restart the idle-eviction
-                // window so a client that FCUnpublish'd intending to
-                // republish shortly isn't judged against a first_seen_at
-                // from the original (possibly long-past) TCP connect.
-                entry.first_seen_at = Some(Instant::now());
-            } else {
-                let sid = rtmp_bridge.stream_id_for_conn(conn_id);
-                entry.stream_id = sid.clone();
-                conn.relay_key = sid;
-                conn.relay_enabled = true;
+            // If the DB deactivation failed, release_publisher keeps the
+            // row in ConnState for a retry on close -- keep tracking this
+            // connection as the active publisher too, so idle eviction
+            // doesn't reclaim it while the still-active row blocks others.
+            if !rtmp_bridge.has_publisher(conn_id) {
+                entry.publishing = false;
+                // A future publish session on this connection should start
+                // codec detection fresh rather than reporting the just-ended
+                // stream's codecs until new detection overwrites them.
+                entry.video_codec.clear();
+                entry.audio_codec.clear();
+                if !is_playing {
+                    entry.stream_id.clear();
+                    conn.relay_key.clear();
+                    conn.relay_enabled = false;
+                    // No role survives this teardown -- restart the idle-eviction
+                    // window so a client that FCUnpublish'd intending to
+                    // republish shortly isn't judged against a first_seen_at
+                    // from the original (possibly long-past) TCP connect.
+                    entry.first_seen_at = Some(Instant::now());
+                } else {
+                    let sid = rtmp_bridge.stream_id_for_conn(conn_id);
+                    entry.stream_id = sid.clone();
+                    conn.relay_key = sid;
+                    conn.relay_enabled = true;
+                }
             }
         }
         if entry.playing && !is_playing {
             rtmp_bridge.release_player(conn_id);
-            entry.playing = false;
-            if !is_publishing {
-                entry.stream_id.clear();
-                conn.relay_key.clear();
-                conn.relay_enabled = false;
-                entry.first_seen_at = Some(Instant::now());
-            } else {
-                let sid = rtmp_bridge.stream_id_for_conn(conn_id);
-                entry.stream_id = sid.clone();
-                conn.relay_key = sid;
-                conn.relay_enabled = true;
+            if !rtmp_bridge.has_player(conn_id) {
+                entry.playing = false;
+                if !is_publishing {
+                    entry.stream_id.clear();
+                    conn.relay_key.clear();
+                    conn.relay_enabled = false;
+                    entry.first_seen_at = Some(Instant::now());
+                } else {
+                    let sid = rtmp_bridge.stream_id_for_conn(conn_id);
+                    entry.stream_id = sid.clone();
+                    conn.relay_key = sid;
+                    conn.relay_enabled = true;
+                }
             }
         }
 
