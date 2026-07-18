@@ -256,6 +256,7 @@ pub(crate) fn process_server_connections(
                     entry.stream_id.clear();
                     conn.relay_key.clear();
                     conn.relay_enabled = false;
+                    conn.pending_relay.clear();
                     // No role survives this teardown -- restart the idle-eviction
                     // window so a client that FCUnpublish'd intending to
                     // republish shortly isn't judged against a first_seen_at
@@ -277,6 +278,7 @@ pub(crate) fn process_server_connections(
                     entry.stream_id.clear();
                     conn.relay_key.clear();
                     conn.relay_enabled = false;
+                    conn.pending_relay.clear();
                     entry.first_seen_at = Some(Instant::now());
                 } else {
                     let sid = rtmp_bridge.stream_id_for_conn(conn_id);
