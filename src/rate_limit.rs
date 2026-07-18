@@ -144,7 +144,11 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
         .map(|info| info.0.ip())
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
 
-    resolve_client_ip(peer, request.headers().get("X-Forwarded-For"), trusted_proxies)
+    resolve_client_ip(
+        peer,
+        request.headers().get("X-Forwarded-For"),
+        trusted_proxies,
+    )
 }
 
 /// Resolve the client IP for access logs / rate limits, honoring
