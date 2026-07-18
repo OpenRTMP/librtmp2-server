@@ -83,7 +83,9 @@ fn now_ts() -> i64 {
 }
 
 fn http_peer(state: &AppState, addr: ClientAddr, headers: &HeaderMap) -> String {
-    let peer = addr.0.unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    let peer = addr
+        .0
+        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
     rate_limit::resolve_client_ip(
         peer,
         headers.get("X-Forwarded-For"),
@@ -1029,7 +1031,11 @@ async fn handle_stream_create(
         }
     }
 
-    crate::log_info!("HTTP: POST /api/v1/streams from {peer} → 201 stream created id={} app={}", s.id, s.app);
+    crate::log_info!(
+        "HTTP: POST /api/v1/streams from {peer} → 201 stream created id={} app={}",
+        s.id,
+        s.app
+    );
 
     (StatusCode::CREATED, Json(stream_to_json(&state.db, &s))).into_response()
 }
@@ -1122,7 +1128,6 @@ async fn handle_stream_delete(
     if state.rtmp_bridge.live_conn_count_for_stream(&id) == 0 {
         return match finalize_stream_delete(&state, &id).await {
             Ok(()) => {
-                // finalize_stream_delete already logs the deletion; include peer here.
                 crate::log_info!(
                     "HTTP: DELETE /api/v1/streams/{id} from {peer} → 200 stream deleted"
                 );
@@ -1370,10 +1375,22 @@ async fn handle_stream_stats(
     let bearer = bearer_ok(&state, &headers);
     if !is_valid_stream_key_part(&id) {
         if bearer {
-            log_http_access("GET", &path, &peer, StatusCode::BAD_REQUEST, "invalid stream id");
+            log_http_access(
+                "GET",
+                &path,
+                &peer,
+                StatusCode::BAD_REQUEST,
+                "invalid stream id",
+            );
             return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
         }
-        log_http_access("GET", &path, &peer, StatusCode::FORBIDDEN, "invalid stats key");
+        log_http_access(
+            "GET",
+            &path,
+            &peer,
+            StatusCode::FORBIDDEN,
+            "invalid stats key",
+        );
         return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     }
     if bearer {
@@ -1383,7 +1400,13 @@ async fn handle_stream_stats(
                 return Json(build_json_stats(&state.db, Some(&id))).into_response();
             }
             DbLookup::Missing => {
-                log_http_access("GET", &path, &peer, StatusCode::NOT_FOUND, "stream not found");
+                log_http_access(
+                    "GET",
+                    &path,
+                    &peer,
+                    StatusCode::NOT_FOUND,
+                    "stream not found",
+                );
                 return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
             }
             DbLookup::Failed => {
@@ -1404,7 +1427,13 @@ async fn handle_stream_stats(
     }
     let start = Instant::now();
     if stats_key_lookup(&state, &q.key, Some(&id)).is_none() {
-        log_http_access("GET", &path, &peer, StatusCode::FORBIDDEN, "invalid stats key");
+        log_http_access(
+            "GET",
+            &path,
+            &peer,
+            StatusCode::FORBIDDEN,
+            "invalid stats key",
+        );
         return pace_public_stats(
             start,
             public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key"),

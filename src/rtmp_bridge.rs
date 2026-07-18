@@ -797,9 +797,7 @@ impl DbRtmpBridge {
         crate::log_info!("RTMP: play request app='{app}' key=<redacted> from {peer}");
 
         let DbLookup::Ok(viewer) = self.db.viewer_find_by_play_key(stream_key) else {
-            crate::log_warn!(
-                "RTMP: play rejected — invalid play_key for app='{app}' from {peer}"
-            );
+            crate::log_warn!("RTMP: play rejected — invalid play_key for app='{app}' from {peer}");
             return Err(AuthFailureKind::Credential);
         };
         let DbLookup::Ok(stream) = self.db.stream_get(&viewer.stream_id) else {
