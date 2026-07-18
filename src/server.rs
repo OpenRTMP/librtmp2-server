@@ -255,7 +255,7 @@ pub(crate) fn process_server_connections(
         if entry.playing && !is_playing {
             rtmp_bridge.release_player(conn_id);
             entry.playing = false;
-            if !is_publishing && !entry.publishing {
+            if !is_publishing {
                 entry.stream_id.clear();
                 conn.relay_key.clear();
                 conn.relay_enabled = false;

@@ -370,80 +370,106 @@ impl DbRtmpBridge {
 
     /// Deactivate the publisher row for this connection without dropping the
     /// whole ConnState (player role / auth rate-limit bookkeeping may remain).
+    ///
+    /// The row is only removed from `ConnState` after the DB deactivation
+    /// succeeds. If it fails, the role is left in place so `on_close` (or a
+    /// later replace via `authorize_publish`) retries the deactivation
+    /// instead of leaking an `active=1` row.
     pub fn release_publisher(&self, conn: ConnId) {
         let pub_row = {
-            let mut guard = self.conns.lock();
-            let Some(cs) = guard.get_mut(&conn) else {
-                return;
-            };
-            let pub_row = cs.publisher.take();
-            if cs.player.is_none() {
-                cs.stream_id.clear();
-            } else if let Some(ref player) = cs.player {
-                cs.stream_id = player.stream_id.clone();
-            }
-            cs.publisher_last_stats_at = None;
-            cs.publisher_bytes_base = 0;
-            cs.publisher_bytes_at_last_stats = 0;
-            cs.publisher_stats_reset_pending = false;
-            pub_row
+            let guard = self.conns.lock();
+            guard.get(&conn).and_then(|cs| cs.publisher.clone())
         };
         let Some(mut pub_row) = pub_row else {
             return;
         };
         pub_row.active = false;
-        if self.db.publisher_update(&pub_row.id, &pub_row) {
-            crate::log_info!(
-                "RTMP: publisher released: stream={} session={}",
-                pub_row.stream_id,
-                pub_row.id
-            );
-        } else {
+        if !self.db.publisher_update(&pub_row.id, &pub_row) {
             crate::log_error!(
-                "RTMP: failed to deactivate publisher on release: stream={} session={}",
+                "RTMP: failed to deactivate publisher on release: stream={} session={} (will retry on close)",
                 pub_row.stream_id,
                 pub_row.id
             );
+            return;
         }
+        crate::log_info!(
+            "RTMP: publisher released: stream={} session={}",
+            pub_row.stream_id,
+            pub_row.id
+        );
+
+        let mut guard = self.conns.lock();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+        // Only clear if the role hasn't already moved on (e.g. replaced
+        // while the DB call above was in flight).
+        if cs.publisher.as_ref().map(|p| p.id.as_str()) != Some(pub_row.id.as_str()) {
+            return;
+        }
+        cs.publisher = None;
+        if let Some(ref player) = cs.player {
+            cs.stream_id = player.stream_id.clone();
+        } else {
+            cs.stream_id.clear();
+        }
+        cs.publisher_last_stats_at = None;
+        cs.publisher_bytes_base = 0;
+        cs.publisher_bytes_at_last_stats = 0;
+        // Arm a rebase for the next publish session on this connection:
+        // authorize_publish only sets this when *replacing* an active
+        // publisher, so a fresh publish after this release would
+        // otherwise inherit a bytes_base of 0 and misattribute the
+        // prior session's bytes to the new one.
+        cs.publisher_stats_reset_pending = true;
     }
 
-    /// Deactivate the player row for this connection without dropping ConnState.
+    /// Deactivate the player row for this connection without dropping
+    /// ConnState. See `release_publisher` for why removal from `ConnState`
+    /// is deferred until the DB deactivation succeeds.
     pub fn release_player(&self, conn: ConnId) {
         let player_row = {
-            let mut guard = self.conns.lock();
-            let Some(cs) = guard.get_mut(&conn) else {
-                return;
-            };
-            let player_row = cs.player.take();
-            cs.viewer_id.clear();
-            if cs.publisher.is_none() {
-                cs.stream_id.clear();
-            } else if let Some(ref pub_row) = cs.publisher {
-                cs.stream_id = pub_row.stream_id.clone();
-            }
-            cs.player_last_stats_at = None;
-            cs.player_bytes_base = 0;
-            cs.player_bytes_at_last_stats = 0;
-            cs.player_stats_reset_pending = false;
-            player_row
+            let guard = self.conns.lock();
+            guard.get(&conn).and_then(|cs| cs.player.clone())
         };
         let Some(mut player_row) = player_row else {
             return;
         };
         player_row.active = false;
-        if self.db.player_update(&player_row.id, &player_row) {
-            crate::log_info!(
-                "RTMP: player released: stream={} session={}",
-                player_row.stream_id,
-                player_row.id
-            );
-        } else {
+        if !self.db.player_update(&player_row.id, &player_row) {
             crate::log_error!(
-                "RTMP: failed to deactivate player on release: stream={} session={}",
+                "RTMP: failed to deactivate player on release: stream={} session={} (will retry on close)",
                 player_row.stream_id,
                 player_row.id
             );
+            return;
         }
+        crate::log_info!(
+            "RTMP: player released: stream={} session={}",
+            player_row.stream_id,
+            player_row.id
+        );
+
+        let mut guard = self.conns.lock();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+        if cs.player.as_ref().map(|p| p.id.as_str()) != Some(player_row.id.as_str()) {
+            return;
+        }
+        cs.player = None;
+        cs.viewer_id.clear();
+        if let Some(ref pub_row) = cs.publisher {
+            cs.stream_id = pub_row.stream_id.clone();
+        } else {
+            cs.stream_id.clear();
+        }
+        cs.player_last_stats_at = None;
+        cs.player_bytes_base = 0;
+        cs.player_bytes_at_last_stats = 0;
+        // See release_publisher: arm the rebase for the next play
+        // session on this connection.
+        cs.player_stats_reset_pending = true;
     }
 
     /// Update publisher stats (media bytes_in, bitrate, codec) in the DB.
@@ -1225,6 +1251,44 @@ mod tests {
 
         bridge.on_close(1);
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
+    }
+
+    #[test]
+    fn release_publisher_keeps_role_when_db_deactivation_fails() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
+
+        // Delete the stream out from under the publisher row (cascades),
+        // so the UPDATE in release_publisher affects 0 rows and fails.
+        assert!(matches!(db.stream_delete("s1"), Some(true)));
+
+        bridge.release_publisher(1);
+
+        // The role must stay tracked so on_close (or a later replace) can
+        // retry the deactivation instead of leaking an active-looking row.
+        let guard = bridge.conns.lock();
+        assert!(guard.get(&1).unwrap().publisher.is_some());
+    }
+
+    #[test]
+    fn release_player_keeps_role_when_db_deactivation_fails() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
+
+        assert!(matches!(db.stream_delete("s1"), Some(true)));
+
+        bridge.release_player(1);
+
+        let guard = bridge.conns.lock();
+        assert!(guard.get(&1).unwrap().player.is_some());
     }
 
     #[test]
