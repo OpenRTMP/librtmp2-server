@@ -212,7 +212,12 @@ pub(crate) fn process_server_connections(
         current_ids.insert(conn_id);
         let entry = tracked.entry(conn_id).or_default();
         if !entry.connected {
-            rtmp_bridge.on_connect(conn_id, &conn.remote_addr);
+            // A publish/play callback may have already run `on_connect` via
+            // `ensure_conn_registered_for_auth` earlier this same poll tick;
+            // skip the redundant call so the connection isn't logged twice.
+            if !rtmp_bridge.is_registered(conn_id) {
+                rtmp_bridge.on_connect(conn_id, &conn.remote_addr);
+            }
             entry.connected = true;
             entry.first_seen_at = Some(Instant::now());
         } else if entry.first_seen_at.is_none() {

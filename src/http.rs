@@ -1302,9 +1302,11 @@ async fn handle_stream_player_create(
 
 async fn handle_stream_player_delete(
     State(state): State<Arc<AppState>>,
+    addr: ClientAddr,
     headers: HeaderMap,
     Path((id, player_id)): Path<(String, String)>,
 ) -> Response {
+    let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
         return err_json(
             StatusCode::UNAUTHORIZED,
@@ -1352,6 +1354,9 @@ async fn handle_stream_player_delete(
         Some(true) => {
             state.revoked_viewers.lock().insert(player_id.clone());
             state.db.players_deactivate_for_viewer(&player_id);
+            crate::log_info!(
+                "HTTP: DELETE /api/v1/streams/{id}/players/{player_id} from {peer} → 200 play key revoked"
+            );
             Json(json!({"status": "deleted"})).into_response()
         }
         Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found"),
