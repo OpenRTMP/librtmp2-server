@@ -242,6 +242,11 @@ pub(crate) fn process_server_connections(
         if entry.publishing && !is_publishing {
             rtmp_bridge.release_publisher(conn_id);
             entry.publishing = false;
+            // A future publish session on this connection should start
+            // codec detection fresh rather than reporting the just-ended
+            // stream's codecs until new detection overwrites them.
+            entry.video_codec.clear();
+            entry.audio_codec.clear();
             if !is_playing {
                 entry.stream_id.clear();
                 conn.relay_key.clear();
