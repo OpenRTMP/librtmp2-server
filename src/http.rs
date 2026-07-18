@@ -1371,13 +1371,15 @@ async fn handle_stream_stats(
     Query(q): Query<KeyQuery>,
 ) -> Response {
     let peer = http_peer(&state, addr, &headers);
-    let path = format!("/api/v1/streams/{id}/stats");
     let bearer = bearer_ok(&state, &headers);
     if !is_valid_stream_key_part(&id) {
+        // `id` is not yet validated here and may contain control characters
+        // decoded from the URL, so it must not be interpolated into the log.
+        const PATH: &str = "/api/v1/streams/<invalid>/stats";
         if bearer {
             log_http_access(
                 "GET",
-                &path,
+                PATH,
                 &peer,
                 StatusCode::BAD_REQUEST,
                 "invalid stream id",
@@ -1386,13 +1388,14 @@ async fn handle_stream_stats(
         }
         log_http_access(
             "GET",
-            &path,
+            PATH,
             &peer,
             StatusCode::FORBIDDEN,
             "invalid stats key",
         );
         return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     }
+    let path = format!("/api/v1/streams/{id}/stats");
     if bearer {
         match state.db.stream_get(&id) {
             DbLookup::Ok(_) => {
