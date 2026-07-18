@@ -234,8 +234,62 @@ pub(crate) fn process_server_connections(
         let Some(stream) = conn.current_stream.as_ref() else {
             continue;
         };
+        let is_publishing = stream.is_publishing;
+        let is_playing = stream.is_playing;
 
-        if stream.is_publishing && !entry.publishing {
+        // Tear down bridge roles when the RTMP session drops publish/play
+        // without closing TCP (FCUnpublish / closeStream / role switch).
+        if entry.publishing && !is_publishing {
+            rtmp_bridge.release_publisher(conn_id);
+            // If the DB deactivation failed, release_publisher keeps the
+            // row in ConnState for a retry on close -- keep tracking this
+            // connection as the active publisher too, so idle eviction
+            // doesn't reclaim it while the still-active row blocks others.
+            if !rtmp_bridge.has_publisher(conn_id) {
+                entry.publishing = false;
+                // A future publish session on this connection should start
+                // codec detection fresh rather than reporting the just-ended
+                // stream's codecs until new detection overwrites them.
+                entry.video_codec.clear();
+                entry.audio_codec.clear();
+                if !is_playing {
+                    entry.stream_id.clear();
+                    conn.relay_key.clear();
+                    conn.relay_enabled = false;
+                    conn.pending_relay.clear();
+                    // No role survives this teardown -- restart the idle-eviction
+                    // window so a client that FCUnpublish'd intending to
+                    // republish shortly isn't judged against a first_seen_at
+                    // from the original (possibly long-past) TCP connect.
+                    entry.first_seen_at = Some(Instant::now());
+                } else {
+                    let sid = rtmp_bridge.stream_id_for_conn(conn_id);
+                    entry.stream_id = sid.clone();
+                    conn.relay_key = sid;
+                    conn.relay_enabled = true;
+                }
+            }
+        }
+        if entry.playing && !is_playing {
+            rtmp_bridge.release_player(conn_id);
+            if !rtmp_bridge.has_player(conn_id) {
+                entry.playing = false;
+                if !is_publishing {
+                    entry.stream_id.clear();
+                    conn.relay_key.clear();
+                    conn.relay_enabled = false;
+                    conn.pending_relay.clear();
+                    entry.first_seen_at = Some(Instant::now());
+                } else {
+                    let sid = rtmp_bridge.stream_id_for_conn(conn_id);
+                    entry.stream_id = sid.clone();
+                    conn.relay_key = sid;
+                    conn.relay_enabled = true;
+                }
+            }
+        }
+
+        if is_publishing && !entry.publishing {
             if !rtmp_bridge.has_publisher(conn_id) {
                 crate::log_warn!(
                     "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
@@ -249,9 +303,17 @@ pub(crate) fn process_server_connections(
             entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
+        } else if is_publishing && entry.publishing {
+            // Same-connection stream switch: bridge already moved the
+            // publisher row; keep relay_key / kick targets in sync.
+            let sid = rtmp_bridge.stream_id_for_conn(conn_id);
+            if !sid.is_empty() && sid != entry.stream_id {
+                entry.stream_id = sid.clone();
+                conn.relay_key = sid;
+            }
         }
 
-        if stream.is_playing && !entry.playing {
+        if is_playing && !entry.playing {
             if !rtmp_bridge.has_player(conn_id) {
                 crate::log_warn!(
                     "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
@@ -262,11 +324,15 @@ pub(crate) fn process_server_connections(
             }
             crate::log_info!("RTMP: player connected from {}", conn.remote_addr);
             entry.playing = true;
-            if entry.stream_id.is_empty() {
-                entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
-            }
+            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
+        } else if is_playing && entry.playing {
+            let sid = rtmp_bridge.stream_id_for_conn(conn_id);
+            if !sid.is_empty() && sid != entry.stream_id {
+                entry.stream_id = sid.clone();
+                conn.relay_key = sid;
+            }
         }
 
         // Kick connections whose stream was deleted.
@@ -287,7 +353,7 @@ pub(crate) fn process_server_connections(
         }
 
         // Publisher stats: media bytes only (excludes RTMP control overhead).
-        if stream.is_publishing {
+        if is_publishing {
             let new_video = conn
                 .detected_video_codec
                 .as_deref()
@@ -321,7 +387,7 @@ pub(crate) fn process_server_connections(
             );
         }
 
-        if stream.is_playing {
+        if is_playing {
             rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
         }
     }

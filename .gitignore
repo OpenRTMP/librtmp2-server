@@ -1,3 +1,7 @@
 /target/
 .env
 .DS_Store
+
+# Bug Hunter local artifacts
+.bug-hunter/
+
