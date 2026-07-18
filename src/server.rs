@@ -246,10 +246,16 @@ pub(crate) fn process_server_connections(
                 entry.stream_id.clear();
                 conn.relay_key.clear();
                 conn.relay_enabled = false;
+                // No role survives this teardown -- restart the idle-eviction
+                // window so a client that FCUnpublish'd intending to
+                // republish shortly isn't judged against a first_seen_at
+                // from the original (possibly long-past) TCP connect.
+                entry.first_seen_at = Some(Instant::now());
             } else {
                 let sid = rtmp_bridge.stream_id_for_conn(conn_id);
                 entry.stream_id = sid.clone();
                 conn.relay_key = sid;
+                conn.relay_enabled = true;
             }
         }
         if entry.playing && !is_playing {
@@ -259,10 +265,12 @@ pub(crate) fn process_server_connections(
                 entry.stream_id.clear();
                 conn.relay_key.clear();
                 conn.relay_enabled = false;
+                entry.first_seen_at = Some(Instant::now());
             } else {
                 let sid = rtmp_bridge.stream_id_for_conn(conn_id);
                 entry.stream_id = sid.clone();
                 conn.relay_key = sid;
+                conn.relay_enabled = true;
             }
         }
 
