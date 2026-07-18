@@ -368,6 +368,84 @@ impl DbRtmpBridge {
             .unwrap_or(false)
     }
 
+    /// Deactivate the publisher row for this connection without dropping the
+    /// whole ConnState (player role / auth rate-limit bookkeeping may remain).
+    pub fn release_publisher(&self, conn: ConnId) {
+        let pub_row = {
+            let mut guard = self.conns.lock();
+            let Some(cs) = guard.get_mut(&conn) else {
+                return;
+            };
+            let pub_row = cs.publisher.take();
+            if cs.player.is_none() {
+                cs.stream_id.clear();
+            } else if let Some(ref player) = cs.player {
+                cs.stream_id = player.stream_id.clone();
+            }
+            cs.publisher_last_stats_at = None;
+            cs.publisher_bytes_base = 0;
+            cs.publisher_bytes_at_last_stats = 0;
+            cs.publisher_stats_reset_pending = false;
+            pub_row
+        };
+        let Some(mut pub_row) = pub_row else {
+            return;
+        };
+        pub_row.active = false;
+        if self.db.publisher_update(&pub_row.id, &pub_row) {
+            crate::log_info!(
+                "RTMP: publisher released: stream={} session={}",
+                pub_row.stream_id,
+                pub_row.id
+            );
+        } else {
+            crate::log_error!(
+                "RTMP: failed to deactivate publisher on release: stream={} session={}",
+                pub_row.stream_id,
+                pub_row.id
+            );
+        }
+    }
+
+    /// Deactivate the player row for this connection without dropping ConnState.
+    pub fn release_player(&self, conn: ConnId) {
+        let player_row = {
+            let mut guard = self.conns.lock();
+            let Some(cs) = guard.get_mut(&conn) else {
+                return;
+            };
+            let player_row = cs.player.take();
+            cs.viewer_id.clear();
+            if cs.publisher.is_none() {
+                cs.stream_id.clear();
+            } else if let Some(ref pub_row) = cs.publisher {
+                cs.stream_id = pub_row.stream_id.clone();
+            }
+            cs.player_last_stats_at = None;
+            cs.player_bytes_base = 0;
+            cs.player_bytes_at_last_stats = 0;
+            cs.player_stats_reset_pending = false;
+            player_row
+        };
+        let Some(mut player_row) = player_row else {
+            return;
+        };
+        player_row.active = false;
+        if self.db.player_update(&player_row.id, &player_row) {
+            crate::log_info!(
+                "RTMP: player released: stream={} session={}",
+                player_row.stream_id,
+                player_row.id
+            );
+        } else {
+            crate::log_error!(
+                "RTMP: failed to deactivate player on release: stream={} session={}",
+                player_row.stream_id,
+                player_row.id
+            );
+        }
+    }
+
     /// Update publisher stats (media bytes_in, bitrate, codec) in the DB.
     /// Called from the server poll loop after every poll iteration.
     pub fn update_publisher_stats(
