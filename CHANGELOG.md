@@ -19,6 +19,32 @@ begin at `1.0.0`.
   workflow version, while local builds fall back to the package version from
   `Cargo.toml`.
 
+## [0.1.6] — 2026-07-18
+
+### Fixed
+- Release the DB publisher/player role and sync `relay_key` when a session
+  drops publish/play without closing the TCP connection (FCUnpublish /
+  closeStream / publish↔play switch), instead of leaving stale role and
+  relay-routing state behind.
+- `release_publisher`/`release_player` now retry the DB deactivation on
+  failure and arm a stats rebase for the connection's next session, instead
+  of losing track of an `active=1` row or misattributing prior-session bytes
+  to the next one.
+- Restart the idle-eviction window and re-enable relay when a role survives
+  mid-session teardown, so a client that intends to republish/replay shortly
+  isn't judged against a stale `first_seen_at` or left without relay.
+- Clear tracked codec strings and `conn.pending_relay` when the last role on
+  a connection ends mid-session, so a later publish/play on the same
+  connection doesn't inherit stale codec metadata or a buffered relay queue.
+- Only clear a connection's tracked publish/play role after the bridge
+  confirms the DB deactivation actually succeeded, so idle eviction can't
+  reclaim a connection whose role row is still active and blocking others.
+
+### Changed
+- Bump the `librtmp2` dependency to the crates.io release **0.4.1**, which
+  tracks the exact claimed publish-route key independently of `relay_key`
+  and clears `Stream.is_playing` on `publish()`.
+
 ## [0.1.5] — 2026-07-15
 
 ### Changed
