@@ -10,8 +10,8 @@
 //!   GET    /api/v1/streams/:id/stats            Bearer = full JSON; key = flat public JSON
 //!   GET    /stats-nginx?key=<stats_key>         XML (nginx-rtmp compatible)
 
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, request::Parts};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
@@ -20,6 +20,8 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -78,6 +80,46 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn http_peer(state: &AppState, addr: ClientAddr, headers: &HeaderMap) -> String {
+    let peer = addr.0.unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    rate_limit::resolve_client_ip(
+        peer,
+        headers.get("X-Forwarded-For"),
+        &state.config.http_trusted_proxies,
+    )
+    .to_string()
+}
+
+/// Optional peer address for access logs. Missing in unit tests that use
+/// `oneshot` without `ConnectInfo`; production always has it via
+/// `into_make_service_with_connect_info`.
+struct ClientAddr(Option<std::net::IpAddr>);
+
+impl<S> FromRequestParts<S> for ClientAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(ClientAddr(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| addr.ip()),
+        ))
+    }
+}
+
+fn log_http_access(method: &str, path: &str, peer: &str, status: StatusCode, detail: &str) {
+    let code = status.as_u16();
+    if detail.is_empty() {
+        crate::log_info!("HTTP: {method} {path} from {peer} → {code}");
+    } else {
+        crate::log_info!("HTTP: {method} {path} from {peer} → {code} {detail}");
+    }
 }
 
 // ---------- errors ----------
@@ -592,27 +634,30 @@ async fn handle_health(State(state): State<Arc<AppState>>, headers: HeaderMap) -
 
 async fn handle_stats_json(
     State(state): State<Arc<AppState>>,
+    addr: ClientAddr,
+    headers: HeaderMap,
     Query(q): Query<KeyQuery>,
 ) -> Response {
+    let peer = http_peer(&state, addr, &headers);
     let start = Instant::now();
     if q.key.is_empty() {
-        return pace_public_stats(
-            start,
-            public_stats_text(StatusCode::UNAUTHORIZED, "stats_key required"),
-        )
-        .await;
+        let status = StatusCode::UNAUTHORIZED;
+        log_http_access("GET", "/stats", &peer, status, "stats_key required");
+        return pace_public_stats(start, public_stats_text(status, "stats_key required")).await;
     }
     let Some(s) = stats_key_lookup(&state, &q.key, None) else {
-        return pace_public_stats(
-            start,
-            public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key"),
-        )
-        .await;
+        let status = StatusCode::FORBIDDEN;
+        log_http_access("GET", "/stats", &peer, status, "invalid stats key");
+        return pace_public_stats(start, public_stats_text(status, "Invalid stats key")).await;
     };
-    let response = match build_public_json_stats(&state.db, &s.id) {
-        Some(body) => Json(body).into_response(),
-        None => public_stats_text(StatusCode::OK, "Stream offline"),
+    let (response, detail) = match build_public_json_stats(&state.db, &s.id) {
+        Some(body) => (Json(body).into_response(), format!("stream='{}'", s.id)),
+        None => (
+            public_stats_text(StatusCode::OK, "Stream offline"),
+            format!("stream='{}' offline", s.id),
+        ),
     };
+    log_http_access("GET", "/stats", &peer, StatusCode::OK, &detail);
     pace_public_stats(start, response).await
 }
 
@@ -753,7 +798,13 @@ const STAT_XSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 </xsl:stylesheet>
 "#;
 
-async fn handle_stat_xsl() -> Response {
+async fn handle_stat_xsl(
+    addr: ClientAddr,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let peer = http_peer(&state, addr, &headers);
+    log_http_access("GET", "/stat.xsl", &peer, StatusCode::OK, "");
     (
         StatusCode::OK,
         [("Content-Type", "text/xsl; charset=utf-8")],
@@ -764,19 +815,29 @@ async fn handle_stat_xsl() -> Response {
 
 async fn handle_stats_nginx(
     State(state): State<Arc<AppState>>,
+    addr: ClientAddr,
+    headers: HeaderMap,
     Query(q): Query<KeyQuery>,
 ) -> Response {
+    let peer = http_peer(&state, addr, &headers);
     let start = Instant::now();
     if q.key.is_empty() {
-        return pace_public_stats(
-            start,
-            err_xml(StatusCode::UNAUTHORIZED, "Missing stats key"),
-        )
-        .await;
+        let status = StatusCode::UNAUTHORIZED;
+        log_http_access("GET", "/stats-nginx", &peer, status, "stats_key required");
+        return pace_public_stats(start, err_xml(status, "Missing stats key")).await;
     }
     let Some(s) = stats_key_lookup(&state, &q.key, None) else {
-        return pace_public_stats(start, err_xml(StatusCode::FORBIDDEN, "Invalid stats key")).await;
+        let status = StatusCode::FORBIDDEN;
+        log_http_access("GET", "/stats-nginx", &peer, status, "invalid stats key");
+        return pace_public_stats(start, err_xml(status, "Invalid stats key")).await;
     };
+    log_http_access(
+        "GET",
+        "/stats-nginx",
+        &peer,
+        StatusCode::OK,
+        &format!("stream='{}'", s.id),
+    );
     let response = xml_response(
         StatusCode::OK,
         build_nginx_xml(&state.db, Some(&s.id), true),
@@ -814,9 +875,11 @@ struct CreateStreamRequest {
 
 async fn handle_stream_create(
     State(state): State<Arc<AppState>>,
+    addr: ClientAddr,
     headers: HeaderMap,
     body: Option<Json<CreateStreamRequest>>,
 ) -> Response {
+    let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
         return err_json(
             StatusCode::UNAUTHORIZED,
@@ -966,7 +1029,7 @@ async fn handle_stream_create(
         }
     }
 
-    crate::log_info!("Stream created: id={} app={}", s.id, s.app);
+    crate::log_info!("HTTP: POST /api/v1/streams from {peer} → 201 stream created id={} app={}", s.id, s.app);
 
     (StatusCode::CREATED, Json(stream_to_json(&state.db, &s))).into_response()
 }
@@ -974,7 +1037,6 @@ async fn handle_stream_create(
 async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), ()> {
     match state.db.stream_delete(id) {
         Some(true) => {
-            crate::log_info!("Stream deleted: {id}");
             state.deleted_streams.lock().remove(id);
             Ok(())
         }
@@ -1007,14 +1069,19 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let _ = finalize_stream_delete(&state, &id).await;
+    match finalize_stream_delete(&state, &id).await {
+        Ok(()) => crate::log_info!("HTTP: stream '{id}' deleted after RTMP drain"),
+        Err(()) => crate::log_error!("HTTP: failed to finalize delete for stream '{id}'"),
+    }
 }
 
 async fn handle_stream_delete(
     State(state): State<Arc<AppState>>,
+    addr: ClientAddr,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
+    let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
         return err_json(
             StatusCode::UNAUTHORIZED,
@@ -1054,7 +1121,13 @@ async fn handle_stream_delete(
 
     if state.rtmp_bridge.live_conn_count_for_stream(&id) == 0 {
         return match finalize_stream_delete(&state, &id).await {
-            Ok(()) => Json(json!({"status": "deleted"})).into_response(),
+            Ok(()) => {
+                // finalize_stream_delete already logs the deletion; include peer here.
+                crate::log_info!(
+                    "HTTP: DELETE /api/v1/streams/{id} from {peer} → 200 stream deleted"
+                );
+                Json(json!({"status": "deleted"})).into_response()
+            }
             Err(()) => err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -1063,6 +1136,9 @@ async fn handle_stream_delete(
         };
     }
 
+    crate::log_info!(
+        "HTTP: DELETE /api/v1/streams/{id} from {peer} → 202 deleting (draining RTMP)"
+    );
     let state_bg = Arc::clone(&state);
     let id_bg = id.clone();
     tokio::spawn(async move {
@@ -1116,10 +1192,12 @@ struct CreatePlayerRequest {
 
 async fn handle_stream_player_create(
     State(state): State<Arc<AppState>>,
+    addr: ClientAddr,
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Option<Json<CreatePlayerRequest>>,
 ) -> Response {
+    let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
         return err_json(
             StatusCode::UNAUTHORIZED,
@@ -1210,7 +1288,7 @@ async fn handle_stream_player_create(
     }
 
     crate::log_info!(
-        "Play key created: stream={} name={}",
+        "HTTP: POST /api/v1/streams/{}/players from {peer} → 201 play key created name={}",
         stream.id,
         viewer.name
     );
@@ -1282,24 +1360,40 @@ async fn handle_stream_player_delete(
 
 async fn handle_stream_stats(
     State(state): State<Arc<AppState>>,
+    addr: ClientAddr,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<KeyQuery>,
 ) -> Response {
+    let peer = http_peer(&state, addr, &headers);
+    let path = format!("/api/v1/streams/{id}/stats");
     let bearer = bearer_ok(&state, &headers);
     if !is_valid_stream_key_part(&id) {
         if bearer {
+            log_http_access("GET", &path, &peer, StatusCode::BAD_REQUEST, "invalid stream id");
             return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
         }
+        log_http_access("GET", &path, &peer, StatusCode::FORBIDDEN, "invalid stats key");
         return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
     }
     if bearer {
         match state.db.stream_get(&id) {
-            DbLookup::Ok(_) => return Json(build_json_stats(&state.db, Some(&id))).into_response(),
+            DbLookup::Ok(_) => {
+                log_http_access("GET", &path, &peer, StatusCode::OK, "bearer");
+                return Json(build_json_stats(&state.db, Some(&id))).into_response();
+            }
             DbLookup::Missing => {
+                log_http_access("GET", &path, &peer, StatusCode::NOT_FOUND, "stream not found");
                 return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
             }
             DbLookup::Failed => {
+                log_http_access(
+                    "GET",
+                    &path,
+                    &peer,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db error",
+                );
                 return err_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "INTERNAL_ERROR",
@@ -1310,16 +1404,21 @@ async fn handle_stream_stats(
     }
     let start = Instant::now();
     if stats_key_lookup(&state, &q.key, Some(&id)).is_none() {
+        log_http_access("GET", &path, &peer, StatusCode::FORBIDDEN, "invalid stats key");
         return pace_public_stats(
             start,
             public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key"),
         )
         .await;
     }
-    let response = match build_public_json_stats(&state.db, &id) {
-        Some(body) => Json(body).into_response(),
-        None => public_stats_text(StatusCode::OK, "Stream offline"),
+    let (response, detail) = match build_public_json_stats(&state.db, &id) {
+        Some(body) => (Json(body).into_response(), format!("stream='{id}'")),
+        None => (
+            public_stats_text(StatusCode::OK, "Stream offline"),
+            format!("stream='{id}' offline"),
+        ),
     };
+    log_http_access("GET", &path, &peer, StatusCode::OK, &detail);
     pace_public_stats(start, response).await
 }
 

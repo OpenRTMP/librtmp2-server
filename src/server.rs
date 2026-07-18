@@ -292,13 +292,18 @@ pub(crate) fn process_server_connections(
         if is_publishing && !entry.publishing {
             if !rtmp_bridge.has_publisher(conn_id) {
                 crate::log_warn!(
-                    "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
+                    "RTMP: closing unauthorized publisher conn={conn_id} from {} app='{}' key=<redacted>",
+                    conn.remote_addr,
                     conn.app
                 );
                 reject_indices.push(idx);
                 continue;
             }
-            crate::log_info!("RTMP: publisher connected from {}", conn.remote_addr);
+            crate::log_info!(
+                "RTMP: publisher connected from {} stream='{}'",
+                conn.remote_addr,
+                rtmp_bridge.stream_id_for_conn(conn_id)
+            );
             entry.publishing = true;
             entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
             conn.relay_key = entry.stream_id.clone();
@@ -316,13 +321,18 @@ pub(crate) fn process_server_connections(
         if is_playing && !entry.playing {
             if !rtmp_bridge.has_player(conn_id) {
                 crate::log_warn!(
-                    "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
+                    "RTMP: closing unauthorized player conn={conn_id} from {} app='{}' key=<redacted>",
+                    conn.remote_addr,
                     conn.app
                 );
                 reject_indices.push(idx);
                 continue;
             }
-            crate::log_info!("RTMP: player connected from {}", conn.remote_addr);
+            crate::log_info!(
+                "RTMP: player connected from {} stream='{}'",
+                conn.remote_addr,
+                rtmp_bridge.stream_id_for_conn(conn_id)
+            );
             entry.playing = true;
             entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
             conn.relay_key = entry.stream_id.clone();
@@ -338,7 +348,8 @@ pub(crate) fn process_server_connections(
         // Kick connections whose stream was deleted.
         if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
             crate::log_info!(
-                "RTMP: kicking conn={conn_id} — stream '{}' was deleted",
+                "RTMP: kicking conn={conn_id} from {} — stream '{}' was deleted",
+                conn.remote_addr,
                 entry.stream_id
             );
             reject_indices.push(idx);
@@ -347,7 +358,10 @@ pub(crate) fn process_server_connections(
 
         let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
         if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
-            crate::log_info!("RTMP: kicking conn={conn_id} — play key '{viewer_id}' was revoked");
+            crate::log_info!(
+                "RTMP: kicking conn={conn_id} from {} — play key '{viewer_id}' was revoked",
+                conn.remote_addr
+            );
             reject_indices.push(idx);
             continue;
         }

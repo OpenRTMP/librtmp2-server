@@ -144,6 +144,16 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
         .map(|info| info.0.ip())
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
 
+    resolve_client_ip(peer, request.headers().get("X-Forwarded-For"), trusted_proxies)
+}
+
+/// Resolve the client IP for access logs / rate limits, honoring
+/// `X-Forwarded-For` only when the direct peer is a configured trusted proxy.
+pub fn resolve_client_ip(
+    peer: IpAddr,
+    x_forwarded_for: Option<&axum::http::HeaderValue>,
+    trusted_proxies: &[IpAddr],
+) -> IpAddr {
     if trusted_proxies.contains(&peer) {
         // Use the rightmost address: the one appended by the immediate trusted
         // proxy ($proxy_add_x_forwarded_for), not client-controlled leftmost entries.
@@ -152,10 +162,7 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
         // trusted proxy appends to, X-Real-IP is commonly just passed through
         // unmodified by proxies that don't set it themselves, which would let
         // a client pick an arbitrary rate-limit bucket by setting it directly.
-        if let Some(xff) = request
-            .headers()
-            .get("X-Forwarded-For")
-            .and_then(|v| v.to_str().ok())
+        if let Some(xff) = x_forwarded_for.and_then(|v| v.to_str().ok())
             && let Some(rightmost) = xff.split(',').map(str::trim).rfind(|part| !part.is_empty())
         {
             match rightmost.parse::<IpAddr>() {
@@ -170,16 +177,28 @@ fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
     peer
 }
 
+/// Client IP from an accepted socket + request headers (same rules as the
+/// rate-limit middleware).
+pub fn client_ip_from_connect(
+    addr: SocketAddr,
+    headers: &axum::http::HeaderMap,
+    trusted_proxies: &[IpAddr],
+) -> IpAddr {
+    resolve_client_ip(addr.ip(), headers.get("X-Forwarded-For"), trusted_proxies)
+}
+
 pub async fn middleware(
     State(limiter): State<RateLimiter>,
     request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path();
+    let path = request.uri().path().to_string();
+    let method = request.method().as_str().to_string();
     let peer = client_ip(&request, limiter.trusted_proxies.as_slice());
     let key = format!("{}:{}", peer, path.split('/').nth(1).unwrap_or(""));
-    let max = limiter.limit_for_path(path);
+    let max = limiter.limit_for_path(&path);
     if !limiter.check(&key, max) {
+        crate::log_warn!("HTTP: {method} {path} from {peer} → 429 rate limit exceeded");
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Content-Type", "text/plain; charset=utf-8")],

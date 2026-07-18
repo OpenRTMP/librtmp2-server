@@ -14,6 +14,11 @@ begin at `1.0.0`.
 ## [Unreleased]
 
 ### Added
+- Connection and access logging aligned with srt-live-server style: RTMP
+  accept/publish/play/release/disconnect and kicks now include the peer
+  `IP:port`, and HTTP `/stats`, `/stats-nginx`, `/stat.xsl`, and per-stream
+  stats requests log client IP, status, and stream id. Admin stream/play-key
+  mutations and HTTP 429 rate-limit hits are logged with client IP as well.
 - Docker startup logs now print an OpenRTMP ASCII banner followed by the
   `librtmp2-server` name and running image version. Release builds embed the
   workflow version, while local builds fall back to the package version from

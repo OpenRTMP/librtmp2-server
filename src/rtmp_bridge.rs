@@ -89,6 +89,8 @@ pub trait RtmpEventHandler: Send + Sync {
 
 #[derive(Default)]
 struct ConnState {
+    /// Full `IP:port` / `[IPv6]:port` peer address as accepted (for logs).
+    remote_addr: String,
     /// Client IP (no port) this connection was accepted from, used to key
     /// auth-failure rate limiting by a stable identity instead of `ConnId`.
     remote_ip: String,
@@ -143,6 +145,16 @@ fn remote_ip_of(remote_addr: &str) -> String {
     match remote_addr.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.to_string(),
         _ => remote_addr.to_string(),
+    }
+}
+
+fn peer_label(cs: &ConnState) -> &str {
+    if !cs.remote_addr.is_empty() {
+        cs.remote_addr.as_str()
+    } else if !cs.remote_ip.is_empty() {
+        cs.remote_ip.as_str()
+    } else {
+        "unknown"
     }
 }
 
@@ -368,6 +380,24 @@ impl DbRtmpBridge {
             .unwrap_or(false)
     }
 
+    /// Peer address (`IP:port`) recorded at `on_connect`, or empty if unknown.
+    pub fn remote_addr_for_conn(&self, conn: ConnId) -> String {
+        self.conns
+            .lock()
+            .get(&conn)
+            .map(|cs| peer_label(cs).to_string())
+            .unwrap_or_default()
+    }
+
+    fn peer_for(&self, conn: ConnId) -> String {
+        let addr = self.remote_addr_for_conn(conn);
+        if addr.is_empty() {
+            "unknown".to_string()
+        } else {
+            addr
+        }
+    }
+
     /// Deactivate the publisher row for this connection without dropping the
     /// whole ConnState (player role / auth rate-limit bookkeeping may remain).
     ///
@@ -376,9 +406,12 @@ impl DbRtmpBridge {
     /// later replace via `authorize_publish`) retries the deactivation
     /// instead of leaking an `active=1` row.
     pub fn release_publisher(&self, conn: ConnId) {
-        let pub_row = {
+        let (pub_row, peer) = {
             let guard = self.conns.lock();
-            guard.get(&conn).and_then(|cs| cs.publisher.clone())
+            match guard.get(&conn) {
+                Some(cs) => (cs.publisher.clone(), peer_label(cs).to_string()),
+                None => return,
+            }
         };
         let Some(mut pub_row) = pub_row else {
             return;
@@ -386,14 +419,14 @@ impl DbRtmpBridge {
         pub_row.active = false;
         if !self.db.publisher_update(&pub_row.id, &pub_row) {
             crate::log_error!(
-                "RTMP: failed to deactivate publisher on release: stream={} session={} (will retry on close)",
+                "RTMP: failed to deactivate publisher on release: stream={} session={} from {peer} (will retry on close)",
                 pub_row.stream_id,
                 pub_row.id
             );
             return;
         }
         crate::log_info!(
-            "RTMP: publisher released: stream={} session={}",
+            "RTMP: publisher released: stream={} session={} from {peer}",
             pub_row.stream_id,
             pub_row.id
         );
@@ -428,9 +461,12 @@ impl DbRtmpBridge {
     /// ConnState. See `release_publisher` for why removal from `ConnState`
     /// is deferred until the DB deactivation succeeds.
     pub fn release_player(&self, conn: ConnId) {
-        let player_row = {
+        let (player_row, peer) = {
             let guard = self.conns.lock();
-            guard.get(&conn).and_then(|cs| cs.player.clone())
+            match guard.get(&conn) {
+                Some(cs) => (cs.player.clone(), peer_label(cs).to_string()),
+                None => return,
+            }
         };
         let Some(mut player_row) = player_row else {
             return;
@@ -438,14 +474,14 @@ impl DbRtmpBridge {
         player_row.active = false;
         if !self.db.player_update(&player_row.id, &player_row) {
             crate::log_error!(
-                "RTMP: failed to deactivate player on release: stream={} session={} (will retry on close)",
+                "RTMP: failed to deactivate player on release: stream={} session={} from {peer} (will retry on close)",
                 player_row.stream_id,
                 player_row.id
             );
             return;
         }
         crate::log_info!(
-            "RTMP: player released: stream={} session={}",
+            "RTMP: player released: stream={} session={} from {peer}",
             player_row.stream_id,
             player_row.id
         );
@@ -645,33 +681,36 @@ impl DbRtmpBridge {
         app: &str,
         stream_key: &str,
     ) -> Result<(), AuthFailureKind> {
-        crate::log_info!("RTMP: publish request app='{app}' key=<redacted>");
+        let peer = self.peer_for(conn);
+        crate::log_info!("RTMP: publish request app='{app}' key=<redacted> from {peer}");
 
         // Look up ignoring `enabled` so a valid key for a disabled/pending-delete
         // stream is classified as an operational rejection below, not a
         // credential mismatch — otherwise a publisher retrying against its own
         // just-disabled stream would burn the shared per-IP auth-failure budget.
         let DbLookup::Ok(stream) = self.db.stream_find_by_publish_key_any(stream_key) else {
-            crate::log_warn!("RTMP: publish rejected — invalid publish_key for app='{app}'");
+            crate::log_warn!(
+                "RTMP: publish rejected — invalid publish_key for app='{app}' from {peer}"
+            );
             return Err(AuthFailureKind::Credential);
         };
         if !stream.enabled {
             crate::log_warn!(
-                "RTMP: publish rejected — stream '{}' is disabled",
+                "RTMP: publish rejected — stream '{}' is disabled from {peer}",
                 stream.id
             );
             return Err(AuthFailureKind::Operational);
         }
         if self.deleted_streams.lock().contains(&stream.id) {
             crate::log_warn!(
-                "RTMP: publish rejected — stream '{}' is being deleted",
+                "RTMP: publish rejected — stream '{}' is being deleted from {peer}",
                 stream.id
             );
             return Err(AuthFailureKind::Operational);
         }
         if stream.app != app {
             crate::log_warn!(
-                "RTMP: publish rejected — key belongs to app='{}', requested app='{app}'",
+                "RTMP: publish rejected — key belongs to app='{}', requested app='{app}' from {peer}",
                 stream.app
             );
             return Err(AuthFailureKind::Credential);
@@ -680,7 +719,9 @@ impl DbRtmpBridge {
         let pub_id = match keygen::keygen_stream_key(PREFIX_PUBLISH_KEY) {
             Ok(id) => id,
             Err(e) => {
-                crate::log_warn!("RTMP: publish rejected — session id generation failed: {e}");
+                crate::log_warn!(
+                    "RTMP: publish rejected — session id generation failed from {peer}: {e}"
+                );
                 return Err(AuthFailureKind::Operational);
             }
         };
@@ -705,7 +746,7 @@ impl DbRtmpBridge {
             let prior_id = prior.id.clone();
             if !self.db.publisher_update(&prior_id, &prior) {
                 crate::log_warn!(
-                    "RTMP: publish rejected — failed to deactivate prior publisher row"
+                    "RTMP: publish rejected — failed to deactivate prior publisher row from {peer}"
                 );
                 return Err(AuthFailureKind::Operational);
             }
@@ -716,11 +757,11 @@ impl DbRtmpBridge {
                 && !self.restore_publisher_row(prior)
             {
                 crate::log_error!(
-                    "RTMP: publish rollback failed — prior publisher row remains inactive"
+                    "RTMP: publish rollback failed — prior publisher row remains inactive from {peer}"
                 );
             }
             crate::log_warn!(
-                "RTMP: publish rejected — stream '{}' already has an active publisher",
+                "RTMP: publish rejected — stream '{}' already has an active publisher from {peer}",
                 stream.id
             );
             return Err(AuthFailureKind::Operational);
@@ -739,7 +780,7 @@ impl DbRtmpBridge {
         }
 
         crate::log_info!(
-            "RTMP: publish authorized stream='{}' publisher session={}",
+            "RTMP: publish authorized stream='{}' publisher session={} from {peer}",
             stream.id,
             cs.publisher.as_ref().map(|p| p.id.as_str()).unwrap_or("")
         );
@@ -752,30 +793,36 @@ impl DbRtmpBridge {
         app: &str,
         stream_key: &str,
     ) -> Result<(), AuthFailureKind> {
-        crate::log_info!("RTMP: play request app='{app}' key=<redacted>");
+        let peer = self.peer_for(conn);
+        crate::log_info!("RTMP: play request app='{app}' key=<redacted> from {peer}");
 
         let DbLookup::Ok(viewer) = self.db.viewer_find_by_play_key(stream_key) else {
-            crate::log_warn!("RTMP: play rejected — invalid play_key for app='{app}'");
+            crate::log_warn!(
+                "RTMP: play rejected — invalid play_key for app='{app}' from {peer}"
+            );
             return Err(AuthFailureKind::Credential);
         };
         let DbLookup::Ok(stream) = self.db.stream_get(&viewer.stream_id) else {
-            crate::log_warn!("RTMP: play rejected — stream missing for play_key");
+            crate::log_warn!("RTMP: play rejected — stream missing for play_key from {peer}");
             return Err(AuthFailureKind::Operational);
         };
         if self.deleted_streams.lock().contains(&stream.id) {
             crate::log_warn!(
-                "RTMP: play rejected — stream '{}' is being deleted",
+                "RTMP: play rejected — stream '{}' is being deleted from {peer}",
                 stream.id
             );
             return Err(AuthFailureKind::Operational);
         }
         if !stream.enabled {
-            crate::log_warn!("RTMP: play rejected — stream '{}' is disabled", stream.id);
+            crate::log_warn!(
+                "RTMP: play rejected — stream '{}' is disabled from {peer}",
+                stream.id
+            );
             return Err(AuthFailureKind::Operational);
         }
         if stream.app != app {
             crate::log_warn!(
-                "RTMP: play rejected — key belongs to app='{}', requested app='{app}'",
+                "RTMP: play rejected — key belongs to app='{}', requested app='{app}' from {peer}",
                 stream.app
             );
             return Err(AuthFailureKind::Credential);
@@ -784,7 +831,9 @@ impl DbRtmpBridge {
         let player_id = match keygen::keygen_stream_key(PREFIX_PLAY_KEY) {
             Ok(id) => id,
             Err(e) => {
-                crate::log_warn!("RTMP: play rejected — session id generation failed: {e}");
+                crate::log_warn!(
+                    "RTMP: play rejected — session id generation failed from {peer}: {e}"
+                );
                 return Err(AuthFailureKind::Operational);
             }
         };
@@ -808,7 +857,9 @@ impl DbRtmpBridge {
             prior.active = false;
             let prior_id = prior.id.clone();
             if !self.db.player_update(&prior_id, &prior) {
-                crate::log_warn!("RTMP: play rejected — failed to deactivate prior player row");
+                crate::log_warn!(
+                    "RTMP: play rejected — failed to deactivate prior player row from {peer}"
+                );
                 return Err(AuthFailureKind::Operational);
             }
         }
@@ -817,10 +868,12 @@ impl DbRtmpBridge {
             if let Some(ref prior) = old_player
                 && !self.restore_player_row(prior)
             {
-                crate::log_error!("RTMP: play rollback failed — prior player row not restored");
+                crate::log_error!(
+                    "RTMP: play rollback failed — prior player row not restored from {peer}"
+                );
             }
             crate::log_warn!(
-                "RTMP: play rejected — connection limit ({}) reached for play key",
+                "RTMP: play rejected — connection limit ({}) reached for play key from {peer}",
                 crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
             );
             return Err(AuthFailureKind::Operational);
@@ -847,7 +900,7 @@ impl DbRtmpBridge {
         }
 
         crate::log_info!(
-            "RTMP: play accepted stream='{}' player session={player_id}",
+            "RTMP: play accepted stream='{}' player session={player_id} from {peer}",
             stream.id
         );
         Ok(())
@@ -861,9 +914,10 @@ impl RtmpEventHandler for DbRtmpBridge {
         // an authorized publisher/player and leave a ghost active row in the DB.
         let mut conns = self.conns.lock();
         let cs = conns.entry(conn).or_default();
+        cs.remote_addr = remote_addr.to_string();
         cs.remote_ip = remote_ip_of(remote_addr);
         drop(conns);
-        crate::log_debug!("RTMP: new connection {conn}");
+        crate::log_info!("RTMP: new connection {conn} from {remote_addr}");
     }
 
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
@@ -873,9 +927,12 @@ impl RtmpEventHandler for DbRtmpBridge {
             .get(&conn)
             .map(|cs| cs.remote_ip.clone())
             .unwrap_or_default();
+        let peer = self.peer_for(conn);
         let rate_key = Self::auth_rate_key(conn, &remote_ip);
         if self.is_auth_rate_limited(&rate_key) {
-            crate::log_warn!("RTMP: publish rejected — auth rate limit exceeded conn={conn}");
+            crate::log_warn!(
+                "RTMP: publish rejected — auth rate limit exceeded conn={conn} from {peer}"
+            );
             return Err(());
         }
         match self.try_authorize_publish(conn, app, stream_key) {
@@ -899,9 +956,12 @@ impl RtmpEventHandler for DbRtmpBridge {
             .get(&conn)
             .map(|cs| cs.remote_ip.clone())
             .unwrap_or_default();
+        let peer = self.peer_for(conn);
         let rate_key = Self::auth_rate_key(conn, &remote_ip);
         if self.is_auth_rate_limited(&rate_key) {
-            crate::log_warn!("RTMP: play rejected — auth rate limit exceeded conn={conn}");
+            crate::log_warn!(
+                "RTMP: play rejected — auth rate limit exceeded conn={conn} from {peer}"
+            );
             return Err(());
         }
         match self.try_authorize_play(conn, app, stream_key) {
@@ -947,18 +1007,20 @@ impl RtmpEventHandler for DbRtmpBridge {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");
             return;
         };
+        let peer = peer_label(&cs).to_string();
+        let had_role = cs.publisher.is_some() || cs.player.is_some();
 
         if let Some(mut pub_row) = cs.publisher {
             pub_row.active = false;
             if self.db.publisher_update(&pub_row.id, &pub_row) {
                 crate::log_info!(
-                    "RTMP: publisher disconnected: stream={} session={}",
+                    "RTMP: publisher disconnected: stream={} session={} from {peer}",
                     pub_row.stream_id,
                     pub_row.id
                 );
             } else {
                 crate::log_error!(
-                    "RTMP: failed to deactivate publisher on close: stream={} session={}",
+                    "RTMP: failed to deactivate publisher on close: stream={} session={} from {peer}",
                     pub_row.stream_id,
                     pub_row.id
                 );
@@ -969,17 +1031,21 @@ impl RtmpEventHandler for DbRtmpBridge {
             player_row.active = false;
             if self.db.player_update(&player_row.id, &player_row) {
                 crate::log_info!(
-                    "RTMP: player disconnected: stream={} session={}",
+                    "RTMP: player disconnected: stream={} session={} from {peer}",
                     player_row.stream_id,
                     player_row.id
                 );
             } else {
                 crate::log_error!(
-                    "RTMP: failed to deactivate player on close: stream={} session={}",
+                    "RTMP: failed to deactivate player on close: stream={} session={} from {peer}",
                     player_row.stream_id,
                     player_row.id
                 );
             }
+        } else if !had_role {
+            // No authorized role — still record the TCP close for auditability
+            // (matches srt-live-server logging accepted peers that never stream).
+            crate::log_info!("RTMP: connection closed {conn} from {peer}");
         }
     }
 }
