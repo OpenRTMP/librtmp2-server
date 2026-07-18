@@ -196,12 +196,12 @@ pub async fn middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path().to_string();
-    let method = request.method().as_str().to_string();
+    let path = request.uri().path();
     let peer = client_ip(&request, limiter.trusted_proxies.as_slice());
     let key = format!("{}:{}", peer, path.split('/').nth(1).unwrap_or(""));
-    let max = limiter.limit_for_path(&path);
+    let max = limiter.limit_for_path(path);
     if !limiter.check(&key, max) {
+        let method = request.method().as_str();
         crate::log_warn!("HTTP: {method} {path} from {peer} → 429 rate limit exceeded");
         return (
             StatusCode::TOO_MANY_REQUESTS,
