@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-07-18
+
 ### Added
 - Connection and access logging aligned with srt-live-server style: RTMP
   accept/publish/play/release/disconnect and kicks now include the peer
