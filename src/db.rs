@@ -298,11 +298,63 @@ impl Db {
         if stale > 0 {
             crate::log_info!("Cleared {stale} stale active publisher/player row(s) from prior run");
         }
+        let _ = Self::audit_cross_stream_key_collisions(&conn);
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Warns about access keys that were already shared across two or more
+    /// distinct streams before global key uniqueness was enforced (e.g. a
+    /// database populated by a pre-fix build). Such rows are not touched
+    /// automatically — deleting or rotating a live credential out from under
+    /// an operator is its own outage — but RTMP publish auth resolves
+    /// `publish_key` directly, so an unresolved collision here means a play
+    /// credential provisioned on one stream can still publish on another
+    /// until an operator rotates the offending key.
+    fn audit_cross_stream_key_collisions(conn: &Connection) -> u32 {
+        let mut stmt = match conn.prepare(
+            "WITH all_keys AS ( \
+                 SELECT publish_key AS key, id AS stream_id FROM streams \
+                 UNION ALL SELECT play_key, id FROM streams \
+                 UNION ALL SELECT stats_key, id FROM streams \
+                 UNION ALL SELECT play_key, stream_id FROM stream_viewers \
+             ) \
+             SELECT key, COUNT(DISTINCT stream_id) AS n FROM all_keys \
+             GROUP BY key HAVING n > 1",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("startup key-collision audit: prepare failed: {e}");
+                return 0;
+            }
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::log_error!("startup key-collision audit: query failed: {e}");
+                return 0;
+            }
+        };
+        let mut count = 0u32;
+        for key in rows.flatten() {
+            count += 1;
+            crate::log_error!(
+                "SECURITY: access key '{key}' is shared across multiple streams (pre-existing \
+                 collision from before global key uniqueness was enforced). RTMP publish auth \
+                 resolves publish_key directly, so this may let a play credential on one stream \
+                 publish on another. Rotate the affected key(s) via the admin API."
+            );
+        }
+        if count > 0 {
+            crate::log_error!(
+                "SECURITY: {count} pre-existing cross-stream access-key collision(s) found at \
+                 startup; see above for the affected keys"
+            );
+        }
+        count
     }
 
     // ==================== SETTINGS ====================
@@ -346,10 +398,17 @@ impl Db {
     /// or as a configured viewer play key. Access keys must be globally unique so
     /// a play credential cannot double as a publish credential on another stream.
     pub fn access_key_globally_in_use(&self, key: &str) -> bool {
+        let conn = self.conn.lock();
+        Self::key_globally_in_use_locked(&conn, key)
+    }
+
+    /// Same check as [`Db::access_key_globally_in_use`] but taking an already-held
+    /// connection so callers can run the check and the following insert under a
+    /// single lock/transaction, closing the TOCTOU window between the two.
+    fn key_globally_in_use_locked(conn: &Connection, key: &str) -> bool {
         if !crate::keygen::is_valid_access_key(key) {
             return false;
         }
-        let conn = self.conn.lock();
         conn.query_row(
             "SELECT 1 FROM streams \
              WHERE publish_key=? OR play_key=? OR stats_key=? \
@@ -365,11 +424,6 @@ impl Db {
     }
 
     pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
-        for key in [&s.publish_key, &s.play_key, &s.stats_key] {
-            if self.access_key_globally_in_use(key) {
-                return Err(StreamAddError::Duplicate);
-            }
-        }
         let viewer_id = match crate::keygen::keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
             Ok(id) => id,
             Err(e) => {
@@ -378,6 +432,13 @@ impl Db {
             }
         };
         let conn = self.conn.lock();
+        // Check-then-insert under the same held lock/transaction: nothing else
+        // can insert a colliding key between the check and the write below.
+        for key in [&s.publish_key, &s.play_key, &s.stats_key] {
+            if Self::key_globally_in_use_locked(&conn, key) {
+                return Err(StreamAddError::Duplicate);
+            }
+        }
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -654,10 +715,12 @@ impl Db {
     const VIEWER_COLS: &'static str = "id,stream_id,name,play_key,enabled,created_at";
 
     pub fn viewer_add(&self, v: &StreamViewer) -> bool {
-        if self.access_key_globally_in_use(&v.play_key) {
+        let conn = self.conn.lock();
+        // Check-then-insert under the same held lock so a concurrent insert of
+        // the same key can't race between the check and the write below.
+        if Self::key_globally_in_use_locked(&conn, &v.play_key) {
             return false;
         }
-        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
              VALUES (?,?,?,?,?,?)",
@@ -1511,6 +1574,42 @@ mod tests {
             !db.viewer_add(&viewer),
             "viewer play_key must not reuse another stream's publish_key"
         );
+    }
+
+    #[test]
+    fn startup_audit_detects_pre_existing_cross_stream_key_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collisions.db");
+        let path_str = path.to_str().unwrap();
+
+        // Seed a database the way a pre-fix build could have: two streams
+        // whose keys collide, inserted directly so the current uniqueness
+        // checks in stream_add/viewer_add are bypassed.
+        {
+            let db = Db::open(path_str).unwrap();
+            let stream_a = sample_stream("audit_a", "pub_audit_a", "play_audit_a", "stats_audit_a");
+            assert!(db.stream_add(&stream_a).is_ok());
+        }
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let colliding_key = crate::keygen::test_pad_access_key("pub_audit_a");
+            conn.execute(
+                "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
+                 VALUES ('audit_b','Stream B','live',?,?,?,1,0)",
+                params![
+                    crate::keygen::test_pad_access_key("pub_audit_b"),
+                    colliding_key,
+                    crate::keygen::test_pad_access_key("stats_audit_b"),
+                ],
+            )
+            .unwrap();
+
+            assert_eq!(Db::audit_cross_stream_key_collisions(&conn), 1);
+            // No collision left once the offending row is gone.
+            conn.execute("DELETE FROM streams WHERE id='audit_b'", [])
+                .unwrap();
+            assert_eq!(Db::audit_cross_stream_key_collisions(&conn), 0);
+        }
     }
 
     #[test]
