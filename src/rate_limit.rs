@@ -138,11 +138,16 @@ impl RateLimiter {
 }
 
 fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
-    let peer = request
+    // Without a real peer address (e.g. `ConnectInfo` missing from a
+    // non-standard embedding), there is no basis for deciding whether the
+    // peer is a trusted proxy, so X-Forwarded-For must not be honored.
+    let Some(peer) = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip())
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    else {
+        return IpAddr::from([127, 0, 0, 1]);
+    };
 
     resolve_client_ip(
         peer,
@@ -179,16 +184,6 @@ pub fn resolve_client_ip(
     }
 
     peer
-}
-
-/// Client IP from an accepted socket + request headers (same rules as the
-/// rate-limit middleware).
-pub fn client_ip_from_connect(
-    addr: SocketAddr,
-    headers: &axum::http::HeaderMap,
-    trusted_proxies: &[IpAddr],
-) -> IpAddr {
-    resolve_client_ip(addr.ip(), headers.get("X-Forwarded-For"), trusted_proxies)
 }
 
 pub async fn middleware(

@@ -3,7 +3,7 @@
 use parking_lot::Mutex;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -17,6 +17,9 @@ pub enum Level {
 
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static FILE: Mutex<Option<LogFile>> = Mutex::new(None);
+/// Bumped on every `init()` so a stale background flusher thread from a
+/// prior `init()` call knows to exit instead of racing a newer one.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Info/Debug lines are buffered and flushed at most this often, so
 /// high-frequency access logs don't force a write syscall per line. Error/Warn
@@ -40,7 +43,23 @@ pub fn init(level: i32, file_path: &str) {
                 *FILE.lock() = Some(LogFile {
                     file: BufWriter::new(file),
                     last_flush: Instant::now(),
-                })
+                });
+                let my_generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(FLUSH_INTERVAL);
+                        if GENERATION.load(Ordering::SeqCst) != my_generation {
+                            return;
+                        }
+                        let mut guard = FILE.lock();
+                        match guard.as_mut() {
+                            Some(lf) => {
+                                let _ = lf.file.flush();
+                            }
+                            None => return,
+                        }
+                    }
+                });
             }
             Err(e) => eprintln!("WARN  failed to open log file '{file_path}': {e}"),
         }

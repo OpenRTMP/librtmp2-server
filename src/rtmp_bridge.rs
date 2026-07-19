@@ -380,7 +380,9 @@ impl DbRtmpBridge {
             .unwrap_or(false)
     }
 
-    /// Peer address (`IP:port`) recorded at `on_connect`, or empty if unknown.
+    /// Peer address (`IP:port`) recorded at `on_connect`, falling back to
+    /// the bare IP or the literal `"unknown"`; empty only if the connection
+    /// isn't tracked at all.
     pub fn remote_addr_for_conn(&self, conn: ConnId) -> String {
         self.conns
             .lock()

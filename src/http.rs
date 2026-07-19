@@ -83,9 +83,12 @@ fn now_ts() -> i64 {
 }
 
 fn http_peer(state: &AppState, addr: ClientAddr, headers: &HeaderMap) -> String {
-    let peer = addr
-        .0
-        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    // Without a real peer address (e.g. `ConnectInfo` missing from a
+    // non-standard embedding), there is no basis for deciding whether the
+    // peer is a trusted proxy, so X-Forwarded-For must not be honored.
+    let Some(peer) = addr.0 else {
+        return "unknown".to_string();
+    };
     rate_limit::resolve_client_ip(
         peer,
         headers.get("X-Forwarded-For"),
@@ -881,8 +884,16 @@ async fn handle_stream_create(
     headers: HeaderMap,
     body: Option<Json<CreateStreamRequest>>,
 ) -> Response {
+    const PATH: &str = "/api/v1/streams";
     let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
+        log_http_access(
+            "POST",
+            PATH,
+            &peer,
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid token",
+        );
         return err_json(
             StatusCode::UNAUTHORIZED,
             "UNAUTHORIZED",
@@ -896,6 +907,13 @@ async fn handle_stream_create(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     else {
+        log_http_access(
+            "POST",
+            PATH,
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "missing 'id' field",
+        );
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Missing 'id' field");
     };
     let app = req
@@ -910,6 +928,13 @@ async fn handle_stream_create(
         .unwrap_or_else(|| id.clone());
 
     if !is_valid_stream_key_part(&id) {
+        log_http_access(
+            "POST",
+            PATH,
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "invalid stream id",
+        );
         return err_json(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
@@ -917,6 +942,7 @@ async fn handle_stream_create(
         );
     }
     if !is_valid_stream_key_part(&app) {
+        log_http_access("POST", PATH, &peer, StatusCode::BAD_REQUEST, "invalid app");
         return err_json(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
@@ -924,6 +950,7 @@ async fn handle_stream_create(
         );
     }
     if !is_valid_display_name(&name) {
+        log_http_access("POST", PATH, &peer, StatusCode::BAD_REQUEST, "invalid name");
         return err_json(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
@@ -931,6 +958,13 @@ async fn handle_stream_create(
         );
     }
     if state.deleted_streams.lock().contains(&id) {
+        log_http_access(
+            "POST",
+            PATH,
+            &peer,
+            StatusCode::CONFLICT,
+            "stream is being deleted",
+        );
         return err_json(
             StatusCode::CONFLICT,
             "CONFLICT",
@@ -942,6 +976,13 @@ async fn handle_stream_create(
         match resolve_or_generate_access_key(req.publish_key, crate::keygen::PREFIX_PUBLISH_KEY) {
             Ok(k) => k,
             Err(AccessKeyFieldError::Invalid) => {
+                log_http_access(
+                    "POST",
+                    PATH,
+                    &peer,
+                    StatusCode::BAD_REQUEST,
+                    "invalid publish_key",
+                );
                 return err_json(
                     StatusCode::BAD_REQUEST,
                     "BAD_REQUEST",
@@ -950,6 +991,13 @@ async fn handle_stream_create(
             }
             Err(AccessKeyFieldError::GenerationFailed) => {
                 crate::log_error!("publish key generation failed");
+                log_http_access(
+                    "POST",
+                    PATH,
+                    &peer,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "publish key generation failed",
+                );
                 return err_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "INTERNAL_ERROR",
@@ -961,6 +1009,13 @@ async fn handle_stream_create(
         match resolve_or_generate_access_key(req.play_key, crate::keygen::PREFIX_PLAY_KEY) {
             Ok(k) => k,
             Err(AccessKeyFieldError::Invalid) => {
+                log_http_access(
+                    "POST",
+                    PATH,
+                    &peer,
+                    StatusCode::BAD_REQUEST,
+                    "invalid play_key",
+                );
                 return err_json(
                     StatusCode::BAD_REQUEST,
                     "BAD_REQUEST",
@@ -969,6 +1024,13 @@ async fn handle_stream_create(
             }
             Err(AccessKeyFieldError::GenerationFailed) => {
                 crate::log_error!("play key generation failed");
+                log_http_access(
+                    "POST",
+                    PATH,
+                    &peer,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "play key generation failed",
+                );
                 return err_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "INTERNAL_ERROR",
@@ -980,6 +1042,13 @@ async fn handle_stream_create(
         match resolve_or_generate_access_key(req.stats_key, crate::keygen::PREFIX_STATS_KEY) {
             Ok(k) => k,
             Err(AccessKeyFieldError::Invalid) => {
+                log_http_access(
+                    "POST",
+                    PATH,
+                    &peer,
+                    StatusCode::BAD_REQUEST,
+                    "invalid stats_key",
+                );
                 return err_json(
                     StatusCode::BAD_REQUEST,
                     "BAD_REQUEST",
@@ -988,6 +1057,13 @@ async fn handle_stream_create(
             }
             Err(AccessKeyFieldError::GenerationFailed) => {
                 crate::log_error!("stats key generation failed");
+                log_http_access(
+                    "POST",
+                    PATH,
+                    &peer,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "stats key generation failed",
+                );
                 return err_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "INTERNAL_ERROR",
@@ -996,6 +1072,13 @@ async fn handle_stream_create(
             }
         };
     if !access_keys_must_be_unique(&[&publish_key, &play_key, &stats_key]) {
+        log_http_access(
+            "POST",
+            PATH,
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "duplicate access keys",
+        );
         return err_json(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
@@ -1016,6 +1099,13 @@ async fn handle_stream_create(
     match state.db.stream_add(&s) {
         Ok(()) => {}
         Err(StreamAddError::Duplicate) => {
+            log_http_access(
+                "POST",
+                PATH,
+                &peer,
+                StatusCode::CONFLICT,
+                "stream id or access key already exists",
+            );
             return err_json(
                 StatusCode::CONFLICT,
                 "CONFLICT",
@@ -1023,6 +1113,13 @@ async fn handle_stream_create(
             );
         }
         Err(StreamAddError::Db) => {
+            log_http_access(
+                "POST",
+                PATH,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -1089,6 +1186,13 @@ async fn handle_stream_delete(
 ) -> Response {
     let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
+        log_http_access(
+            "DELETE",
+            "/api/v1/streams/:id",
+            &peer,
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid token",
+        );
         return err_json(
             StatusCode::UNAUTHORIZED,
             "UNAUTHORIZED",
@@ -1096,16 +1200,47 @@ async fn handle_stream_delete(
         );
     }
     if !is_valid_stream_key_part(&id) {
+        // `id` is not yet validated here and may contain control characters
+        // decoded from the URL, so it must not be interpolated into the log.
+        log_http_access(
+            "DELETE",
+            "/api/v1/streams/<invalid>",
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "invalid stream id",
+        );
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
+    let path = format!("/api/v1/streams/{id}");
     if state.deleted_streams.lock().contains(&id) {
+        log_http_access(
+            "DELETE",
+            &path,
+            &peer,
+            StatusCode::CONFLICT,
+            "stream is being deleted",
+        );
         return err_json(StatusCode::CONFLICT, "CONFLICT", "Stream is being deleted");
     }
     match state.db.stream_get(&id) {
         DbLookup::Missing => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::NOT_FOUND,
+                "stream not found",
+            );
             return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
         }
         DbLookup::Failed => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -1118,6 +1253,13 @@ async fn handle_stream_delete(
     state.deleted_streams.lock().insert(id.clone());
     if state.db.stream_disable(&id).is_none() {
         state.deleted_streams.lock().remove(&id);
+        log_http_access(
+            "DELETE",
+            &path,
+            &peer,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to disable stream",
+        );
         return err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -1133,11 +1275,20 @@ async fn handle_stream_delete(
                 );
                 Json(json!({"status": "deleted"})).into_response()
             }
-            Err(()) => err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Failed to delete stream",
-            ),
+            Err(()) => {
+                log_http_access(
+                    "DELETE",
+                    &path,
+                    &peer,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to delete stream",
+                );
+                err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "Failed to delete stream",
+                )
+            }
         };
     }
 
@@ -1204,6 +1355,13 @@ async fn handle_stream_player_create(
 ) -> Response {
     let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
+        log_http_access(
+            "POST",
+            "/api/v1/streams/:id/players",
+            &peer,
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid token",
+        );
         return err_json(
             StatusCode::UNAUTHORIZED,
             "UNAUTHORIZED",
@@ -1211,14 +1369,38 @@ async fn handle_stream_player_create(
         );
     }
     if !is_valid_stream_key_part(&id) {
+        // `id` is not yet validated here and may contain control characters
+        // decoded from the URL, so it must not be interpolated into the log.
+        log_http_access(
+            "POST",
+            "/api/v1/streams/<invalid>/players",
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "invalid stream id",
+        );
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
+    let path = format!("/api/v1/streams/{id}/players");
     let stream = match state.db.stream_get(&id) {
         DbLookup::Ok(s) => s,
         DbLookup::Missing => {
+            log_http_access(
+                "POST",
+                &path,
+                &peer,
+                StatusCode::NOT_FOUND,
+                "stream not found",
+            );
             return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
         }
         DbLookup::Failed => {
+            log_http_access(
+                "POST",
+                &path,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -1235,6 +1417,13 @@ async fn handle_stream_player_create(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("Player {slot}"));
     if !is_valid_display_name(&name) {
+        log_http_access(
+            "POST",
+            &path,
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "invalid name",
+        );
         return err_json(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
@@ -1246,6 +1435,13 @@ async fn handle_stream_player_create(
         match resolve_or_generate_access_key(req.play_key, crate::keygen::PREFIX_PLAY_KEY) {
             Ok(k) => k,
             Err(AccessKeyFieldError::Invalid) => {
+                log_http_access(
+                    "POST",
+                    &path,
+                    &peer,
+                    StatusCode::BAD_REQUEST,
+                    "invalid play_key",
+                );
                 return err_json(
                     StatusCode::BAD_REQUEST,
                     "BAD_REQUEST",
@@ -1254,6 +1450,13 @@ async fn handle_stream_player_create(
             }
             Err(AccessKeyFieldError::GenerationFailed) => {
                 crate::log_error!("play key generation failed");
+                log_http_access(
+                    "POST",
+                    &path,
+                    &peer,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "play key generation failed",
+                );
                 return err_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "INTERNAL_ERROR",
@@ -1270,6 +1473,13 @@ async fn handle_stream_player_create(
             .iter()
             .any(|v| v.play_key == play_key)
     {
+        log_http_access(
+            "POST",
+            &path,
+            &peer,
+            StatusCode::CONFLICT,
+            "play_key already in use",
+        );
         return err_json(
             StatusCode::CONFLICT,
             "CONFLICT",
@@ -1278,6 +1488,13 @@ async fn handle_stream_player_create(
     }
     let Some(viewer) = create_viewer_row(&stream.id, &name, &play_key, now_ts()) else {
         crate::log_error!("viewer id generation failed");
+        log_http_access(
+            "POST",
+            &path,
+            &peer,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "viewer id generation failed",
+        );
         return err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -1285,6 +1502,13 @@ async fn handle_stream_player_create(
         );
     };
     if !state.db.viewer_add(&viewer) {
+        log_http_access(
+            "POST",
+            &path,
+            &peer,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "db error",
+        );
         return err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -1308,6 +1532,13 @@ async fn handle_stream_player_delete(
 ) -> Response {
     let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
+        log_http_access(
+            "DELETE",
+            "/api/v1/streams/:id/players/:player_id",
+            &peer,
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid token",
+        );
         return err_json(
             StatusCode::UNAUTHORIZED,
             "UNAUTHORIZED",
@@ -1315,13 +1546,37 @@ async fn handle_stream_player_delete(
         );
     }
     if !is_valid_stream_key_part(&id) {
+        // `id` is not yet validated here and may contain control characters
+        // decoded from the URL, so it must not be interpolated into the log.
+        log_http_access(
+            "DELETE",
+            "/api/v1/streams/<invalid>/players/:player_id",
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "invalid stream id",
+        );
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
+    let path = format!("/api/v1/streams/{id}/players/{player_id}");
     match state.db.stream_get(&id) {
         DbLookup::Missing => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::NOT_FOUND,
+                "stream not found",
+            );
             return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
         }
         DbLookup::Failed => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -1332,9 +1587,23 @@ async fn handle_stream_player_delete(
     }
     match state.db.viewer_get(&id, &player_id) {
         DbLookup::Missing => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::NOT_FOUND,
+                "player not found",
+            );
             return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found");
         }
         DbLookup::Failed => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -1344,6 +1613,13 @@ async fn handle_stream_player_delete(
         DbLookup::Ok(_) => {}
     }
     if state.db.viewer_list(&id).len() <= 1 {
+        log_http_access(
+            "DELETE",
+            &path,
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "cannot delete last play key",
+        );
         return err_json(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
@@ -1359,12 +1635,30 @@ async fn handle_stream_player_delete(
             );
             Json(json!({"status": "deleted"})).into_response()
         }
-        Some(false) => err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found"),
-        None => err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            "Failed to delete play key",
-        ),
+        Some(false) => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::NOT_FOUND,
+                "player not found",
+            );
+            err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found")
+        }
+        None => {
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
+            err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to delete play key",
+            )
+        }
     }
 }
 
