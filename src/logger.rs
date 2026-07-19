@@ -1,8 +1,8 @@
 //! Simple level-filtered logging to stderr or a file.
 
 use parking_lot::Mutex;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
@@ -19,13 +19,16 @@ static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static FILE: Mutex<Option<LogFile>> = Mutex::new(None);
 
 /// Info/Debug lines are buffered and flushed at most this often, so
-/// high-frequency access logs don't force a syscall per line. Error/Warn
+/// high-frequency access logs don't force a write syscall per line. Error/Warn
 /// lines are always flushed immediately since they're rare and operators
 /// rely on seeing them right away, including right before a crash.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
 struct LogFile {
-    file: File,
+    // `File` has no internal buffer, so wrap it in `BufWriter` — otherwise
+    // every `write_all` is its own syscall regardless of how often `flush`
+    // is called, defeating the point of throttling flushes.
+    file: BufWriter<std::fs::File>,
     last_flush: Instant,
 }
 
@@ -35,7 +38,7 @@ pub fn init(level: i32, file_path: &str) {
         match OpenOptions::new().create(true).append(true).open(file_path) {
             Ok(file) => {
                 *FILE.lock() = Some(LogFile {
-                    file,
+                    file: BufWriter::new(file),
                     last_flush: Instant::now(),
                 })
             }
