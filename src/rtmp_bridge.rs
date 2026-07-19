@@ -1084,6 +1084,50 @@ mod tests {
     }
 
     #[test]
+    fn play_key_cannot_authorize_publish_on_another_stream() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let shared_key = "shared_access_key_with_sufficient_length01";
+        let stream_a = crate::db::Stream {
+            id: "stream_a".to_string(),
+            name: "Stream A".to_string(),
+            app: "live".to_string(),
+            publish_key: shared_key.to_string(),
+            play_key: "play_a_key_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_a_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&stream_a).unwrap();
+
+        let stream_b = crate::db::Stream {
+            id: "stream_b".to_string(),
+            name: "Stream B".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_b_key_with_sufficient_length_here01".to_string(),
+            play_key: shared_key.to_string(),
+            stats_key: "stats_b_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        assert!(
+            db.stream_add(&stream_b).is_err(),
+            "global key uniqueness must block play_key/publish_key reuse across streams"
+        );
+
+        let bridge = test_bridge(db);
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge.authorize_play(1, "live", shared_key).is_err(),
+            "stream B was not created, so the shared key must not authorize play"
+        );
+        assert!(
+            bridge.authorize_publish(1, "live", shared_key).is_ok(),
+            "shared key still authorizes publish only on stream A"
+        );
+        assert_eq!(bridge.stream_id_for_conn(1), "stream_a");
+    }
+
+    #[test]
     fn auth_failure_map_saturation_does_not_reset_rate_limited_ip() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = test_bridge(db);

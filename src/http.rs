@@ -1467,6 +1467,7 @@ async fn handle_stream_player_create(
     if play_key == stream.publish_key
         || play_key == stream.stats_key
         || play_key == stream.play_key
+        || state.db.access_key_globally_in_use(&play_key)
         || state
             .db
             .viewer_list(&id)
@@ -1483,7 +1484,7 @@ async fn handle_stream_player_create(
         return err_json(
             StatusCode::CONFLICT,
             "CONFLICT",
-            "play_key already in use for this stream or conflicts with publish_key/stats_key",
+            "play_key already in use for this stream or conflicts with another access key",
         );
     }
     let Some(viewer) = create_viewer_row(&stream.id, &name, &play_key, now_ts()) else {
@@ -2135,6 +2136,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_stream_rejects_play_key_that_matches_another_streams_publish_key() {
+        let state = test_state("a-strong-random-secret-value");
+        let app = router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"victim","publish_key":"pub_victim_key_with_sufficient_length01","play_key":"play_victim_key_with_sufficient_len01","stats_key":"stats_victim_key_with_sufficient_len01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"attacker","publish_key":"pub_attacker_key_with_sufficient_len01","play_key":"pub_victim_key_with_sufficient_length01","stats_key":"stats_attacker_key_with_sufficient_len01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn create_player_rejects_play_key_that_matches_another_streams_publish_key() {
+        let state = test_state("a-strong-random-secret-value");
+        let app = router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"victim","publish_key":"pub_victim_key_with_sufficient_length01","play_key":"play_victim_key_with_sufficient_len01","stats_key":"stats_victim_key_with_sufficient_len01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"other","publish_key":"pub_other_key_with_sufficient_length01","play_key":"play_other_key_with_sufficient_length01","stats_key":"stats_other_key_with_sufficient_length01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams/other/players")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Guest","play_key":"pub_victim_key_with_sufficient_length01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
