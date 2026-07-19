@@ -304,13 +304,13 @@ pub(crate) fn process_server_connections(
                 reject_indices.push(idx);
                 continue;
             }
+            let stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
             crate::log_info!(
-                "RTMP: publisher connected from {} stream='{}'",
-                conn.remote_addr,
-                rtmp_bridge.stream_id_for_conn(conn_id)
+                "RTMP: publisher connected from {} stream='{stream_id}'",
+                conn.remote_addr
             );
             entry.publishing = true;
-            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            entry.stream_id = stream_id;
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
         } else if is_publishing && entry.publishing {
@@ -333,13 +333,13 @@ pub(crate) fn process_server_connections(
                 reject_indices.push(idx);
                 continue;
             }
+            let stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
             crate::log_info!(
-                "RTMP: player connected from {} stream='{}'",
-                conn.remote_addr,
-                rtmp_bridge.stream_id_for_conn(conn_id)
+                "RTMP: player connected from {} stream='{stream_id}'",
+                conn.remote_addr
             );
             entry.playing = true;
-            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            entry.stream_id = stream_id;
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
         } else if is_playing && entry.playing {

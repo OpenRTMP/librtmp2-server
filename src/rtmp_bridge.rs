@@ -398,6 +398,18 @@ impl DbRtmpBridge {
         }
     }
 
+    /// Like `peer_for` plus the bare `remote_ip` (for auth rate-limit
+    /// keying), read under a single `conns` lock instead of two.
+    fn remote_ip_and_peer(&self, conn: ConnId) -> (String, String) {
+        let guard = self.conns.lock();
+        let Some(cs) = guard.get(&conn) else {
+            return (String::new(), "unknown".to_string());
+        };
+        let remote_ip = cs.remote_ip.clone();
+        let peer = peer_label(cs).to_string();
+        (remote_ip, peer)
+    }
+
     /// Deactivate the publisher row for this connection without dropping the
     /// whole ConnState (player role / auth rate-limit bookkeeping may remain).
     ///
@@ -919,13 +931,7 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
-        let remote_ip = self
-            .conns
-            .lock()
-            .get(&conn)
-            .map(|cs| cs.remote_ip.clone())
-            .unwrap_or_default();
-        let peer = self.peer_for(conn);
+        let (remote_ip, peer) = self.remote_ip_and_peer(conn);
         let rate_key = Self::auth_rate_key(conn, &remote_ip);
         if self.is_auth_rate_limited(&rate_key) {
             crate::log_warn!(
@@ -948,13 +954,7 @@ impl RtmpEventHandler for DbRtmpBridge {
     }
 
     fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
-        let remote_ip = self
-            .conns
-            .lock()
-            .get(&conn)
-            .map(|cs| cs.remote_ip.clone())
-            .unwrap_or_default();
-        let peer = self.peer_for(conn);
+        let (remote_ip, peer) = self.remote_ip_and_peer(conn);
         let rate_key = Self::auth_rate_key(conn, &remote_ip);
         if self.is_auth_rate_limited(&rate_key) {
             crate::log_warn!(
