@@ -1557,6 +1557,19 @@ async fn handle_stream_player_delete(
         );
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
+    if !is_valid_access_key(&player_id) {
+        // `player_id` is not yet validated here and may contain control
+        // characters decoded from the URL, so it must not be interpolated
+        // into the log.
+        log_http_access(
+            "DELETE",
+            &format!("/api/v1/streams/{id}/players/<invalid>"),
+            &peer,
+            StatusCode::BAD_REQUEST,
+            "invalid player id",
+        );
+        return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid player id");
+    }
     let path = format!("/api/v1/streams/{id}/players/{player_id}");
     match state.db.stream_get(&id) {
         DbLookup::Missing => {
