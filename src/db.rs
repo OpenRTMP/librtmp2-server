@@ -342,7 +342,34 @@ impl Db {
 
     // ==================== STREAMS ====================
 
+    /// True when `key` is already used as any publish/play/stats key on a stream
+    /// or as a configured viewer play key. Access keys must be globally unique so
+    /// a play credential cannot double as a publish credential on another stream.
+    pub fn access_key_globally_in_use(&self, key: &str) -> bool {
+        if !crate::keygen::is_valid_access_key(key) {
+            return false;
+        }
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT 1 FROM streams \
+             WHERE publish_key=? OR play_key=? OR stats_key=? \
+             UNION ALL \
+             SELECT 1 FROM stream_viewers WHERE play_key=? \
+             LIMIT 1",
+            params![key, key, key, key],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|opt| opt.is_some())
+        .unwrap_or(false)
+    }
+
     pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
+        for key in [&s.publish_key, &s.play_key, &s.stats_key] {
+            if self.access_key_globally_in_use(key) {
+                return Err(StreamAddError::Duplicate);
+            }
+        }
         let viewer_id = match crate::keygen::keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
             Ok(id) => id,
             Err(e) => {
@@ -627,6 +654,9 @@ impl Db {
     const VIEWER_COLS: &'static str = "id,stream_id,name,play_key,enabled,created_at";
 
     pub fn viewer_add(&self, v: &StreamViewer) -> bool {
+        if self.access_key_globally_in_use(&v.play_key) {
+            return false;
+        }
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
@@ -1435,6 +1465,52 @@ mod tests {
             ..Default::default()
         };
         assert!(!db.player_try_acquire(&overflow));
+    }
+
+    #[test]
+    fn access_keys_must_be_globally_unique_across_streams_and_roles() {
+        let db = Db::open(":memory:").unwrap();
+        let publish_key = "pub_collision_key_with_sufficient_len01";
+        let stream_a = Stream {
+            id: "stream_a".to_string(),
+            name: "Stream A".to_string(),
+            app: "live".to_string(),
+            publish_key: publish_key.to_string(),
+            play_key: "play_a_key_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_a_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert!(db.stream_add(&stream_a).is_ok());
+
+        let stream_b = Stream {
+            id: "stream_b".to_string(),
+            name: "Stream B".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_b_key_with_sufficient_length_here01".to_string(),
+            play_key: publish_key.to_string(),
+            stats_key: "stats_b_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.stream_add(&stream_b),
+            Err(StreamAddError::Duplicate),
+            "play_key must not reuse another stream's publish_key"
+        );
+
+        let viewer = StreamViewer {
+            id: "vi_extra".to_string(),
+            stream_id: "stream_a".to_string(),
+            name: "Extra".to_string(),
+            play_key: publish_key.to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert!(
+            !db.viewer_add(&viewer),
+            "viewer play_key must not reuse another stream's publish_key"
+        );
     }
 
     #[test]
