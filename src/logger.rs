@@ -1,9 +1,10 @@
 //! Simple level-filtered logging to stderr or a file.
 
 use parking_lot::Mutex;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -15,20 +16,62 @@ pub enum Level {
 }
 
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
-static FILE: Mutex<Option<File>> = Mutex::new(None);
+static FILE: Mutex<Option<LogFile>> = Mutex::new(None);
+/// Bumped on every `init()` so a stale background flusher thread from a
+/// prior `init()` call knows to exit instead of racing a newer one.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Info/Debug lines are buffered and flushed at most this often, so
+/// high-frequency access logs don't force a write syscall per line. Error/Warn
+/// lines are always flushed immediately since they're rare and operators
+/// rely on seeing them right away, including right before a crash.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+
+struct LogFile {
+    // `File` has no internal buffer, so wrap it in `BufWriter` — otherwise
+    // every `write_all` is its own syscall regardless of how often `flush`
+    // is called, defeating the point of throttling flushes.
+    file: BufWriter<std::fs::File>,
+    last_flush: Instant,
+}
 
 pub fn init(level: i32, file_path: &str) {
     LEVEL.store(level.clamp(0, 3) as u8, Ordering::Relaxed);
     if !file_path.is_empty() {
         match OpenOptions::new().create(true).append(true).open(file_path) {
-            Ok(f) => *FILE.lock() = Some(f),
+            Ok(file) => {
+                *FILE.lock() = Some(LogFile {
+                    file: BufWriter::new(file),
+                    last_flush: Instant::now(),
+                });
+                let my_generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(FLUSH_INTERVAL);
+                        if GENERATION.load(Ordering::SeqCst) != my_generation {
+                            return;
+                        }
+                        let mut guard = FILE.lock();
+                        match guard.as_mut() {
+                            Some(lf) => {
+                                let _ = lf.file.flush();
+                            }
+                            None => return,
+                        }
+                    }
+                });
+            }
             Err(e) => eprintln!("WARN  failed to open log file '{file_path}': {e}"),
         }
     }
 }
 
 pub fn close() {
-    *FILE.lock() = None;
+    let mut guard = FILE.lock();
+    if let Some(lf) = guard.as_mut() {
+        let _ = lf.file.flush();
+    }
+    *guard = None;
 }
 
 /// Escapes all control characters (newlines, carriage returns, ANSI escape
@@ -49,14 +92,17 @@ fn sanitize_for_log(msg: &str) -> String {
     out
 }
 
-fn write_line(prefix: &str, msg: &str) {
+fn write_line(level: Level, prefix: &str, msg: &str) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let safe_msg = sanitize_for_log(msg);
     let line = format!("[{now}] {prefix} {safe_msg}\n");
     let mut guard = FILE.lock();
-    if let Some(f) = guard.as_mut() {
-        let _ = f.write_all(line.as_bytes());
-        let _ = f.flush();
+    if let Some(lf) = guard.as_mut() {
+        let _ = lf.file.write_all(line.as_bytes());
+        if level <= Level::Warn || lf.last_flush.elapsed() >= FLUSH_INTERVAL {
+            let _ = lf.file.flush();
+            lf.last_flush = Instant::now();
+        }
     } else {
         drop(guard);
         eprint!("{line}");
@@ -78,7 +124,7 @@ pub fn log(level: Level, msg: &str) {
         Level::Info => "INFO ",
         Level::Debug => "DEBUG",
     };
-    write_line(prefix, msg);
+    write_line(level, prefix, msg);
 }
 
 #[macro_export]

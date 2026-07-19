@@ -212,7 +212,12 @@ pub(crate) fn process_server_connections(
         current_ids.insert(conn_id);
         let entry = tracked.entry(conn_id).or_default();
         if !entry.connected {
-            rtmp_bridge.on_connect(conn_id, &conn.remote_addr);
+            // A publish/play callback may have already run `on_connect` via
+            // `ensure_conn_registered_for_auth` earlier this same poll tick;
+            // skip the redundant call so the connection isn't logged twice.
+            if !rtmp_bridge.is_registered(conn_id) {
+                rtmp_bridge.on_connect(conn_id, &conn.remote_addr);
+            }
             entry.connected = true;
             entry.first_seen_at = Some(Instant::now());
         } else if entry.first_seen_at.is_none() {
@@ -292,15 +297,20 @@ pub(crate) fn process_server_connections(
         if is_publishing && !entry.publishing {
             if !rtmp_bridge.has_publisher(conn_id) {
                 crate::log_warn!(
-                    "RTMP: closing unauthorized publisher conn={conn_id} app='{}' key=<redacted>",
+                    "RTMP: closing unauthorized publisher conn={conn_id} from {} app='{}' key=<redacted>",
+                    conn.remote_addr,
                     conn.app
                 );
                 reject_indices.push(idx);
                 continue;
             }
-            crate::log_info!("RTMP: publisher connected from {}", conn.remote_addr);
+            let stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            crate::log_info!(
+                "RTMP: publisher connected from {} stream='{stream_id}'",
+                conn.remote_addr
+            );
             entry.publishing = true;
-            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            entry.stream_id = stream_id;
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
         } else if is_publishing && entry.publishing {
@@ -316,15 +326,20 @@ pub(crate) fn process_server_connections(
         if is_playing && !entry.playing {
             if !rtmp_bridge.has_player(conn_id) {
                 crate::log_warn!(
-                    "RTMP: closing unauthorized player conn={conn_id} app='{}' key=<redacted>",
+                    "RTMP: closing unauthorized player conn={conn_id} from {} app='{}' key=<redacted>",
+                    conn.remote_addr,
                     conn.app
                 );
                 reject_indices.push(idx);
                 continue;
             }
-            crate::log_info!("RTMP: player connected from {}", conn.remote_addr);
+            let stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            crate::log_info!(
+                "RTMP: player connected from {} stream='{stream_id}'",
+                conn.remote_addr
+            );
             entry.playing = true;
-            entry.stream_id = rtmp_bridge.stream_id_for_conn(conn_id);
+            entry.stream_id = stream_id;
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
         } else if is_playing && entry.playing {
@@ -338,7 +353,8 @@ pub(crate) fn process_server_connections(
         // Kick connections whose stream was deleted.
         if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
             crate::log_info!(
-                "RTMP: kicking conn={conn_id} — stream '{}' was deleted",
+                "RTMP: kicking conn={conn_id} from {} — stream '{}' was deleted",
+                conn.remote_addr,
                 entry.stream_id
             );
             reject_indices.push(idx);
@@ -347,7 +363,10 @@ pub(crate) fn process_server_connections(
 
         let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
         if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
-            crate::log_info!("RTMP: kicking conn={conn_id} — play key '{viewer_id}' was revoked");
+            crate::log_info!(
+                "RTMP: kicking conn={conn_id} from {} — play key '{viewer_id}' was revoked",
+                conn.remote_addr
+            );
             reject_indices.push(idx);
             continue;
         }
