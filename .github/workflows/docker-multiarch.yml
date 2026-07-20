@@ -42,6 +42,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Quay.io
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_TOKEN }}
+
       - name: Compute image tags
         id: tags
         env:
@@ -53,7 +60,10 @@ jobs:
           fi
           TAGS="ghcr.io/openrtmp/librtmp2-server:latest
           ghcr.io/openrtmp/librtmp2-server:beta
-          ghcr.io/openrtmp/librtmp2-server:alpha"
+          ghcr.io/openrtmp/librtmp2-server:alpha
+          quay.io/openrtmp/librtmp2-server:latest
+          quay.io/openrtmp/librtmp2-server:beta
+          quay.io/openrtmp/librtmp2-server:alpha"
           if [ -n "$VERSION" ]; then
             # Only treat this as a "v"-prefixed release version (and mirror
             # it under both the bare and v-prefixed tag) when it actually
@@ -71,7 +81,8 @@ jobs:
               exit 1
             fi
             TAGS="$TAGS
-          ghcr.io/openrtmp/librtmp2-server:$BARE_VERSION"
+          ghcr.io/openrtmp/librtmp2-server:$BARE_VERSION
+          quay.io/openrtmp/librtmp2-server:$BARE_VERSION"
             # Publish the v-prefixed alias too whenever this looks like a
             # semver-shaped release version (0.1.1 or v0.1.1 alike), so a
             # single dispatch always produces both tags regardless of which
@@ -80,7 +91,8 @@ jobs:
             # not an invented alias.
             if echo "$BARE_VERSION" | grep -qE '^[0-9]+\.[0-9]'; then
               TAGS="$TAGS
-          ghcr.io/openrtmp/librtmp2-server:v$BARE_VERSION"
+          ghcr.io/openrtmp/librtmp2-server:v$BARE_VERSION
+          quay.io/openrtmp/librtmp2-server:v$BARE_VERSION"
             fi
           fi
           {
