@@ -93,10 +93,17 @@ quick rollback.
    sudo find "$RESTORE_DIR" -maxdepth 1 -name 'server.db*' \
      -exec chown --reference="$DB" -- {} + \
      -exec chmod 600 -- {} +
+   sudo test -f "$RESTORE_DIR/server.db" || {
+     echo "Restore failed: $RESTORE_DIR/server.db not found" >&2
+     exit 1
+   }
    ```
 
    `BACKUP_DIR` must point at the backup you selected to restore, not
-   necessarily the fresh pre-restore backup made in the previous step.
+   necessarily the fresh pre-restore backup made in the previous step. The
+   `test -f` check guards against pointing the server at an empty
+   `RESTORE_DIR`, which would otherwise make it silently bootstrap a brand
+   new, empty database and token.
 
 3. Point `LRTMP2_DB` or `LRTMP2_DB_PATH` at
    `/var/lib/librtmp2-server-restored/server.db`, then start the server.
@@ -123,6 +130,7 @@ used by the container:
 DATA_VOLUME=librtmp2-server-data
 IMAGE=<same-image-tag-or-digest-as-the-server>
 BACKUP_DIR="$PWD/backups"
+ARCHIVE="librtmp2-data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 umask 077
 mkdir -p "$BACKUP_DIR"
 
@@ -131,31 +139,37 @@ docker run --rm --user 0 --entrypoint sh \
   -v "$DATA_VOLUME":/data:ro \
   -v "$BACKUP_DIR":/backup \
   "$IMAGE" \
-  -c 'tar -czf /backup/librtmp2-data.tar.gz -C /data .'
+  -c "tar -czf /backup/$ARCHIVE -C /data ."
 docker start librtmp2-server
 ```
 
-This archives the whole volume, including any WAL sidecars.
+Each run writes a distinct, timestamped archive so re-running the backup never
+overwrites a prior recovery point. This archives the whole volume, including
+any WAL sidecars.
 
 ## Docker named-volume restore or migration
 
-Restore into a new named volume instead of overwriting the existing one:
+Restore into a new named volume instead of overwriting the existing one. Set
+`ARCHIVE` to the filename of the backup you selected to restore, not
+necessarily the most recent one:
 
 ```bash
 RESTORE_VOLUME=librtmp2-server-data-restored
+ARCHIVE=librtmp2-data-<selected-backup-timestamp>.tar.gz
 docker volume create "$RESTORE_VOLUME"
 
 docker run --rm --user 0 --entrypoint sh \
   -v "$RESTORE_VOLUME":/data \
   -v "$BACKUP_DIR":/backup:ro \
   "$IMAGE" \
-  -c 'set -eu
-      tar -xzf /backup/librtmp2-data.tar.gz -C /data
+  -c "set -eu
+      tar -xzf /backup/$ARCHIVE -C /data
       chown -R openrtmp:openrtmp /data
       chmod 700 /data
       for f in /data/server.db*; do
-        [ -e "$f" ] && chmod 600 "$f"
-      done'
+        [ -e \"\$f\" ] && chmod 600 \"\$f\"
+      done
+      test -f /data/server.db"
 ```
 
 Stop the old container, but keep it (do not remove it) so it stays available
@@ -185,21 +199,32 @@ archive the complete host directory:
 ```bash
 DATA_DIR=/srv/librtmp2
 BACKUP_DIR="$PWD/backups"
+ARCHIVE="librtmp2-data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 umask 077
 mkdir -p "$BACKUP_DIR"
 
 docker stop librtmp2-server
-sudo tar -czf "$BACKUP_DIR/librtmp2-data.tar.gz" -C "$DATA_DIR" .
+sudo tar -czf "$BACKUP_DIR/$ARCHIVE" -C "$DATA_DIR" .
 docker start librtmp2-server
 ```
 
+Each run writes a distinct, timestamped archive so re-running the backup never
+overwrites a prior recovery point.
+
 Restore into a new host directory, preserve restrictive permissions, and mount
-that directory at `/data` in the replacement container:
+that directory at `/data` in the replacement container. Set `ARCHIVE` to the
+filename of the backup you selected to restore, not necessarily the most
+recent one:
 
 ```bash
 RESTORE_DIR=/srv/librtmp2-restored
+ARCHIVE=librtmp2-data-<selected-backup-timestamp>.tar.gz
 sudo install -d -m 700 "$RESTORE_DIR"
-sudo tar -xzf "$BACKUP_DIR/librtmp2-data.tar.gz" -C "$RESTORE_DIR"
+sudo tar -xzf "$BACKUP_DIR/$ARCHIVE" -C "$RESTORE_DIR"
+sudo test -f "$RESTORE_DIR/server.db" || {
+  echo "Restore failed: $RESTORE_DIR/server.db not found" >&2
+  exit 1
+}
 
 docker run --rm --user 0 --entrypoint sh \
   -v "$RESTORE_DIR":/data \
