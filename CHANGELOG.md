@@ -13,6 +13,24 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-07-21
+
+### Security
+- Bump the `librtmp2` dependency to the crates.io release **0.4.2**, which
+  bounds `Client::publish()`/`Client::play()`'s blocking AMF exchange to the
+  configured connect-timeout wall-clock deadline instead of allowing
+  indefinite blocking, strictly UTF-8-validates route strings (app/stream
+  names), rejects embedded NUL bytes in `read_string_checked()` instead of
+  copying them, and has the server session layer reject empty app/stream
+  names and gate metadata relay to players on callback registration.
+
+### Fixed
+- (via the `librtmp2` 0.4.2 bump) `bytes_received` tracking now uses 64-bit
+  integers instead of 32-bit, so pacing stays correct after a connection
+  exceeds 4 GiB of inbound data. Client Aggregate-message playback now
+  passes sub-tag slices directly to callbacks instead of cloning each into
+  separate vectors.
+
 ## [0.1.7] — 2026-07-18
 
 ### Added
@@ -234,7 +252,10 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.2...v0.1.3
