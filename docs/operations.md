@@ -105,8 +105,12 @@ quick rollback.
    `RESTORE_DIR`, which would otherwise make it silently bootstrap a brand
    new, empty database and token.
 
-3. Point `LRTMP2_DB` or `LRTMP2_DB_PATH` at
-   `/var/lib/librtmp2-server-restored/server.db`, then start the server.
+3. Stop the server again (the backup procedure's step 3 started it). Point
+   `LRTMP2_DB` at `/var/lib/librtmp2-server-restored/server.db`. The server
+   reads `LRTMP2_DB` before `LRTMP2_DB_PATH`, so if the service environment
+   already sets `LRTMP2_DB_PATH`, either update `LRTMP2_DB` to override it or
+   unset/align `LRTMP2_DB_PATH` too — otherwise the service keeps using the
+   old database. Then start the server.
 4. Run the verification checks below. Keep the old directory unchanged until
    verification succeeds.
 
@@ -139,7 +143,11 @@ docker run --rm --user 0 --entrypoint sh \
   -v "$DATA_VOLUME":/data:ro \
   -v "$BACKUP_DIR":/backup \
   "$IMAGE" \
-  -c "tar -czf /backup/$ARCHIVE -C /data ."
+  -c "set -eu; tar -czf /backup/$ARCHIVE -C /data ."
+test -s "$BACKUP_DIR/$ARCHIVE" || {
+  echo "Backup failed: $BACKUP_DIR/$ARCHIVE is missing or empty" >&2
+  exit 1
+}
 docker start librtmp2-server
 ```
 
@@ -205,6 +213,10 @@ mkdir -p "$BACKUP_DIR"
 
 docker stop librtmp2-server
 sudo tar -czf "$BACKUP_DIR/$ARCHIVE" -C "$DATA_DIR" .
+test -s "$BACKUP_DIR/$ARCHIVE" || {
+  echo "Backup failed: $BACKUP_DIR/$ARCHIVE is missing or empty" >&2
+  exit 1
+}
 docker start librtmp2-server
 ```
 
