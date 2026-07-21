@@ -319,8 +319,12 @@ Schedule downtime and take a backup first.
    PY
    ```
 
-3. Set `LRTMP2_API_TOKEN` in the panel's `.env` to the value in `TOKEN_FILE`.
-   Keep the token out of command-line arguments and shell history.
+3. Set `LRTMP2_API_TOKEN` to the value in `TOKEN_FILE` as a real process
+   environment variable for the panel (for example, a systemd `Environment=`
+   or `EnvironmentFile=` unit drop-in outside the panel's own `.env`, or a
+   Docker/Compose `environment:`/`--env-file` entry), not by adding it to the
+   panel's `.env` file. Keep the token out of command-line arguments and
+   shell history.
 4. Start the server, then start the panel, and run both verification requests
    below.
 5. After every client has been updated, securely remove `TOKEN_FILE`.
