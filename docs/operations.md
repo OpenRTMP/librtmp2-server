@@ -163,7 +163,9 @@ necessarily the most recent one:
 
 ```bash
 RESTORE_VOLUME=librtmp2-server-data-restored
+BACKUP_DIR="$PWD/backups"
 ARCHIVE=librtmp2-data-<selected-backup-timestamp>.tar.gz
+IMAGE=<same-image-tag-or-digest-as-the-server>
 docker volume create "$RESTORE_VOLUME"
 
 docker run --rm --user 0 --entrypoint sh \
@@ -230,7 +232,9 @@ recent one:
 
 ```bash
 RESTORE_DIR=/srv/librtmp2-restored
+BACKUP_DIR="$PWD/backups"
 ARCHIVE=librtmp2-data-<selected-backup-timestamp>.tar.gz
+IMAGE=<same-image-tag-or-digest-as-the-server>
 sudo install -d -m 700 "$RESTORE_DIR"
 sudo tar -xzf "$BACKUP_DIR/$ARCHIVE" -C "$RESTORE_DIR"
 sudo test -f "$RESTORE_DIR/server.db" || {
