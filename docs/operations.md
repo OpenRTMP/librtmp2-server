@@ -82,14 +82,21 @@ quick rollback.
 2. Copy the selected backup into a new private directory:
 
    ```bash
+   DB=/var/lib/librtmp2-server/server.db
+   BACKUP_DIR=/path/to/selected/backup
    RESTORE_DIR=/var/lib/librtmp2-server-restored
    umask 077
    sudo install -d -m 700 "$RESTORE_DIR"
-   sudo cp -a -- "$BACKUP_DIR"/server.db* "$RESTORE_DIR/"
+   sudo find "$BACKUP_DIR" -maxdepth 1 -name 'server.db*' \
+     -exec cp -a -t "$RESTORE_DIR" -- {} +
    sudo chown --reference="$(dirname "$DB")" "$RESTORE_DIR"
-   sudo chown --reference="$DB" "$RESTORE_DIR"/server.db*
-   sudo chmod 600 "$RESTORE_DIR"/server.db*
+   sudo find "$RESTORE_DIR" -maxdepth 1 -name 'server.db*' \
+     -exec chown --reference="$DB" -- {} + \
+     -exec chmod 600 -- {} +
    ```
+
+   `BACKUP_DIR` must point at the backup you selected to restore, not
+   necessarily the fresh pre-restore backup made in the previous step.
 
 3. Point `LRTMP2_DB` or `LRTMP2_DB_PATH` at
    `/var/lib/librtmp2-server-restored/server.db`, then start the server.
@@ -151,9 +158,12 @@ docker run --rm --user 0 --entrypoint sh \
       done'
 ```
 
-Stop the old container, then create the replacement with the same ports and
-environment but mount `"$RESTORE_VOLUME":/data`. For Compose, change the volume
-mapping to the restored external volume before running `docker compose up -d`.
+Stop the old container, but keep it (do not remove it) so it stays available
+for rollback. Create the replacement under a temporary name — for example
+`librtmp2-server-restored` — with the same ports and environment but mounting
+`"$RESTORE_VOLUME":/data`. For Compose, change the volume mapping to the
+restored external volume and set `container_name` to the temporary name before
+running `docker compose up -d`.
 
 For migration to another host, copy `librtmp2-data.tar.gz` over a secure
 channel, create a new volume there, and run the same restore command. Do not
@@ -161,8 +171,11 @@ start both copies against a shared database or expose both with the same stream
 keys.
 
 Keep the old stopped container and volume until the restored deployment passes
-verification. Rollback is switching the replacement container back to the old
-volume.
+the verification checks below. Only then remove the old container and rename
+the replacement to `librtmp2-server` (or update the Compose `container_name`
+and re-apply). Rollback before that point is starting the old container again;
+rollback after that point is switching the replacement container back to the
+old volume.
 
 ## Docker bind mounts
 
@@ -288,15 +301,16 @@ curl --fail --silent --show-error \
   http://127.0.0.1:8080/api/v1/health
 ```
 
-Then read the token without placing it in the command line and verify an
-authenticated request:
+Then read the token without placing it in curl's process arguments and verify
+an authenticated request:
 
 ```bash
 read -r -s -p 'API token: ' API_TOKEN
 printf '\n'
-curl --fail --silent --show-error \
-  -H "Authorization: Bearer $API_TOKEN" \
-  http://127.0.0.1:8080/api/v1/streams
+curl --fail --silent --show-error --config - \
+  http://127.0.0.1:8080/api/v1/streams <<EOF
+header = "Authorization: Bearer ${API_TOKEN}"
+EOF
 unset API_TOKEN
 ```
 
