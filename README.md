@@ -130,6 +130,9 @@ LRTMP2_DB=./server.db ./target/release/librtmp2-server -p 1935 -w 8080 -v
 
 The API token is generated on first startup, stored in the SQLite database, and printed once to stderr. Use that printed token for Bearer-authenticated API calls and for `librtmp2-server-panel`.
 
+See [Operations: SQLite data and API token](docs/operations.md) for backups,
+restores, volume migration, token behavior, and rollback procedures.
+
 ---
 
 ## Configuration
@@ -447,6 +450,9 @@ To build from source instead:
 ```bash
 docker compose up -d
 ```
+
+For named-volume and bind-mount backup, restore, and host-migration procedures,
+see [Operations: SQLite data and API token](docs/operations.md).
 
 ---
 
