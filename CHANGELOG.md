@@ -13,7 +13,7 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
-## [0.1.7] — 2026-07-21
+## [0.1.7] — 2026-07-24
 
 ### Added
 - Connection and access logging aligned with srt-live-server style: RTMP
@@ -25,22 +25,43 @@ begin at `1.0.0`.
   `librtmp2-server` name and running image version. Release builds embed the
   workflow version, while local builds fall back to the package version from
   `Cargo.toml`.
+- `RTMP_MAX_CONNECTIONS_PER_ADDR` / `LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR`
+  configure the maximum number of active RTMP/RTMPS connections accepted from
+  one source IP.
+- `RTMP_MAX_PENDING_TLS_PER_ADDR` /
+  `LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR` independently configure the number of
+  incomplete RTMPS handshakes retained per source IP. Both per-IP settings
+  default to `i32::MAX` in the server application to preserve the previous
+  behavior for deployments behind NAT, load balancers, or proxies; operators
+  can opt into stricter limits explicitly.
+
+### Changed
+- Bump the `librtmp2` dependency to the crates.io release **0.5.0**. This
+  includes the new `ServerConfig::max_connections_per_addr` field, so both
+  server and test configuration literals now set the active-connection and
+  pending-TLS per-address limits explicitly.
+- README and `.env.example` now document both the `.env` names (`RTMP_*`) and
+  direct process-environment overrides (`LRTMP2_RTMP_*`), including the
+  remaining global admission-control backstop when the per-IP TLS limit is
+  effectively disabled.
 
 ### Security
-- Bump the `librtmp2` dependency to the crates.io release **0.4.2**, which
-  bounds `Client::publish()`/`Client::play()`'s blocking AMF exchange to the
-  configured connect-timeout wall-clock deadline instead of allowing
-  indefinite blocking, strictly UTF-8-validates route strings (app/stream
-  names), rejects embedded NUL bytes in `read_string_checked()` instead of
-  copying them, and has the server session layer reject empty app/stream
-  names and gate metadata relay to players on callback registration.
+- The `librtmp2` 0.5.0 upgrade closes post-connect idle-slot exhaustion,
+  separates active-connection and pending-TLS per-IP admission caps, bounds
+  accept-loop work per poll, and prevents stalled partial RTMP messages from
+  retaining large duplicate chunk scratch buffers.
+- Cached init-frame replay is deduplicated and rate-limited, publisher cache
+  eviction is isolated per publisher, and multitrack codec authorization
+  validates every contained track.
 
 ### Fixed
-- (via the `librtmp2` 0.4.2 bump) `bytes_received` tracking now uses 64-bit
-  integers instead of 32-bit, so pacing stays correct after a connection
-  exceeds 4 GiB of inbound data. Client Aggregate-message playback now
-  passes sub-tag slices directly to callbacks instead of cloning each into
-  separate vectors.
+- The inherited RTMP session teardown paths now consistently clear
+  publish/play/paused state, refresh the idle grace window only after real
+  active-to-idle transitions, and allow valid connections to publish or play
+  again without being prematurely disconnected.
+- Reconnects are no longer rejected against stale per-IP connection counts,
+  and newly accepted sockets are processed during the same server poll tick.
+- Client AMF3 data handling avoids an unnecessary intermediate payload copy.
 
 ## [0.1.6] — 2026-07-18
 
