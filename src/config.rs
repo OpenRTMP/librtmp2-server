@@ -17,6 +17,17 @@ pub struct ServerConfig {
     /// behavior of no per-IP cap (only the global `rtmp_max_conn` applies);
     /// operators who want the cap can set it explicitly.
     pub rtmp_max_connections_per_addr: i32,
+    /// Max incomplete TLS handshakes retained per remote peer IP before the
+    /// oldest is evicted, passed through to
+    /// `librtmp2::types::ServerConfig::max_pending_tls_per_addr`. Same
+    /// 0/negative-falls-back-to-built-in-default-of-4 semantics and the same
+    /// NAT/load-balancer/proxy surprise potential as
+    /// `rtmp_max_connections_per_addr`, so it defaults to `i32::MAX` too.
+    /// Unlike the established-connection cap, an unbounded value here has no
+    /// other backstop (a single IP could hold open unlimited half-open TLS
+    /// handshakes), so operators exposed directly to the internet may want
+    /// to set this explicitly.
+    pub rtmp_max_pending_tls_per_addr: i32,
     /// Drop RTMP peers that never complete publish/play auth within this window.
     pub rtmp_idle_timeout_secs: u64,
 
@@ -73,6 +84,7 @@ impl Default for ServerConfig {
             rtmp_bind: "0.0.0.0:1935".to_string(),
             rtmp_max_conn: 100,
             rtmp_max_connections_per_addr: i32::MAX,
+            rtmp_max_pending_tls_per_addr: i32::MAX,
             rtmp_idle_timeout_secs: 30,
             rtmp_max_reassembly_mb: 32,
             rtmp_max_cache_mb: 64,
@@ -194,17 +206,17 @@ fn parse_max_connections(val: &str) -> i32 {
     }
 }
 
-fn parse_max_connections_per_addr(val: &str) -> i32 {
+fn parse_per_addr_cap(val: &str, key: &str) -> i32 {
     match val.parse::<i32>() {
         Ok(v) if v > 0 => v,
         Ok(_) => {
             eprintln!(
-                "Config: ignoring non-positive RTMP_MAX_CONNECTIONS_PER_ADDR value '{val}' (would fall back to librtmp2's built-in per-IP default); keeping no per-IP cap"
+                "Config: ignoring non-positive {key} value '{val}' (would fall back to librtmp2's built-in per-IP default); keeping no per-IP cap"
             );
             i32::MAX
         }
         Err(_) => {
-            eprintln!("Config: ignoring invalid RTMP_MAX_CONNECTIONS_PER_ADDR value '{val}'");
+            eprintln!("Config: ignoring invalid {key} value '{val}'");
             i32::MAX
         }
     }
@@ -285,7 +297,12 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "RTMP_BIND" => config.rtmp_bind = val.to_string(),
         "RTMP_MAX_CONNECTIONS" => config.rtmp_max_conn = parse_max_connections(val),
         "RTMP_MAX_CONNECTIONS_PER_ADDR" => {
-            config.rtmp_max_connections_per_addr = parse_max_connections_per_addr(val);
+            config.rtmp_max_connections_per_addr =
+                parse_per_addr_cap(val, "RTMP_MAX_CONNECTIONS_PER_ADDR");
+        }
+        "RTMP_MAX_PENDING_TLS_PER_ADDR" => {
+            config.rtmp_max_pending_tls_per_addr =
+                parse_per_addr_cap(val, "RTMP_MAX_PENDING_TLS_PER_ADDR");
         }
         "RTMP_IDLE_TIMEOUT_SECS" => {
             config.rtmp_idle_timeout_secs = parse_idle_timeout_secs(val);
@@ -392,7 +409,15 @@ where
     if let Some(v) = get("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR")
         && !v.is_empty()
     {
-        config.rtmp_max_connections_per_addr = parse_max_connections_per_addr(&v);
+        config.rtmp_max_connections_per_addr =
+            parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR");
+    }
+
+    if let Some(v) = get("LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR")
+        && !v.is_empty()
+    {
+        config.rtmp_max_pending_tls_per_addr =
+            parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR");
     }
 
     if let Some(v) = get("LRTMP2_RTMP_IDLE_TIMEOUT_SECS")
@@ -508,6 +533,7 @@ mod tests {
         assert_eq!(config.http_bind, "0.0.0.0:8080");
         assert_eq!(config.rtmp_max_conn, 100);
         assert_eq!(config.rtmp_max_connections_per_addr, i32::MAX);
+        assert_eq!(config.rtmp_max_pending_tls_per_addr, i32::MAX);
         assert_eq!(config.rtmp_idle_timeout_secs, 30);
         assert_eq!(config.rtmp_max_reassembly_mb, 32);
         assert_eq!(config.rtmp_max_cache_mb, 64);
@@ -535,6 +561,7 @@ mod tests {
              RTMP_BIND=127.0.0.1:1936\n\
              RTMP_MAX_CONNECTIONS=50\n\
              RTMP_MAX_CONNECTIONS_PER_ADDR=7\n\
+             RTMP_MAX_PENDING_TLS_PER_ADDR=9\n\
              RTMP_MAX_REASSEMBLY_MB=16\n\
              RTMP_MAX_CACHE_MB=32\n\
              RTMP_MAX_RELAY_QUEUE_MB=4\n\
@@ -557,6 +584,7 @@ mod tests {
         assert_eq!(config.rtmp_bind, "127.0.0.1:1936");
         assert_eq!(config.rtmp_max_conn, 50);
         assert_eq!(config.rtmp_max_connections_per_addr, 7);
+        assert_eq!(config.rtmp_max_pending_tls_per_addr, 9);
         assert_eq!(config.rtmp_max_reassembly_mb, 16);
         assert_eq!(config.rtmp_max_cache_mb, 32);
         assert_eq!(config.rtmp_max_relay_queue_mb, 4);
@@ -659,22 +687,26 @@ mod tests {
     }
 
     #[test]
-    fn max_connections_per_addr_defaults_to_unlimited_and_rejects_non_positive() {
-        assert_eq!(parse_max_connections_per_addr("5"), 5);
+    fn per_addr_cap_defaults_to_unlimited_and_rejects_non_positive() {
+        assert_eq!(parse_per_addr_cap("5", "TEST_KEY"), 5);
         // 0/negative would make librtmp2 fall back to its own built-in
         // per-IP default (4), which is exactly the surprise this config
         // guards against, so it must not pass through unchanged.
-        assert_eq!(parse_max_connections_per_addr("0"), i32::MAX);
-        assert_eq!(parse_max_connections_per_addr("-1"), i32::MAX);
-        assert_eq!(parse_max_connections_per_addr("not-a-number"), i32::MAX);
+        assert_eq!(parse_per_addr_cap("0", "TEST_KEY"), i32::MAX);
+        assert_eq!(parse_per_addr_cap("-1", "TEST_KEY"), i32::MAX);
+        assert_eq!(parse_per_addr_cap("not-a-number", "TEST_KEY"), i32::MAX);
     }
 
     #[test]
     fn env_overrides_rtmp_max_connections_per_addr() {
-        let env = HashMap::from([("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR", "8")]);
+        let env = HashMap::from([
+            ("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR", "8"),
+            ("LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR", "6"),
+        ]);
         let mut config = ServerConfig::default();
         config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
         assert_eq!(config.rtmp_max_connections_per_addr, 8);
+        assert_eq!(config.rtmp_max_pending_tls_per_addr, 6);
     }
 
     #[test]
