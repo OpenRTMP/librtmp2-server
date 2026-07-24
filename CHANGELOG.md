@@ -13,18 +13,9 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
-## [0.1.7] — 2026-07-24
+## [0.1.8] — 2026-07-24
 
 ### Added
-- Connection and access logging aligned with srt-live-server style: RTMP
-  accept/publish/play/release/disconnect and kicks now include the peer
-  `IP:port`, and HTTP `/stats`, `/stats-nginx`, `/stat.xsl`, and per-stream
-  stats requests log client IP, status, and stream id. Admin stream/play-key
-  mutations and HTTP 429 rate-limit hits are logged with client IP as well.
-- Docker startup logs now print an OpenRTMP ASCII banner followed by the
-  `librtmp2-server` name and running image version. Release builds embed the
-  workflow version, while local builds fall back to the package version from
-  `Cargo.toml`.
 - `RTMP_MAX_CONNECTIONS_PER_ADDR` / `LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR`
   configure the maximum number of active RTMP/RTMPS connections accepted from
   one source IP.
@@ -62,6 +53,35 @@ begin at `1.0.0`.
 - Reconnects are no longer rejected against stale per-IP connection counts,
   and newly accepted sockets are processed during the same server poll tick.
 - Client AMF3 data handling avoids an unnecessary intermediate payload copy.
+
+## [0.1.7] — 2026-07-21
+
+### Added
+- Connection and access logging aligned with srt-live-server style: RTMP
+  accept/publish/play/release/disconnect and kicks now include the peer
+  `IP:port`, and HTTP `/stats`, `/stats-nginx`, `/stat.xsl`, and per-stream
+  stats requests log client IP, status, and stream id. Admin stream/play-key
+  mutations and HTTP 429 rate-limit hits are logged with client IP as well.
+- Docker startup logs now print an OpenRTMP ASCII banner followed by the
+  `librtmp2-server` name and running image version. Release builds embed the
+  workflow version, while local builds fall back to the package version from
+  `Cargo.toml`.
+
+### Security
+- Bump the `librtmp2` dependency to the crates.io release **0.4.2**, which
+  bounds `Client::publish()`/`Client::play()`'s blocking AMF exchange to the
+  configured connect-timeout wall-clock deadline instead of allowing
+  indefinite blocking, strictly UTF-8-validates route strings (app/stream
+  names), rejects embedded NUL bytes in `read_string_checked()` instead of
+  copying them, and has the server session layer reject empty app/stream
+  names and gate metadata relay to players on callback registration.
+
+### Fixed
+- (via the `librtmp2` 0.4.2 bump) `bytes_received` tracking now uses 64-bit
+  integers instead of 32-bit, so pacing stays correct after a connection
+  exceeds 4 GiB of inbound data. Client Aggregate-message playback now
+  passes sub-tag slices directly to callbacks instead of cloning each into
+  separate vectors.
 
 ## [0.1.6] — 2026-07-18
 
@@ -271,7 +291,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.4...v0.1.5
