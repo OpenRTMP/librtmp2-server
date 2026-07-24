@@ -619,6 +619,8 @@ impl ServerApp {
         let rtmps_bind = bind_with_default_port(&self.config.rtmps_bind, self.config.rtmps_port());
         let rtmps_log_bind = rtmps_bind.clone();
         let rtmp_max_conn = self.config.rtmp_max_conn;
+        let rtmp_max_connections_per_addr = self.config.rtmp_max_connections_per_addr;
+        let rtmp_max_pending_tls_per_addr = self.config.rtmp_max_pending_tls_per_addr;
         let idle_timeout_secs = self.config.rtmp_idle_timeout_secs.clamp(5, 600);
         let rtmp_idle_timeout = Duration::from_secs(idle_timeout_secs);
         let rtmp_resource_limits = self.config.rtmp_resource_limits();
@@ -644,6 +646,8 @@ impl ServerApp {
                 tls_key_file: std::ptr::null(),
                 tls_ca_file: std::ptr::null(),
                 tls_insecure: 0,
+                max_pending_tls_per_addr: rtmp_max_pending_tls_per_addr,
+                max_connections_per_addr: rtmp_max_connections_per_addr,
             };
             let mut server = match RtmpServer::new(cfg) {
                 Ok(s) => s,

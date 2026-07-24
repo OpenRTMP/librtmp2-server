@@ -146,6 +146,25 @@ RTMP_BIND=0.0.0.0:1935
 # Maximum concurrent RTMP/RTMPS connections across all listeners combined
 RTMP_MAX_CONNECTIONS=100
 
+# Maximum concurrent RTMP/RTMPS connections from a single remote IP. Unset
+# (or non-positive) means no per-IP cap, only RTMP_MAX_CONNECTIONS above
+# applies - keep it unset behind NAT/a load balancer/a proxy.
+# RTMP_MAX_CONNECTIONS_PER_ADDR=100
+
+# Maximum incomplete TLS handshakes retained per remote IP before the oldest
+# is evicted. Unset (or non-positive) means no per-IP cap - RTMP_MAX_CONNECTIONS
+# above still bounds the *global* number of pending handshakes, so this is a
+# per-IP fairness knob on top of that, not the only defense against a
+# handshake flood.
+# RTMP_MAX_PENDING_TLS_PER_ADDR=100
+```
+
+Every `RTMP_*` key above is read from the `.env` file; the corresponding
+process environment variable uses an `LRTMP2_RTMP_*` prefix instead (e.g.
+`LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR`) and takes precedence over the `.env`
+file when set.
+
+```env
 # RTMPS (TLS) - disabled by default.
 # When enabled, RTMPS_BIND runs *alongside* RTMP_BIND rather than replacing it.
 TLS_ENABLED=false
