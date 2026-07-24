@@ -1,0 +1,45 @@
+name: Refresh Cargo lock
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-lock-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Update librtmp2 lock entry
+        run: cargo update -p librtmp2 --precise 0.5.0
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Run release tests
+        run: cargo test --release --locked
+
+      - name: Commit updated lockfile
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "Update Cargo.lock for librtmp2 0.5.0"
+          git push origin "HEAD:${{ github.head_ref }}"
