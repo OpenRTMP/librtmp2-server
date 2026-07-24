@@ -13,6 +13,47 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-07-24
+
+### Added
+- `RTMP_MAX_CONNECTIONS_PER_ADDR` / `LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR`
+  configure the maximum number of active RTMP/RTMPS connections accepted from
+  one source IP.
+- `RTMP_MAX_PENDING_TLS_PER_ADDR` /
+  `LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR` independently configure the number of
+  incomplete RTMPS handshakes retained per source IP. Both per-IP settings
+  default to `i32::MAX` in the server application to preserve the previous
+  behavior for deployments behind NAT, load balancers, or proxies; operators
+  can opt into stricter limits explicitly.
+
+### Changed
+- Bump the `librtmp2` dependency to the crates.io release **0.5.0**. This
+  includes the new `ServerConfig::max_connections_per_addr` field, so both
+  server and test configuration literals now set the active-connection and
+  pending-TLS per-address limits explicitly.
+- README and `.env.example` now document both the `.env` names (`RTMP_*`) and
+  direct process-environment overrides (`LRTMP2_RTMP_*`), including the
+  remaining global admission-control backstop when the per-IP TLS limit is
+  effectively disabled.
+
+### Security
+- The `librtmp2` 0.5.0 upgrade closes post-connect idle-slot exhaustion,
+  separates active-connection and pending-TLS per-IP admission caps, bounds
+  accept-loop work per poll, and prevents stalled partial RTMP messages from
+  retaining large duplicate chunk scratch buffers.
+- Cached init-frame replay is deduplicated and rate-limited, publisher cache
+  eviction is isolated per publisher, and multitrack codec authorization
+  validates every contained track.
+
+### Fixed
+- The inherited RTMP session teardown paths now consistently clear
+  publish/play/paused state, refresh the idle grace window only after real
+  active-to-idle transitions, and allow valid connections to publish or play
+  again without being prematurely disconnected.
+- Reconnects are no longer rejected against stale per-IP connection counts,
+  and newly accepted sockets are processed during the same server poll tick.
+- Client AMF3 data handling avoids an unnecessary intermediate payload copy.
+
 ## [0.1.7] — 2026-07-21
 
 ### Added
@@ -250,7 +291,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.4...v0.1.5
