@@ -23,10 +23,11 @@ pub struct ServerConfig {
     /// 0/negative-falls-back-to-built-in-default-of-4 semantics and the same
     /// NAT/load-balancer/proxy surprise potential as
     /// `rtmp_max_connections_per_addr`, so it defaults to `i32::MAX` too.
-    /// Unlike the established-connection cap, an unbounded value here has no
-    /// other backstop (a single IP could hold open unlimited half-open TLS
-    /// handshakes), so operators exposed directly to the internet may want
-    /// to set this explicitly.
+    /// librtmp2 also caps the *global* number of pending handshakes (bounded
+    /// by `rtmp_max_conn` when finite, or 128 when unlimited), so this is a
+    /// per-IP fairness knob layered on top of that global cap, not the only
+    /// defense against a handshake flood; set it explicitly if one address
+    /// monopolizing the pending-handshake budget is a concern.
     pub rtmp_max_pending_tls_per_addr: i32,
     /// Drop RTMP peers that never complete publish/play auth within this window.
     pub rtmp_idle_timeout_secs: u64,
