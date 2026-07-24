@@ -151,6 +151,12 @@ RTMP_MAX_CONNECTIONS=100
 # applies - keep it unset behind NAT/a load balancer/a proxy.
 # RTMP_MAX_CONNECTIONS_PER_ADDR=100
 
+# Maximum incomplete TLS handshakes retained per remote IP before the oldest
+# is evicted. Unset (or non-positive) means no per-IP cap. Unlike the
+# connection cap above, an unbounded value here has no other backstop, so
+# consider setting this on deployments exposed directly to the internet.
+# RTMP_MAX_PENDING_TLS_PER_ADDR=100
+
 # RTMPS (TLS) - disabled by default.
 # When enabled, RTMPS_BIND runs *alongside* RTMP_BIND rather than replacing it.
 TLS_ENABLED=false
