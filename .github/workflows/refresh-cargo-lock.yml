@@ -6,11 +6,10 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   refresh-lock-and-test:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check out PR branch
@@ -32,14 +31,8 @@ jobs:
       - name: Run release tests
         run: cargo test --release --locked
 
-      - name: Commit updated lockfile
-        run: |
-          if git diff --quiet -- Cargo.lock; then
-            echo "Cargo.lock is already current."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock
-          git commit -m "Update Cargo.lock for librtmp2 0.5.0"
-          git push origin "HEAD:${{ github.head_ref }}"
+      - name: Upload updated lockfile
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-lock
+          path: Cargo.lock
