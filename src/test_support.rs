@@ -108,9 +108,9 @@ impl TestServer {
                 tls_key_file: std::ptr::null(),
                 tls_ca_file: std::ptr::null(),
                 tls_insecure: 0,
-                max_pending_tls_per_addr: 0,
                 // No per-IP cap in tests: multiple simulated clients connect
                 // from the same loopback address.
+                max_pending_tls_per_addr: i32::MAX,
                 max_connections_per_addr: i32::MAX,
             };
 

@@ -534,6 +534,7 @@ mod tests {
             "# test config\n\
              RTMP_BIND=127.0.0.1:1936\n\
              RTMP_MAX_CONNECTIONS=50\n\
+             RTMP_MAX_CONNECTIONS_PER_ADDR=7\n\
              RTMP_MAX_REASSEMBLY_MB=16\n\
              RTMP_MAX_CACHE_MB=32\n\
              RTMP_MAX_RELAY_QUEUE_MB=4\n\
@@ -555,6 +556,7 @@ mod tests {
         let config = config_load(path.to_str().unwrap()).expect("config_load");
         assert_eq!(config.rtmp_bind, "127.0.0.1:1936");
         assert_eq!(config.rtmp_max_conn, 50);
+        assert_eq!(config.rtmp_max_connections_per_addr, 7);
         assert_eq!(config.rtmp_max_reassembly_mb, 16);
         assert_eq!(config.rtmp_max_cache_mb, 32);
         assert_eq!(config.rtmp_max_relay_queue_mb, 4);

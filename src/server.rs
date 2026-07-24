@@ -645,10 +645,11 @@ impl ServerApp {
                 tls_key_file: std::ptr::null(),
                 tls_ca_file: std::ptr::null(),
                 tls_insecure: 0,
-                // 0 = librtmp2's built-in default for the pending-TLS-handshake
-                // queue; unlike max_connections_per_addr this isn't a cap on
-                // established connections, so the built-in default is fine.
-                max_pending_tls_per_addr: 0,
+                // 0 would fall back to librtmp2's built-in default of 4 pending
+                // TLS handshakes per IP, which has the same NAT/LB/proxy
+                // surprise potential as max_connections_per_addr, so avoid it
+                // here too.
+                max_pending_tls_per_addr: i32::MAX,
                 max_connections_per_addr: rtmp_max_connections_per_addr,
             };
             let mut server = match RtmpServer::new(cfg) {

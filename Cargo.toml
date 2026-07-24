@@ -15,11 +15,7 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-# TODO: switch back to a crates.io version requirement once a librtmp2
-# release including `ServerConfig::max_connections_per_addr` (OpenRTMP/librtmp2#167)
-# is published; pinned to a commit in the meantime so this repo can build
-# against the new field ahead of that release.
-librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", rev = "adfcbc70c7492b014b700e52dd574a9db8f07eef", features = ["tls"] }
+librtmp2 = { version = "0.4.2", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
