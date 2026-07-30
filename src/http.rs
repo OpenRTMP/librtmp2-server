@@ -848,7 +848,13 @@ async fn handle_stats_nginx(
         return pace_public_stats(start, err_xml(status, "Missing stats key")).await;
     }
     let Some(s) = stats_key_lookup(&state, &q.key, None) else {
-        log_http_access("GET", "/stats-nginx", &peer, StatusCode::OK, "invalid stats key");
+        log_http_access(
+            "GET",
+            "/stats-nginx",
+            &peer,
+            StatusCode::OK,
+            "invalid stats key",
+        );
         return pace_public_stats(start, public_stats_offline_nginx(&state.db)).await;
     };
     log_http_access(
@@ -1714,13 +1720,7 @@ async fn handle_stream_stats(
             );
             return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
         }
-        log_http_access(
-            "GET",
-            PATH,
-            &peer,
-            StatusCode::OK,
-            "invalid stream id",
-        );
+        log_http_access("GET", PATH, &peer, StatusCode::OK, "invalid stream id");
         return public_stats_offline_response();
     }
     let path = format!("/api/v1/streams/{id}/stats");
