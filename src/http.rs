@@ -163,6 +163,23 @@ fn public_stats_text(status: StatusCode, msg: &str) -> Response {
         .into_response()
 }
 
+const PUBLIC_STATS_OFFLINE_MSG: &str = "Stream offline";
+
+/// Uniform offline response for public stats routes. Returned for both valid
+/// keys with no active publisher and failed stats-key auth so remote clients
+/// cannot distinguish guesses from offline streams.
+fn public_stats_offline_response() -> Response {
+    public_stats_text(StatusCode::OK, PUBLIC_STATS_OFFLINE_MSG)
+}
+
+fn public_stats_offline_nginx(db: &Db) -> Response {
+    xml_response(
+        StatusCode::OK,
+        // Scoped to a non-existent stream id so the shell matches a valid offline key.
+        build_nginx_xml(db, Some(""), true),
+    )
+}
+
 /// XML 1.0 forbids most control characters; the rest of the five reserved
 /// characters are escaped so attacker-controlled strings (RTMP `app`,
 /// stream names) can't inject markup into the stats document.
@@ -651,14 +668,13 @@ async fn handle_stats_json(
         return pace_public_stats(start, public_stats_text(status, "stats_key required")).await;
     }
     let Some(s) = stats_key_lookup(&state, &q.key, None) else {
-        let status = StatusCode::FORBIDDEN;
-        log_http_access("GET", "/stats", &peer, status, "invalid stats key");
-        return pace_public_stats(start, public_stats_text(status, "Invalid stats key")).await;
+        log_http_access("GET", "/stats", &peer, StatusCode::OK, "invalid stats key");
+        return pace_public_stats(start, public_stats_offline_response()).await;
     };
     let (response, detail) = match build_public_json_stats(&state.db, &s.id) {
         Some(body) => (Json(body).into_response(), format!("stream='{}'", s.id)),
         None => (
-            public_stats_text(StatusCode::OK, "Stream offline"),
+            public_stats_offline_response(),
             format!("stream='{}' offline", s.id),
         ),
     };
@@ -832,9 +848,14 @@ async fn handle_stats_nginx(
         return pace_public_stats(start, err_xml(status, "Missing stats key")).await;
     }
     let Some(s) = stats_key_lookup(&state, &q.key, None) else {
-        let status = StatusCode::FORBIDDEN;
-        log_http_access("GET", "/stats-nginx", &peer, status, "invalid stats key");
-        return pace_public_stats(start, err_xml(status, "Invalid stats key")).await;
+        log_http_access(
+            "GET",
+            "/stats-nginx",
+            &peer,
+            StatusCode::OK,
+            "invalid stats key",
+        );
+        return pace_public_stats(start, public_stats_offline_nginx(&state.db)).await;
     };
     log_http_access(
         "GET",
@@ -1699,14 +1720,8 @@ async fn handle_stream_stats(
             );
             return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
         }
-        log_http_access(
-            "GET",
-            PATH,
-            &peer,
-            StatusCode::FORBIDDEN,
-            "invalid stream id",
-        );
-        return public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key");
+        log_http_access("GET", PATH, &peer, StatusCode::OK, "invalid stream id");
+        return public_stats_offline_response();
     }
     let path = format!("/api/v1/streams/{id}/stats");
     if bearer {
@@ -1743,23 +1758,13 @@ async fn handle_stream_stats(
     }
     let start = Instant::now();
     if stats_key_lookup(&state, &q.key, Some(&id)).is_none() {
-        log_http_access(
-            "GET",
-            &path,
-            &peer,
-            StatusCode::FORBIDDEN,
-            "invalid stats key",
-        );
-        return pace_public_stats(
-            start,
-            public_stats_text(StatusCode::FORBIDDEN, "Invalid stats key"),
-        )
-        .await;
+        log_http_access("GET", &path, &peer, StatusCode::OK, "invalid stats key");
+        return pace_public_stats(start, public_stats_offline_response()).await;
     }
     let (response, detail) = match build_public_json_stats(&state.db, &id) {
         Some(body) => (Json(body).into_response(), format!("stream='{id}'")),
         None => (
-            public_stats_text(StatusCode::OK, "Stream offline"),
+            public_stats_offline_response(),
             format!("stream='{id}' offline"),
         ),
     };
@@ -2678,11 +2683,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(body, "Invalid stats key");
+        assert_eq!(body, PUBLIC_STATS_OFFLINE_MSG);
 
         let resp = app
             .oneshot(
