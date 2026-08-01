@@ -1331,9 +1331,7 @@ mod tests {
 
         bridge.on_connect(1, ip);
         assert!(
-            bridge
-                .authorize_publish(1, "live", &s.publish_key)
-                .is_err(),
+            bridge.authorize_publish(1, "live", &s.publish_key).is_err(),
             "valid key on disabled stream must still be rejected"
         );
         bridge.on_close(1);
