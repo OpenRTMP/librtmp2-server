@@ -27,15 +27,24 @@ const RTMP_AUTH_MAX_FAILURES: usize = 10;
 /// grow `auth_failures` without bound, mirroring `rate_limit::MAX_TRACKED_KEYS`.
 const MAX_TRACKED_AUTH_FAILURE_KEYS: usize = 10_000;
 
-/// Distinguishes a brute-forceable credential/app mismatch from a rejection
-/// that has nothing to do with guessing a valid key (deleted/disabled
-/// stream, connection-limit, DB or keygen error). Only the former should
-/// count against the auth-failure rate limit — counting the latter lets
-/// unrelated operational failures throttle a legitimate client.
+/// Classifies publish/play auth rejections for logging and rate limiting.
+/// `Credential` and `RecognizedKey` both consume the per-IP auth-failure
+/// budget so a remote peer cannot probe whether a key exists by observing
+/// whether their attempt counted toward the limit (valid keys rejected
+/// because the stream is disabled, pending delete, or already has a
+/// publisher/player must not bypass the limiter). `Operational` is reserved
+/// for internal failures that do not confirm key validity (keygen/DB errors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthFailureKind {
     Credential,
+    RecognizedKey,
     Operational,
+}
+
+impl AuthFailureKind {
+    fn consumes_auth_budget(self) -> bool {
+        matches!(self, Self::Credential | Self::RecognizedKey)
+    }
 }
 
 /// Opaque per-connection identifier assigned by the RTMP layer. The original
@@ -713,14 +722,14 @@ impl DbRtmpBridge {
                 "RTMP: publish rejected — stream '{}' is disabled from {peer}",
                 stream.id
             );
-            return Err(AuthFailureKind::Operational);
+            return Err(AuthFailureKind::RecognizedKey);
         }
         if self.deleted_streams.lock().contains(&stream.id) {
             crate::log_warn!(
                 "RTMP: publish rejected — stream '{}' is being deleted from {peer}",
                 stream.id
             );
-            return Err(AuthFailureKind::Operational);
+            return Err(AuthFailureKind::RecognizedKey);
         }
         if stream.app != app {
             crate::log_warn!(
@@ -778,7 +787,7 @@ impl DbRtmpBridge {
                 "RTMP: publish rejected — stream '{}' already has an active publisher from {peer}",
                 stream.id
             );
-            return Err(AuthFailureKind::Operational);
+            return Err(AuthFailureKind::RecognizedKey);
         }
 
         let stream_id = stream.id.clone();
@@ -823,14 +832,14 @@ impl DbRtmpBridge {
                 "RTMP: play rejected — stream '{}' is being deleted from {peer}",
                 stream.id
             );
-            return Err(AuthFailureKind::Operational);
+            return Err(AuthFailureKind::RecognizedKey);
         }
         if !stream.enabled {
             crate::log_warn!(
                 "RTMP: play rejected — stream '{}' is disabled from {peer}",
                 stream.id
             );
-            return Err(AuthFailureKind::Operational);
+            return Err(AuthFailureKind::RecognizedKey);
         }
         if stream.app != app {
             crate::log_warn!(
@@ -888,7 +897,7 @@ impl DbRtmpBridge {
                 "RTMP: play rejected — connection limit ({}) reached for play key from {peer}",
                 crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
             );
-            return Err(AuthFailureKind::Operational);
+            return Err(AuthFailureKind::RecognizedKey);
         }
 
         let player_id = player_row.id.clone();
@@ -947,7 +956,7 @@ impl RtmpEventHandler for DbRtmpBridge {
                 Ok(())
             }
             Err(kind) => {
-                if kind == AuthFailureKind::Credential {
+                if kind.consumes_auth_budget() {
                     self.record_auth_failure(&rate_key);
                 }
                 Err(())
@@ -970,7 +979,7 @@ impl RtmpEventHandler for DbRtmpBridge {
                 Ok(())
             }
             Err(kind) => {
-                if kind == AuthFailureKind::Credential {
+                if kind.consumes_auth_budget() {
                     self.record_auth_failure(&rate_key);
                 }
                 Err(())
@@ -1291,18 +1300,14 @@ mod tests {
     }
 
     #[test]
-    fn publish_with_valid_key_for_disabled_stream_does_not_burn_auth_budget() {
+    fn recognized_key_rejections_consume_auth_budget() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         assert!(db.stream_disable("s1").unwrap());
         let bridge = test_bridge(db);
         let ip = "203.0.113.8:1935";
 
-        // A valid key for a disabled/pending-delete stream must be rejected
-        // as an operational failure, not a credential mismatch — otherwise
-        // it would consume the shared per-IP auth-failure budget just like
-        // a brute-force guess would.
-        for conn in 0..(RTMP_AUTH_MAX_FAILURES as u64 + 2) {
+        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
             bridge.on_connect(conn, ip);
             assert!(
                 bridge
@@ -1312,7 +1317,37 @@ mod tests {
             bridge.on_close(conn);
         }
 
-        assert!(!bridge.is_auth_rate_limited(&remote_ip_of(ip)));
+        assert!(bridge.is_auth_rate_limited(&remote_ip_of(ip)));
+    }
+
+    #[test]
+    fn recognized_key_and_credential_failures_share_auth_budget() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        assert!(db.stream_disable("s1").unwrap());
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.55:1935";
+        let remote_ip = remote_ip_of(ip);
+
+        bridge.on_connect(1, ip);
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &s.publish_key)
+                .is_err(),
+            "valid key on disabled stream must still be rejected"
+        );
+        bridge.on_close(1);
+
+        for conn in 2..=(RTMP_AUTH_MAX_FAILURES as u64) {
+            bridge.on_connect(conn, ip);
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+            bridge.on_close(conn);
+        }
+
+        assert!(
+            bridge.is_auth_rate_limited(&remote_ip),
+            "recognized-key probe followed by bogus guesses must hit the same limit as invalid keys alone"
+        );
     }
 
     #[test]
