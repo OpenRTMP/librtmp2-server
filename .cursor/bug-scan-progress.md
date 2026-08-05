@@ -1,16 +1,25 @@
 # Bug scan progress
 
-Last scanned: logger (2026-07-02)
+Last scanned: config (2026-08-05)
 
 ## Modules
 
 - [x] config — .env loader, env overrides
-- [x] db — SQLite persistence, stream/publisher/player CRUD
-- [x] http — REST API, auth, stats endpoints
-- [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
-- [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [x] keygen — Stream key generation
-- [x] logger — Logging
+- [ ] db — SQLite persistence, stream/publisher/player CRUD
+- [ ] http — REST API, auth, stats endpoints
+- [ ] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
+- [ ] rtmp_bridge — RTMP protocol ↔ DB integration seam
+- [ ] keygen — Stream key generation
+- [ ] logger — Logging
+
+## Findings (2026-08-05 config pass)
+
+- **Critical (fixed):** CLI `-p`/`-w` port overrides rewrote bind addresses as
+  `0.0.0.0:{port}`, discarding a configured localhost-only host
+  (`RTMP_BIND=127.0.0.1:1935` or `HTTP_BIND=127.0.0.1:8080`). An operator
+  changing only the port via `-p`/`-w` would unintentionally expose RTMP/HTTP on
+  all interfaces. Fixed with `set_bind_port()` that preserves the configured host
+  (including bracketed IPv6) while replacing the port.
 
 ## Findings (2026-07-02 logger pass)
 
