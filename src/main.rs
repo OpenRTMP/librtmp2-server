@@ -1,4 +1,4 @@
-use librtmp2_server::config::{ServerConfig, config_apply_env, config_load};
+use librtmp2_server::config::{ServerConfig, config_apply_env, config_load, set_bind_port};
 use librtmp2_server::logger;
 use librtmp2_server::server::ServerApp;
 
@@ -44,10 +44,10 @@ fn run() -> Result<(), String> {
     config_apply_env(&mut config);
 
     if let Some(port) = cli.rtmp_port {
-        config.rtmp_bind = format!("0.0.0.0:{port}");
+        config.rtmp_bind = set_bind_port(&config.rtmp_bind, port);
     }
     if let Some(port) = cli.http_port {
-        config.http_bind = format!("0.0.0.0:{port}");
+        config.http_bind = set_bind_port(&config.http_bind, port);
     }
 
     if cli.verbose {

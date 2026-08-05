@@ -154,6 +154,30 @@ impl ServerConfig {
 ///
 /// The only case with an explicit port is `"[v6addr]:port"` or exactly one
 /// unbracketed `:` (`"host:port"`).
+/// Host portion of a "host:port" bind string, with IPv6 bracketing when needed.
+/// Mirrors the host parsing rules used by `port_of` and `server::bind_with_default_port`.
+fn bind_host_of(bind: &str) -> String {
+    let bind = bind.trim();
+    if let Some(bracket_end) = bind.rfind(']') {
+        return bind[..=bracket_end].to_string();
+    }
+    let colon_count = bind.chars().filter(|&c| c == ':').count();
+    match colon_count {
+        0 => bind.to_string(),
+        1 => match bind.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => host.to_string(),
+            Some((host, _)) => host.to_string(),
+            None => bind.to_string(),
+        },
+        _ => format!("[{bind}]"),
+    }
+}
+
+/// Replace the port in a bind string while preserving the configured host.
+pub fn set_bind_port(bind: &str, new_port: u16) -> String {
+    format!("{}:{new_port}", bind_host_of(bind))
+}
+
 fn port_of(bind: &str, default: u16) -> u16 {
     if let Some(bracket_end) = bind.rfind(']') {
         return bind[bracket_end + 1..]
@@ -781,6 +805,20 @@ mod tests {
         assert_eq!(config.http_rate_limit_stats, 15);
         assert_eq!(config.http_rate_limit_default, 25);
         assert_eq!(config.http_max_body_bytes, 2048);
+    }
+
+    #[test]
+    fn set_bind_port_preserves_localhost_host() {
+        assert_eq!(set_bind_port("127.0.0.1:1935", 1936), "127.0.0.1:1936");
+        assert_eq!(set_bind_port("127.0.0.1:8080", 8081), "127.0.0.1:8081");
+    }
+
+    #[test]
+    fn set_bind_port_preserves_wildcard_and_ipv6_hosts() {
+        assert_eq!(set_bind_port("0.0.0.0:1935", 1936), "0.0.0.0:1936");
+        assert_eq!(set_bind_port("[::1]:1935", 1936), "[::1]:1936");
+        assert_eq!(set_bind_port("::1", 1936), "[::1]:1936");
+        assert_eq!(set_bind_port("127.0.0.1", 1935), "127.0.0.1:1935");
     }
 
     #[test]
