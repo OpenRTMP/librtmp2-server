@@ -2730,6 +2730,46 @@ mod tests {
             ..Default::default()
         });
         let app = router(state);
+        let (header, value) = bearer("token");
+
+        for _ in 0..3 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/streams")
+                        .header(header, &value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn health_rate_limit_does_not_exhaust_authenticated_api_budget() {
+        let state = test_state_with_config(ServerConfig {
+            api_token: "token".to_string(),
+            http_rate_limit_api: 3,
+            http_rate_limit_default: 3,
+            ..Default::default()
+        });
+        let app = router(state);
+        let (header, value) = bearer("token");
 
         for _ in 0..3 {
             let resp = app
@@ -2746,6 +2786,7 @@ mod tests {
         }
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/health")
@@ -2755,6 +2796,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "authenticated admin API must not share the public health rate-limit bucket"
+        );
     }
 
     #[tokio::test]

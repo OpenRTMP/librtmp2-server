@@ -126,13 +126,19 @@ impl RateLimiter {
         true
     }
 
-    fn limit_for_path(&self, path: &str) -> usize {
-        if path.starts_with("/api/") {
-            self.config.api_max
+    /// Classify a request path into a rate-limit bucket and its per-window cap.
+    /// `/api/v1/health` is public and probed by orchestrators; it must not share
+    /// the authenticated `/api/*` bucket or unauthenticated health traffic can
+    /// exhaust the admin API budget for the same client IP.
+    fn classify_path(&self, path: &str) -> (usize, &'static str) {
+        if path == "/api/v1/health" {
+            (self.config.default_max, "health")
+        } else if path.starts_with("/api/") {
+            (self.config.api_max, "api")
         } else if path.starts_with("/stats") {
-            self.config.stats_max
+            (self.config.stats_max, "stats")
         } else {
-            self.config.default_max
+            (self.config.default_max, "default")
         }
     }
 }
@@ -193,8 +199,8 @@ pub async fn middleware(
 ) -> Response {
     let path = request.uri().path();
     let peer = client_ip(&request, limiter.trusted_proxies.as_slice());
-    let key = format!("{}:{}", peer, path.split('/').nth(1).unwrap_or(""));
-    let max = limiter.limit_for_path(path);
+    let (max, bucket) = limiter.classify_path(path);
+    let key = format!("{peer}:{bucket}");
     if !limiter.check(&key, max) {
         let method = request.method().as_str();
         crate::log_warn!("HTTP: {method} {path} from {peer} → 429 rate limit exceeded");
@@ -292,6 +298,40 @@ mod tests {
         assert!(
             !limiter.check("203.0.113.255:api", max),
             "new client must be denied when every tracked bucket is throttled"
+        );
+    }
+
+    #[test]
+    fn health_uses_separate_bucket_from_authenticated_api() {
+        let limiter = RateLimiter::new(
+            HttpRateLimitConfig {
+                api_max: 3,
+                default_max: 60,
+                ..HttpRateLimitConfig::default()
+            },
+            Vec::new(),
+        );
+
+        let (health_max, health_bucket) = limiter.classify_path("/api/v1/health");
+        let (api_max, api_bucket) = limiter.classify_path("/api/v1/streams");
+        assert_eq!(health_bucket, "health");
+        assert_eq!(api_bucket, "api");
+        assert_eq!(health_max, 60);
+        assert_eq!(api_max, 3);
+
+        for i in 0..3 {
+            assert!(
+                limiter.check("127.0.0.1:api", api_max),
+                "api request {i} should succeed"
+            );
+        }
+        assert!(
+            !limiter.check("127.0.0.1:api", api_max),
+            "api bucket should be exhausted"
+        );
+        assert!(
+            limiter.check("127.0.0.1:health", health_max),
+            "health bucket must remain independent of the api bucket"
         );
     }
 
