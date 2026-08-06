@@ -872,6 +872,26 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        if p.active {
+            let other_active: i64 = match conn.query_row(
+                "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1 AND id!=?",
+                params![p.stream_id, id],
+                |row| row.get(0),
+            ) {
+                Ok(count) => count,
+                Err(e) => {
+                    crate::log_error!("publisher_update: active-slot check failed for {id}: {e}");
+                    return false;
+                }
+            };
+            if other_active > 0 {
+                crate::log_warn!(
+                    "publisher_update: rejected reactivation of {id} — stream '{}' already has an active publisher",
+                    p.stream_id
+                );
+                return false;
+            }
+        }
         match conn.execute(
             "UPDATE publishers SET stream_id=?,app=?,stream_name=?,\
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
@@ -1051,6 +1071,30 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        if p.active {
+            if p.viewer_id.is_empty() {
+                crate::log_error!("player_update: missing viewer_id for {id}");
+                return false;
+            }
+            let active: i64 = match conn.query_row(
+                "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1 AND id!=?",
+                params![p.viewer_id, id],
+                |row| row.get(0),
+            ) {
+                Ok(count) => count,
+                Err(e) => {
+                    crate::log_error!("player_update: active-slot check failed for {id}: {e}");
+                    return false;
+                }
+            };
+            if active >= MAX_CONNECTIONS_PER_PLAY_KEY as i64 {
+                crate::log_warn!(
+                    "player_update: rejected reactivation of {id} — viewer '{}' is at the connection cap",
+                    p.viewer_id
+                );
+                return false;
+            }
+        }
         match conn.execute(
             "UPDATE players SET stream_id=?,viewer_id=?,app=?,stream_name=?,\
              bytes_out=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
@@ -1610,6 +1654,99 @@ mod tests {
                 .unwrap();
             assert_eq!(Db::audit_cross_stream_key_collisions(&conn), 0);
         }
+    }
+
+    #[test]
+    fn publisher_update_rejects_second_active_slot_on_stream() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+
+        let first = Publisher {
+            id: "pub1".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        let second = Publisher {
+            id: "pub2".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&first));
+        let mut inactive = first.clone();
+        inactive.active = false;
+        assert!(db.publisher_update("pub1", &inactive));
+        assert!(db.publisher_try_acquire(&second));
+
+        let mut ghost = first;
+        ghost.active = true;
+        assert!(
+            !db.publisher_update("pub1", &ghost),
+            "publisher_update must not create a second active publisher on the same stream"
+        );
+        assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
+    }
+
+    #[test]
+    fn player_update_respects_per_viewer_connection_cap() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+
+        let mut ids = Vec::new();
+        for i in 0..MAX_CONNECTIONS_PER_PLAY_KEY {
+            let id = format!("pl{i}");
+            assert!(db.player_try_acquire(&Player {
+                id: id.clone(),
+                stream_id: "stream1".to_string(),
+                viewer_id: viewer.id.clone(),
+                connected_at: now_ts(),
+                active: true,
+                ..Default::default()
+            }));
+            ids.push(id);
+        }
+
+        let evicted = Player {
+            id: ids[0].clone(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: false,
+            ..Default::default()
+        };
+        assert!(db.player_update(&ids[0], &evicted));
+        assert!(db.player_try_acquire(&Player {
+            id: "pl_replacement".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+
+        let mut reactivate = evicted.clone();
+        reactivate.active = true;
+        assert!(
+            !db.player_update(&ids[0], &reactivate),
+            "player_update must not exceed the per-viewer connection cap"
+        );
+        assert_eq!(
+            db.player_list(Some("stream1")).len(),
+            MAX_CONNECTIONS_PER_PLAY_KEY
+        );
     }
 
     #[test]
