@@ -13,6 +13,48 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-06
+
+### Security
+- The HTTP rate limiter's route classification for `/stats*` now matches
+  only the exact `/stats` and `/stats-nginx` paths; previously any unmatched
+  path starting with `/stats` (e.g. `/stats-<random>`) got its own bucket,
+  letting a client mint unbounded rate-limit buckets by hitting unique
+  unmatched paths instead of falling under the shared default bucket.
+- The admin API rate limiter now previews Bearer authentication before
+  bucketing: authenticated `/api/*` requests still draw from
+  `HTTP_RATE_LIMIT_API` as before, but unauthenticated `/api/*` requests —
+  including the public `GET /api/v1/health` — now draw from
+  `HTTP_RATE_LIMIT_DEFAULT` under a separate "public" bucket instead of the
+  authenticated admin budget. This closes a path where a client sharing an
+  IP with an admin (NAT, reverse proxy) could exhaust the admin API's
+  request budget without a valid token. `/stats` and `/stats-nginx` again
+  track independent budgets from each other.
+- `publisher_update`/`player_update` now re-validate the single-active-
+  publisher and per-viewer connection-cap invariants when a row transitions
+  into an active slot (or moves to a different stream/viewer while active),
+  closing a path where an RTMP stream-switch rollback could leave a "ghost"
+  active row that blocked new publishes until restart.
+- Publish/play rejections that occur after a successful key lookup (disabled
+  stream, pending delete, publisher slot already taken, play connection cap)
+  now count toward the per-IP auth-failure rate-limit budget, closing a side
+  channel that let a remote peer distinguish a valid key from a guess by
+  whether the attempt consumed rate-limit quota.
+- `/stats`, `/stats-nginx`, and `GET /api/v1/streams/{id}/stats` now return
+  identical "offline" responses for an invalid `stats_key` and a
+  valid-but-offline one, closing a `stats_key` enumeration oracle.
+
+### Fixed
+- `-p`/`-w` CLI overrides no longer rewrite `RTMP_BIND`/`HTTP_BIND` to
+  `0.0.0.0:{port}`; they now replace only the port and preserve the
+  configured host (including bracketed IPv6 literals), so overriding the
+  port no longer silently exposes a previously localhost-only listener on
+  all interfaces.
+- `publisher_update`/`player_update` skip their active-slot uniqueness/cap
+  re-check on routine stats-flush updates that leave a row's slot unchanged
+  (`active=true`, same stream/viewer), instead of re-running the indexed
+  scan on every periodic update.
+
 ## [0.1.8] — 2026-07-24
 
 ### Added
@@ -291,7 +333,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.5...v0.1.6
