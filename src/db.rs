@@ -873,23 +873,43 @@ impl Db {
         };
         let conn = self.conn.lock();
         if p.active {
-            let other_active: i64 = match conn.query_row(
-                "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1 AND id!=?",
-                params![p.stream_id, id],
-                |row| row.get(0),
-            ) {
-                Ok(count) => count,
-                Err(e) => {
-                    crate::log_error!("publisher_update: active-slot check failed for {id}: {e}");
+            // Only re-verify the single-active-publisher invariant on a real
+            // transition into (or across) an active slot. A row that is
+            // already active on the same stream and merely being refreshed
+            // by a periodic stats flush was already checked when it became
+            // active, so re-running the indexed COUNT(*) scan below on every
+            // flush would add unnecessary DB-mutex contention under high
+            // connection churn.
+            let current: Option<(bool, String)> = conn
+                .query_row(
+                    "SELECT active, stream_id FROM publishers WHERE id=?",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            let is_transition =
+                !matches!(&current, Some((true, stream_id)) if *stream_id == p.stream_id);
+            if is_transition {
+                let other_active: i64 = match conn.query_row(
+                    "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1 AND id!=?",
+                    params![p.stream_id, id],
+                    |row| row.get(0),
+                ) {
+                    Ok(count) => count,
+                    Err(e) => {
+                        crate::log_error!(
+                            "publisher_update: active-slot check failed for {id}: {e}"
+                        );
+                        return false;
+                    }
+                };
+                if other_active > 0 {
+                    crate::log_warn!(
+                        "publisher_update: rejected reactivation of {id} — stream '{}' already has an active publisher",
+                        p.stream_id
+                    );
                     return false;
                 }
-            };
-            if other_active > 0 {
-                crate::log_warn!(
-                    "publisher_update: rejected reactivation of {id} — stream '{}' already has an active publisher",
-                    p.stream_id
-                );
-                return false;
             }
         }
         match conn.execute(
@@ -1076,23 +1096,37 @@ impl Db {
                 crate::log_error!("player_update: missing viewer_id for {id}");
                 return false;
             }
-            let active: i64 = match conn.query_row(
-                "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1 AND id!=?",
-                params![p.viewer_id, id],
-                |row| row.get(0),
-            ) {
-                Ok(count) => count,
-                Err(e) => {
-                    crate::log_error!("player_update: active-slot check failed for {id}: {e}");
+            // Only re-verify the per-viewer connection cap on a real
+            // transition into (or across) an active slot — see the matching
+            // comment in `publisher_update`.
+            let current: Option<(bool, String)> = conn
+                .query_row(
+                    "SELECT active, viewer_id FROM players WHERE id=?",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            let is_transition =
+                !matches!(&current, Some((true, viewer_id)) if *viewer_id == p.viewer_id);
+            if is_transition {
+                let active: i64 = match conn.query_row(
+                    "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1 AND id!=?",
+                    params![p.viewer_id, id],
+                    |row| row.get(0),
+                ) {
+                    Ok(count) => count,
+                    Err(e) => {
+                        crate::log_error!("player_update: active-slot check failed for {id}: {e}");
+                        return false;
+                    }
+                };
+                if active >= MAX_CONNECTIONS_PER_PLAY_KEY as i64 {
+                    crate::log_warn!(
+                        "player_update: rejected reactivation of {id} — viewer '{}' is at the connection cap",
+                        p.viewer_id
+                    );
                     return false;
                 }
-            };
-            if active >= MAX_CONNECTIONS_PER_PLAY_KEY as i64 {
-                crate::log_warn!(
-                    "player_update: rejected reactivation of {id} — viewer '{}' is at the connection cap",
-                    p.viewer_id
-                );
-                return false;
             }
         }
         match conn.execute(
@@ -1697,6 +1731,51 @@ mod tests {
     }
 
     #[test]
+    fn publisher_update_skips_active_slot_recheck_on_same_stream_flush() {
+        // A periodic stats flush (active stays true, stream_id unchanged) is
+        // not a reactivation and must not re-run the active-slot uniqueness
+        // check — only a real inactive -> active (or cross-stream) transition
+        // does. Prove the boundary by manually inserting a second "phantom"
+        // active row that bypasses publisher_try_acquire/update entirely: if
+        // the flush still ran the check, it would find this row and (wrongly)
+        // reject the flush of an already-valid publisher.
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+
+        let first = Publisher {
+            id: "pub1".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&first));
+
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO publishers (id,stream_id,connected_at,active) VALUES ('phantom','stream1',0,1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut flushed = first;
+        flushed.bitrate_kbps = 4200.0;
+        assert!(
+            db.publisher_update("pub1", &flushed),
+            "a stats flush that keeps active=true on the same stream must not be rejected \
+             by the active-slot check, which only guards real transitions"
+        );
+    }
+
+    #[test]
     fn player_update_respects_per_viewer_connection_cap() {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
@@ -1746,6 +1825,51 @@ mod tests {
         assert_eq!(
             db.player_list(Some("stream1")).len(),
             MAX_CONNECTIONS_PER_PLAY_KEY
+        );
+    }
+
+    #[test]
+    fn player_update_skips_connection_cap_recheck_on_same_viewer_flush() {
+        // Mirrors publisher_update_skips_active_slot_recheck_on_same_stream_flush:
+        // a stats flush that keeps active=true for the same viewer_id is not
+        // a reactivation and must not re-run the per-viewer connection-cap
+        // check. Prove it by manually pushing the viewer over the cap via a
+        // direct insert that bypasses player_try_acquire/update.
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+
+        let first = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&first));
+
+        {
+            let conn = db.conn.lock();
+            for i in 0..MAX_CONNECTIONS_PER_PLAY_KEY {
+                conn.execute(
+                    "INSERT INTO players (id,stream_id,viewer_id,connected_at,active) \
+                     VALUES (?,?,?,0,1)",
+                    params![format!("phantom{i}"), "stream1", viewer.id],
+                )
+                .unwrap();
+            }
+        }
+
+        let mut flushed = first;
+        flushed.bitrate_kbps = 1500.0;
+        assert!(
+            db.player_update("pl0", &flushed),
+            "a stats flush that keeps active=true for the same viewer must not be rejected \
+             by the connection-cap check, which only guards real transitions"
         );
     }
 
