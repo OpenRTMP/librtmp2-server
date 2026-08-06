@@ -1,7 +1,7 @@
 //! Per-client HTTP rate limiting (in-process sliding window).
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use parking_lot::Mutex;
@@ -38,14 +38,20 @@ pub struct RateLimiter {
     inner: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     config: HttpRateLimitConfig,
     trusted_proxies: Arc<Vec<IpAddr>>,
+    /// API bearer token, used only to preview whether an `/api/*` request is
+    /// authenticated for rate-limit bucket selection (see `bucket_for`).
+    /// This does not perform request authorization — each handler still
+    /// enforces that independently.
+    api_token: Arc<str>,
 }
 
 impl RateLimiter {
-    pub fn new(config: HttpRateLimitConfig, trusted_proxies: Vec<IpAddr>) -> Self {
+    pub fn new(config: HttpRateLimitConfig, trusted_proxies: Vec<IpAddr>, api_token: &str) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             config,
             trusted_proxies: Arc::new(trusted_proxies),
+            api_token: Arc::from(api_token),
         }
     }
 
@@ -126,15 +132,66 @@ impl RateLimiter {
         true
     }
 
-    fn limit_for_path(&self, path: &str) -> usize {
+    /// Classify a request into a rate-limit bucket and its per-window cap.
+    ///
+    /// `/api/*` requests without a valid Bearer token — including the public
+    /// `GET /api/v1/health` — never draw from `api_max`. Rate limiting runs
+    /// before authentication, so if any unauthenticated `/api/*` request
+    /// shared the authenticated bucket, an attacker on the client's IP could
+    /// exhaust the admin API budget without a token at all (not just via
+    /// health): they would just hit a protected route and let its 401 count
+    /// against the same budget as a real admin call. Authenticated requests
+    /// (including an authenticated health check) share the trusted `api`
+    /// budget as before.
+    ///
+    /// `/stats` and `/stats-nginx` keep independent budgets per exact path —
+    /// they are different endpoints with different legitimate polling
+    /// clients, and collapsing them onto one shared bucket would let traffic
+    /// to one starve the other's allowance.
+    fn bucket_for(&self, path: &str, authenticated: bool) -> (usize, String) {
         if path.starts_with("/api/") {
-            self.config.api_max
-        } else if path.starts_with("/stats") {
-            self.config.stats_max
+            if authenticated {
+                (self.config.api_max, "api".to_string())
+            } else {
+                (self.config.default_max, "public".to_string())
+            }
+        } else if matches!(path, "/stats" | "/stats-nginx") {
+            (self.config.stats_max, path.to_string())
         } else {
-            self.config.default_max
+            (self.config.default_max, "default".to_string())
         }
     }
+}
+
+/// Constant-time string equality so token validation does not leak the
+/// secret one byte at a time via response timing.
+pub(crate) fn ct_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let n = a.len().max(b.len());
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..n {
+        let ca = a.get(i).copied().unwrap_or(0);
+        let cb = b.get(i).copied().unwrap_or(0);
+        diff |= ca ^ cb;
+    }
+    diff == 0
+}
+
+/// Preview whether `headers` carries the configured API bearer token, for
+/// rate-limit bucket selection only. This intentionally mirrors the real
+/// auth check (`http::bearer_ok`) so the two never drift apart — a request
+/// classified here as authenticated must also pass the handler's own check.
+pub(crate) fn bearer_authenticated(headers: &HeaderMap, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let Some(hdr) = headers.get("Authorization").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(tok) = hdr.strip_prefix("Bearer ") else {
+        return false;
+    };
+    ct_str_eq(tok.trim(), token)
 }
 
 fn client_ip(request: &Request, trusted_proxies: &[IpAddr]) -> IpAddr {
@@ -193,8 +250,9 @@ pub async fn middleware(
 ) -> Response {
     let path = request.uri().path();
     let peer = client_ip(&request, limiter.trusted_proxies.as_slice());
-    let key = format!("{}:{}", peer, path.split('/').nth(1).unwrap_or(""));
-    let max = limiter.limit_for_path(path);
+    let authenticated = bearer_authenticated(request.headers(), &limiter.api_token);
+    let (max, bucket) = limiter.bucket_for(path, authenticated);
+    let key = format!("{peer}:{bucket}");
     if !limiter.check(&key, max) {
         let method = request.method().as_str();
         crate::log_warn!("HTTP: {method} {path} from {peer} → 429 rate limit exceeded");
@@ -214,7 +272,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn test_limiter() -> RateLimiter {
-        RateLimiter::new(HttpRateLimitConfig::default(), Vec::new())
+        RateLimiter::new(HttpRateLimitConfig::default(), Vec::new(), "test-token")
     }
 
     #[test]
@@ -296,6 +354,79 @@ mod tests {
     }
 
     #[test]
+    fn unauthenticated_api_requests_use_a_bucket_separate_from_authenticated_api() {
+        let limiter = RateLimiter::new(
+            HttpRateLimitConfig {
+                api_max: 3,
+                default_max: 60,
+                ..HttpRateLimitConfig::default()
+            },
+            Vec::new(),
+            "test-token",
+        );
+
+        let (health_max, health_bucket) = limiter.bucket_for("/api/v1/health", false);
+        let (api_max, api_bucket) = limiter.bucket_for("/api/v1/streams", true);
+        assert_eq!(health_bucket, "public");
+        assert_eq!(api_bucket, "api");
+        assert_eq!(health_max, 60);
+        assert_eq!(api_max, 3);
+
+        for i in 0..3 {
+            assert!(
+                limiter.check("127.0.0.1:api", api_max),
+                "api request {i} should succeed"
+            );
+        }
+        assert!(
+            !limiter.check("127.0.0.1:api", api_max),
+            "api bucket should be exhausted"
+        );
+        assert!(
+            limiter.check("127.0.0.1:public", health_max),
+            "public bucket must remain independent of the authenticated api bucket"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_requests_to_protected_routes_do_not_exhaust_admin_budget() {
+        // Regression: rate limiting runs before auth, so an unauthenticated
+        // request to any /api/* route (not just health) must not be able to
+        // exhaust the authenticated admin budget for a shared client IP.
+        let limiter = RateLimiter::new(
+            HttpRateLimitConfig {
+                api_max: 3,
+                default_max: 3,
+                ..HttpRateLimitConfig::default()
+            },
+            Vec::new(),
+            "test-token",
+        );
+
+        for i in 0..3 {
+            let (max, bucket) = limiter.bucket_for("/api/v1/streams", false);
+            assert_eq!(bucket, "public");
+            assert!(
+                limiter.check(&format!("127.0.0.1:{bucket}"), max),
+                "unauthenticated request {i} should succeed"
+            );
+        }
+        let (max, bucket) = limiter.bucket_for("/api/v1/streams", false);
+        assert!(
+            !limiter.check(&format!("127.0.0.1:{bucket}"), max),
+            "public bucket should now be exhausted"
+        );
+
+        let (api_max, api_bucket) = limiter.bucket_for("/api/v1/streams", true);
+        assert_eq!(api_bucket, "api");
+        assert!(
+            limiter.check(&format!("127.0.0.1:{api_bucket}"), api_max),
+            "authenticated admin API request must still succeed after unauthenticated \
+             requests exhausted the public bucket"
+        );
+    }
+
+    #[test]
     fn stats_limit_uses_configured_bucket() {
         let limiter = RateLimiter::new(
             HttpRateLimitConfig {
@@ -303,6 +434,7 @@ mod tests {
                 ..HttpRateLimitConfig::default()
             },
             Vec::new(),
+            "test-token",
         );
         for i in 0..5 {
             assert!(
@@ -314,6 +446,105 @@ mod tests {
             !limiter.check("127.0.0.1:stats", 5),
             "sixth stats request should be rate limited"
         );
+    }
+
+    #[test]
+    fn stats_and_stats_nginx_have_independent_budgets() {
+        let limiter = RateLimiter::new(
+            HttpRateLimitConfig {
+                stats_max: 2,
+                ..HttpRateLimitConfig::default()
+            },
+            Vec::new(),
+            "test-token",
+        );
+
+        let (max, stats_bucket) = limiter.bucket_for("/stats", false);
+        let (_, nginx_bucket) = limiter.bucket_for("/stats-nginx", false);
+        assert_ne!(
+            stats_bucket, nginx_bucket,
+            "/stats and /stats-nginx must not share a rate-limit bucket"
+        );
+
+        for i in 0..2 {
+            assert!(
+                limiter.check(&format!("127.0.0.1:{stats_bucket}"), max),
+                "/stats request {i} should succeed"
+            );
+        }
+        assert!(
+            !limiter.check(&format!("127.0.0.1:{stats_bucket}"), max),
+            "/stats bucket should now be exhausted"
+        );
+        assert!(
+            limiter.check(&format!("127.0.0.1:{nginx_bucket}"), max),
+            "/stats-nginx must still have its own budget after /stats was exhausted"
+        );
+    }
+
+    #[test]
+    fn unmatched_stats_prefixed_paths_use_the_default_bucket_not_a_fresh_one() {
+        // Regression: a naive `starts_with("/stats")` classification would
+        // key the bucket by the full (attacker-controlled) path, letting a
+        // client mint an unlimited number of fresh `stats_max`-sized buckets
+        // via unique unmatched paths like `/stats-<random>`. Only the two
+        // real stats routes get their own bucket; everything else — matched
+        // or not — shares "default".
+        let limiter = RateLimiter::new(
+            HttpRateLimitConfig {
+                stats_max: 5,
+                default_max: 60,
+                ..HttpRateLimitConfig::default()
+            },
+            Vec::new(),
+            "test-token",
+        );
+
+        let (max_a, bucket_a) = limiter.bucket_for("/stats-abc123", false);
+        let (max_b, bucket_b) = limiter.bucket_for("/stats-xyz789", false);
+        assert_eq!(bucket_a, "default");
+        assert_eq!(bucket_b, "default");
+        assert_eq!(max_a, 60);
+        assert_eq!(max_b, 60);
+    }
+
+    #[test]
+    fn bearer_authenticated_matches_configured_token_only() {
+        use axum::body::Body;
+
+        let authorized = Request::builder()
+            .uri("/api/v1/streams")
+            .header("Authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        assert!(bearer_authenticated(authorized.headers(), "secret"));
+
+        let wrong_token = Request::builder()
+            .uri("/api/v1/streams")
+            .header("Authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!bearer_authenticated(wrong_token.headers(), "secret"));
+
+        let missing_header = Request::builder()
+            .uri("/api/v1/streams")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!bearer_authenticated(missing_header.headers(), "secret"));
+
+        let empty_token = Request::builder()
+            .uri("/api/v1/streams")
+            .header("Authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!bearer_authenticated(empty_token.headers(), ""));
+    }
+
+    #[test]
+    fn ct_str_eq_matches_and_differs() {
+        assert!(ct_str_eq("abc", "abc"));
+        assert!(!ct_str_eq("abc", "abd"));
+        assert!(!ct_str_eq("abc", "abcd"));
     }
 
     #[test]
