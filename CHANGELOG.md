@@ -41,8 +41,11 @@ begin at `1.0.0`.
   channel that let a remote peer distinguish a valid key from a guess by
   whether the attempt consumed rate-limit quota.
 - `/stats`, `/stats-nginx`, and `GET /api/v1/streams/{id}/stats` now return
-  identical "offline" responses for an invalid `stats_key` and a
-  valid-but-offline one, closing a `stats_key` enumeration oracle.
+  identical "offline" responses for an invalid `stats_key` and a stream with
+  no active publisher, closing the `stats_key` enumeration oracle for that
+  case. `/stats-nginx` can still distinguish a valid key from an invalid one
+  when the stream has an active player but no publisher, since its response
+  includes connected-viewer data.
 
 ### Fixed
 - `-p`/`-w` CLI overrides no longer rewrite `RTMP_BIND`/`HTTP_BIND` to
