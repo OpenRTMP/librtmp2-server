@@ -880,9 +880,7 @@ impl Db {
             ) {
                 Ok(count) => count,
                 Err(e) => {
-                    crate::log_error!(
-                        "publisher_update: active-slot check failed for {id}: {e}"
-                    );
+                    crate::log_error!("publisher_update: active-slot check failed for {id}: {e}");
                     return false;
                 }
             };
