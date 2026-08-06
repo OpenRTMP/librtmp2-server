@@ -1,16 +1,28 @@
 # Bug scan progress
 
-Last scanned: config (2026-08-05)
+Last scanned: db (2026-08-06)
 
 ## Modules
 
 - [x] config — .env loader, env overrides
-- [ ] db — SQLite persistence, stream/publisher/player CRUD
+- [x] db — SQLite persistence, stream/publisher/player CRUD
 - [ ] http — REST API, auth, stats endpoints
 - [ ] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [ ] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [ ] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-08-06 db pass)
+
+- **Critical (fixed):** `publisher_update()` / `player_update()` could set
+  `active=1` without enforcing the same single-publisher-per-stream and
+  per-viewer connection-cap invariants as `publisher_try_acquire()` /
+  `player_try_acquire()`. During RTMP stream-switch rollback
+  (`restore_publisher_row` / `restore_player_row` in rtmp_bridge.rs), a
+  brief deactivation window let another client take the slot; the rollback
+  path then reactivated the old row via `publisher_update`, leaving two
+  active publisher rows for one stream — blocking legitimate publishes until
+  restart. Guarded `publisher_update` / `player_update` when `active=true`.
 
 ## Findings (2026-08-05 config pass)
 
