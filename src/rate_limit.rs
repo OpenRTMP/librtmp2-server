@@ -155,7 +155,7 @@ impl RateLimiter {
             } else {
                 (self.config.default_max, "public".to_string())
             }
-        } else if path.starts_with("/stats") {
+        } else if matches!(path, "/stats" | "/stats-nginx") {
             (self.config.stats_max, path.to_string())
         } else {
             (self.config.default_max, "default".to_string())
@@ -480,6 +480,32 @@ mod tests {
             limiter.check(&format!("127.0.0.1:{nginx_bucket}"), max),
             "/stats-nginx must still have its own budget after /stats was exhausted"
         );
+    }
+
+    #[test]
+    fn unmatched_stats_prefixed_paths_use_the_default_bucket_not_a_fresh_one() {
+        // Regression: a naive `starts_with("/stats")` classification would
+        // key the bucket by the full (attacker-controlled) path, letting a
+        // client mint an unlimited number of fresh `stats_max`-sized buckets
+        // via unique unmatched paths like `/stats-<random>`. Only the two
+        // real stats routes get their own bucket; everything else — matched
+        // or not — shares "default".
+        let limiter = RateLimiter::new(
+            HttpRateLimitConfig {
+                stats_max: 5,
+                default_max: 60,
+                ..HttpRateLimitConfig::default()
+            },
+            Vec::new(),
+            "test-token",
+        );
+
+        let (max_a, bucket_a) = limiter.bucket_for("/stats-abc123", false);
+        let (max_b, bucket_b) = limiter.bucket_for("/stats-xyz789", false);
+        assert_eq!(bucket_a, "default");
+        assert_eq!(bucket_b, "default");
+        assert_eq!(max_a, 60);
+        assert_eq!(max_b, 60);
     }
 
     #[test]
