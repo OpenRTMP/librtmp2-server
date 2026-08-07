@@ -108,7 +108,9 @@ mod tests {
         // Build secret/nonce at runtime so static analysis does not treat
         // them as hard-coded production cryptographic material.
         let secret: String = (0u8..24).map(|i| char::from(b'a' + (i % 26))).collect();
-        let nonce: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(17).wrapping_add(3)).collect();
+        let nonce: Vec<u8> = (0u8..16)
+            .map(|i| i.wrapping_mul(17).wrapping_add(3))
+            .collect();
         let a = auth_response(&secret, &nonce);
         let b = auth_response(&secret, &nonce);
         assert_eq!(a, b);
