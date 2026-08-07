@@ -13,6 +13,29 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- Optional high-availability clustering behind Cargo feature `cluster`
+  (OpenRaft 0.9.24 control plane, SQLite state machine, media mesh on
+  ports 1940/1941). Runtime default remains `CLUSTER_ENABLED=false`
+  (standalone unchanged). See `docs/clustering.md`.
+- `StateCoordinator` routes durable stream/viewer/token/ownership
+  mutations through local SQLite or Raft.
+- Authenticated cluster APIs: `GET /api/v1/cluster`, `/nodes`, `/streams`,
+  `POST .../nodes/{id}/drain|resume`, `DELETE .../nodes/{id}`; health
+  includes panel-shaped `cluster` block when enabled.
+- Raft `CreateStream` carries a pre-generated default viewer for identical
+  replica applies; StatsProxy for non-owner stream stats.
+- Multi-node loopback tests in `tests/cluster_ha.rs`.
+- Depends on `librtmp2` 0.7 path (relay export / inject / init snapshot).
+- Follower durable writes forward to the Raft leader over the authenticated
+  control plane (`ClientWrite`); clients never need leader discovery.
+
+### Changed
+- Package version `0.1.9` → `0.2.0`.
+- Official Docker image builds with `--features cluster` on
+  `rust:1.97-bookworm` / `debian:bookworm-slim`; clustering stays disabled
+  unless configured. Compose documents ports 1940/1941.
+
 ## [0.1.9] — 2026-08-06
 
 ### Security

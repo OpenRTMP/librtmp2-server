@@ -1,6 +1,6 @@
 [package]
 name = "librtmp2-server"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,9 +15,9 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-librtmp2 = { version = "0.6.0", features = ["tls"] }
+librtmp2 = { path = "../librtmp2", features = ["tls"] }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,8 +26,33 @@ rand = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12"
 
+# Optional HA clustering (OpenRaft). Off by default; enable with `--features cluster`.
+openraft = { version = "=0.9.24", optional = true, features = ["serde", "storage-v2"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = { version = "2", optional = true }
+futures = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+uuid = { version = "1", optional = true, features = ["v4"] }
+
 [features]
+default = []
 test-support = []
+cluster = [
+    "dep:openraft",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:futures",
+    "dep:bytes",
+    "dep:tracing",
+    "dep:sha2",
+    "dep:hex",
+    "dep:uuid",
+]
 
 [dev-dependencies]
 tempfile = "3"
@@ -45,6 +70,11 @@ required-features = ["test-support"]
 name = "rtmp_http_e2e"
 path = "tests/rtmp_http_e2e.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "cluster_ha"
+path = "tests/cluster_ha.rs"
+required-features = ["cluster", "test-support"]
 
 [profile.release]
 opt-level = 3

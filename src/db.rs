@@ -17,7 +17,7 @@ pub struct Db {
 /// Max simultaneous RTMP play connections per play key (not configurable).
 pub const MAX_CONNECTIONS_PER_PLAY_KEY: usize = 5;
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Stream {
     pub id: String,
     pub name: String,
@@ -30,7 +30,7 @@ pub struct Stream {
 }
 
 /// Panel-managed play key for a stream (auto-generated `play_*` key).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct StreamViewer {
     pub id: String,
     pub stream_id: String,
@@ -38,6 +38,21 @@ pub struct StreamViewer {
     pub play_key: String,
     pub enabled: bool,
     pub created_at: i64,
+}
+
+/// Publisher ownership row replicated via Raft when clustering is enabled.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StreamOwner {
+    pub stream_id: String,
+    pub owner_node_id: u64,
+    pub epoch: u64,
+    pub acquired_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerError {
+    Conflict,
+    Db,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -200,6 +215,29 @@ CREATE TABLE IF NOT EXISTS stream_viewers (
 CREATE INDEX IF NOT EXISTS idx_viewer_stream ON stream_viewers(stream_id);
 CREATE INDEX IF NOT EXISTS idx_viewer_play_key ON stream_viewers(play_key);
 CREATE INDEX IF NOT EXISTS idx_player_viewer ON players(viewer_id);
+CREATE TABLE IF NOT EXISTS stream_owners (
+  stream_id TEXT PRIMARY KEY REFERENCES streams(id) ON DELETE CASCADE,
+  owner_node_id INTEGER NOT NULL,
+  epoch INTEGER NOT NULL,
+  acquired_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS raft_vote (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  vote_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS raft_log (
+  log_index INTEGER PRIMARY KEY,
+  entry_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS raft_meta (
+  key TEXT PRIMARY KEY,
+  val TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS raft_snapshots (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  meta_json TEXT NOT NULL,
+  data BLOB NOT NULL
+);
 ";
 
 /// WAL mode creates sibling `-wal`/`-shm` files; restrict all three so stream
@@ -423,17 +461,60 @@ impl Db {
         .unwrap_or(false)
     }
 
-    pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
-        let viewer_id = match crate::keygen::keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
-            Ok(id) => id,
-            Err(e) => {
-                crate::log_error!("Failed to generate viewer id for stream {}: {e}", s.id);
-                return Err(StreamAddError::Db);
-            }
-        };
+    /// Insert stream row only (no default viewer). Used by Raft snapshot/seed
+    /// restores where viewers are applied explicitly with fixed IDs.
+    pub fn stream_insert_only(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
         let conn = self.conn.lock();
-        // Check-then-insert under the same held lock/transaction: nothing else
-        // can insert a colliding key between the check and the write below.
+        for key in [&s.publish_key, &s.play_key, &s.stats_key] {
+            if Self::key_globally_in_use_locked(&conn, key) {
+                return Err(StreamAddError::Duplicate);
+            }
+        }
+        match conn.execute(
+            "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
+             VALUES (?,?,?,?,?,?,?,?)",
+            params![
+                s.id,
+                s.name,
+                s.app,
+                s.publish_key,
+                s.play_key,
+                s.stats_key,
+                s.enabled,
+                s.created_at
+            ],
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                crate::log_error!("Failed to insert stream {}: {e}", s.id);
+                if matches!(
+                    e,
+                    rusqlite::Error::SqliteFailure(ref err, _)
+                        if err.code == rusqlite::ErrorCode::ConstraintViolation
+                ) {
+                    Err(StreamAddError::Duplicate)
+                } else {
+                    Err(StreamAddError::Db)
+                }
+            }
+        }
+    }
+
+    /// Insert stream + a pre-generated default viewer in one transaction.
+    /// Raft nodes must use identical viewer IDs (no local keygen on apply).
+    pub fn stream_add_with_viewer(
+        &self,
+        s: &Stream,
+        viewer: &StreamViewer,
+    ) -> std::result::Result<(), StreamAddError> {
+        if viewer.stream_id != s.id || viewer.play_key != s.play_key {
+            crate::log_error!(
+                "stream_add_with_viewer: viewer stream_id/play_key mismatch for {}",
+                s.id
+            );
+            return Err(StreamAddError::Db);
+        }
+        let conn = self.conn.lock();
         for key in [&s.publish_key, &s.play_key, &s.stats_key] {
             if Self::key_globally_in_use_locked(&conn, key) {
                 return Err(StreamAddError::Duplicate);
@@ -442,7 +523,7 @@ impl Db {
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
-                crate::log_error!("stream_add: begin tx failed: {e}");
+                crate::log_error!("stream_add_with_viewer: begin tx failed: {e}");
                 return Err(StreamAddError::Db);
             }
         };
@@ -478,7 +559,14 @@ impl Db {
             .execute(
                 "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
                  VALUES (?,?,?,?,?,?)",
-                params![viewer_id, s.id, "Player 1", s.play_key, true, s.created_at],
+                params![
+                    viewer.id,
+                    viewer.stream_id,
+                    viewer.name,
+                    viewer.play_key,
+                    viewer.enabled,
+                    viewer.created_at
+                ],
             )
             .is_err()
         {
@@ -491,10 +579,54 @@ impl Db {
                 Ok(())
             }
             Err(e) => {
-                crate::log_error!("stream_add commit failed for {}: {e}", s.id);
+                crate::log_error!("stream_add_with_viewer commit failed for {}: {e}", s.id);
                 Err(StreamAddError::Db)
             }
         }
+    }
+
+    pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
+        let viewer_id = match crate::keygen::keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
+            Ok(id) => id,
+            Err(e) => {
+                crate::log_error!("Failed to generate viewer id for stream {}: {e}", s.id);
+                return Err(StreamAddError::Db);
+            }
+        };
+        let viewer = StreamViewer {
+            id: viewer_id,
+            stream_id: s.id.clone(),
+            name: "Player 1".to_string(),
+            play_key: s.play_key.clone(),
+            enabled: true,
+            created_at: s.created_at,
+        };
+        self.stream_add_with_viewer(s, &viewer)
+    }
+
+    /// Read/write generic settings keys (e.g. replicated `cluster_id`).
+    pub fn setting_get(&self, key: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT val FROM settings WHERE key=?",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+    }
+
+    pub fn setting_set(&self, key: &str, val: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings(key,val) VALUES(?,?) \
+             ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+            params![key, val],
+        )
+        .map_err(|e| format!("DB error writing setting {key}: {e}"))?;
+        Ok(())
     }
 
     fn load_stream_row(row: &rusqlite::Row) -> rusqlite::Result<Stream> {
@@ -716,9 +848,34 @@ impl Db {
 
     pub fn viewer_add(&self, v: &StreamViewer) -> bool {
         let conn = self.conn.lock();
-        // Check-then-insert under the same held lock so a concurrent insert of
-        // the same key can't race between the check and the write below.
-        if Self::key_globally_in_use_locked(&conn, &v.play_key) {
+        // Default viewer shares the stream's play_key (both rows hold it). Allow
+        // that pairing; still reject when another viewer already owns the key or
+        // when the key collides with a different stream's access keys.
+        let parent_play: Option<String> = conn
+            .query_row(
+                "SELECT play_key FROM streams WHERE id=?",
+                params![v.stream_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let is_default_play = parent_play.as_deref() == Some(v.play_key.as_str());
+        if is_default_play {
+            let taken: bool = conn
+                .query_row(
+                    "SELECT 1 FROM stream_viewers WHERE play_key=? LIMIT 1",
+                    params![v.play_key],
+                    |_| Ok(true),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some();
+            if taken {
+                return false;
+            }
+        } else if Self::key_globally_in_use_locked(&conn, &v.play_key) {
             return false;
         }
         conn.execute(
@@ -803,6 +960,158 @@ impl Db {
             params![viewer_id],
         )
         .is_ok()
+    }
+
+    /// List every viewer across all streams (used for cluster bootstrap seed).
+    pub fn viewer_list_all(&self) -> Vec<StreamViewer> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {} FROM stream_viewers ORDER BY created_at",
+            Self::VIEWER_COLS
+        )) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("viewer_list_all: prepare failed: {e}");
+                return Vec::new();
+            }
+        };
+        stmt.query_map([], Self::load_viewer_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    // ==================== STREAM OWNERS (cluster) ====================
+
+    pub fn stream_owner_get(&self, stream_id: &str) -> Option<StreamOwner> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT stream_id, owner_node_id, epoch, acquired_at FROM stream_owners WHERE stream_id=?",
+            params![stream_id],
+            |row| {
+                Ok(StreamOwner {
+                    stream_id: row.get(0)?,
+                    owner_node_id: row.get::<_, i64>(1)? as u64,
+                    epoch: row.get::<_, i64>(2)? as u64,
+                    acquired_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn stream_owner_list(&self) -> Vec<StreamOwner> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT stream_id, owner_node_id, epoch, acquired_at FROM stream_owners",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            Ok(StreamOwner {
+                stream_id: row.get(0)?,
+                owner_node_id: row.get::<_, i64>(1)? as u64,
+                epoch: row.get::<_, i64>(2)? as u64,
+                acquired_at: row.get(3)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Acquire ownership when free or already owned by the same node.
+    /// Returns the epoch stored on success.
+    pub fn stream_owner_acquire(
+        &self,
+        stream_id: &str,
+        node_id: u64,
+        epoch: u64,
+        acquired_at: i64,
+    ) -> Result<u64, OwnerError> {
+        let conn = self.conn.lock();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| OwnerError::Db)?;
+        let existing: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT owner_node_id, epoch FROM stream_owners WHERE stream_id=?",
+                params![stream_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| OwnerError::Db)?;
+        if let Some((owner, _ep)) = existing {
+            if owner as u64 != node_id {
+                return Err(OwnerError::Conflict);
+            }
+            tx.execute(
+                "UPDATE stream_owners SET epoch=?, acquired_at=? WHERE stream_id=?",
+                params![epoch as i64, acquired_at, stream_id],
+            )
+            .map_err(|_| OwnerError::Db)?;
+        } else {
+            tx.execute(
+                "INSERT INTO stream_owners(stream_id, owner_node_id, epoch, acquired_at) VALUES (?,?,?,?)",
+                params![stream_id, node_id as i64, epoch as i64, acquired_at],
+            )
+            .map_err(|_| OwnerError::Db)?;
+        }
+        tx.commit().map_err(|_| OwnerError::Db)?;
+        Ok(epoch)
+    }
+
+    /// Release ownership only when the epoch matches (fencing).
+    pub fn stream_owner_release(&self, stream_id: &str, epoch: u64) -> bool {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM stream_owners WHERE stream_id=? AND epoch=?",
+            params![stream_id, epoch as i64],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn stream_owners_release_for_node(&self, node_id: u64) -> usize {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM stream_owners WHERE owner_node_id=?",
+            params![node_id as i64],
+        )
+        .unwrap_or(0)
+    }
+
+    /// True when this DB already has raft log/vote state (joining a cluster
+    /// with leftover raft state from another cluster is refused).
+    pub fn raft_has_state(&self) -> bool {
+        let conn = self.conn.lock();
+        let vote: i64 = conn
+            .query_row("SELECT COUNT(*) FROM raft_vote", [], |r| r.get(0))
+            .unwrap_or(0);
+        let logs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM raft_log", [], |r| r.get(0))
+            .unwrap_or(0);
+        vote > 0 || logs > 0
+    }
+
+    /// True when durable app tables have content that would conflict with a
+    /// join that expects an empty learner DB.
+    pub fn has_populated_app_state(&self) -> bool {
+        let conn = self.conn.lock();
+        let streams: i64 = conn
+            .query_row("SELECT COUNT(*) FROM streams", [], |r| r.get(0))
+            .unwrap_or(0);
+        streams > 0
+    }
+
+    /// Low-level access for Raft storage (same mutex as the rest of `Db`).
+    pub(crate) fn with_conn<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Connection) -> R,
+    {
+        let conn = self.conn.lock();
+        f(&conn)
     }
 
     /// Atomically insert an active publisher only when the stream has none.

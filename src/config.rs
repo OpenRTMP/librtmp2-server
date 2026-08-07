@@ -77,6 +77,11 @@ pub struct ServerConfig {
     /// 0=error, 1=warn, 2=info, 3=debug
     pub log_level: i32,
     pub log_file: String,
+
+    /// Optional HA cluster settings (compiled only with `--features cluster`).
+    /// Runtime default remains disabled (`CLUSTER_ENABLED=false`).
+    #[cfg(feature = "cluster")]
+    pub cluster: crate::cluster::ClusterConfig,
 }
 
 impl Default for ServerConfig {
@@ -105,6 +110,8 @@ impl Default for ServerConfig {
             config_file: String::new(),
             log_level: 2,
             log_file: String::new(),
+            #[cfg(feature = "cluster")]
+            cluster: crate::cluster::ClusterConfig::default(),
         }
     }
 }
@@ -292,6 +299,11 @@ fn parse_max_body_bytes(val: &str) -> usize {
 }
 
 /// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
+pub(crate) fn parse_env_line_public(line: &str) -> Option<(String, String)> {
+    parse_env_line(line)
+}
+
+/// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
 fn parse_env_line(line: &str) -> Option<(String, String)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -398,6 +410,15 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
         config.rtmp_bind,
         config.http_bind
     );
+
+    #[cfg(feature = "cluster")]
+    {
+        // Re-read file for cluster keys (same path).
+        match crate::cluster::ClusterConfig::load(path) {
+            Ok(c) => config.cluster = c,
+            Err(e) => crate::log_warn!("Cluster config: {e}"),
+        }
+    }
 
     Ok(config)
 }
@@ -542,6 +563,31 @@ where
         match v.parse::<i32>() {
             Ok(lvl) if (0..=3).contains(&lvl) => config.log_level = lvl,
             _ => crate::log_warn!("Ignoring invalid LRTMP2_LOG_LEVEL value '{v}' (expected 0-3)"),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    {
+        // `ClusterConfig::load_from_kv` always applies `LRTMP2_CLUSTER_*` process
+        // env. Only replace the file-derived cluster block when at least one
+        // override is present, so a bare `config_apply_env` does not wipe
+        // `.env` cluster settings.
+        let has_cluster_env = [
+            "LRTMP2_CLUSTER_ENABLED",
+            "LRTMP2_CLUSTER_NODE_ID",
+            "LRTMP2_CLUSTER_SECRET",
+            "LRTMP2_CLUSTER_BOOTSTRAP",
+            "LRTMP2_CLUSTER_JOIN",
+            "LRTMP2_CLUSTER_BIND",
+            "LRTMP2_CLUSTER_MEDIA_BIND",
+        ]
+        .iter()
+        .any(|k| get(k).filter(|v| !v.is_empty()).is_some());
+        if has_cluster_env {
+            match crate::cluster::ClusterConfig::load_from_kv(|key| get(key)) {
+                Ok(c) => config.cluster = c,
+                Err(e) => crate::log_warn!("Cluster env config: {e}"),
+            }
         }
     }
 }

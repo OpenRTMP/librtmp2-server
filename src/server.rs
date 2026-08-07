@@ -13,6 +13,7 @@ use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
 use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
+use crate::state::StateCoordinator;
 
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
@@ -530,6 +531,7 @@ fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
 pub struct ServerApp {
     config: ServerConfig,
     db: Arc<Db>,
+    coordinator: Arc<StateCoordinator>,
     rtmp_bridge: Arc<DbRtmpBridge>,
     /// Stream IDs deleted via HTTP while connections are live. The RTMP poll
     /// loop reads this set and kicks any connection whose stream_id appears.
@@ -563,14 +565,18 @@ impl ServerApp {
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
 
+        let coordinator = Arc::new(StateCoordinator::standalone(Arc::clone(&db)));
+
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(
             Arc::clone(&db),
             Arc::clone(&deleted_streams),
         ));
+        rtmp_bridge.set_coordinator(Arc::clone(&coordinator));
 
         Ok(ServerApp {
             config,
             db,
+            coordinator,
             rtmp_bridge,
             deleted_streams,
             revoked_viewers,
@@ -580,6 +586,25 @@ impl ServerApp {
     /// Runs until SIGINT/SIGTERM. Blocks the calling task.
     pub async fn run(&self) -> Result<(), String> {
         crate::log_info!("OpenRTMP librtmp2-server alpha starting...");
+
+        #[cfg(feature = "cluster")]
+        let coordinator = {
+            if self.config.cluster.enabled {
+                let mgr = crate::cluster::ClusterManager::start(
+                    self.config.cluster.clone(),
+                    Arc::clone(&self.db),
+                    tokio::runtime::Handle::current(),
+                )
+                .await?;
+                let coord = Arc::new(StateCoordinator::cluster(mgr));
+                self.rtmp_bridge.set_coordinator(Arc::clone(&coord));
+                coord
+            } else {
+                Arc::clone(&self.coordinator)
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let coordinator = Arc::clone(&self.coordinator);
 
         if self.config.tls_enabled {
             if self.config.tls_cert_file.is_empty() || self.config.tls_key_file.is_empty() {
@@ -597,6 +622,7 @@ impl ServerApp {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
             rtmp_bridge: Arc::clone(&self.rtmp_bridge),
+            coordinator: Arc::clone(&coordinator),
             deleted_streams: Arc::clone(&self.deleted_streams),
             revoked_viewers: Arc::clone(&self.revoked_viewers),
         });
@@ -632,6 +658,10 @@ impl ServerApp {
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
         let rtmp_stop_clone = Arc::clone(&rtmp_stop);
+        #[cfg(feature = "cluster")]
+        let cluster_enabled = self.config.cluster.enabled;
+        #[cfg(feature = "cluster")]
+        let media_queue_mb = self.config.cluster.media_queue_mb;
 
         let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
         let rtmp_thread = std::thread::spawn(move || {
@@ -663,6 +693,11 @@ impl ServerApp {
             server.on_media_cb = Some(rtmp_media_cb);
             server.on_publish_cb = Some(rtmp_publish_cb);
             server.on_play_cb = Some(rtmp_play_cb);
+            #[cfg(feature = "cluster")]
+            if cluster_enabled {
+                let max_bytes = (media_queue_mb as usize).saturating_mul(1024 * 1024);
+                server.enable_relay_export(4096, max_bytes.max(1024 * 1024));
+            }
             if let Err(e) = server.listen(&rtmp_bind) {
                 let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
                 crate::log_warn!("{msg}");
@@ -713,6 +748,56 @@ impl ServerApp {
                     &revoked_now,
                     rtmp_idle_timeout,
                 );
+
+                #[cfg(feature = "cluster")]
+                if cluster_enabled {
+                    if let Some(mgr) = rtmp_bridge.cluster_manager() {
+                        for frame in server.drain_exported_relay_frames() {
+                            let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
+                            let stream_id = if sid.is_empty() {
+                                rtmp_bridge
+                                    .stream_id_for_publish_route(&frame.stream_name)
+                                    .unwrap_or_else(|| frame.stream_name.clone())
+                            } else {
+                                sid
+                            };
+                            let epoch = rtmp_bridge
+                                .ownership_epoch_for_stream(&stream_id)
+                                .or_else(|| {
+                                    mgr.db()
+                                        .stream_owner_get(&stream_id)
+                                        .map(|o| o.epoch)
+                                })
+                                .unwrap_or(0);
+                            use crate::cluster::media::protocol::MediaMessage;
+                            mgr.enqueue_export(crate::cluster::ExportedFrame {
+                                app: frame.app.clone(),
+                                stream: stream_id,
+                                epoch,
+                                frame_type: MediaMessage::frame_type_from_librtmp2(frame.frame_type),
+                                timestamp: frame.timestamp,
+                                payload: frame.payload,
+                            });
+                        }
+                        for inj in mgr.drain_injects() {
+                            if let Some(ft) =
+                                crate::cluster::media::protocol::MediaMessage::frame_type_to_librtmp2(
+                                    inj.frame_type,
+                                )
+                            {
+                                // Inject using stream name expected by local players:
+                                // resolve play route via stream id → stream.play_key / name.
+                                let _ = server.inject_relay_frame(
+                                    &inj.app,
+                                    &inj.stream,
+                                    ft,
+                                    inj.timestamp,
+                                    &inj.payload,
+                                );
+                            }
+                        }
+                    }
+                }
 
                 // A conn_id still in `tracked` but absent this cycle was
                 // closed by the peer (rather than rejected above) — notify
@@ -780,6 +865,10 @@ impl ServerApp {
         .map_err(|e| format!("HTTP server error: {e}"));
 
         crate::log_info!("Shutting down...");
+        #[cfg(feature = "cluster")]
+        if let Some(mgr) = coordinator.cluster_manager() {
+            mgr.shutdown_blocking();
+        }
         rtmp_stop.store(true, Ordering::Relaxed);
         let _ = rtmp_thread.join();
         crate::log_info!("RTMP thread joined.");

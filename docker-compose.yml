@@ -1,8 +1,9 @@
 services:
   server:
     build:
-      context: .
-      dockerfile: Dockerfile
+      # Parent OpenRTMP context so path dependency ../librtmp2 resolves.
+      context: ..
+      dockerfile: librtmp2-server/Dockerfile
     image: ghcr.io/OpenRTMP/librtmp2-server:latest
     container_name: librtmp2-server
     restart: unless-stopped
@@ -16,19 +17,29 @@ services:
       # - LRTMP2_TLS_CERT_FILE=/certs/fullchain.pem
       # - LRTMP2_TLS_KEY_FILE=/certs/privkey.pem
       # - LRTMP2_RTMPS_BIND=0.0.0.0:1936
+      # Optional HA cluster (binary includes --features cluster; runtime default off):
+      # - LRTMP2_CLUSTER_ENABLED=true
+      # - LRTMP2_CLUSTER_NODE_ID=1
+      # - LRTMP2_CLUSTER_BOOTSTRAP=true
+      # - LRTMP2_CLUSTER_SECRET=<long-random-secret>
+      # - LRTMP2_CLUSTER_BIND=0.0.0.0:1940
+      # - LRTMP2_CLUSTER_MEDIA_BIND=0.0.0.0:1941
       # HTTP rate limiting (sliding window per client IP + route class):
       # - LRTMP2_HTTP_RATE_LIMIT_WINDOW_SECS=60
-      # - LRTMP2_HTTP_RATE_LIMIT_STATS=30      # /stats, /stats-nginx
-      # - LRTMP2_HTTP_RATE_LIMIT_API=120       # /api/*
-      # - LRTMP2_HTTP_RATE_LIMIT_DEFAULT=60    # other HTTP routes
+      # - LRTMP2_HTTP_RATE_LIMIT_STATS=30
+      # - LRTMP2_HTTP_RATE_LIMIT_API=120
+      # - LRTMP2_HTTP_RATE_LIMIT_DEFAULT=60
       # - LRTMP2_HTTP_MAX_BODY_BYTES=65536
     volumes:
       - server-data:/data
-      # - ./certs:/certs:ro   # needed when RTMPS is enabled
+      # - ./certs:/certs:ro
     ports:
-      - "1935:1935"   # RTMP ingest/play
-      # - "1936:1936" # RTMPS ingest/play — uncomment when RTMPS is enabled
-      - "8080:8080"   # HTTP API + health
+      - "1935:1935"
+      # - "1936:1936"
+      - "8080:8080"
+      # Cluster internal (trusted peers only — do not expose publicly):
+      # - "1940:1940"
+      # - "1941:1941"
     networks:
       - openrtmp
     healthcheck:

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::db::{Db, DbLookup, Player, Publisher};
 use crate::keygen::{self, PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY};
+use crate::state::StateCoordinator;
 
 const RTMP_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const RTMP_AUTH_MAX_FAILURES: usize = 10;
@@ -141,6 +142,10 @@ pub struct DbRtmpBridge {
     /// reconnecting on a fresh TCP connection does not reset the window —
     /// see `is_auth_rate_limited`.
     auth_failures: Mutex<HashMap<String, Vec<Instant>>>,
+    /// Durable coordinator (standalone or cluster). Set after construction.
+    coordinator: Mutex<Option<Arc<StateCoordinator>>>,
+    /// Per-connection acquired ownership epoch (cluster fencing).
+    ownership_epochs: Mutex<HashMap<ConnId, (String, u64)>>,
 }
 
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
@@ -202,6 +207,36 @@ impl DbRtmpBridge {
             conns: Mutex::new(HashMap::new()),
             deleted_streams,
             auth_failures: Mutex::new(HashMap::new()),
+            coordinator: Mutex::new(None),
+            ownership_epochs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn set_coordinator(&self, coordinator: Arc<StateCoordinator>) {
+        *self.coordinator.lock() = Some(coordinator);
+    }
+
+    #[cfg(feature = "cluster")]
+    pub fn cluster_manager(&self) -> Option<Arc<crate::cluster::ClusterManager>> {
+        self.coordinator
+            .lock()
+            .as_ref()
+            .and_then(|c| c.cluster_manager().cloned())
+    }
+
+    pub fn ownership_epoch_for_stream(&self, stream_id: &str) -> Option<u64> {
+        self.ownership_epochs
+            .lock()
+            .values()
+            .find(|(sid, _)| sid == stream_id)
+            .map(|(_, ep)| *ep)
+    }
+
+    /// Map RTMP relay route key (URL stream name / publish key) to DB stream id.
+    pub fn stream_id_for_publish_route(&self, stream_key: &str) -> Option<String> {
+        match self.db.stream_find_by_publish_key_any(stream_key) {
+            DbLookup::Ok(s) => Some(s.id),
+            _ => None,
         }
     }
 
@@ -775,7 +810,46 @@ impl DbRtmpBridge {
             }
         }
 
+        // Cluster ownership fencing (Raft) before local publisher slot.
+        let mut acquired_epoch: Option<u64> = None;
+        if let Some(coord) = self.coordinator.lock().clone() {
+            let (node_id, epoch) = {
+                #[cfg(feature = "cluster")]
+                {
+                    if let Some(mgr) = coord.cluster_manager() {
+                        (mgr.node_id(), mgr.ownership().next_epoch())
+                    } else {
+                        (0u64, 1u64)
+                    }
+                }
+                #[cfg(not(feature = "cluster"))]
+                {
+                    (0u64, 1u64)
+                }
+            };
+            match coord.acquire_stream_owner(&stream.id, node_id, epoch, crate::db::now_ts()) {
+                Ok(ep) => {
+                    acquired_epoch = Some(ep);
+                }
+                Err(e) => {
+                    if let Some(ref prior) = old_pub {
+                        let _ = self.restore_publisher_row(prior);
+                    }
+                    crate::log_warn!(
+                        "RTMP: publish rejected — cluster ownership acquire failed for '{}' from {peer}: {e:?}",
+                        stream.id
+                    );
+                    return Err(AuthFailureKind::RecognizedKey);
+                }
+            }
+        }
+
         if !self.db.publisher_try_acquire(&pub_row) {
+            if let Some(ep) = acquired_epoch
+                && let Some(coord) = self.coordinator.lock().clone()
+            {
+                let _ = coord.release_stream_owner(&stream.id, ep);
+            }
             if let Some(ref prior) = old_pub
                 && !self.restore_publisher_row(prior)
             {
@@ -788,6 +862,12 @@ impl DbRtmpBridge {
                 stream.id
             );
             return Err(AuthFailureKind::RecognizedKey);
+        }
+
+        if let Some(ep) = acquired_epoch {
+            self.ownership_epochs
+                .lock()
+                .insert(conn, (stream.id.clone(), ep));
         }
 
         let stream_id = stream.id.clone();
@@ -911,13 +991,20 @@ impl DbRtmpBridge {
             cs.player = Some(player_row);
             cs.viewer_id = viewer_id;
             if cs.publisher.is_none() || cs.stream_id.is_empty() {
-                cs.stream_id = stream_id;
+                cs.stream_id = stream_id.clone();
             }
             if replacing_player {
                 cs.player_last_stats_at = None;
                 cs.player_bytes_at_last_stats = 0;
                 cs.player_stats_reset_pending = true;
             }
+        }
+
+        #[cfg(feature = "cluster")]
+        if let Some(coord) = self.coordinator.lock().clone()
+            && let Some(mgr) = coord.cluster_manager()
+        {
+            mgr.notify_play_subscription(app, &stream.id);
         }
 
         crate::log_info!(
@@ -1011,6 +1098,11 @@ impl RtmpEventHandler for DbRtmpBridge {
         // IP (not ConnId) precisely so a client can't reset the brute-force
         // window by reconnecting. Entries expire naturally via the sliding
         // window in is_auth_rate_limited/record_auth_failure.
+        if let Some((stream_id, epoch)) = self.ownership_epochs.lock().remove(&conn)
+            && let Some(coord) = self.coordinator.lock().clone()
+        {
+            let _ = coord.release_stream_owner(&stream_id, epoch);
+        }
         let cs = self.conns.lock().remove(&conn);
         let Some(cs) = cs else {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");

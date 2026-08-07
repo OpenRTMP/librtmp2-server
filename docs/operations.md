@@ -23,6 +23,12 @@ Listener settings, TLS certificates and keys, logs, and the server `.env` file
 are not stored in SQLite. Back them up separately when they are part of the
 deployment.
 
+When clustering is enabled (`CLUSTER_ENABLED=true`, binary built with
+`--features cluster`), the same database file also holds `raft_*` tables and
+`stream_owners`. Each node must keep its **own** DB file — do not share one
+SQLite file across nodes. See [clustering.md](clustering.md) for reseed rules
+before joining a cluster with a previously used database.
+
 ## Support status
 
 | Operation | Status |

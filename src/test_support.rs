@@ -59,10 +59,14 @@ impl TestServer {
             ..Default::default()
         };
 
+        let coordinator = Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db)));
+        rtmp_bridge.set_coordinator(Arc::clone(&coordinator));
+
         let state = Arc::new(AppState {
             db: Arc::clone(&db),
             config,
             rtmp_bridge: Arc::clone(&rtmp_bridge),
+            coordinator,
             deleted_streams: Arc::clone(&deleted_streams),
             revoked_viewers: Arc::clone(&revoked_viewers),
         });
