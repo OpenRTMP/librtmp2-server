@@ -852,7 +852,8 @@ impl ClusterManager {
     }
 
     fn process_state_effects(&self) {
-        let Some(rx) = self.effects_rx.lock().as_ref() else {
+        let guard = self.effects_rx.lock();
+        let Some(rx) = guard.as_ref() else {
             return;
         };
         use crate::cluster::raft::state_machine::StateEffect;
