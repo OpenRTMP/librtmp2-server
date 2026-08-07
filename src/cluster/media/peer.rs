@@ -208,14 +208,14 @@ async fn connect_and_run(
 ) -> Result<ConnectEnd, std::io::Error> {
     let tcp = TcpStream::connect(addr).await?;
     let mut stream: Box<dyn MediaIo> = if let Some(cfg) = tls_client {
-            let connector = TlsConnector::from(cfg);
-            let host = crate::cluster::network::tls_server_name_from_addr(addr)
-                .map_err(std::io::Error::other)?;
-            let tls = connector.connect(host, tcp).await?;
-            Box::new(tls)
-        } else {
-            Box::new(tcp)
-        };
+        let connector = TlsConnector::from(cfg);
+        let host = crate::cluster::network::tls_server_name_from_addr(addr)
+            .map_err(std::io::Error::other)?;
+        let tls = connector.connect(host, tcp).await?;
+        Box::new(tls)
+    } else {
+        Box::new(tcp)
+    };
 
     client_media_auth(&mut stream, secret, local_id).await?;
     write_media_frame(
@@ -304,7 +304,13 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     local_id: NodeId,
 ) -> Result<NodeId, std::io::Error> {
     let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
-    write_media_frame(stream, &MediaMessage::AuthChallenge { nonce: nonce.clone() }).await?;
+    write_media_frame(
+        stream,
+        &MediaMessage::AuthChallenge {
+            nonce: nonce.clone(),
+        },
+    )
+    .await?;
     let auth = read_auth_media_frame(stream).await?;
     let MediaMessage::Auth { node_id, response } = auth else {
         write_media_frame(stream, &MediaMessage::AuthFail).await?;
@@ -319,7 +325,11 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     write_media_frame(stream, &MediaMessage::AuthOk).await?;
 
     let hello = read_media_frame(stream).await?;
-    let MediaMessage::Hello { version, node_id: hello_id } = hello else {
+    let MediaMessage::Hello {
+        version,
+        node_id: hello_id,
+    } = hello
+    else {
         return Err(std::io::Error::other("expected HELLO"));
     };
     if version != crate::cluster::media::MEDIA_PROTOCOL_VERSION {

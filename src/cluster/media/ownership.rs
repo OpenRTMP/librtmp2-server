@@ -32,7 +32,8 @@ impl OwnershipTracker {
             .lock()
             .insert(stream_id.to_string(), (node_id, epoch));
         if epoch >= self.next_epoch.load(Ordering::Relaxed) {
-            self.next_epoch.store(epoch.saturating_add(1), Ordering::Relaxed);
+            self.next_epoch
+                .store(epoch.saturating_add(1), Ordering::Relaxed);
         }
     }
 

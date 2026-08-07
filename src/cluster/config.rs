@@ -107,20 +107,18 @@ impl ClusterConfig {
         let mut drain_at_mbps: Option<f64> = None;
         let mut resume_at_mbps: Option<f64> = None;
 
-        let mut apply = |key: &str, val: &str| {
-            match key {
-                "CLUSTER_DRAIN_AT_MBPS" => {
-                    if let Ok(mbps) = val.parse::<f64>() {
-                        drain_at_mbps = Some(mbps);
-                    }
+        let mut apply = |key: &str, val: &str| match key {
+            "CLUSTER_DRAIN_AT_MBPS" => {
+                if let Ok(mbps) = val.parse::<f64>() {
+                    drain_at_mbps = Some(mbps);
                 }
-                "CLUSTER_RESUME_AT_MBPS" => {
-                    if let Ok(mbps) = val.parse::<f64>() {
-                        resume_at_mbps = Some(mbps);
-                    }
-                }
-                _ => apply_cluster_kv(&mut cfg, key, val),
             }
+            "CLUSTER_RESUME_AT_MBPS" => {
+                if let Ok(mbps) = val.parse::<f64>() {
+                    resume_at_mbps = Some(mbps);
+                }
+            }
+            _ => apply_cluster_kv(&mut cfg, key, val),
         };
 
         for key in CLUSTER_FILE_KEYS {

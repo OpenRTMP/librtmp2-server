@@ -59,38 +59,42 @@ impl SqliteStateMachine {
     }
 
     fn load_last_applied(db: &Db) -> Result<Option<LogId<u64>>, StorageError<u64>> {
-        db.with_conn(|conn| match conn.query_row(
-            "SELECT val FROM raft_meta WHERE key='last_applied'",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
-            Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::read_state_machine(&e),
-            }),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(StorageError::IO {
-                source: StorageIOError::<u64>::read_state_machine(&e),
-            }),
+        db.with_conn(|conn| {
+            match conn.query_row(
+                "SELECT val FROM raft_meta WHERE key='last_applied'",
+                [],
+                |r| r.get::<_, String>(0),
+            ) {
+                Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::read_state_machine(&e),
+                }),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(StorageError::IO {
+                    source: StorageIOError::<u64>::read_state_machine(&e),
+                }),
+            }
         })
     }
 
     fn load_last_membership(
         db: &Db,
     ) -> Result<StoredMembership<u64, openraft::BasicNode>, StorageError<u64>> {
-        db.with_conn(|conn| match conn.query_row(
-            "SELECT val FROM raft_meta WHERE key='last_membership'",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
-            Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::read_state_machine(&e),
-            }),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Ok(StoredMembership::new(None, openraft::Membership::default()))
+        db.with_conn(|conn| {
+            match conn.query_row(
+                "SELECT val FROM raft_meta WHERE key='last_membership'",
+                [],
+                |r| r.get::<_, String>(0),
+            ) {
+                Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::read_state_machine(&e),
+                }),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    Ok(StoredMembership::new(None, openraft::Membership::default()))
+                }
+                Err(e) => Err(StorageError::IO {
+                    source: StorageIOError::<u64>::read_state_machine(&e),
+                }),
             }
-            Err(e) => Err(StorageError::IO {
-                source: StorageIOError::<u64>::read_state_machine(&e),
-            }),
         })
     }
 
@@ -315,90 +319,96 @@ impl SqliteStateMachine {
     fn install_app_snapshot(&self, snap: &AppSnapshot) -> Result<(), String> {
         // Snapshot local session children before deleting `streams` — FK CASCADE
         // would otherwise wipe publishers/players/stats_samples while RTMP is live.
-        let local_pubs = self.db.with_conn(|conn| -> Result<Vec<crate::db::Publisher>, String> {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id,stream_id,app,stream_name,video_codec,audio_codec,\
+        let local_pubs =
+            self.db
+                .with_conn(|conn| -> Result<Vec<crate::db::Publisher>, String> {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id,stream_id,app,stream_name,video_codec,audio_codec,\
                      video_width,video_height,fps,audio_sample_rate,audio_channels,\
                      bytes_in,bitrate_kbps,rtt_ms,connected_at,active FROM publishers",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(crate::db::Publisher {
-                        id: row.get(0)?,
-                        stream_id: row.get(1)?,
-                        app: row.get(2)?,
-                        stream_name: row.get(3)?,
-                        video_codec: row.get(4)?,
-                        audio_codec: row.get(5)?,
-                        video_width: row.get(6)?,
-                        video_height: row.get(7)?,
-                        fps: row.get(8)?,
-                        audio_sample_rate: row.get(9)?,
-                        audio_channels: row.get(10)?,
-                        bytes_in: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
-                        bitrate_kbps: row.get(12)?,
-                        rtt_ms: row.get(13)?,
-                        connected_at: row.get(14)?,
-                        active: row.get(15)?,
-                    })
-                })
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())
-        })?;
-        let local_players = self.db.with_conn(|conn| -> Result<Vec<crate::db::Player>, String> {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id,stream_id,viewer_id,app,stream_name,bytes_out,\
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(crate::db::Publisher {
+                                id: row.get(0)?,
+                                stream_id: row.get(1)?,
+                                app: row.get(2)?,
+                                stream_name: row.get(3)?,
+                                video_codec: row.get(4)?,
+                                audio_codec: row.get(5)?,
+                                video_width: row.get(6)?,
+                                video_height: row.get(7)?,
+                                fps: row.get(8)?,
+                                audio_sample_rate: row.get(9)?,
+                                audio_channels: row.get(10)?,
+                                bytes_in: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                                bitrate_kbps: row.get(12)?,
+                                rtt_ms: row.get(13)?,
+                                connected_at: row.get(14)?,
+                                active: row.get(15)?,
+                            })
+                        })
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())
+                })?;
+        let local_players =
+            self.db
+                .with_conn(|conn| -> Result<Vec<crate::db::Player>, String> {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id,stream_id,viewer_id,app,stream_name,bytes_out,\
                      bitrate_kbps,rtt_ms,connected_at,active FROM players",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(crate::db::Player {
-                        id: row.get(0)?,
-                        stream_id: row.get(1)?,
-                        viewer_id: row.get(2)?,
-                        app: row.get(3)?,
-                        stream_name: row.get(4)?,
-                        bytes_out: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
-                        bitrate_kbps: row.get(6)?,
-                        rtt_ms: row.get(7)?,
-                        connected_at: row.get(8)?,
-                        active: row.get(9)?,
-                    })
-                })
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())
-        })?;
-        let local_stats = self.db.with_conn(|conn| -> Result<Vec<crate::db::StatSample>, String> {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,\
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(crate::db::Player {
+                                id: row.get(0)?,
+                                stream_id: row.get(1)?,
+                                viewer_id: row.get(2)?,
+                                app: row.get(3)?,
+                                stream_name: row.get(4)?,
+                                bytes_out: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                                bitrate_kbps: row.get(6)?,
+                                rtt_ms: row.get(7)?,
+                                connected_at: row.get(8)?,
+                                active: row.get(9)?,
+                            })
+                        })
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())
+                })?;
+        let local_stats =
+            self.db
+                .with_conn(|conn| -> Result<Vec<crate::db::StatSample>, String> {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,\
                      audio_codec,player_count,ts FROM stats_samples",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(crate::db::StatSample {
-                        stream_id: row.get(0)?,
-                        bitrate_in_kbps: row.get(1)?,
-                        fps: row.get(2)?,
-                        width: row.get(3)?,
-                        height: row.get(4)?,
-                        video_codec: row.get(5)?,
-                        audio_codec: row.get(6)?,
-                        player_count: row.get(7)?,
-                        ts: row.get(8)?,
-                    })
-                })
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())
-        })?;
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(crate::db::StatSample {
+                                stream_id: row.get(0)?,
+                                bitrate_in_kbps: row.get(1)?,
+                                fps: row.get(2)?,
+                                width: row.get(3)?,
+                                height: row.get(4)?,
+                                video_codec: row.get(5)?,
+                                audio_codec: row.get(6)?,
+                                player_count: row.get(7)?,
+                                ts: row.get(8)?,
+                            })
+                        })
+                        .map_err(|e| e.to_string())?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())
+                })?;
 
         // Only wipe durable replicated tables.
         self.db.with_conn(|conn| {

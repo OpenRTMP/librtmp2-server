@@ -237,15 +237,21 @@ impl NetworkConnection {
         req: ControlMessage,
     ) -> Result<ControlMessage, RPCError<NodeId, BasicNode, typ::RaftError>> {
         let addr = &self.target_node.addr;
-        authed_roundtrip_inner(addr, &self.secret, self.local_id, self.tls_client.clone(), req)
-            .await
-            .map_err(|e| {
-                if e.contains("connect") || e.contains("tcp") {
-                    RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e)))
-                } else {
-                    RPCError::Network(NetworkError::new(&std::io::Error::other(e)))
-                }
-            })
+        authed_roundtrip_inner(
+            addr,
+            &self.secret,
+            self.local_id,
+            self.tls_client.clone(),
+            req,
+        )
+        .await
+        .map_err(|e| {
+            if e.contains("connect") || e.contains("tcp") {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e)))
+            } else {
+                RPCError::Network(NetworkError::new(&std::io::Error::other(e)))
+            }
+        })
     }
 }
 
@@ -343,8 +349,9 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
 }
 
 /// Result of accepting a join request (topology for the joiner).
-pub type JoinAcceptFn =
-    Arc<dyn Fn(NodeId, String, String) -> Result<(String, Vec<JoinPeerInfo>), String> + Send + Sync>;
+pub type JoinAcceptFn = Arc<
+    dyn Fn(NodeId, String, String) -> Result<(String, Vec<JoinPeerInfo>), String> + Send + Sync,
+>;
 
 /// Peer heartbeat payload (addrs + session counts for aggregation).
 #[derive(Debug, Clone)]
@@ -399,11 +406,9 @@ pub async fn serve_control_plane_listener(
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let acceptor = tls_server.map(TlsAcceptor::from);
-    let bind = listener.local_addr().unwrap_or_else(|_| {
-        "0.0.0.0:0"
-            .parse()
-            .expect("static bind parse")
-    });
+    let bind = listener
+        .local_addr()
+        .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static bind parse"));
     tracing::info!(%bind, tls = acceptor.is_some(), "cluster control plane listening");
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -458,7 +463,13 @@ async fn server_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     local_id: NodeId,
 ) -> Result<NodeId, std::io::Error> {
     let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
-    write_frame(stream, &ControlMessage::AuthChallenge { nonce: nonce.clone() }).await?;
+    write_frame(
+        stream,
+        &ControlMessage::AuthChallenge {
+            nonce: nonce.clone(),
+        },
+    )
+    .await?;
     let auth = read_auth_frame(stream).await?;
     let ControlMessage::Auth { node_id, response } = auth else {
         write_frame(stream, &ControlMessage::AuthFail).await?;
@@ -629,7 +640,9 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Extract TLS server name (host/IP without brackets or port) from an authority.
-pub fn tls_server_name_from_addr(addr: &str) -> Result<rustls::pki_types::ServerName<'static>, String> {
+pub fn tls_server_name_from_addr(
+    addr: &str,
+) -> Result<rustls::pki_types::ServerName<'static>, String> {
     let host = if let Ok(sock) = addr.parse::<SocketAddr>() {
         match sock.ip() {
             std::net::IpAddr::V4(v4) => v4.to_string(),
@@ -637,10 +650,7 @@ pub fn tls_server_name_from_addr(addr: &str) -> Result<rustls::pki_types::Server
         }
     } else if let Some(rest) = addr.strip_prefix('[') {
         // [ipv6]:port
-        rest.split(']')
-            .next()
-            .unwrap_or("localhost")
-            .to_string()
+        rest.split(']').next().unwrap_or("localhost").to_string()
     } else {
         addr.rsplit_once(':')
             .map(|(h, _)| h.to_string())
@@ -956,10 +966,7 @@ pub async fn send_change_membership(
     .await?
     {
         ControlMessage::ChangeMembershipResp { ok: true, .. } => Ok(()),
-        ControlMessage::ChangeMembershipResp {
-            ok: false,
-            message,
-        } => Err(message),
+        ControlMessage::ChangeMembershipResp { ok: false, message } => Err(message),
         ControlMessage::AdminErr { message } => Err(message),
         _ => Err("unexpected change membership response".into()),
     }

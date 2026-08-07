@@ -110,9 +110,7 @@ impl ExportQueue {
             let Some(old) = st.0.pop_front() else {
                 break;
             };
-            st.1 = st
-                .1
-                .saturating_sub(old.payload.len().saturating_add(64));
+            st.1 = st.1.saturating_sub(old.payload.len().saturating_add(64));
             tracing::warn!(
                 app = %old.app,
                 stream = %old.stream,
@@ -262,9 +260,13 @@ impl MediaHub {
         self: Arc<Self>,
         stream: tokio::net::TcpStream,
     ) -> Result<(), std::io::Error> {
-        let (peer_id, io) =
-            peer::accept_tls_then_auth(stream, &self.secret, self.local_id, self.tls_server.clone())
-                .await?;
+        let (peer_id, io) = peer::accept_tls_then_auth(
+            stream,
+            &self.secret,
+            self.local_id,
+            self.tls_server.clone(),
+        )
+        .await?;
         // Track Subscribe messages on this connection so a drop without Unsubscribe
         // cannot leave stale SubscriptionTable entries for the peer.
         let mut conn_subs: std::collections::HashMap<(String, String), usize> =
@@ -470,11 +472,7 @@ impl MediaHub {
         };
         for (app, stream) in self.subs.streams_for_peer(peer_id) {
             let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
-            let _ = peer.try_send(MediaMessage::Subscribe {
-                app,
-                stream,
-                epoch,
-            });
+            let _ = peer.try_send(MediaMessage::Subscribe { app, stream, epoch });
         }
     }
 

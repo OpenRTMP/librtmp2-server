@@ -551,9 +551,11 @@ impl DbRtmpBridge {
             player_row.id
         );
 
-        let stream_id_for_unsub = player_row.stream_id.clone();
         #[cfg(feature = "cluster")]
-        self.maybe_unsubscribe_remote_play(&stream_id_for_unsub);
+        {
+            let stream_id_for_unsub = player_row.stream_id.clone();
+            self.maybe_unsubscribe_remote_play(&stream_id_for_unsub);
+        }
 
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {

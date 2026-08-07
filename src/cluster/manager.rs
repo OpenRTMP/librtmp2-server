@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::BasicNode;
+use openraft::ChangeMembers;
 use openraft::Config as RaftConfig;
 use openraft::RaftMetrics;
-use openraft::ChangeMembers;
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
 
@@ -17,11 +17,13 @@ use crate::cluster::admission::{
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::health::{HealthTracker, NodeHealthState};
-use crate::cluster::media::hub::{ExportQueue, ExportedFrame, InjectQueue, InjectedFrame, MediaHub};
+use crate::cluster::media::hub::{
+    ExportQueue, ExportedFrame, InjectQueue, InjectedFrame, MediaHub,
+};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::membership::{
-    bootstrap_single_node, check_join_reseed, seed_from_local_db, verify_cluster_identity,
-    JoinReseedAction,
+    JoinReseedAction, bootstrap_single_node, check_join_reseed, seed_from_local_db,
+    verify_cluster_identity,
 };
 use crate::cluster::metrics::{ClusterMetrics, ClusterStreamInfo, NodeInfo};
 use crate::cluster::network::{self, JoinPeerInfo, NetworkFactory};
@@ -59,11 +61,11 @@ pub struct ClusterManager {
     /// Per-peer publisher/player counts from heartbeats.
     peer_session_counts: Mutex<std::collections::HashMap<NodeId, (u64, u64)>>,
     /// Per-peer per-stream player counts from heartbeats.
-    peer_stream_players: Mutex<std::collections::HashMap<NodeId, std::collections::HashMap<String, u64>>>,
+    peer_stream_players:
+        Mutex<std::collections::HashMap<NodeId, std::collections::HashMap<String, u64>>>,
     /// Raft state-machine side-effect channel (drain/revoke/token).
-    effects_rx: Mutex<
-        Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>,
-    >,
+    effects_rx:
+        Mutex<Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>>,
 }
 
 /// Shared with AppState so Raft applies can mark deleted streams / revoked viewers
@@ -134,11 +136,8 @@ impl ClusterManager {
             config.secret.clone(),
             tls_client.clone(),
         ));
-        let mut net_factory = NetworkFactory::new(
-            config.node_id,
-            config.secret.clone(),
-            tls_client.clone(),
-        );
+        let mut net_factory =
+            NetworkFactory::new(config.node_id, config.secret.clone(), tls_client.clone());
         net_factory.nodes = Arc::clone(&network.nodes);
 
         let raft = openraft::Raft::new(
@@ -214,9 +213,8 @@ impl ClusterManager {
             let on_join: network::JoinAcceptFn = Arc::new(move |nid, ctrl, media_addr| {
                 let mgr = Arc::clone(&mgr_join);
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async move {
-                        mgr.accept_join(nid, ctrl, media_addr).await
-                    })
+                    tokio::runtime::Handle::current()
+                        .block_on(async move { mgr.accept_join(nid, ctrl, media_addr).await })
                 })
             });
             let health_hb = Arc::clone(&mgr.health);
@@ -274,10 +272,7 @@ impl ClusterManager {
                     counts_hb
                         .peer_stream_players
                         .lock()
-                        .insert(
-                            info.node_id,
-                            info.stream_players.into_iter().collect(),
-                        );
+                        .insert(info.node_id, info.stream_players.into_iter().collect());
                 });
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
@@ -380,13 +375,9 @@ impl ClusterManager {
                         if p.node_id == config.node_id {
                             continue;
                         }
-                        mgr.network
-                            .upsert_node(p.node_id, p.control_addr.clone());
-                        mgr.meta.set_addrs(
-                            p.node_id,
-                            p.control_addr.clone(),
-                            p.media_addr.clone(),
-                        );
+                        mgr.network.upsert_node(p.node_id, p.control_addr.clone());
+                        mgr.meta
+                            .set_addrs(p.node_id, p.control_addr.clone(), p.media_addr.clone());
                         let _ = mgr.media.connect_peer(p.node_id, &p.media_addr).await;
                         mgr.health.note_peer(
                             p.node_id,
@@ -678,9 +669,7 @@ impl ClusterManager {
                         ftl.leader_id
                             .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
                     })
-                    .ok_or_else(|| {
-                        "forward_to_leader: no leader address available".to_string()
-                    })?;
+                    .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
                 network::send_change_membership(
                     &leader_addr,
                     &self.config.secret,
@@ -734,7 +723,13 @@ impl ClusterManager {
         use openraft::error::{ClientWriteError, RaftError};
         match self
             .raft
-            .add_learner(node_id, BasicNode { addr: control_addr.clone() }, true)
+            .add_learner(
+                node_id,
+                BasicNode {
+                    addr: control_addr.clone(),
+                },
+                true,
+            )
             .await
         {
             Ok(_) => {}
@@ -746,9 +741,7 @@ impl ClusterManager {
                         ftl.leader_id
                             .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
                     })
-                    .ok_or_else(|| {
-                        "forward_to_leader: no leader address available".to_string()
-                    })?;
+                    .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
                 return network::forward_join(
                     &leader_addr,
                     &self.config.secret,
@@ -916,19 +909,10 @@ impl ClusterManager {
             let ctrl = node.addr.clone();
             self.network.upsert_node(*id, ctrl.clone());
             // Media addr unknown until topology/heartbeat; seed control only.
-            let media = self
-                .meta
-                .get(*id)
-                .map(|(_, m)| m)
-                .unwrap_or_default();
+            let media = self.meta.get(*id).map(|(_, m)| m).unwrap_or_default();
             self.meta.set_addrs(*id, ctrl.clone(), media);
-            self.health.note_peer(
-                *id,
-                NodeHealthState::Ready,
-                0.0,
-                Some(ctrl),
-                None,
-            );
+            self.health
+                .note_peer(*id, NodeHealthState::Ready, 0.0, Some(ctrl), None);
         }
     }
 
@@ -978,13 +962,9 @@ impl ClusterManager {
             if p.node_id == self.config.node_id {
                 continue;
             }
-            self.network
-                .upsert_node(p.node_id, p.control_addr.clone());
-            self.meta.set_addrs(
-                p.node_id,
-                p.control_addr.clone(),
-                p.media_addr.clone(),
-            );
+            self.network.upsert_node(p.node_id, p.control_addr.clone());
+            self.meta
+                .set_addrs(p.node_id, p.control_addr.clone(), p.media_addr.clone());
             let _ = self.media.connect_peer(p.node_id, &p.media_addr).await;
             self.health.note_peer(
                 p.node_id,
@@ -1101,15 +1081,11 @@ impl ClusterManager {
 
     /// Drop remote media subscription when the last local player for a stream leaves.
     pub fn notify_play_unsubscribe(&self, app: &str, stream_id: &str) {
-        let Some(owner) = self
-            .ownership
-            .get(stream_id)
-            .or_else(|| {
-                self.db
-                    .stream_owner_get(stream_id)
-                    .map(|o| (o.owner_node_id, o.epoch))
-            })
-        else {
+        let Some(owner) = self.ownership.get(stream_id).or_else(|| {
+            self.db
+                .stream_owner_get(stream_id)
+                .map(|o| (o.owner_node_id, o.epoch))
+        }) else {
             return;
         };
         let (owner_node, _) = owner;

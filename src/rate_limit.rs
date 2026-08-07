@@ -281,7 +281,11 @@ mod tests {
     }
 
     fn test_limiter() -> RateLimiter {
-        RateLimiter::new(HttpRateLimitConfig::default(), Vec::new(), token("test-token"))
+        RateLimiter::new(
+            HttpRateLimitConfig::default(),
+            Vec::new(),
+            token("test-token"),
+        )
     }
 
     #[test]
