@@ -57,7 +57,10 @@ impl StateCoordinator {
         }
     }
 
-    pub fn create_stream(&self, stream: &Stream) -> Result<(), CoordError> {
+    /// Returns the default viewer created alongside the stream, so callers can
+    /// build a response without a local read that may lag behind the write on
+    /// a cluster follower.
+    pub fn create_stream(&self, stream: &Stream) -> Result<StreamViewer, CoordError> {
         match self {
             StateCoordinator::Standalone(db) => db.stream_add(stream).map_err(Into::into),
             #[cfg(feature = "cluster")]

@@ -329,8 +329,7 @@ fn viewer_to_json(v: &StreamViewer) -> Value {
     })
 }
 
-fn stream_to_json(db: &Db, s: &Stream) -> Value {
-    let players: Vec<Value> = db.viewer_list(&s.id).iter().map(viewer_to_json).collect();
+fn stream_to_json_with_players(s: &Stream, players: Vec<Value>) -> Value {
     json!({
         "id": s.id,
         "name": s.name,
@@ -342,6 +341,11 @@ fn stream_to_json(db: &Db, s: &Stream) -> Value {
         "enabled": s.enabled,
         "created_at": s.created_at,
     })
+}
+
+fn stream_to_json(db: &Db, s: &Stream) -> Value {
+    let players: Vec<Value> = db.viewer_list(&s.id).iter().map(viewer_to_json).collect();
+    stream_to_json_with_players(s, players)
 }
 
 fn create_viewer_row(
@@ -1139,8 +1143,8 @@ async fn handle_stream_create(
         created_at: now_ts(),
     };
 
-    match state.coordinator.create_stream(&s) {
-        Ok(()) => {}
+    let default_viewer = match state.coordinator.create_stream(&s) {
+        Ok(viewer) => viewer,
         Err(CoordError::Duplicate) => {
             log_http_access(
                 "POST",
@@ -1169,7 +1173,7 @@ async fn handle_stream_create(
                 "Failed to create stream",
             );
         }
-    }
+    };
 
     crate::log_info!(
         "HTTP: POST /api/v1/streams from {peer} → 201 stream created id={} app={}",
@@ -1177,7 +1181,8 @@ async fn handle_stream_create(
         s.app
     );
 
-    (StatusCode::CREATED, Json(stream_to_json(&state.db, &s))).into_response()
+    let body = stream_to_json_with_players(&s, vec![viewer_to_json(&default_viewer)]);
+    (StatusCode::CREATED, Json(body)).into_response()
 }
 
 async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), ()> {

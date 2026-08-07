@@ -972,12 +972,12 @@ mod tests {
     #[test]
     fn tls_server_name_from_bracketed_ipv6_authority() {
         let name = tls_server_name_from_addr("[2001:db8::1]:1940").expect("parse");
-        assert_eq!(name.as_ref(), "2001:db8::1");
+        assert_eq!(name.to_str(), "2001:db8::1");
     }
 
     #[test]
     fn tls_server_name_from_ipv4_socket_addr() {
         let name = tls_server_name_from_addr("203.0.113.5:1940").expect("parse");
-        assert_eq!(name.as_ref(), "203.0.113.5");
+        assert_eq!(name.to_str(), "203.0.113.5");
     }
 }

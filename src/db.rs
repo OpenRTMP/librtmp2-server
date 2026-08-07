@@ -604,7 +604,7 @@ impl Db {
         }
     }
 
-    pub fn stream_add(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
+    pub fn stream_add(&self, s: &Stream) -> std::result::Result<StreamViewer, StreamAddError> {
         let viewer_id = match crate::keygen::keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID) {
             Ok(id) => id,
             Err(e) => {
@@ -620,7 +620,7 @@ impl Db {
             enabled: true,
             created_at: s.created_at,
         };
-        self.stream_add_with_viewer(s, &viewer)
+        self.stream_add_with_viewer(s, &viewer).map(|()| viewer)
     }
 
     /// Read/write generic settings keys (e.g. replicated `cluster_id`).

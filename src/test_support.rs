@@ -62,11 +62,11 @@ impl TestServer {
         let coordinator = Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db)));
         rtmp_bridge.set_coordinator(Arc::clone(&coordinator));
 
-        let api_token = Arc::new(parking_lot::RwLock::new(config.api_token.clone()));
+        let api_token_lock = Arc::new(parking_lot::RwLock::new(config.api_token.clone()));
         let state = Arc::new(AppState {
             db: Arc::clone(&db),
             config,
-            api_token,
+            api_token: api_token_lock,
             rtmp_bridge: Arc::clone(&rtmp_bridge),
             coordinator,
             deleted_streams: Arc::clone(&deleted_streams),

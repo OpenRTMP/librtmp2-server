@@ -458,7 +458,12 @@ impl ClusterManager {
         self.inject.drain()
     }
 
-    pub fn create_stream(&self, stream: &Stream) -> Result<(), CoordError> {
+    /// Returns the default viewer applied by the state machine. Since its ID
+    /// and fields are generated here (before propose) rather than read back
+    /// from the local DB, the caller gets an authoritative value even when
+    /// this node is a follower whose local apply may still be lagging behind
+    /// the leader's commit.
+    pub fn create_stream(&self, stream: &Stream) -> Result<StreamViewer, CoordError> {
         let viewer_id = crate::keygen::keygen_stream_key(crate::keygen::PREFIX_VIEWER_ID)
             .map_err(|e| CoordError::Cluster(format!("viewer id: {e}")))?;
         let default_viewer = StreamViewer {
@@ -471,9 +476,10 @@ impl ClusterManager {
         };
         self.block_on_write(ClusterCommand::CreateStream {
             stream: stream.clone(),
-            default_viewer,
+            default_viewer: default_viewer.clone(),
         })?
-        .into_coord_result()
+        .into_coord_result()?;
+        Ok(default_viewer)
     }
 
     pub fn begin_delete_stream(&self, id: &str) -> Result<(), CoordError> {
