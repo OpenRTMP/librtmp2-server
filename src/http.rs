@@ -1159,19 +1159,27 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
     }
 }
 
+/// How long to wait before logging that an async stream delete is taking
+/// longer than expected. The drain loop never gives up: `deleted_streams`
+/// must stay populated until every live RTMP session is gone so the poll loop
+/// keeps kicking them; removing the marker early left stuck publishers
+/// broadcasting on a disabled/pending-delete stream indefinitely.
+#[cfg(test)]
+const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
+
 async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = Instant::now();
+    let mut last_warn = started;
     while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
-        if std::time::Instant::now() >= deadline {
-            // Leave the stream disabled (`pending_delete=1`) so a failed drain
-            // does not silently re-enable publish/play keys. Operators can
-            // retry the delete once RTMP sessions drop.
-            state.deleted_streams.lock().remove(&id);
+        if last_warn.elapsed() >= DELETE_DRAIN_WARN_AFTER {
             crate::log_warn!(
-                "Timed out deleting stream '{id}' — stream stays disabled; \
-                 active RTMP sessions remained"
+                "Still deleting stream '{id}' — stream stays disabled; \
+                 waiting for {} active RTMP session(s) to drain",
+                state.rtmp_bridge.live_conn_count_for_stream(&id)
             );
-            return;
+            last_warn = Instant::now();
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -1220,10 +1228,10 @@ async fn handle_stream_delete(
             "DELETE",
             &path,
             &peer,
-            StatusCode::CONFLICT,
-            "stream is being deleted",
+            StatusCode::ACCEPTED,
+            "stream delete already in progress",
         );
-        return err_json(StatusCode::CONFLICT, "CONFLICT", "Stream is being deleted");
+        return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
     }
     match state.db.stream_get(&id) {
         DbLookup::Missing => {
@@ -3015,6 +3023,57 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn delete_stream_keeps_eviction_marker_past_warn_interval() {
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "sticky".to_string(),
+            name: "Sticky".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_sticky_key_with_sufficient_length_here".to_string(),
+            play_key: "play_sticky_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_sticky_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        state.rtmp_bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            state
+                .rtmp_bridge
+                .authorize_publish(1, "live", "pub_sticky_key_with_sufficient_length_here")
+                .is_ok()
+        );
+
+        let app = router(state.clone());
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/sticky")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(state.deleted_streams.lock().contains("sticky"));
+
+        tokio::time::sleep(DELETE_DRAIN_WARN_AFTER + Duration::from_millis(50)).await;
+        assert!(
+            state.deleted_streams.lock().contains("sticky"),
+            "deleted_streams must stay set until RTMP sessions drain"
+        );
+
+        state.rtmp_bridge.on_close(1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(matches!(state.db.stream_get("sticky"), DbLookup::Missing));
+        assert!(!state.deleted_streams.lock().contains("sticky"));
     }
 }
