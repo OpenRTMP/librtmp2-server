@@ -66,6 +66,12 @@ pub struct ClusterManager {
     /// Raft state-machine side-effect channel (drain/revoke/token).
     effects_rx:
         Mutex<Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>>,
+    /// Streams whose `ClearDrainStream` effect arrived while this node still
+    /// had live local RTMP sessions on them (e.g. mid catch-up, having
+    /// applied `DrainStream` and `ClearDrainStream` back to back before the
+    /// RTMP poll loop reacted to the marker). Retried until local sessions
+    /// actually drain — see `retry_pending_drain_clears`.
+    pending_drain_clears: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Shared with AppState so Raft applies can mark deleted streams / revoked viewers
@@ -205,6 +211,7 @@ impl ClusterManager {
             peer_session_counts: Mutex::new(std::collections::HashMap::new()),
             peer_stream_players: Mutex::new(std::collections::HashMap::new()),
             effects_rx: Mutex::new(Some(effects_rx)),
+            pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
         });
 
         // Control + media listeners
@@ -324,7 +331,7 @@ impl ClusterManager {
             if db.raft_has_state() {
                 // Existing voter restart — do not re-initialize OpenRaft storage.
                 if let Some(ref join_addr) = config.join {
-                    mgr.refresh_topology_from(join_addr).await?;
+                    mgr.refresh_topology_from_any(join_addr).await?;
                 }
                 health.set_local(NodeHealthState::Ready);
                 crate::log_info!(
@@ -350,7 +357,7 @@ impl ClusterManager {
         } else if let Some(ref join_addr) = config.join {
             match join_action {
                 JoinReseedAction::ResumeExisting => {
-                    mgr.refresh_topology_from(join_addr).await?;
+                    mgr.refresh_topology_from_any(join_addr).await?;
                     health.set_local(NodeHealthState::Ready);
                     crate::log_info!(
                         "Cluster: resuming existing member node {} (CLUSTER_JOIN set but local raft state present)",
@@ -754,11 +761,34 @@ impl ClusterManager {
                 .await;
             }
             Err(e) => {
-                // Already a member / idempotent learner add — continue with topology.
                 let msg = e.to_string();
                 if !(msg.contains("already") || msg.contains("Exists") || msg.contains("exist")) {
                     return Err(format!("add_learner: {e}"));
                 }
+                // A reseeded/replaced node can rejoin under its previous node
+                // ID with a fresh, empty database — often at a new address.
+                // Treating "already exists" as a no-op success would leave
+                // Raft membership (and thus replication) still targeting the
+                // old address, so this blank learner would never catch up.
+                // SetNodes replaces the registered address for an existing
+                // member, which lets OpenRaft's normal log/snapshot
+                // catch-up target the right place.
+                crate::log_warn!(
+                    "Cluster: node {node_id} rejoined with an existing ID at {control_addr}; \
+                     updating registered address for catch-up (likely a reseeded replacement)"
+                );
+                self.raft
+                    .change_membership(
+                        ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
+                            node_id,
+                            BasicNode {
+                                addr: control_addr.clone(),
+                            },
+                        )])),
+                        false,
+                    )
+                    .await
+                    .map_err(|e| format!("SetNodes for rejoined node {node_id}: {e}"))?;
             }
         }
 
@@ -860,8 +890,69 @@ impl ClusterManager {
     }
 
     fn mark_stream_drain_clear(&self, stream_id: &str) {
+        if self.local_live_sessions(stream_id) > 0 {
+            // This node can apply DrainStream and ClearDrainStream back to
+            // back while catching up (e.g. it was unreachable when the
+            // leader counted remote sessions as zero and finalized the
+            // delete), before the RTMP poll loop has had a chance to react
+            // to the marker. Keep it set — and thus keep kicking local
+            // sessions — until they actually drain.
+            self.pending_drain_clears
+                .lock()
+                .insert(stream_id.to_string());
+            return;
+        }
         if let Some(hooks) = self.session_hooks.lock().as_ref() {
             hooks.deleted_streams.lock().remove(stream_id);
+        }
+    }
+
+    /// Retry streams whose drain marker was kept because this node still had
+    /// live local sessions when `ClearDrainStream` was applied. Called on
+    /// every health-loop tick so the marker still gets cleared promptly once
+    /// those sessions actually disconnect.
+    fn retry_pending_drain_clears(&self) {
+        let candidates: Vec<String> = self.pending_drain_clears.lock().iter().cloned().collect();
+        for stream_id in candidates {
+            if self.local_live_sessions(&stream_id) == 0 {
+                self.pending_drain_clears.lock().remove(&stream_id);
+                if let Some(hooks) = self.session_hooks.lock().as_ref() {
+                    hooks.deleted_streams.lock().remove(&stream_id);
+                }
+            }
+        }
+    }
+
+    /// After returning to READY from an isolation/partition, this node's
+    /// local active publishers may still hold `stream_owners` rows and keep
+    /// exporting under an epoch a majority already released (and possibly
+    /// reassigned) while this node was cut off. Reacquire ownership for each
+    /// such stream so exports resume under a fresh, correctly fenced epoch.
+    /// A conflict (a replacement owner already claimed it) is logged for now
+    /// — there is no per-connection close hook here to also force that
+    /// publisher off; it self-corrects on reconnect.
+    fn reconcile_publishers_after_isolation(&self) {
+        let node_id = self.config.node_id;
+        for p in self.db.publisher_list_all() {
+            let owner = self.db.stream_owner_get(&p.stream_id);
+            if owner.as_ref().map(|o| o.owner_node_id) == Some(node_id) {
+                continue;
+            }
+            match self.acquire_stream_owner(&p.stream_id, node_id, 0, crate::db::now_ts()) {
+                Ok(epoch) => {
+                    crate::log_info!(
+                        "Cluster: reacquired ownership of stream {} at epoch {epoch} after isolation cleared",
+                        p.stream_id
+                    );
+                }
+                Err(e) => {
+                    crate::log_warn!(
+                        "Cluster: could not reacquire ownership of stream {} after isolation cleared ({e:?}); \
+                         local publisher may export under a stale/conflicting epoch until it reconnects",
+                        p.stream_id
+                    );
+                }
+            }
         }
     }
 
@@ -922,6 +1013,23 @@ impl ClusterManager {
         let Some(rm) = self.last_metrics.lock().clone() else {
             return;
         };
+        // Promoting a learner to voter changes Raft membership but the
+        // node's own local health stays `Learner` (set once at join) unless
+        // reconciled here; otherwise it keeps advertising/reporting itself
+        // as a learner indefinitely after a successful promotion.
+        if self.health.local() == NodeHealthState::Learner
+            && rm
+                .membership_config
+                .membership()
+                .voter_ids()
+                .any(|id| id == self.config.node_id)
+        {
+            self.health.set_local(NodeHealthState::Ready);
+            crate::log_info!(
+                "Cluster: node {} promoted to voter, health Learner -> Ready",
+                self.config.node_id
+            );
+        }
         let members: std::collections::HashSet<NodeId> = rm
             .membership_config
             .membership()
@@ -975,6 +1083,32 @@ impl ClusterManager {
             );
         }
         Ok(())
+    }
+
+    /// Like `refresh_topology_from`, but if the given address doesn't answer,
+    /// fall back to any peer control address already restored from persisted
+    /// Raft membership (`restore_topology_from_membership` runs before this
+    /// is called). A surviving majority of an existing cluster must be able
+    /// to restart even if the original bootstrap/join address is
+    /// permanently gone, as long as some other persisted member responds.
+    async fn refresh_topology_from_any(&self, primary_addr: &str) -> Result<(), String> {
+        let primary_err = match self.refresh_topology_from(primary_addr).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let fallbacks: Vec<String> = self
+            .meta
+            .all()
+            .into_iter()
+            .map(|(_, ctrl, _)| ctrl)
+            .filter(|ctrl| ctrl != primary_addr)
+            .collect();
+        for ctrl in fallbacks {
+            if self.refresh_topology_from(&ctrl).await.is_ok() {
+                return Ok(());
+            }
+        }
+        Err(primary_err)
     }
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
@@ -1120,8 +1254,49 @@ impl ClusterManager {
     fn sync_ownership_from_db(&self) {
         let owners = self.db.stream_owner_list();
         let changed = self.ownership.sync_from(&owners);
-        if !changed.is_empty() {
-            self.refresh_subscriptions_for(&changed);
+        if changed.is_empty() {
+            return;
+        }
+        // sync_from() already replaced the tracker with the new owners, so
+        // looking them up now (as refresh_subscriptions_for's
+        // notify_play_unsubscribe does) would only ever find the new owner,
+        // never unsubscribing from the actual previous one. Unsubscribe
+        // directly from the (node, epoch) sync_from captured before the
+        // swap.
+        for (stream_id, old_owner) in &changed {
+            let Some((old_node, _)) = old_owner else {
+                continue;
+            };
+            if *old_node == self.config.node_id {
+                continue;
+            }
+            let app = match self.db.stream_get(stream_id) {
+                crate::db::DbLookup::Ok(s) => s.app,
+                _ => "live".to_string(),
+            };
+            let media = Arc::clone(&self.media);
+            let owner_node = *old_node;
+            let stream = stream_id.clone();
+            self.rt_handle.spawn(async move {
+                media.unsubscribe_remote(owner_node, &app, &stream).await;
+            });
+        }
+        let ids: Vec<String> = changed.into_iter().map(|(id, _)| id).collect();
+        self.resubscribe_active_players(&ids);
+    }
+
+    /// Re-subscribe local players to their (already-updated) current owner.
+    /// Does not unsubscribe — callers that know the previous owner should
+    /// unsubscribe from it explicitly first (see `sync_ownership_from_db`).
+    fn resubscribe_active_players(&self, stream_ids: &[String]) {
+        for sid in stream_ids {
+            if self.db.player_list(Some(sid)).iter().any(|p| p.active) {
+                let app = match self.db.stream_get(sid) {
+                    crate::db::DbLookup::Ok(s) => s.app,
+                    _ => "live".to_string(),
+                };
+                self.notify_play_subscription(&app, sid);
+            }
         }
     }
 
@@ -1154,6 +1329,7 @@ impl ClusterManager {
         loop {
             ticker.tick().await;
             self.process_state_effects();
+            self.retry_pending_drain_clears();
             if !self.config.bandwidth_interface.is_empty() {
                 let iface = self.config.bandwidth_interface.clone();
                 let max = self.config.bandwidth_max_mbps;
@@ -1257,6 +1433,7 @@ impl ClusterManager {
                 } else if self.health.local() == NodeHealthState::Isolated {
                     crate::log_info!("Cluster: quorum restored");
                     self.health.set_local(NodeHealthState::Ready);
+                    self.reconcile_publishers_after_isolation();
                 }
             }
         }

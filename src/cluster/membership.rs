@@ -111,9 +111,11 @@ pub async fn remove_node(raft: &Raft, node_id: NodeId) -> Result<(), String> {
 
 /// Seed replicated state from existing standalone rows (bootstrap only).
 pub async fn seed_from_local_db(raft: &Raft, db: &Arc<Db>) -> Result<(), String> {
-    let streams = db.stream_list();
-    let viewers = db.viewer_list_all();
-    let api_token = db.token_get().map_err(|e| e)?;
+    // stream_list()/viewer_list_all() silently drop rows that fail to
+    // decode, which would permanently omit them from the seeded cluster.
+    // read_replicated_snapshot() reads both tables in one transaction and
+    // surfaces every row/query failure instead.
+    let (streams, viewers, _owners, api_token, _cluster_id) = db.read_replicated_snapshot()?;
     if streams.is_empty() && viewers.is_empty() && api_token.is_none() {
         return Ok(());
     }

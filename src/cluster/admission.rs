@@ -17,7 +17,13 @@ pub trait IngressEligibility: Send + Sync {
 pub struct AdmissionController {
     config: ClusterConfig,
     health: Arc<HealthTracker>,
+    /// Load-based (automatic) drain hysteresis.
     draining: AtomicBool,
+    /// Operator-requested drain (via the drain endpoint / `force_drain`).
+    /// Kept separate from `draining` so a load update that drops back below
+    /// `resume_threshold` can't silently end an operator's intended
+    /// maintenance window.
+    manual_drain: AtomicBool,
     /// Last measured interface utilization 0.0–1.0 (or configured capacity).
     load: parking_lot::Mutex<f64>,
 }
@@ -28,6 +34,7 @@ impl AdmissionController {
             config,
             health,
             draining: AtomicBool::new(false),
+            manual_drain: AtomicBool::new(false),
             load: parking_lot::Mutex::new(0.0),
         })
     }
@@ -44,11 +51,15 @@ impl AdmissionController {
             );
         } else if self.draining.load(Ordering::Relaxed) && load <= self.config.resume_threshold {
             self.draining.store(false, Ordering::Relaxed);
-            if self.health.local() == NodeHealthState::Draining {
+            // Only the automatic (load-based) drain resumes here; an
+            // operator-requested drain must survive a load dip.
+            if !self.manual_drain.load(Ordering::Relaxed)
+                && self.health.local() == NodeHealthState::Draining
+            {
                 self.health.set_local(NodeHealthState::Ready);
             }
             crate::log_info!(
-                "Cluster admission: resuming READY (load={load:.2} <= {:.2})",
+                "Cluster admission: load-based draining cleared (load={load:.2} <= {:.2})",
                 self.config.resume_threshold
             );
         }
@@ -59,13 +70,19 @@ impl AdmissionController {
     }
 
     pub fn force_drain(&self) {
-        self.draining.store(true, Ordering::Relaxed);
+        self.manual_drain.store(true, Ordering::Relaxed);
         self.health.set_local(NodeHealthState::Draining);
     }
 
     pub fn force_resume(&self) {
-        self.draining.store(false, Ordering::Relaxed);
-        self.health.set_local(NodeHealthState::Ready);
+        self.manual_drain.store(false, Ordering::Relaxed);
+        // Resume clears only an operator-requested drain; it must not
+        // override a stronger unavailability state (ISOLATED/DOWN/LEAVING)
+        // that reflects real cluster/network conditions the next health
+        // sweep hasn't cleared yet.
+        if self.health.local() == NodeHealthState::Draining {
+            self.health.set_local(NodeHealthState::Ready);
+        }
     }
 }
 
@@ -78,6 +95,7 @@ impl IngressEligibility for AdmissionController {
         let state = self.health.local();
         matches!(state, NodeHealthState::Ready | NodeHealthState::Learner)
             && !self.draining.load(Ordering::Relaxed)
+            && !self.manual_drain.load(Ordering::Relaxed)
     }
 
     fn should_accept_new_play(&self) -> bool {

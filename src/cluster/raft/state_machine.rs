@@ -117,25 +117,6 @@ impl SqliteStateMachine {
         }
     }
 
-    fn persist_applied(&self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let json = serde_json::to_string(&log_id).map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_state_machine(&e),
-        })?;
-        self.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO raft_meta(key,val) VALUES('last_applied',?) \
-                 ON CONFLICT(key) DO UPDATE SET val=excluded.val",
-                params![json],
-            )
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_state_machine(&e),
-            })?;
-            Ok::<(), StorageError<u64>>(())
-        })?;
-        *self.last_applied.lock() = Some(log_id);
-        Ok(())
-    }
-
     /// Persist `last_applied` (+ optional membership) in one SQLite transaction.
     fn persist_applied_tx(
         &self,
@@ -217,15 +198,29 @@ impl SqliteStateMachine {
             ClusterCommand::DeleteViewer {
                 stream_id,
                 viewer_id,
-            } => match self.db.viewer_delete(stream_id, viewer_id) {
-                Some(true) => {
-                    self.db.players_deactivate_for_viewer(viewer_id);
-                    self.emit_effect(StateEffect::RevokeViewer(viewer_id.clone()));
-                    ClusterResponse::Ok
+            } => {
+                // The HTTP layer only pre-checks "not the last viewer" before
+                // proposing this command, so two concurrent last-viewer deletes
+                // submitted through different nodes can both pass that check.
+                // Raft serializes the actual applies, so recheck here — the
+                // second one to apply must not leave the stream with zero
+                // usable play keys.
+                let viewers = self.db.viewer_list(stream_id);
+                let would_remove_last =
+                    viewers.len() == 1 && viewers.iter().any(|v| v.id == *viewer_id);
+                if would_remove_last {
+                    return ClusterResponse::Conflict;
                 }
-                Some(false) => ClusterResponse::NotFound,
-                None => ClusterResponse::Error("db".into()),
-            },
+                match self.db.viewer_delete(stream_id, viewer_id) {
+                    Some(true) => {
+                        self.db.players_deactivate_for_viewer(viewer_id);
+                        self.emit_effect(StateEffect::RevokeViewer(viewer_id.clone()));
+                        ClusterResponse::Ok
+                    }
+                    Some(false) => ClusterResponse::NotFound,
+                    None => ClusterResponse::Error("db".into()),
+                }
+            }
             ClusterCommand::SetApiToken { token } => match self.db.token_replace(token) {
                 Ok(()) => {
                     self.emit_effect(StateEffect::ApiToken(token.clone()));
@@ -306,6 +301,7 @@ impl SqliteStateMachine {
     fn build_app_snapshot(&self) -> Result<AppSnapshot, String> {
         let (streams, viewers, owners, api_token, cluster_id) =
             self.db.read_replicated_snapshot()?;
+        let pending_delete_stream_ids = self.db.stream_ids_pending_delete();
         Ok(AppSnapshot {
             streams,
             viewers,
@@ -313,124 +309,141 @@ impl SqliteStateMachine {
             api_token,
             cluster_id,
             last_applied_index: self.last_applied.lock().map(|l| l.index),
+            pending_delete_stream_ids,
         })
     }
 
     fn install_app_snapshot(&self, snap: &AppSnapshot) -> Result<(), String> {
-        // Snapshot local session children before deleting `streams` — FK CASCADE
-        // would otherwise wipe publishers/players/stats_samples while RTMP is live.
-        let local_pubs =
-            self.db
-                .with_conn(|conn| -> Result<Vec<crate::db::Publisher>, String> {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id,stream_id,app,stream_name,video_codec,audio_codec,\
+        // Everything below runs inside one locked connection + one transaction
+        // so a concurrently running RTMP connection on this node can never
+        // observe a torn state: streams/local sessions deleted but not yet
+        // reinserted, or a captured pre-delete session row reinserted after
+        // (and overwriting) a legitimate concurrent update. `Db::with_conn`
+        // holds the connection mutex for the whole closure, which is what
+        // actually provides that exclusion — every other `db.rs` accessor
+        // goes through the same mutex.
+        self.db.with_conn(|conn| -> Result<(), String> {
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+
+            // Snapshot local session children before deleting `streams` — FK
+            // CASCADE would otherwise wipe publishers/players/stats_samples.
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id,stream_id,app,stream_name,video_codec,audio_codec,\
                      video_width,video_height,fps,audio_sample_rate,audio_channels,\
                      bytes_in,bitrate_kbps,rtt_ms,connected_at,active FROM publishers",
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok(crate::db::Publisher {
-                                id: row.get(0)?,
-                                stream_id: row.get(1)?,
-                                app: row.get(2)?,
-                                stream_name: row.get(3)?,
-                                video_codec: row.get(4)?,
-                                audio_codec: row.get(5)?,
-                                video_width: row.get(6)?,
-                                video_height: row.get(7)?,
-                                fps: row.get(8)?,
-                                audio_sample_rate: row.get(9)?,
-                                audio_channels: row.get(10)?,
-                                bytes_in: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
-                                bitrate_kbps: row.get(12)?,
-                                rtt_ms: row.get(13)?,
-                                connected_at: row.get(14)?,
-                                active: row.get(15)?,
-                            })
-                        })
-                        .map_err(|e| e.to_string())?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| e.to_string())
-                })?;
-        let local_players =
-            self.db
-                .with_conn(|conn| -> Result<Vec<crate::db::Player>, String> {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id,stream_id,viewer_id,app,stream_name,bytes_out,\
-                     bitrate_kbps,rtt_ms,connected_at,active FROM players",
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok(crate::db::Player {
-                                id: row.get(0)?,
-                                stream_id: row.get(1)?,
-                                viewer_id: row.get(2)?,
-                                app: row.get(3)?,
-                                stream_name: row.get(4)?,
-                                bytes_out: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
-                                bitrate_kbps: row.get(6)?,
-                                rtt_ms: row.get(7)?,
-                                connected_at: row.get(8)?,
-                                active: row.get(9)?,
-                            })
-                        })
-                        .map_err(|e| e.to_string())?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| e.to_string())
-                })?;
-        let local_stats =
-            self.db
-                .with_conn(|conn| -> Result<Vec<crate::db::StatSample>, String> {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,\
-                     audio_codec,player_count,ts FROM stats_samples",
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok(crate::db::StatSample {
-                                stream_id: row.get(0)?,
-                                bitrate_in_kbps: row.get(1)?,
-                                fps: row.get(2)?,
-                                width: row.get(3)?,
-                                height: row.get(4)?,
-                                video_codec: row.get(5)?,
-                                audio_codec: row.get(6)?,
-                                player_count: row.get(7)?,
-                                ts: row.get(8)?,
-                            })
-                        })
-                        .map_err(|e| e.to_string())?;
-                    rows.collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| e.to_string())
-                })?;
+                )
+                .map_err(|e| e.to_string())?;
+            let local_pubs: Vec<crate::db::Publisher> = stmt
+                .query_map([], |row| {
+                    Ok(crate::db::Publisher {
+                        id: row.get(0)?,
+                        stream_id: row.get(1)?,
+                        app: row.get(2)?,
+                        stream_name: row.get(3)?,
+                        video_codec: row.get(4)?,
+                        audio_codec: row.get(5)?,
+                        video_width: row.get(6)?,
+                        video_height: row.get(7)?,
+                        fps: row.get(8)?,
+                        audio_sample_rate: row.get(9)?,
+                        audio_channels: row.get(10)?,
+                        bytes_in: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                        bitrate_kbps: row.get(12)?,
+                        rtt_ms: row.get(13)?,
+                        connected_at: row.get(14)?,
+                        active: row.get(15)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            drop(stmt);
 
-        // Only wipe durable replicated tables.
-        self.db.with_conn(|conn| {
-            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id,stream_id,viewer_id,app,stream_name,bytes_out,\
+                     bitrate_kbps,rtt_ms,connected_at,active FROM players",
+                )
+                .map_err(|e| e.to_string())?;
+            let local_players: Vec<crate::db::Player> = stmt
+                .query_map([], |row| {
+                    Ok(crate::db::Player {
+                        id: row.get(0)?,
+                        stream_id: row.get(1)?,
+                        viewer_id: row.get(2)?,
+                        app: row.get(3)?,
+                        stream_name: row.get(4)?,
+                        bytes_out: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                        bitrate_kbps: row.get(6)?,
+                        rtt_ms: row.get(7)?,
+                        connected_at: row.get(8)?,
+                        active: row.get(9)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            drop(stmt);
+
+            let mut stmt = tx
+                .prepare(
+                    "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,\
+                     audio_codec,player_count,ts FROM stats_samples",
+                )
+                .map_err(|e| e.to_string())?;
+            let local_stats: Vec<crate::db::StatSample> = stmt
+                .query_map([], |row| {
+                    Ok(crate::db::StatSample {
+                        stream_id: row.get(0)?,
+                        bitrate_in_kbps: row.get(1)?,
+                        fps: row.get(2)?,
+                        width: row.get(3)?,
+                        height: row.get(4)?,
+                        video_codec: row.get(5)?,
+                        audio_codec: row.get(6)?,
+                        player_count: row.get(7)?,
+                        ts: row.get(8)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            drop(stmt);
+
+            // Only wipe durable replicated tables.
             tx.execute_batch(
                 "DELETE FROM stream_owners;
                  DELETE FROM stream_viewers;
                  DELETE FROM streams;",
             )
             .map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
-            Ok::<(), String>(())
-        })?;
-        for s in &snap.streams {
-            self.db
-                .stream_insert_only(s)
-                .map_err(|_| "stream_insert_only failed during snapshot install".to_string())?;
-        }
+            for s in &snap.streams {
+                tx.execute(
+                    "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
+                     VALUES (?,?,?,?,?,?,?,?)",
+                    params![
+                        s.id,
+                        s.name,
+                        s.app,
+                        s.publish_key,
+                        s.play_key,
+                        s.stats_key,
+                        s.enabled,
+                        s.created_at,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            for stream_id in &snap.pending_delete_stream_ids {
+                tx.execute(
+                    "UPDATE streams SET pending_delete=1 WHERE id=?",
+                    params![stream_id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
 
-        // Reinsert local session rows whose parent stream survived the snapshot.
-        self.db.with_conn(|conn| {
-            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            // Reinsert local session rows whose parent stream survived the snapshot.
             for p in &local_pubs {
                 let keep: bool = tx
                     .query_row(
@@ -720,25 +733,21 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     &std::io::Error::other(e),
                 ),
             })?;
-        *self.last_applied.lock() = meta.last_log_id;
         *self.last_membership.lock() = meta.last_membership.clone();
+        // Persist both values in a single transaction (persist_applied_tx):
+        // a crash between two separate writes here would leave the snapshot
+        // boundary recorded with stale membership, and once logs through
+        // that boundary are compacted, restart could resume with the wrong
+        // voter set.
         if let Some(log_id) = meta.last_log_id {
-            self.persist_applied(log_id)?;
+            let membership_json =
+                serde_json::to_string(&meta.last_membership).map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::write_state_machine(&e),
+                })?;
+            self.persist_applied_tx(log_id, Some(&membership_json))?;
+        } else {
+            *self.last_applied.lock() = meta.last_log_id;
         }
-        let json = serde_json::to_string(&meta.last_membership).map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_state_machine(&e),
-        })?;
-        self.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
-                 ON CONFLICT(key) DO UPDATE SET val=excluded.val",
-                params![json],
-            )
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_state_machine(&e),
-            })?;
-            Ok::<(), StorageError<u64>>(())
-        })?;
         *self.current_snapshot.lock() = Some(StoredSnapshot {
             meta: meta.clone(),
             data,

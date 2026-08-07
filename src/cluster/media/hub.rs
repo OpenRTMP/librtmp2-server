@@ -276,16 +276,27 @@ impl MediaHub {
             loop {
                 let msg = peer::read_media_frame(&mut rh).await?;
                 match msg {
-                    MediaMessage::Subscribe { app, stream, epoch } => {
+                    MediaMessage::Subscribe {
+                        app,
+                        stream,
+                        epoch: _,
+                    } => {
                         self.subs.add(peer_id, &app, &stream);
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
                         if let Some(cache) = self.cache.get(&app, &stream) {
+                            // Send the epoch the cache was actually captured
+                            // under, not the subscriber-requested one — a
+                            // stale cache from a previous owner must not be
+                            // relabeled as belonging to the current epoch, or
+                            // receiver-side epoch fencing would accept and
+                            // inject old codec state.
+                            let cache_epoch = cache.epoch;
                             let _ = peer::write_media_frame(
                                 &mut wh,
                                 &MediaMessage::InitCache {
                                     app: app.clone(),
                                     stream: stream.clone(),
-                                    epoch,
+                                    epoch: cache_epoch,
                                     metadata: cache.metadata,
                                     avc_header: cache.avc_header,
                                     aac_header: cache.aac_header,
@@ -437,6 +448,73 @@ impl MediaHub {
                     timestamp,
                     payload,
                 });
+            }
+            // A subscriber's outbound MediaPeer reader forwards the owner's
+            // InitCache reply here (see handle_inbound_conn's Subscribe arm,
+            // which writes it back over that same connection). Previously
+            // this hit the wildcard and was discarded, so late joiners on an
+            // outbound-subscriber connection never got cached codec headers
+            // or the last keyframe.
+            MediaMessage::InitCache {
+                app,
+                stream,
+                epoch,
+                metadata,
+                avc_header,
+                aac_header,
+                keyframe,
+            } => {
+                self.cache.put(
+                    &app,
+                    &stream,
+                    InitCacheEntry {
+                        metadata: metadata.clone(),
+                        avc_header: avc_header.clone(),
+                        aac_header: aac_header.clone(),
+                        keyframe: keyframe.clone(),
+                        epoch,
+                    },
+                );
+                if let Some(md) = metadata {
+                    let _ = self.inject.try_send(InjectedFrame {
+                        app: app.clone(),
+                        stream: stream.clone(),
+                        epoch,
+                        frame_type: 2,
+                        timestamp: 0,
+                        payload: md,
+                    });
+                }
+                if let Some(h) = avc_header {
+                    let _ = self.inject.try_send(InjectedFrame {
+                        app: app.clone(),
+                        stream: stream.clone(),
+                        epoch,
+                        frame_type: 1,
+                        timestamp: 0,
+                        payload: h,
+                    });
+                }
+                if let Some(h) = aac_header {
+                    let _ = self.inject.try_send(InjectedFrame {
+                        app: app.clone(),
+                        stream: stream.clone(),
+                        epoch,
+                        frame_type: 0,
+                        timestamp: 0,
+                        payload: h,
+                    });
+                }
+                if let Some((ts, kf)) = keyframe {
+                    let _ = self.inject.try_send(InjectedFrame {
+                        app,
+                        stream,
+                        epoch,
+                        frame_type: 1,
+                        timestamp: ts,
+                        payload: kf,
+                    });
+                }
             }
             _ => {}
         }

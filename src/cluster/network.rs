@@ -26,6 +26,12 @@ const MAX_FRAME: u32 = 64 * 1024 * 1024;
 /// Bound unauthenticated frames (challenge/auth) to limit DoS before AuthOk.
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds an entire authenticated client round trip (connect + TLS + auth +
+/// write + response read). Callers like `ClusterManager::block_on_write`
+/// invoke this synchronously from the RTMP poll thread when forwarding a
+/// write to the leader, so an unbounded call here can stall every
+/// connection's poll for as long as the OS TCP timeout.
+const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Combined IO trait so we can box plain TCP or rustls streams.
 trait ClusterIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -422,7 +428,14 @@ pub async fn serve_control_plane_listener(
         tokio::spawn(async move {
             let result = async {
                 if let Some(ref acc) = acceptor {
-                    let mut tls = acc.accept(stream).await?;
+                    // Bound the TLS handshake itself — a client that opens
+                    // the connection and never sends ClientHello would
+                    // otherwise stall this per-connection task forever.
+                    let mut tls = tokio::time::timeout(AUTH_TIMEOUT, acc.accept(stream))
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::TimedOut, "tls accept timeout")
+                        })??;
                     handle_control_conn(
                         &mut tls,
                         &secret,
@@ -680,6 +693,21 @@ async fn connect_raw(
 }
 
 async fn authed_roundtrip_inner(
+    addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    tls_client: Option<Arc<ClientConfig>>,
+    msg: ControlMessage,
+) -> Result<ControlMessage, String> {
+    tokio::time::timeout(
+        ROUNDTRIP_TIMEOUT,
+        authed_roundtrip_unbounded(addr, secret, local_id, tls_client, msg),
+    )
+    .await
+    .unwrap_or_else(|_| Err(format!("control round trip to {addr} timed out")))
+}
+
+async fn authed_roundtrip_unbounded(
     addr: &str,
     secret: &str,
     local_id: NodeId,

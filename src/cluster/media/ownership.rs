@@ -62,10 +62,14 @@ impl OwnershipTracker {
         }
     }
 
-    /// Sync from DB list; returns stream ids whose (node, epoch) changed.
+    /// Sync from DB list; returns (stream_id, previous (node, epoch)) for every
+    /// entry whose owner changed, so the caller can unsubscribe from the
+    /// actual previous owner — this map is already replaced with the new
+    /// owners by the time this returns, so a lookup afterward would only
+    /// ever see the new owner.
     /// Advances the local epoch counter past the highest observed epoch so a
     /// follower never reallocates a stale fencing token after release.
-    pub fn sync_from(&self, owners: &[StreamOwner]) -> Vec<String> {
+    pub fn sync_from(&self, owners: &[StreamOwner]) -> Vec<(String, Option<(u64, u64)>)> {
         let mut changed = Vec::new();
         let mut next = HashMap::with_capacity(owners.len());
         let mut max_epoch = 0u64;
@@ -77,12 +81,12 @@ impl OwnershipTracker {
         for (sid, new) in &next {
             match g.get(sid) {
                 Some(old) if old == new => {}
-                _ => changed.push(sid.clone()),
+                old => changed.push((sid.clone(), old.copied())),
             }
         }
         for sid in g.keys() {
             if !next.contains_key(sid) {
-                changed.push(sid.clone());
+                changed.push((sid.clone(), g.get(sid).copied()));
             }
         }
         *g = next;

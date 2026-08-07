@@ -85,21 +85,25 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
         self.db.with_conn(|conn| {
-            let last_purged: Option<String> = conn
-                .query_row(
-                    "SELECT val FROM raft_meta WHERE key='last_purged_log_id'",
-                    [],
-                    |r| r.get(0),
-                )
-                .ok();
+            let last_purged: Option<String> = match conn.query_row(
+                "SELECT val FROM raft_meta WHERE key='last_purged_log_id'",
+                [],
+                |r| r.get(0),
+            ) {
+                Ok(v) => Some(v),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(Self::read_err(e)),
+            };
             let last_purged_log_id = match last_purged {
                 Some(j) => Some(serde_json::from_str(&j).map_err(Self::read_err)?),
                 None => None,
             };
+            // MAX() over an empty table still returns one row with NULL (decoded
+            // as None below), so any Err here is a genuine read failure, not
+            // absence — never swallow it via .ok().
             let last_index: Option<i64> = conn
                 .query_row("SELECT MAX(log_index) FROM raft_log", [], |r| r.get(0))
-                .ok()
-                .flatten();
+                .map_err(Self::read_err)?;
             let last_log_id = if let Some(idx) = last_index {
                 let json: String = conn
                     .query_row(
@@ -139,11 +143,13 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
         self.db.with_conn(|conn| {
+            use rusqlite::OptionalExtension;
             let json: Option<String> = conn
                 .query_row("SELECT val FROM raft_meta WHERE key='committed'", [], |r| {
                     r.get(0)
                 })
-                .ok();
+                .optional()
+                .map_err(Self::read_err)?;
             match json {
                 Some(j) => Ok(serde_json::from_str(&j).map_err(Self::read_err)?),
                 None => Ok(None),

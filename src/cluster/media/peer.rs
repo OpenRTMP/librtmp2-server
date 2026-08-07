@@ -252,10 +252,16 @@ async fn connect_and_run(
                     break;
                 };
                 let size = approx_size(&msg);
+                // Account for this message being off the queue whether the
+                // write succeeds or the socket fails — a failed write still
+                // exits this loop and reconnects, and it must not leave
+                // queue_bytes permanently inflated by every message dropped
+                // this way (which would eventually make try_send() report
+                // the queue full even though the real channel is empty).
+                queue_bytes.fetch_sub(size.min(queue_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
                 if write_media_frame(&mut wh, &msg).await.is_err() {
                     break;
                 }
-                queue_bytes.fetch_sub(size.min(queue_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if read_closed.load(Ordering::Relaxed) {
@@ -358,7 +364,16 @@ pub(crate) async fn accept_tls_then_auth(
 ) -> Result<(NodeId, Box<dyn MediaIo>), std::io::Error> {
     let mut io: Box<dyn MediaIo> = if let Some(cfg) = tls_server {
         let acceptor = TlsAcceptor::from(cfg);
-        Box::new(acceptor.accept(stream).await?)
+        // A client that opens the TCP connection and never sends a
+        // ClientHello would otherwise hang this accept indefinitely; every
+        // accepted socket gets its own task, so repeated stalls could
+        // exhaust resources. Reuse the same deadline as the auth handshake.
+        let tls = tokio::time::timeout(AUTH_TIMEOUT, acceptor.accept(stream))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tls accept timeout")
+            })??;
+        Box::new(tls)
     } else {
         Box::new(stream)
     };
