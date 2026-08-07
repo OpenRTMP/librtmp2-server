@@ -160,11 +160,13 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         self.db.with_conn(|conn| {
+            use rusqlite::OptionalExtension;
             let json: Option<String> = conn
                 .query_row("SELECT vote_json FROM raft_vote WHERE id=1", [], |r| {
                     r.get(0)
                 })
-                .ok();
+                .optional()
+                .map_err(Self::read_err)?;
             match json {
                 Some(j) => Ok(Some(serde_json::from_str(&j).map_err(Self::read_err)?)),
                 None => Ok(None),

@@ -1,9 +1,13 @@
 services:
   server:
     build:
-      # Parent OpenRTMP context so path dependency ../librtmp2 resolves.
-      context: ..
-      dockerfile: librtmp2-server/Dockerfile
+      # Default: standalone clone of this repo (`docker compose up -d`).
+      # Dockerfile fetches librtmp2 from Git when the context is librtmp2-server.
+      # Optional monorepo override (OpenRTMP parent with sibling librtmp2/):
+      #   context: ..
+      #   dockerfile: librtmp2-server/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     image: ghcr.io/OpenRTMP/librtmp2-server:latest
     container_name: librtmp2-server
     restart: unless-stopped

@@ -135,6 +135,12 @@ pub enum ControlMessage {
     ClientWrite(serde_json::Value),
     /// `{"ok":true,"data":...}` or `{"ok":false,"error":"..."}`.
     ClientWriteResp(serde_json::Value),
+    /// Follower-forwarded OpenRaft membership change (JSON `ChangeMembers`).
+    ChangeMembership(serde_json::Value),
+    ChangeMembershipResp {
+        ok: bool,
+        message: String,
+    },
 }
 
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(
@@ -362,7 +368,38 @@ pub async fn serve_control_plane(
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(bind).await?;
+    serve_control_plane_listener(
+        listener,
+        secret,
+        local_id,
+        raft,
+        on_join,
+        on_heartbeat,
+        on_admin,
+        on_stats,
+        tls_server,
+    )
+    .await
+}
+
+/// Serve on an already-bound listener (bind-before-spawn startup).
+pub async fn serve_control_plane_listener(
+    listener: TcpListener,
+    secret: String,
+    local_id: NodeId,
+    raft: Raft,
+    on_join: JoinAcceptFn,
+    on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
+    on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
+    on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+    tls_server: Option<Arc<ServerConfig>>,
+) -> Result<(), std::io::Error> {
     let acceptor = tls_server.map(TlsAcceptor::from);
+    let bind = listener.local_addr().unwrap_or_else(|_| {
+        "0.0.0.0:0"
+            .parse()
+            .expect("static bind parse")
+    });
     tracing::info!(%bind, tls = acceptor.is_some(), "cluster control plane listening");
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -552,6 +589,21 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 }),
             };
             ControlMessage::ClientWriteResp(body)
+        }
+        ControlMessage::ChangeMembership(req) => {
+            use openraft::ChangeMembers;
+            let change: ChangeMembers<NodeId, BasicNode> =
+                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
+            match raft.change_membership(change, false).await {
+                Ok(_) => ControlMessage::ChangeMembershipResp {
+                    ok: true,
+                    message: "ok".into(),
+                },
+                Err(e) => ControlMessage::ChangeMembershipResp {
+                    ok: false,
+                    message: e.to_string(),
+                },
+            }
         }
         admin @ (ControlMessage::AdminDrain { .. }
         | ControlMessage::AdminResume { .. }
@@ -874,5 +926,33 @@ pub async fn send_client_write(
         }
         ControlMessage::AdminErr { message } => Err(message),
         _ => Err("unexpected client write response".into()),
+    }
+}
+
+/// Forward an OpenRaft membership change to the current leader.
+pub async fn send_change_membership(
+    leader_addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    change: openraft::ChangeMembers<NodeId, BasicNode>,
+    tls_client: Option<Arc<ClientConfig>>,
+) -> Result<(), String> {
+    let req = serde_json::to_value(&change).map_err(|e| e.to_string())?;
+    match authed_roundtrip_inner(
+        leader_addr,
+        secret,
+        local_id,
+        tls_client,
+        ControlMessage::ChangeMembership(req),
+    )
+    .await?
+    {
+        ControlMessage::ChangeMembershipResp { ok: true, .. } => Ok(()),
+        ControlMessage::ChangeMembershipResp {
+            ok: false,
+            message,
+        } => Err(message),
+        ControlMessage::AdminErr { message } => Err(message),
+        _ => Err("unexpected change membership response".into()),
     }
 }

@@ -6,7 +6,9 @@ use std::time::Duration;
 use openraft::BasicNode;
 use openraft::Config as RaftConfig;
 use openraft::RaftMetrics;
+use openraft::ChangeMembers;
 use parking_lot::Mutex;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::cluster::NodeId;
@@ -19,7 +21,7 @@ use crate::cluster::health::{HealthTracker, NodeHealthState};
 use crate::cluster::media::hub::{ExportedFrame, InjectedFrame, MediaHub};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::membership::{
-    bootstrap_single_node, check_join_reseed, promote_learners, remove_node, seed_from_local_db,
+    bootstrap_single_node, check_join_reseed, seed_from_local_db, verify_cluster_identity,
     JoinReseedAction,
 };
 use crate::cluster::metrics::{ClusterMetrics, ClusterStreamInfo, NodeInfo};
@@ -247,13 +249,17 @@ impl ClusterManager {
             let bind = config
                 .control_socket_addr()
                 .map_err(|e| format!("CLUSTER_BIND: {e}"))?;
+            // Bind before spawn so startup fails hard on port conflict (same as media).
+            let listener = TcpListener::bind(bind)
+                .await
+                .map_err(|e| format!("CLUSTER_BIND {bind}: {e}"))?;
             let raft_c = mgr.raft.clone();
             let secret = config.secret.clone();
             let local_id = config.node_id;
             let tls_srv = tls_server.clone();
             tokio::spawn(async move {
-                if let Err(e) = network::serve_control_plane(
-                    bind,
+                if let Err(e) = network::serve_control_plane_listener(
+                    listener,
                     secret,
                     local_id,
                     raft_c,
@@ -282,7 +288,7 @@ impl ClusterManager {
             if db.raft_has_state() {
                 // Existing voter restart — do not re-initialize OpenRaft storage.
                 if let Some(ref join_addr) = config.join {
-                    let _ = mgr.refresh_topology_from(join_addr).await;
+                    mgr.refresh_topology_from(join_addr).await?;
                 }
                 health.set_local(NodeHealthState::Ready);
                 crate::log_info!(
@@ -308,7 +314,7 @@ impl ClusterManager {
         } else if let Some(ref join_addr) = config.join {
             match join_action {
                 JoinReseedAction::ResumeExisting => {
-                    let _ = mgr.refresh_topology_from(join_addr).await;
+                    mgr.refresh_topology_from(join_addr).await?;
                     health.set_local(NodeHealthState::Ready);
                     crate::log_info!(
                         "Cluster: resuming existing member node {} (CLUSTER_JOIN set but local raft state present)",
@@ -384,6 +390,10 @@ impl ClusterManager {
 
     pub fn admission(&self) -> &Arc<AdmissionController> {
         &self.admission
+    }
+
+    pub fn should_accept_new_play(&self) -> bool {
+        self.admission.should_accept_new_play()
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -589,9 +599,11 @@ impl ClusterManager {
 
     pub async fn remove_peer(&self, node_id: NodeId) -> Result<(), String> {
         let _ = self.release_owners_for_node(node_id);
-        remove_node(&self.raft, node_id)
-            .await
-            .map_err(|e| format!("remove node: {e}"))?;
+        self.change_membership_forwarded(ChangeMembers::RemoveVoters(
+            std::collections::BTreeSet::from([node_id]),
+        ))
+        .await
+        .map_err(|e| format!("remove node: {e}"))?;
         self.media.disconnect_peer(node_id);
         self.meta.remove(node_id);
         self.network.nodes.write().remove(&node_id);
@@ -600,11 +612,46 @@ impl ClusterManager {
     }
 
     pub async fn promote_learner(&self, node_id: NodeId) -> Result<(), String> {
-        promote_learners(&self.raft, [node_id])
-            .await
-            .map_err(|e| format!("promote: {e}"))?;
+        self.change_membership_forwarded(ChangeMembers::AddVoterIds(
+            std::collections::BTreeSet::from([node_id]),
+        ))
+        .await
+        .map_err(|e| format!("promote: {e}"))?;
         crate::log_info!("Cluster: node {node_id} promoted to voter");
         Ok(())
+    }
+
+    /// Run `change_membership` locally or forward to the current leader.
+    async fn change_membership_forwarded(
+        &self,
+        change: ChangeMembers<NodeId, BasicNode>,
+    ) -> Result<(), String> {
+        use openraft::error::{ClientWriteError, RaftError};
+
+        match self.raft.change_membership(change.clone(), false).await {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                let leader_addr = ftl
+                    .leader_node
+                    .map(|n| n.addr)
+                    .or_else(|| {
+                        ftl.leader_id
+                            .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
+                    })
+                    .ok_or_else(|| {
+                        "forward_to_leader: no leader address available".to_string()
+                    })?;
+                network::send_change_membership(
+                    &leader_addr,
+                    &self.config.secret,
+                    self.config.node_id,
+                    change,
+                    self.tls_client.clone(),
+                )
+                .await
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn forward_admin(
@@ -852,7 +899,9 @@ impl ClusterManager {
             self.tls_client.clone(),
         )
         .await?;
-        if !cluster_id.is_empty() {
+        let local = self.db.setting_get(CLUSTER_ID_SETTING);
+        verify_cluster_identity(local.as_deref(), &cluster_id)?;
+        if !cluster_id.is_empty() && local.is_none() {
             let _ = self.db.setting_set(CLUSTER_ID_SETTING, &cluster_id);
         }
         for p in peers {
@@ -1059,15 +1108,18 @@ impl ClusterManager {
             ticker.tick().await;
             self.process_state_effects();
             if !self.config.bandwidth_interface.is_empty() {
-                match measure_interface_utilization(
-                    &self.config.bandwidth_interface,
-                    self.config.bandwidth_max_mbps,
-                    self.config.bandwidth_mode,
-                ) {
-                    Ok(load) => self.admission.update_load(load),
-                    Err(e) => {
-                        crate::log_warn!("Cluster bandwidth: {e}");
-                    }
+                let iface = self.config.bandwidth_interface.clone();
+                let max = self.config.bandwidth_max_mbps;
+                let mode = self.config.bandwidth_mode;
+                // Probe sleeps ~200ms — keep it off the Tokio worker.
+                match tokio::task::spawn_blocking(move || {
+                    measure_interface_utilization(&iface, max, mode)
+                })
+                .await
+                {
+                    Ok(Ok(load)) => self.admission.update_load(load),
+                    Ok(Err(e)) => crate::log_warn!("Cluster bandwidth: {e}"),
+                    Err(e) => crate::log_warn!("Cluster bandwidth probe join: {e}"),
                 }
             }
             let down = self.health.sweep_stale();

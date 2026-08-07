@@ -1,7 +1,8 @@
 # Build stage (official Rust toolchain — matches package rust-version / OpenRaft)
-# Preferred monorepo build (from OpenRTMP parent):
+# Standalone (default `docker compose` context `.`):
+#   docker build -t librtmp2-server .
+# Monorepo (parent OpenRTMP with sibling librtmp2/):
 #   docker build -f librtmp2-server/Dockerfile .
-# Standalone build (server repo only) clones librtmp2 from GitHub.
 FROM rust:1.97-bookworm AS builder
 
 RUN apt-get update \

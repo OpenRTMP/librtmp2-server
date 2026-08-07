@@ -475,6 +475,27 @@ fn recover_pending_stream_deletes(db: &Db) {
     }
 }
 
+#[cfg(feature = "cluster")]
+fn recover_pending_stream_deletes_via_coordinator(coordinator: &StateCoordinator) {
+    for id in coordinator.db().stream_ids_pending_delete() {
+        match coordinator.finalize_delete_stream(&id) {
+            Ok(()) => {
+                crate::log_warn!(
+                    "Recovered abandoned delete for stream '{id}' via Raft from a prior run"
+                );
+            }
+            Err(crate::state::CoordError::NotFound) => {
+                // Already gone on leader / concurrent finalize.
+            }
+            Err(e) => {
+                crate::log_error!(
+                    "Failed to recover abandoned delete for stream '{id}' via Raft: {e:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Load the API bearer token from the database, seeding it from `LRTMP2_API_TOKEN`
 /// or generating a new value on first startup.
 fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
@@ -560,6 +581,13 @@ impl ServerApp {
         );
 
         config.api_token = resolve_api_token(&db, db_path)?;
+        // Standalone: finalize abandoned deletes locally. Cluster mode must not
+        // mutate SQLite here — recovery runs via Raft after ClusterManager starts.
+        #[cfg(feature = "cluster")]
+        if !config.cluster.enabled {
+            recover_pending_stream_deletes(&db);
+        }
+        #[cfg(not(feature = "cluster"))]
         recover_pending_stream_deletes(&db);
 
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
@@ -598,6 +626,8 @@ impl ServerApp {
                 .await?;
                 let coord = Arc::new(StateCoordinator::cluster(mgr));
                 self.rtmp_bridge.set_coordinator(Arc::clone(&coord));
+                // Pending deletes must go through Raft so all replicas converge.
+                recover_pending_stream_deletes_via_coordinator(&coord);
                 coord
             } else {
                 Arc::clone(&self.coordinator)

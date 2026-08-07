@@ -940,6 +940,18 @@ impl DbRtmpBridge {
             return Err(AuthFailureKind::Credential);
         }
 
+        #[cfg(feature = "cluster")]
+        if let Some(coord) = self.coordinator.lock().clone()
+            && let Some(mgr) = coord.cluster_manager()
+            && !mgr.should_accept_new_play()
+        {
+            crate::log_warn!(
+                "RTMP: play rejected — cluster admission unavailable for stream '{}' from {peer}",
+                stream.id
+            );
+            return Err(AuthFailureKind::Operational);
+        }
+
         let player_id = match keygen::keygen_stream_key(PREFIX_PLAY_KEY) {
             Ok(id) => id,
             Err(e) => {

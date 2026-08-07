@@ -242,11 +242,30 @@ impl SqliteStateMachine {
                 viewers,
                 api_token,
             } => {
+                // Bootstrap node already has these rows; Duplicate is expected.
+                // Any other failure must surface so last_applied does not advance.
                 for s in streams {
-                    let _ = self.db.stream_insert_only(s);
+                    match self.db.stream_insert_only(s) {
+                        Ok(()) | Err(StreamAddError::Duplicate) => {}
+                        Err(StreamAddError::Db) => {
+                            return ClusterResponse::Error(
+                                "stream_insert_only failed during SeedFromStandalone".into(),
+                            );
+                        }
+                    }
                 }
                 for v in viewers {
-                    let _ = self.db.viewer_add(v);
+                    if self.db.viewer_add(v) {
+                        continue;
+                    }
+                    match self.db.viewer_get(&v.stream_id, &v.id) {
+                        crate::db::DbLookup::Ok(_) => {}
+                        crate::db::DbLookup::Missing | crate::db::DbLookup::Failed => {
+                            return ClusterResponse::Error(
+                                "viewer_add failed during SeedFromStandalone".into(),
+                            );
+                        }
+                    }
                 }
                 if let Some(token) = api_token {
                     if let Err(e) = self.db.token_replace(token) {
@@ -275,7 +294,94 @@ impl SqliteStateMachine {
     }
 
     fn install_app_snapshot(&self, snap: &AppSnapshot) -> Result<(), String> {
-        // Only wipe durable replicated tables — keep local publishers/players/stats.
+        // Snapshot local session children before deleting `streams` — FK CASCADE
+        // would otherwise wipe publishers/players/stats_samples while RTMP is live.
+        let local_pubs = self.db.with_conn(|conn| -> Result<Vec<crate::db::Publisher>, String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id,stream_id,app,stream_name,video_codec,audio_codec,\
+                     video_width,video_height,fps,audio_sample_rate,audio_channels,\
+                     bytes_in,bitrate_kbps,rtt_ms,connected_at,active FROM publishers",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(crate::db::Publisher {
+                        id: row.get(0)?,
+                        stream_id: row.get(1)?,
+                        app: row.get(2)?,
+                        stream_name: row.get(3)?,
+                        video_codec: row.get(4)?,
+                        audio_codec: row.get(5)?,
+                        video_width: row.get(6)?,
+                        video_height: row.get(7)?,
+                        fps: row.get(8)?,
+                        audio_sample_rate: row.get(9)?,
+                        audio_channels: row.get(10)?,
+                        bytes_in: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                        bitrate_kbps: row.get(12)?,
+                        rtt_ms: row.get(13)?,
+                        connected_at: row.get(14)?,
+                        active: row.get(15)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })?;
+        let local_players = self.db.with_conn(|conn| -> Result<Vec<crate::db::Player>, String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id,stream_id,viewer_id,app,stream_name,bytes_out,\
+                     bitrate_kbps,rtt_ms,connected_at,active FROM players",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(crate::db::Player {
+                        id: row.get(0)?,
+                        stream_id: row.get(1)?,
+                        viewer_id: row.get(2)?,
+                        app: row.get(3)?,
+                        stream_name: row.get(4)?,
+                        bytes_out: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                        bitrate_kbps: row.get(6)?,
+                        rtt_ms: row.get(7)?,
+                        connected_at: row.get(8)?,
+                        active: row.get(9)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })?;
+        let local_stats = self.db.with_conn(|conn| -> Result<Vec<crate::db::StatSample>, String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT stream_id,bitrate_in_kbps,fps,width,height,video_codec,\
+                     audio_codec,player_count,ts FROM stats_samples",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(crate::db::StatSample {
+                        stream_id: row.get(0)?,
+                        bitrate_in_kbps: row.get(1)?,
+                        fps: row.get(2)?,
+                        width: row.get(3)?,
+                        height: row.get(4)?,
+                        video_codec: row.get(5)?,
+                        audio_codec: row.get(6)?,
+                        player_count: row.get(7)?,
+                        ts: row.get(8)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })?;
+
+        // Only wipe durable replicated tables.
         self.db.with_conn(|conn| {
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             tx.execute_batch(
@@ -292,6 +398,121 @@ impl SqliteStateMachine {
                 .stream_insert_only(s)
                 .map_err(|_| "stream_insert_only failed during snapshot install".to_string())?;
         }
+
+        // Reinsert local session rows whose parent stream survived the snapshot.
+        self.db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            for p in &local_pubs {
+                let keep: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM streams WHERE id=?",
+                        params![p.stream_id],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                if !keep {
+                    continue;
+                }
+                let bytes_in = i64::try_from(p.bytes_in).unwrap_or(i64::MAX);
+                tx.execute(
+                    "INSERT INTO publishers \
+                     (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,\
+                      video_height,fps,audio_sample_rate,audio_channels,bytes_in,\
+                      bitrate_kbps,rtt_ms,connected_at,active) \
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![
+                        p.id,
+                        p.stream_id,
+                        p.app,
+                        p.stream_name,
+                        p.video_codec,
+                        p.audio_codec,
+                        p.video_width,
+                        p.video_height,
+                        p.fps,
+                        p.audio_sample_rate,
+                        p.audio_channels,
+                        bytes_in,
+                        p.bitrate_kbps,
+                        p.rtt_ms,
+                        p.connected_at,
+                        p.active,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            for p in &local_players {
+                let keep: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM streams WHERE id=?",
+                        params![p.stream_id],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                if !keep {
+                    continue;
+                }
+                let bytes_out = i64::try_from(p.bytes_out).unwrap_or(i64::MAX);
+                tx.execute(
+                    "INSERT INTO players \
+                     (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,\
+                      rtt_ms,connected_at,active) \
+                     VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    params![
+                        p.id,
+                        p.stream_id,
+                        p.viewer_id,
+                        p.app,
+                        p.stream_name,
+                        bytes_out,
+                        p.bitrate_kbps,
+                        p.rtt_ms,
+                        p.connected_at,
+                        p.active,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            for s in &local_stats {
+                let keep: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM streams WHERE id=?",
+                        params![s.stream_id],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                if !keep {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO stats_samples \
+                     (stream_id,bitrate_in_kbps,fps,width,height,video_codec,\
+                      audio_codec,player_count,ts) \
+                     VALUES (?,?,?,?,?,?,?,?,?)",
+                    params![
+                        s.stream_id,
+                        s.bitrate_in_kbps,
+                        s.fps,
+                        s.width,
+                        s.height,
+                        s.video_codec,
+                        s.audio_codec,
+                        s.player_count,
+                        s.ts,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })?;
+
         for v in &snap.viewers {
             if !self.db.viewer_add(v) {
                 return Err("viewer_add failed during snapshot install".into());

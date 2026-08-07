@@ -14,6 +14,7 @@ pub enum JoinReseedAction {
     /// Empty DB — perform join handshake.
     FreshJoin,
     /// Local raft state already belongs to this deployment; skip join, resume.
+    /// Caller must still verify stored `cluster_id` against the target peer.
     ResumeExisting,
 }
 
@@ -22,12 +23,17 @@ pub enum JoinReseedAction {
 /// Allow restart of an existing member that still has `CLUSTER_JOIN` set when
 /// local raft state already exists (same cluster resume). Only refuse an
 /// unrelated populated DB / wrong-cluster leftover without raft membership.
+///
+/// When returning [`JoinReseedAction::ResumeExisting`], the caller must compare
+/// the local `cluster_id` to the join target (e.g. via topology) before
+/// applying peer metadata — see [`verify_cluster_identity`].
 pub fn check_join_reseed(db: &Db, joining: bool) -> Result<JoinReseedAction, String> {
     if !joining {
         return Ok(JoinReseedAction::FreshJoin);
     }
     if db.raft_has_state() {
         // Existing member restart with CLUSTER_JOIN still configured.
+        // Identity vs the join target is verified later (needs network).
         return Ok(JoinReseedAction::ResumeExisting);
     }
     if db.has_populated_app_state() {
@@ -45,6 +51,18 @@ pub fn check_join_reseed(db: &Db, joining: bool) -> Result<JoinReseedAction, Str
         );
     }
     Ok(JoinReseedAction::FreshJoin)
+}
+
+/// Fail when a persisted node would resume against a different cluster identity.
+pub fn verify_cluster_identity(local: Option<&str>, remote: &str) -> Result<(), String> {
+    match local {
+        Some(local) if !remote.is_empty() && local != remote => Err(format!(
+            "local cluster_id '{local}' does not match target cluster_id '{remote}'; \
+             refuse to mix deployments. Reseed with an empty DB \
+             (see docs/clustering.md#reseed)"
+        )),
+        _ => Ok(()),
+    }
 }
 
 pub async fn bootstrap_single_node(

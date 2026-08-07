@@ -104,9 +104,23 @@ impl ClusterConfig {
         F: FnMut(&str) -> Option<String>,
     {
         let mut cfg = ClusterConfig::default();
+        let mut drain_at_mbps: Option<f64> = None;
+        let mut resume_at_mbps: Option<f64> = None;
 
         let mut apply = |key: &str, val: &str| {
-            apply_cluster_kv(&mut cfg, key, val);
+            match key {
+                "CLUSTER_DRAIN_AT_MBPS" => {
+                    if let Ok(mbps) = val.parse::<f64>() {
+                        drain_at_mbps = Some(mbps);
+                    }
+                }
+                "CLUSTER_RESUME_AT_MBPS" => {
+                    if let Ok(mbps) = val.parse::<f64>() {
+                        resume_at_mbps = Some(mbps);
+                    }
+                }
+                _ => apply_cluster_kv(&mut cfg, key, val),
+            }
         };
 
         for key in CLUSTER_FILE_KEYS {
@@ -124,6 +138,8 @@ impl ClusterConfig {
             }
         }
 
+        normalize_absolute_bandwidth_thresholds(&mut cfg, drain_at_mbps, resume_at_mbps);
+
         if cfg.enabled {
             cfg.validate()?;
         }
@@ -137,11 +153,26 @@ impl ClusterConfig {
     where
         F: FnMut(&str) -> Option<String>,
     {
+        let mut drain_at_mbps: Option<f64> = None;
+        let mut resume_at_mbps: Option<f64> = None;
         for (env_key, file_key) in CLUSTER_ENV_OVERRIDES {
             if let Some(val) = get(env_key).filter(|v| !v.is_empty()) {
-                apply_cluster_kv(self, file_key, &val);
+                match *file_key {
+                    "CLUSTER_DRAIN_AT_MBPS" => {
+                        if let Ok(mbps) = val.parse::<f64>() {
+                            drain_at_mbps = Some(mbps);
+                        }
+                    }
+                    "CLUSTER_RESUME_AT_MBPS" => {
+                        if let Ok(mbps) = val.parse::<f64>() {
+                            resume_at_mbps = Some(mbps);
+                        }
+                    }
+                    _ => apply_cluster_kv(self, file_key, &val),
+                }
             }
         }
+        normalize_absolute_bandwidth_thresholds(self, drain_at_mbps, resume_at_mbps);
         if self.enabled {
             self.validate()?;
         }
@@ -405,11 +436,8 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
             }
         }
         "CLUSTER_DRAIN_AT_MBPS" => {
-            if let Ok(mbps) = val.parse::<f64>() {
-                if cfg.bandwidth_max_mbps > 0.0 {
-                    cfg.drain_threshold = (mbps / cfg.bandwidth_max_mbps).clamp(0.0, 1.0);
-                }
-            }
+            // Handled in a second pass after BANDWIDTH_MAX_MBPS is known.
+            let _ = val;
         }
         "CLUSTER_RESUME_THRESHOLD" => {
             if let Ok(v) = val.parse::<f64>() {
@@ -417,11 +445,8 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
             }
         }
         "CLUSTER_RESUME_AT_MBPS" => {
-            if let Ok(mbps) = val.parse::<f64>() {
-                if cfg.bandwidth_max_mbps > 0.0 {
-                    cfg.resume_threshold = (mbps / cfg.bandwidth_max_mbps).clamp(0.0, 1.0);
-                }
-            }
+            // Handled in a second pass after BANDWIDTH_MAX_MBPS is known.
+            let _ = val;
         }
         "CLUSTER_BANDWIDTH_MODE" => {
             if let Some(mode) = BandwidthMode::parse(val) {
@@ -455,6 +480,23 @@ fn parse_bool(val: &str, default: bool) -> bool {
         "1" | "true" | "TRUE" | "yes" | "YES" => true,
         "0" | "false" | "FALSE" | "no" | "NO" => false,
         _ => default,
+    }
+}
+
+/// Convert absolute Mbps thresholds once `bandwidth_max_mbps` is finalized.
+fn normalize_absolute_bandwidth_thresholds(
+    cfg: &mut ClusterConfig,
+    drain_at_mbps: Option<f64>,
+    resume_at_mbps: Option<f64>,
+) {
+    if cfg.bandwidth_max_mbps <= 0.0 {
+        return;
+    }
+    if let Some(mbps) = drain_at_mbps {
+        cfg.drain_threshold = (mbps / cfg.bandwidth_max_mbps).clamp(0.0, 1.0);
+    }
+    if let Some(mbps) = resume_at_mbps {
+        cfg.resume_threshold = (mbps / cfg.bandwidth_max_mbps).clamp(0.0, 1.0);
     }
 }
 
@@ -511,5 +553,21 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.node_id, 1);
         assert!(cfg.bootstrap);
+    }
+
+    #[test]
+    fn absolute_bandwidth_thresholds_normalize_after_max() {
+        let map = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef"),
+            ("CLUSTER_DRAIN_AT_MBPS", "800"),
+            ("CLUSTER_RESUME_AT_MBPS", "500"),
+            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
+        ]);
+        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!((cfg.drain_threshold - 0.8).abs() < f64::EPSILON);
+        assert!((cfg.resume_threshold - 0.5).abs() < f64::EPSILON);
     }
 }
