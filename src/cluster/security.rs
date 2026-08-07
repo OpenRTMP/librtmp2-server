@@ -43,11 +43,9 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     let file = File::open(path).map_err(|e| format!("open key {}: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
-    let keys: Result<Vec<_>, _> = rustls_pemfile::pkcs8_private_keys(&mut reader).collect();
-    let mut keys = keys.map_err(|e| format!("parse key {}: {e}", path.display()))?;
-    keys.pop()
-        .map(PrivateKeyDer::Pkcs8)
-        .ok_or_else(|| format!("no PKCS8 private key in {}", path.display()))
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| format!("parse key {}: {e}", path.display()))?
+        .ok_or_else(|| format!("no private key in {}", path.display()))
 }
 
 pub fn build_server_tls(

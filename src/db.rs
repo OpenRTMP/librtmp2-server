@@ -114,6 +114,12 @@ pub enum StreamAddError {
     Db,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerAddError {
+    Duplicate,
+    Db,
+}
+
 /// Result of a single-row lookup: found, not found, or a real DB error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbLookup<T> {
@@ -859,39 +865,46 @@ impl Db {
 
     const VIEWER_COLS: &'static str = "id,stream_id,name,play_key,enabled,created_at";
 
-    pub fn viewer_add(&self, v: &StreamViewer) -> bool {
+    pub fn viewer_add(&self, v: &StreamViewer) -> Result<(), ViewerAddError> {
         let conn = self.conn.lock();
         // Default viewer shares the stream's play_key (both rows hold it). Allow
         // that pairing; still reject when another viewer already owns the key or
         // when the key collides with a different stream's access keys.
-        let parent_play: Option<String> = conn
-            .query_row(
-                "SELECT play_key FROM streams WHERE id=?",
-                params![v.stream_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
+        let parent_play: Option<String> = match conn.query_row(
+            "SELECT play_key FROM streams WHERE id=?",
+            params![v.stream_id],
+            |r| r.get(0),
+        ) {
+            Ok(k) => Some(k),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                crate::log_error!("viewer_add: parent play_key lookup failed: {e}");
+                return Err(ViewerAddError::Db);
+            }
+        };
         let is_default_play = parent_play.as_deref() == Some(v.play_key.as_str());
         if is_default_play {
-            let taken: bool = conn
+            let taken = match conn
                 .query_row(
                     "SELECT 1 FROM stream_viewers WHERE play_key=? LIMIT 1",
                     params![v.play_key],
                     |_| Ok(true),
                 )
                 .optional()
-                .ok()
-                .flatten()
-                .is_some();
+            {
+                Ok(opt) => opt.is_some(),
+                Err(e) => {
+                    crate::log_error!("viewer_add: play_key taken check failed: {e}");
+                    return Err(ViewerAddError::Db);
+                }
+            };
             if taken {
-                return false;
+                return Err(ViewerAddError::Duplicate);
             }
         } else if Self::key_globally_in_use_locked(&conn, &v.play_key) {
-            return false;
+            return Err(ViewerAddError::Duplicate);
         }
-        conn.execute(
+        match conn.execute(
             "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
              VALUES (?,?,?,?,?,?)",
             params![
@@ -902,8 +915,21 @@ impl Db {
                 v.enabled,
                 v.created_at
             ],
-        )
-        .is_ok()
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                crate::log_error!("viewer_add insert failed for {}: {e}", v.id);
+                if matches!(
+                    e,
+                    rusqlite::Error::SqliteFailure(ref err, _)
+                        if err.code == rusqlite::ErrorCode::ConstraintViolation
+                ) {
+                    Err(ViewerAddError::Duplicate)
+                } else {
+                    Err(ViewerAddError::Db)
+                }
+            }
+        }
     }
 
     pub fn viewer_list(&self, stream_id: &str) -> Vec<StreamViewer> {
@@ -1074,23 +1100,34 @@ impl Db {
     }
 
     /// Release ownership only when the epoch matches (fencing).
-    pub fn stream_owner_release(&self, stream_id: &str, epoch: u64) -> bool {
+    /// `Ok(true)` = row deleted, `Ok(false)` = already released / epoch mismatch,
+    /// `Err(OwnerError::Db)` = SQLite failure.
+    pub fn stream_owner_release(&self, stream_id: &str, epoch: u64) -> Result<bool, OwnerError> {
         let conn = self.conn.lock();
-        conn.execute(
+        match conn.execute(
             "DELETE FROM stream_owners WHERE stream_id=? AND epoch=?",
             params![stream_id, epoch as i64],
-        )
-        .map(|n| n > 0)
-        .unwrap_or(false)
+        ) {
+            Ok(n) => Ok(n > 0),
+            Err(e) => {
+                crate::log_error!("stream_owner_release failed for {stream_id}: {e}");
+                Err(OwnerError::Db)
+            }
+        }
     }
 
-    pub fn stream_owners_release_for_node(&self, node_id: u64) -> usize {
+    pub fn stream_owners_release_for_node(&self, node_id: u64) -> Result<usize, OwnerError> {
         let conn = self.conn.lock();
-        conn.execute(
+        match conn.execute(
             "DELETE FROM stream_owners WHERE owner_node_id=?",
             params![node_id as i64],
-        )
-        .unwrap_or(0)
+        ) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                crate::log_error!("stream_owners_release_for_node failed for {node_id}: {e}");
+                Err(OwnerError::Db)
+            }
+        }
     }
 
     /// True when this DB already has raft log/vote/meta/snapshot state (joining a
@@ -1976,8 +2013,9 @@ mod tests {
             enabled: true,
             created_at: now_ts(),
         };
-        assert!(
-            !db.viewer_add(&viewer),
+        assert_eq!(
+            db.viewer_add(&viewer),
+            Err(ViewerAddError::Duplicate),
             "viewer play_key must not reuse another stream's publish_key"
         );
     }

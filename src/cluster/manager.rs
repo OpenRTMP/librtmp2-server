@@ -18,7 +18,7 @@ use crate::cluster::admission::{
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::health::{HealthTracker, NodeHealthState};
-use crate::cluster::media::hub::{ExportedFrame, InjectedFrame, MediaHub};
+use crate::cluster::media::hub::{ExportedFrame, InjectQueue, InjectedFrame, MediaHub};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::membership::{
     bootstrap_single_node, check_join_reseed, seed_from_local_db, verify_cluster_identity,
@@ -48,7 +48,9 @@ pub struct ClusterManager {
     media: Arc<MediaHub>,
     meta: Arc<ClusterMeta>,
     ownership: Arc<OwnershipTracker>,
-    inject_rx: Mutex<mpsc::UnboundedReceiver<InjectedFrame>>,
+    inject: Arc<InjectQueue>,
+    /// Ordered export path — one worker preserves RTMP frame order.
+    export_tx: mpsc::UnboundedSender<ExportedFrame>,
     rt_handle: tokio::runtime::Handle,
     last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
     tls_client: Option<Arc<ClientConfig>>,
@@ -56,6 +58,8 @@ pub struct ClusterManager {
     session_hooks: Mutex<Option<SessionHooks>>,
     /// Per-peer publisher/player counts from heartbeats.
     peer_session_counts: Mutex<std::collections::HashMap<NodeId, (u64, u64)>>,
+    /// Per-peer per-stream player counts from heartbeats.
+    peer_stream_players: Mutex<std::collections::HashMap<NodeId, std::collections::HashMap<String, u64>>>,
     /// Raft state-machine side-effect channel (drain/revoke/token).
     effects_rx: Mutex<
         Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>,
@@ -120,7 +124,8 @@ impl ClusterManager {
         );
 
         let log_store = SqliteLogStore::new(Arc::clone(&db));
-        let state_machine = SqliteStateMachine::new(Arc::clone(&db));
+        let state_machine = SqliteStateMachine::new(Arc::clone(&db))
+            .map_err(|e| format!("state machine init: {e}"))?;
         let sm_handle = state_machine.clone();
         let (effects_tx, effects_rx) = std::sync::mpsc::channel();
         sm_handle.set_effects_tx(effects_tx);
@@ -150,17 +155,26 @@ impl ClusterManager {
         let admission = AdmissionController::new(config.clone(), Arc::clone(&health));
         let ownership = Arc::new(OwnershipTracker::new());
         ownership.hydrate_from(&db.stream_owner_list());
-        let (inject_tx, inject_rx) = mpsc::unbounded_channel();
+        let inject = InjectQueue::new(config.media_queue_mb);
         let media = MediaHub::new(
             config.node_id,
             config.secret.clone(),
             config.media_queue_mb,
             config.media_replicas,
             Arc::clone(&ownership),
-            inject_tx,
+            Arc::clone(&inject),
             tls_server.clone(),
             tls_client.clone(),
         );
+        let (export_tx, mut export_rx) = mpsc::unbounded_channel::<ExportedFrame>();
+        {
+            let media_export = Arc::clone(&media);
+            tokio::spawn(async move {
+                while let Some(frame) = export_rx.recv().await {
+                    media_export.fanout_local_frame(frame).await;
+                }
+            });
+        }
         let meta = Arc::new(ClusterMeta::new());
 
         let advertise = config.advertise_control();
@@ -178,12 +192,14 @@ impl ClusterManager {
             media: Arc::clone(&media),
             meta: Arc::clone(&meta),
             ownership,
-            inject_rx: Mutex::new(inject_rx),
+            inject,
+            export_tx,
             rt_handle,
             last_metrics: Mutex::new(None),
             tls_client: tls_client.clone(),
             session_hooks: Mutex::new(None),
             peer_session_counts: Mutex::new(std::collections::HashMap::new()),
+            peer_stream_players: Mutex::new(std::collections::HashMap::new()),
             effects_rx: Mutex::new(Some(effects_rx)),
         });
 
@@ -237,6 +253,13 @@ impl ClusterManager {
                         .peer_session_counts
                         .lock()
                         .insert(info.node_id, (info.publishers, info.players));
+                    counts_hb
+                        .peer_stream_players
+                        .lock()
+                        .insert(
+                            info.node_id,
+                            info.stream_players.into_iter().collect(),
+                        );
                 });
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
@@ -409,19 +432,12 @@ impl ClusterManager {
     }
 
     pub fn enqueue_export(&self, frame: ExportedFrame) {
-        let media = Arc::clone(&self.media);
-        self.rt_handle.spawn(async move {
-            media.fanout_local_frame(frame).await;
-        });
+        // Single ordered worker — do not spawn per-frame tasks (reorder risk).
+        let _ = self.export_tx.send(frame);
     }
 
     pub fn drain_injects(&self) -> Vec<InjectedFrame> {
-        let mut out = Vec::new();
-        let mut rx = self.inject_rx.lock();
-        while let Ok(frame) = rx.try_recv() {
-            out.push(frame);
-        }
-        out
+        self.inject.drain()
     }
 
     pub fn create_stream(&self, stream: &Stream) -> Result<(), CoordError> {
@@ -1128,10 +1144,14 @@ impl ClusterManager {
             let is_leader =
                 metrics.as_ref().and_then(|m| m.current_leader) == Some(self.config.node_id);
             if is_leader {
-                for id in down {
+                for id in &down {
                     crate::log_info!("Cluster: node {id} DOWN — releasing owners");
-                    let _ = self.release_owners_for_node(id);
+                    let _ = self.release_owners_for_node(*id);
                 }
+            }
+            for id in &down {
+                self.peer_session_counts.lock().remove(id);
+                self.peer_stream_players.lock().remove(id);
             }
             // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
             self.sync_ownership_from_db();
@@ -1147,6 +1167,12 @@ impl ClusterManager {
                 .iter()
                 .filter(|p| p.active)
                 .count() as u64;
+            let mut stream_players: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            for p in self.db.player_list_all().iter().filter(|p| p.active) {
+                *stream_players.entry(p.stream_id.clone()).or_insert(0) += 1;
+            }
+            let stream_players: Vec<(String, u64)> = stream_players.into_iter().collect();
             let advertise = self.config.advertise_control();
             let media_advertise = self.config.advertise_media();
             // Emit heartbeats to known peers
@@ -1164,6 +1190,7 @@ impl ClusterManager {
                     media_advertise.clone(),
                     local_pubs,
                     local_players,
+                    stream_players.clone(),
                     self.tls_client.clone(),
                 )
                 .await;
@@ -1378,6 +1405,12 @@ impl ClusterManager {
         for (id, peer) in self.health.peers_snapshot() {
             let age = peer.last_seen.elapsed().as_secs();
             let is_voter = voter_ids.contains(&id);
+            let (peer_pubs, peer_players) = self
+                .peer_session_counts
+                .lock()
+                .get(&id)
+                .copied()
+                .unwrap_or((0, 0));
             out.push(NodeInfo {
                 id,
                 name: format!("node-{id}"),
@@ -1397,8 +1430,8 @@ impl ClusterManager {
                 rx_mbps: peer.load * cap,
                 tx_mbps: peer.load * cap,
                 capacity_mbps: cap,
-                publishers: 0,
-                players: 0,
+                publishers: peer_pubs as usize,
+                players: peer_players as usize,
                 last_heartbeat: format!("{age}s ago"),
                 control_addr: if peer.control_addr.is_empty() {
                     None
@@ -1416,6 +1449,7 @@ impl ClusterManager {
     }
 
     pub fn streams_info(&self) -> Vec<ClusterStreamInfo> {
+        let peer_stream = self.peer_stream_players.lock().clone();
         self.db
             .stream_list()
             .into_iter()
@@ -1428,6 +1462,10 @@ impl ClusterManager {
                     .iter()
                     .filter(|p| p.active)
                     .count();
+                let remote_players: u64 = peer_stream
+                    .values()
+                    .map(|m| m.get(&s.id).copied().unwrap_or(0))
+                    .sum();
                 // Standby = configured replica slots we are pushing to beyond subscribers.
                 let standby: Vec<NodeId> = if self.config.media_replicas > 0 {
                     self.meta
@@ -1453,7 +1491,7 @@ impl ClusterManager {
                     epoch: owner.as_ref().map(|o| o.epoch),
                     subscribed_nodes: subscribed,
                     standby_nodes: standby,
-                    cluster_players: local_players,
+                    cluster_players: local_players.saturating_add(remote_players as usize),
                 }
             })
             .collect()

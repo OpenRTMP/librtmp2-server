@@ -237,13 +237,19 @@ impl ClusterConfig {
                 }
             }
         }
+        if !self.drain_threshold.is_finite() || !(0.0..=1.0).contains(&self.drain_threshold) {
+            return Err("CLUSTER_DRAIN_THRESHOLD must be a finite value in 0.0..=1.0".into());
+        }
+        if !self.resume_threshold.is_finite() || !(0.0..=1.0).contains(&self.resume_threshold) {
+            return Err("CLUSTER_RESUME_THRESHOLD must be a finite value in 0.0..=1.0".into());
+        }
         if self.drain_threshold <= self.resume_threshold {
             return Err(
                 "CLUSTER_DRAIN_THRESHOLD must be greater than CLUSTER_RESUME_THRESHOLD".into(),
             );
         }
-        if !(0.0..=1.0).contains(&self.capacity) {
-            return Err("CLUSTER_CAPACITY must be between 0.0 and 1.0".into());
+        if !self.capacity.is_finite() || !(0.0..=1.0).contains(&self.capacity) {
+            return Err("CLUSTER_CAPACITY must be a finite value between 0.0 and 1.0".into());
         }
         if self.media_queue_mb == 0 || self.media_queue_mb > 1024 {
             return Err("CLUSTER_MEDIA_QUEUE_MB must be 1–1024".into());

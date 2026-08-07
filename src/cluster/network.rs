@@ -130,6 +130,9 @@ pub enum ControlMessage {
         publishers: u64,
         #[serde(default)]
         players: u64,
+        /// Per-stream active player counts `(stream_id, count)`.
+        #[serde(default)]
+        stream_players: Vec<(String, u64)>,
     },
     /// Follower-forwarded durable mutation (`ClusterCommand` as JSON).
     ClientWrite(serde_json::Value),
@@ -353,6 +356,7 @@ pub struct HeartbeatInfo {
     pub media_addr: String,
     pub publishers: u64,
     pub players: u64,
+    pub stream_players: Vec<(String, u64)>,
 }
 
 /// Accept control-plane connections and dispatch Raft / admin messages.
@@ -559,6 +563,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             media_addr,
             publishers,
             players,
+            stream_players,
         } => {
             on_heartbeat(HeartbeatInfo {
                 node_id,
@@ -568,6 +573,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 media_addr,
                 publishers,
                 players,
+                stream_players,
             });
             ControlMessage::AdminOk
         }
@@ -809,6 +815,7 @@ pub async fn send_heartbeat(
     media_addr: String,
     publishers: u64,
     players: u64,
+    stream_players: Vec<(String, u64)>,
     tls_client: Option<Arc<ClientConfig>>,
 ) {
     let _ = tokio::time::timeout(Duration::from_millis(500), async {
@@ -825,6 +832,7 @@ pub async fn send_heartbeat(
                 media_addr,
                 publishers,
                 players,
+                stream_players,
             },
         )
         .await;

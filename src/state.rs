@@ -105,13 +105,11 @@ impl StateCoordinator {
 
     pub fn create_viewer(&self, viewer: &StreamViewer) -> Result<(), CoordError> {
         match self {
-            StateCoordinator::Standalone(db) => {
-                if db.viewer_add(viewer) {
-                    Ok(())
-                } else {
-                    Err(CoordError::Duplicate)
-                }
-            }
+            StateCoordinator::Standalone(db) => match db.viewer_add(viewer) {
+                Ok(()) => Ok(()),
+                Err(crate::db::ViewerAddError::Duplicate) => Err(CoordError::Duplicate),
+                Err(crate::db::ViewerAddError::Db) => Err(CoordError::Db),
+            },
             #[cfg(feature = "cluster")]
             StateCoordinator::Cluster(mgr) => mgr.create_viewer(viewer),
         }

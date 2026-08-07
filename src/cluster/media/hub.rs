@@ -40,6 +40,46 @@ pub struct InjectedFrame {
     pub payload: Vec<u8>,
 }
 
+/// Byte-bounded queue for remote→local media injection (drop-on-overflow).
+pub struct InjectQueue {
+    state: Mutex<(std::collections::VecDeque<InjectedFrame>, usize)>,
+    max_bytes: usize,
+}
+
+impl InjectQueue {
+    pub fn new(max_mb: u32) -> Arc<Self> {
+        let max_bytes = (max_mb as usize)
+            .saturating_mul(1024 * 1024)
+            .max(1024 * 1024);
+        Arc::new(Self {
+            state: Mutex::new((std::collections::VecDeque::new(), 0)),
+            max_bytes,
+        })
+    }
+
+    pub fn try_send(&self, frame: InjectedFrame) -> Result<(), ()> {
+        let size = frame.payload.len().saturating_add(64);
+        let mut st = self.state.lock();
+        if st.1.saturating_add(size) > self.max_bytes {
+            tracing::warn!(
+                app = %frame.app,
+                stream = %frame.stream,
+                "inbound media inject queue full — dropping frame"
+            );
+            return Err(());
+        }
+        st.1 = st.1.saturating_add(size);
+        st.0.push_back(frame);
+        Ok(())
+    }
+
+    pub fn drain(&self) -> Vec<InjectedFrame> {
+        let mut st = self.state.lock();
+        st.1 = 0;
+        st.0.drain(..).collect()
+    }
+}
+
 pub struct MediaHub {
     local_id: NodeId,
     secret: String,
@@ -50,7 +90,7 @@ pub struct MediaHub {
     subs: SubscriptionTable,
     cache: InitCacheStore,
     timelines: Mutex<HashMap<(String, String), TimelineRemapper>>,
-    inject_tx: mpsc::UnboundedSender<InjectedFrame>,
+    inject: Arc<InjectQueue>,
     inbound_tx: mpsc::UnboundedSender<MediaMessage>,
     shutdown: AtomicBool,
     tls_server: Option<Arc<ServerConfig>>,
@@ -65,7 +105,7 @@ impl MediaHub {
         queue_mb: u32,
         replicas: u32,
         ownership: Arc<OwnershipTracker>,
-        inject_tx: mpsc::UnboundedSender<InjectedFrame>,
+        inject: Arc<InjectQueue>,
         tls_server: Option<Arc<ServerConfig>>,
         tls_client: Option<Arc<ClientConfig>>,
     ) -> Arc<Self> {
@@ -81,7 +121,7 @@ impl MediaHub {
             subs: SubscriptionTable::new(),
             cache: InitCacheStore::new(),
             timelines: Mutex::new(HashMap::new()),
-            inject_tx,
+            inject,
             inbound_tx,
             shutdown: AtomicBool::new(false),
             tls_server,
@@ -191,7 +231,7 @@ impl MediaHub {
                             let key = (app.clone(), stream.clone());
                             maps.entry(key).or_default().map(epoch, timeline_ts)
                         };
-                        let _ = self.inject_tx.send(InjectedFrame {
+                        let _ = self.inject.try_send(InjectedFrame {
                             app,
                             stream,
                             epoch,
@@ -222,7 +262,7 @@ impl MediaHub {
                         },
                     );
                     if let Some(md) = metadata {
-                        let _ = self.inject_tx.send(InjectedFrame {
+                        let _ = self.inject.try_send(InjectedFrame {
                             app: app.clone(),
                             stream: stream.clone(),
                             epoch,
@@ -232,7 +272,7 @@ impl MediaHub {
                         });
                     }
                     if let Some(h) = avc_header {
-                        let _ = self.inject_tx.send(InjectedFrame {
+                        let _ = self.inject.try_send(InjectedFrame {
                             app: app.clone(),
                             stream: stream.clone(),
                             epoch,
@@ -242,7 +282,7 @@ impl MediaHub {
                         });
                     }
                     if let Some(h) = aac_header {
-                        let _ = self.inject_tx.send(InjectedFrame {
+                        let _ = self.inject.try_send(InjectedFrame {
                             app: app.clone(),
                             stream: stream.clone(),
                             epoch,
@@ -252,7 +292,7 @@ impl MediaHub {
                         });
                     }
                     if let Some((ts, kf)) = keyframe {
-                        let _ = self.inject_tx.send(InjectedFrame {
+                        let _ = self.inject.try_send(InjectedFrame {
                             app,
                             stream,
                             epoch,
@@ -289,7 +329,7 @@ impl MediaHub {
                     let key = (app.clone(), stream.clone());
                     maps.entry(key).or_default().map(epoch, timeline_ts)
                 };
-                let _ = self.inject_tx.send(InjectedFrame {
+                let _ = self.inject.try_send(InjectedFrame {
                     app,
                     stream,
                     epoch,
@@ -305,9 +345,11 @@ impl MediaHub {
     fn ensure_peer(&self, peer_id: NodeId, addr: &str) -> Arc<MediaPeer> {
         let mut peers = self.peers.lock();
         if let Some(p) = peers.get(&peer_id) {
-            if !p.is_closed() {
+            if !p.is_closed() && p.addr == addr {
                 return Arc::clone(p);
             }
+            // Closed, or advertised address changed — drop and redial.
+            p.close();
             peers.remove(&peer_id);
         }
         let peer = Arc::new(MediaPeer::spawn(

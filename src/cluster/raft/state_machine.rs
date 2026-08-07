@@ -15,7 +15,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::raft::TypeConfig;
 use crate::cluster::raft::snapshot::AppSnapshot;
-use crate::db::{Db, StreamAddError};
+use crate::db::{Db, OwnerError, StreamAddError, ViewerAddError};
 
 /// Side effects that must run after a Raft apply on every node (session markers,
 /// in-memory bearer refresh). Delivered via an optional channel set by
@@ -45,34 +45,53 @@ struct StoredSnapshot {
 }
 
 impl SqliteStateMachine {
-    pub fn new(db: Arc<Db>) -> Self {
-        let last_applied = db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT val FROM raft_meta WHERE key='last_applied'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|j| serde_json::from_str(&j).ok())
-        });
-        let last_membership = db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT val FROM raft_meta WHERE key='last_membership'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_else(|| StoredMembership::new(None, openraft::Membership::default()))
-        });
-        Self {
+    pub fn new(db: Arc<Db>) -> Result<Self, StorageError<u64>> {
+        let last_applied = Self::load_last_applied(&db)?;
+        let last_membership = Self::load_last_membership(&db)?;
+        Ok(Self {
             db,
             last_applied: Arc::new(Mutex::new(last_applied)),
             last_membership: Arc::new(Mutex::new(last_membership)),
             current_snapshot: Arc::new(Mutex::new(None)),
             snapshot_idx: Arc::new(AtomicU64::new(0)),
             effects: Arc::new(Mutex::new(None)),
-        }
+        })
+    }
+
+    fn load_last_applied(db: &Db) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+        db.with_conn(|conn| match conn.query_row(
+            "SELECT val FROM raft_meta WHERE key='last_applied'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::read_state_machine(&e),
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StorageError::IO {
+                source: StorageIOError::<u64>::read_state_machine(&e),
+            }),
+        })
+    }
+
+    fn load_last_membership(
+        db: &Db,
+    ) -> Result<StoredMembership<u64, openraft::BasicNode>, StorageError<u64>> {
+        db.with_conn(|conn| match conn.query_row(
+            "SELECT val FROM raft_meta WHERE key='last_membership'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::read_state_machine(&e),
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Ok(StoredMembership::new(None, openraft::Membership::default()))
+            }
+            Err(e) => Err(StorageError::IO {
+                source: StorageIOError::<u64>::read_state_machine(&e),
+            }),
+        })
     }
 
     pub fn db(&self) -> &Arc<Db> {
@@ -186,13 +205,11 @@ impl SqliteStateMachine {
                     ClusterResponse::Error("db".into())
                 }
             }
-            ClusterCommand::CreateViewer { viewer } => {
-                if self.db.viewer_add(viewer) {
-                    ClusterResponse::Ok
-                } else {
-                    ClusterResponse::Duplicate
-                }
-            }
+            ClusterCommand::CreateViewer { viewer } => match self.db.viewer_add(viewer) {
+                Ok(()) => ClusterResponse::Ok,
+                Err(ViewerAddError::Duplicate) => ClusterResponse::Duplicate,
+                Err(ViewerAddError::Db) => ClusterResponse::Error("db".into()),
+            },
             ClusterCommand::DeleteViewer {
                 stream_id,
                 viewer_id,
@@ -226,16 +243,19 @@ impl SqliteStateMachine {
                 Err(crate::db::OwnerError::Db) => ClusterResponse::Error("db".into()),
             },
             ClusterCommand::ReleaseStreamOwner { stream_id, epoch } => {
-                if self.db.stream_owner_release(stream_id, *epoch) {
-                    ClusterResponse::Ok
-                } else {
+                match self.db.stream_owner_release(stream_id, *epoch) {
                     // Idempotent: already released or epoch mismatch on follower catch-up.
-                    ClusterResponse::Ok
+                    Ok(_) => ClusterResponse::Ok,
+                    Err(OwnerError::Db) => ClusterResponse::Error("db".into()),
+                    Err(OwnerError::Conflict) => ClusterResponse::Error("db".into()),
                 }
             }
             ClusterCommand::ReleaseOwnersForNode { node_id } => {
-                self.db.stream_owners_release_for_node(*node_id);
-                ClusterResponse::Ok
+                match self.db.stream_owners_release_for_node(*node_id) {
+                    Ok(_) => ClusterResponse::Ok,
+                    Err(OwnerError::Db) => ClusterResponse::Error("db".into()),
+                    Err(OwnerError::Conflict) => ClusterResponse::Error("db".into()),
+                }
             }
             ClusterCommand::SeedFromStandalone {
                 streams,
@@ -255,12 +275,9 @@ impl SqliteStateMachine {
                     }
                 }
                 for v in viewers {
-                    if self.db.viewer_add(v) {
-                        continue;
-                    }
-                    match self.db.viewer_get(&v.stream_id, &v.id) {
-                        crate::db::DbLookup::Ok(_) => {}
-                        crate::db::DbLookup::Missing | crate::db::DbLookup::Failed => {
+                    match self.db.viewer_add(v) {
+                        Ok(()) | Err(ViewerAddError::Duplicate) => {}
+                        Err(ViewerAddError::Db) => {
                             return ClusterResponse::Error(
                                 "viewer_add failed during SeedFromStandalone".into(),
                             );
@@ -514,8 +531,12 @@ impl SqliteStateMachine {
         })?;
 
         for v in &snap.viewers {
-            if !self.db.viewer_add(v) {
-                return Err("viewer_add failed during snapshot install".into());
+            match self.db.viewer_add(v) {
+                Ok(()) => {}
+                Err(ViewerAddError::Duplicate) => {}
+                Err(ViewerAddError::Db) => {
+                    return Err("viewer_add failed during snapshot install".into());
+                }
             }
         }
         for o in &snap.owners {

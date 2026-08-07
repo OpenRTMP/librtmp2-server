@@ -71,6 +71,10 @@ impl AdmissionController {
 
 impl IngressEligibility for AdmissionController {
     fn should_accept_new_publish(&self) -> bool {
+        // CLUSTER_CAPACITY=0 (or load at/above capacity) means no admission headroom.
+        if self.config.capacity <= 0.0 || self.current_load() >= self.config.capacity {
+            return false;
+        }
         let state = self.health.local();
         matches!(state, NodeHealthState::Ready | NodeHealthState::Learner)
             && !self.draining.load(Ordering::Relaxed)
