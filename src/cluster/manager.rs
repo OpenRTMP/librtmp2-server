@@ -9,7 +9,6 @@ use openraft::RaftMetrics;
 use openraft::ChangeMembers;
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 
 use crate::cluster::NodeId;
 use crate::cluster::admission::{
@@ -18,7 +17,7 @@ use crate::cluster::admission::{
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::health::{HealthTracker, NodeHealthState};
-use crate::cluster::media::hub::{ExportedFrame, InjectQueue, InjectedFrame, MediaHub};
+use crate::cluster::media::hub::{ExportQueue, ExportedFrame, InjectQueue, InjectedFrame, MediaHub};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::membership::{
     bootstrap_single_node, check_join_reseed, seed_from_local_db, verify_cluster_identity,
@@ -50,7 +49,8 @@ pub struct ClusterManager {
     ownership: Arc<OwnershipTracker>,
     inject: Arc<InjectQueue>,
     /// Ordered export path — one worker preserves RTMP frame order.
-    export_tx: mpsc::UnboundedSender<ExportedFrame>,
+    /// Byte-bounded (drop-oldest) so librtmp2 drain cannot grow unbounded.
+    export_q: Arc<ExportQueue>,
     rt_handle: tokio::runtime::Handle,
     last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
     tls_client: Option<Arc<ClientConfig>>,
@@ -166,12 +166,17 @@ impl ClusterManager {
             tls_server.clone(),
             tls_client.clone(),
         );
-        let (export_tx, mut export_rx) = mpsc::unbounded_channel::<ExportedFrame>();
+        // Byte-bounded ordered export (drop-oldest on overload) — see ExportQueue.
+        let export_q = ExportQueue::new(config.media_queue_mb);
         {
             let media_export = Arc::clone(&media);
+            let export_q = Arc::clone(&export_q);
             tokio::spawn(async move {
-                while let Some(frame) = export_rx.recv().await {
-                    media_export.fanout_local_frame(frame).await;
+                loop {
+                    let frames = export_q.wait_and_drain().await;
+                    for frame in frames {
+                        media_export.fanout_local_frame(frame).await;
+                    }
                 }
             });
         }
@@ -193,7 +198,7 @@ impl ClusterManager {
             meta: Arc::clone(&meta),
             ownership,
             inject,
-            export_tx,
+            export_q,
             rt_handle,
             last_metrics: Mutex::new(None),
             tls_client: tls_client.clone(),
@@ -221,6 +226,19 @@ impl ClusterManager {
             let counts_hb = Arc::clone(&mgr);
             let on_heartbeat: Arc<dyn Fn(network::HeartbeatInfo) + Send + Sync> =
                 Arc::new(move |info: network::HeartbeatInfo| {
+                    // Ignore heartbeats from nodes outside current Raft membership
+                    // once membership is known — prevents removed nodes from
+                    // re-entering meta/health/media via stale heartbeats.
+                    if let Some(rm) = counts_hb.last_metrics.lock().as_ref() {
+                        let in_membership = rm
+                            .membership_config
+                            .membership()
+                            .nodes()
+                            .any(|(id, _)| *id == info.node_id);
+                        if !in_membership {
+                            return;
+                        }
+                    }
                     let state =
                         NodeHealthState::parse(&info.health).unwrap_or(NodeHealthState::Ready);
                     let ctrl = if info.control_addr.is_empty() {
@@ -433,7 +451,7 @@ impl ClusterManager {
 
     pub fn enqueue_export(&self, frame: ExportedFrame) {
         // Single ordered worker — do not spawn per-frame tasks (reorder risk).
-        let _ = self.export_tx.send(frame);
+        self.export_q.push(frame);
     }
 
     pub fn drain_injects(&self) -> Vec<InjectedFrame> {
@@ -908,6 +926,35 @@ impl ClusterManager {
         }
     }
 
+    /// Drop meta/health/media/network cache entries for nodes no longer in
+    /// Raft membership. Runs on every node so removals are not initiator-only.
+    fn prune_topology_to_membership(&self) {
+        let Some(rm) = self.last_metrics.lock().clone() else {
+            return;
+        };
+        let members: std::collections::HashSet<NodeId> = rm
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        if members.is_empty() {
+            return;
+        }
+        for (id, _, _) in self.meta.all() {
+            if id == self.config.node_id || members.contains(&id) {
+                continue;
+            }
+            self.meta.remove(id);
+            self.health.remove(id);
+            self.media.disconnect_peer(id);
+            self.network.nodes.write().remove(&id);
+            self.peer_session_counts.lock().remove(&id);
+            self.peer_stream_players.lock().remove(&id);
+            crate::log_info!("Cluster: pruned removed node {id} from local topology caches");
+        }
+    }
+
     async fn refresh_topology_from(&self, peer_addr: &str) -> Result<(), String> {
         let (cluster_id, peers) = network::send_topology(
             peer_addr,
@@ -1113,6 +1160,7 @@ impl ClusterManager {
                 );
             }
             *self.last_metrics.lock() = Some(m);
+            self.prune_topology_to_membership();
             if metrics.changed().await.is_err() {
                 break;
             }
@@ -1175,26 +1223,46 @@ impl ClusterManager {
             let stream_players: Vec<(String, u64)> = stream_players.into_iter().collect();
             let advertise = self.config.advertise_control();
             let media_advertise = self.config.advertise_media();
-            // Emit heartbeats to known peers
-            for (id, ctrl, _) in self.meta.all() {
-                if id == self.config.node_id {
-                    continue;
+            self.prune_topology_to_membership();
+            // Emit heartbeats concurrently so a few dead peers cannot exceed
+            // the stale threshold waiting on sequential 500ms timeouts.
+            let peers: Vec<_> = self
+                .meta
+                .all()
+                .into_iter()
+                .filter(|(id, _, _)| *id != self.config.node_id)
+                .collect();
+            let secret = self.config.secret.clone();
+            let node_id = self.config.node_id;
+            let health = self.health.local().as_str().to_string();
+            let load = self.admission.current_load();
+            let tls = self.tls_client.clone();
+            let futs = peers.into_iter().map(|(id, ctrl, _)| {
+                let secret = secret.clone();
+                let advertise = advertise.clone();
+                let media_advertise = media_advertise.clone();
+                let health = health.clone();
+                let stream_players = stream_players.clone();
+                let tls = tls.clone();
+                async move {
+                    let _ = id;
+                    network::send_heartbeat(
+                        &ctrl,
+                        &secret,
+                        node_id,
+                        &health,
+                        load,
+                        advertise,
+                        media_advertise,
+                        local_pubs,
+                        local_players,
+                        stream_players,
+                        tls,
+                    )
+                    .await;
                 }
-                network::send_heartbeat(
-                    &ctrl,
-                    &self.config.secret,
-                    self.config.node_id,
-                    self.health.local().as_str(),
-                    self.admission.current_load(),
-                    advertise.clone(),
-                    media_advertise.clone(),
-                    local_pubs,
-                    local_players,
-                    stream_players.clone(),
-                    self.tls_client.clone(),
-                )
-                .await;
-            }
+            });
+            futures::future::join_all(futs).await;
             if let Some(m) = metrics {
                 let voters: Vec<NodeId> = m.membership_config.membership().voter_ids().collect();
                 let alive = self.health.alive_voters(&voters, self.config.node_id);

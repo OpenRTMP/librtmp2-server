@@ -810,6 +810,9 @@ impl DbRtmpBridge {
             guard.get(&conn).and_then(|cs| cs.publisher.clone())
         };
         let replacing_publisher = old_pub.is_some();
+        // Prior Raft ownership for this connection (released only after a successful
+        // switch to a different stream — see below).
+        let prior_ownership = self.ownership_epochs.lock().get(&conn).cloned();
         if let Some(mut prior) = old_pub.clone() {
             prior.active = false;
             let prior_id = prior.id.clone();
@@ -821,7 +824,24 @@ impl DbRtmpBridge {
             }
         }
 
-        // Cluster ownership fencing (Raft) before local publisher slot.
+        // Reserve the local publisher slot BEFORE advancing Raft ownership.
+        // Acquiring ownership first then failing try_acquire would release the
+        // new epoch and wipe fencing for an already-active publisher on this node.
+        if !self.db.publisher_try_acquire(&pub_row) {
+            if let Some(ref prior) = old_pub
+                && !self.restore_publisher_row(prior)
+            {
+                crate::log_error!(
+                    "RTMP: publish rollback failed — prior publisher row remains inactive from {peer}"
+                );
+            }
+            crate::log_warn!(
+                "RTMP: publish rejected — stream '{}' already has an active publisher from {peer}",
+                stream.id
+            );
+            return Err(AuthFailureKind::RecognizedKey);
+        }
+
         let mut acquired_epoch: Option<u64> = None;
         if let Some(coord) = self.coordinator.lock().clone() {
             let (node_id, epoch) = {
@@ -843,8 +863,15 @@ impl DbRtmpBridge {
                     acquired_epoch = Some(ep);
                 }
                 Err(e) => {
-                    if let Some(ref prior) = old_pub {
-                        let _ = self.restore_publisher_row(prior);
+                    let mut failed = pub_row.clone();
+                    failed.active = false;
+                    let _ = self.db.publisher_update(&failed.id, &failed);
+                    if let Some(ref prior) = old_pub
+                        && !self.restore_publisher_row(prior)
+                    {
+                        crate::log_error!(
+                            "RTMP: publish rollback failed — prior publisher row remains inactive from {peer}"
+                        );
                     }
                     crate::log_warn!(
                         "RTMP: publish rejected — cluster ownership acquire failed for '{}' from {peer}: {e:?}",
@@ -855,27 +882,14 @@ impl DbRtmpBridge {
             }
         }
 
-        if !self.db.publisher_try_acquire(&pub_row) {
-            if let Some(ep) = acquired_epoch
+        if let Some(ep) = acquired_epoch {
+            // Successful A→B switch: release prior stream ownership so it is not leaked.
+            if let Some((prior_sid, prior_ep)) = prior_ownership
+                && prior_sid != stream.id
                 && let Some(coord) = self.coordinator.lock().clone()
             {
-                let _ = coord.release_stream_owner(&stream.id, ep);
+                let _ = coord.release_stream_owner(&prior_sid, prior_ep);
             }
-            if let Some(ref prior) = old_pub
-                && !self.restore_publisher_row(prior)
-            {
-                crate::log_error!(
-                    "RTMP: publish rollback failed — prior publisher row remains inactive from {peer}"
-                );
-            }
-            crate::log_warn!(
-                "RTMP: publish rejected — stream '{}' already has an active publisher from {peer}",
-                stream.id
-            );
-            return Err(AuthFailureKind::RecognizedKey);
-        }
-
-        if let Some(ep) = acquired_epoch {
             self.ownership_epochs
                 .lock()
                 .insert(conn, (stream.id.clone(), ep));
@@ -986,8 +1000,8 @@ impl DbRtmpBridge {
                 );
                 return Err(AuthFailureKind::Operational);
             }
-            #[cfg(feature = "cluster")]
-            self.maybe_unsubscribe_remote_play(&prior.stream_id);
+            // Defer remote unsubscribe until the replacement player slot is acquired —
+            // otherwise a failed switch would leave the prior stream unsubscribed.
         }
 
         if !self.db.player_try_acquire(&player_row) {
@@ -1026,10 +1040,17 @@ impl DbRtmpBridge {
         }
 
         #[cfg(feature = "cluster")]
-        if let Some(coord) = self.coordinator.lock().clone()
-            && let Some(mgr) = coord.cluster_manager()
         {
-            mgr.notify_play_subscription(app, &stream.id);
+            if let Some(ref prior) = old_player
+                && prior.stream_id != stream.id
+            {
+                self.maybe_unsubscribe_remote_play(&prior.stream_id);
+            }
+            if let Some(coord) = self.coordinator.lock().clone()
+                && let Some(mgr) = coord.cluster_manager()
+            {
+                mgr.notify_play_subscription(app, &stream.id);
+            }
         }
 
         crate::log_info!(

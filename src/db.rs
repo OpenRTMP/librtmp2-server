@@ -1040,24 +1040,129 @@ impl Db {
         .flatten()
     }
 
-    pub fn stream_owner_list(&self) -> Vec<StreamOwner> {
+    /// List every stream owner (used for cluster bootstrap / OwnershipTracker hydrate).
+    /// Fallible variant for Raft snapshot builds — does not swallow SQLite errors.
+    pub fn stream_owner_list_result(&self) -> Result<Vec<StreamOwner>, String> {
         let conn = self.conn.lock();
-        let mut stmt = match conn
+        let mut stmt = conn
             .prepare("SELECT stream_id, owner_node_id, epoch, acquired_at FROM stream_owners")
-        {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        stmt.query_map([], |row| {
-            Ok(StreamOwner {
-                stream_id: row.get(0)?,
-                owner_node_id: row.get::<_, i64>(1)? as u64,
-                epoch: row.get::<_, i64>(2)? as u64,
-                acquired_at: row.get(3)?,
+            .map_err(|e| format!("stream_owner_list prepare: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StreamOwner {
+                    stream_id: row.get(0)?,
+                    owner_node_id: row.get::<_, i64>(1)? as u64,
+                    epoch: row.get::<_, i64>(2)? as u64,
+                    acquired_at: row.get(3)?,
+                })
             })
+            .map_err(|e| format!("stream_owner_list query: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("stream_owner_list row: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Read all Raft-replicated app tables + settings from one SQLite snapshot
+    /// transaction so a concurrent apply cannot interleave mid-read.
+    #[cfg(feature = "cluster")]
+    pub fn read_replicated_snapshot(
+        &self,
+    ) -> Result<
+        (
+            Vec<Stream>,
+            Vec<StreamViewer>,
+            Vec<StreamOwner>,
+            Option<String>,
+            Option<String>,
+        ),
+        String,
+    > {
+        let conn = self.conn.lock();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("snapshot tx begin: {e}"))?;
+
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT {} FROM streams ORDER BY created_at",
+                Self::STREAM_COLS
+            ))
+            .map_err(|e| format!("snapshot streams prepare: {e}"))?;
+        let stream_rows = stmt
+            .query_map([], Self::load_stream_row)
+            .map_err(|e| format!("snapshot streams query: {e}"))?;
+        let mut streams = Vec::new();
+        for row in stream_rows {
+            streams.push(row.map_err(|e| format!("snapshot streams row: {e}"))?);
+        }
+        drop(stmt);
+
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT {} FROM stream_viewers ORDER BY created_at",
+                Self::VIEWER_COLS
+            ))
+            .map_err(|e| format!("snapshot viewers prepare: {e}"))?;
+        let viewer_rows = stmt
+            .query_map([], Self::load_viewer_row)
+            .map_err(|e| format!("snapshot viewers query: {e}"))?;
+        let mut viewers = Vec::new();
+        for row in viewer_rows {
+            viewers.push(row.map_err(|e| format!("snapshot viewers row: {e}"))?);
+        }
+        drop(stmt);
+
+        let mut stmt = tx
+            .prepare("SELECT stream_id, owner_node_id, epoch, acquired_at FROM stream_owners")
+            .map_err(|e| format!("snapshot owners prepare: {e}"))?;
+        let owner_rows = stmt
+            .query_map([], |row| {
+                Ok(StreamOwner {
+                    stream_id: row.get(0)?,
+                    owner_node_id: row.get::<_, i64>(1)? as u64,
+                    epoch: row.get::<_, i64>(2)? as u64,
+                    acquired_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("snapshot owners query: {e}"))?;
+        let mut owners = Vec::new();
+        for row in owner_rows {
+            owners.push(row.map_err(|e| format!("snapshot owners row: {e}"))?);
+        }
+        drop(stmt);
+
+        let api_token: Option<String> = tx
+            .query_row(
+                "SELECT val FROM settings WHERE key='api_token'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("snapshot api_token: {e}"))?
+            .filter(|v| !v.is_empty());
+
+        let cluster_id: Option<String> = tx
+            .query_row(
+                "SELECT val FROM settings WHERE key=?",
+                params!["cluster_id"],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("snapshot cluster_id: {e}"))?
+            .filter(|v| !v.is_empty());
+
+        // Read-only snapshot: rollback is fine (no writes).
+        let _ = tx.rollback();
+        Ok((streams, viewers, owners, api_token, cluster_id))
+    }
+
+    pub fn stream_owner_list(&self) -> Vec<StreamOwner> {
+        self.stream_owner_list_result().unwrap_or_else(|e| {
+            crate::log_error!("stream_owner_list: {e}");
+            Vec::new()
         })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
     }
 
     /// Acquire ownership when free or already owned by the same node.

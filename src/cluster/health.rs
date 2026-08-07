@@ -108,6 +108,10 @@ impl HealthTracker {
         }
     }
 
+    pub fn remove(&self, id: NodeId) {
+        self.peers.lock().remove(&id);
+    }
+
     /// Mark peers that have missed heartbeats as DOWN. Returns newly-down node ids
     /// (callers may propose `ReleaseOwnersForNode` after quorum confirms).
     pub fn sweep_stale(&self) -> Vec<NodeId> {

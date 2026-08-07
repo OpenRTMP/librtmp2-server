@@ -299,15 +299,17 @@ impl SqliteStateMachine {
         }
     }
 
-    fn build_app_snapshot(&self) -> AppSnapshot {
-        AppSnapshot {
-            streams: self.db.stream_list(),
-            viewers: self.db.viewer_list_all(),
-            owners: self.db.stream_owner_list(),
-            api_token: self.db.token_get().ok().flatten(),
-            cluster_id: self.db.setting_get("cluster_id"),
+    fn build_app_snapshot(&self) -> Result<AppSnapshot, String> {
+        let (streams, viewers, owners, api_token, cluster_id) =
+            self.db.read_replicated_snapshot()?;
+        Ok(AppSnapshot {
+            streams,
+            viewers,
+            owners,
+            api_token,
+            cluster_id,
             last_applied_index: self.last_applied.lock().map(|l| l.index),
-        }
+        })
     }
 
     fn install_app_snapshot(&self, snap: &AppSnapshot) -> Result<(), String> {
@@ -559,7 +561,9 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         let last_applied = *self.last_applied.lock();
         let last_membership = self.last_membership.lock().clone();
-        let data = self.build_app_snapshot();
+        let data = self.build_app_snapshot().map_err(|e| StorageError::IO {
+            source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
+        })?;
         let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_state_machine(&e),
         })?;

@@ -59,6 +59,12 @@ impl SubscriptionTable {
             .collect()
     }
 
+    /// Drop every subscription entry for `peer` (inbound connection teardown).
+    pub fn clear_peer(&self, peer: u64) {
+        let mut g = self.inner.lock();
+        g.retain(|(p, _, _), _| *p != peer);
+    }
+
     pub fn count(&self) -> usize {
         self.inner.lock().len()
     }

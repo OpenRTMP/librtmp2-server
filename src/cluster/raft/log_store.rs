@@ -49,7 +49,8 @@ impl RaftLogReader<TypeConfig> for SqliteLogStore {
         let end_excl = match range.end_bound() {
             std::ops::Bound::Included(v) => v.saturating_add(1),
             std::ops::Bound::Excluded(v) => *v,
-            std::ops::Bound::Unbounded => u64::MAX,
+            // u64::MAX as i64 is -1 and would make `log_index < -1` match nothing.
+            std::ops::Bound::Unbounded => i64::MAX as u64,
         };
         self.db.with_conn(|conn| {
             let mut stmt = conn
@@ -57,8 +58,13 @@ impl RaftLogReader<TypeConfig> for SqliteLogStore {
                     "SELECT entry_json FROM raft_log WHERE log_index >= ? AND log_index < ? ORDER BY log_index",
                 )
                 .map_err(Self::read_err)?;
+            let end_bind = if end_excl >= i64::MAX as u64 {
+                i64::MAX
+            } else {
+                end_excl as i64
+            };
             let rows = stmt
-                .query_map(params![start as i64, end_excl as i64], |row| {
+                .query_map(params![start as i64, end_bind], |row| {
                     row.get::<_, String>(0)
                 })
                 .map_err(Self::read_err)?;
