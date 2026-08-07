@@ -91,7 +91,9 @@ CLUSTER_MEDIA_ADVERTISE_ADDR=10.0.0.1:1941
 ```
 
 Existing standalone streams/viewers/token are seeded into Raft on first bootstrap.
-A `cluster_id` UUID is written to `settings` on bootstrap.
+A `cluster_id` UUID is written via Raft (`SetClusterId`) and included in snapshots.
+`JoinResponse` returns `cluster_id` plus known peer control/media addresses so the
+joiner can heartbeat and open media mesh links.
 
 ### Join (additional node)
 
@@ -105,12 +107,21 @@ CLUSTER_SECRET=<same-secret>
 LRTMP2_DB=/data/node2.db   # fresh file
 ```
 
-Joined nodes start as **learners**. Promote to voter via membership APIs when caught up.
+Joined nodes start as **learners**. Promote to voter after catch-up:
+
+```http
+POST /api/v1/cluster/nodes/{id}/promote
+Authorization: Bearer <token>
+```
 
 ## Reseed
 
-Join is refused if the local DB already has `raft_*` rows or populated streams
-from an unrelated deployment.
+Join is refused if the local DB has populated streams **without** raft state, or
+a leftover `cluster_id` without raft membership.
+
+**Existing member restart:** if `CLUSTER_JOIN` is still set but local `raft_*`
+state already exists, the node **resumes** (skips the join handshake) instead of
+failing.
 
 **To reseed a node:**
 
@@ -132,7 +143,8 @@ conflicting Raft state.
 | GET | `/api/v1/cluster/streams` | Streams + ownership / mesh subscriptions |
 | POST | `/api/v1/cluster/nodes/{id}/drain` | Mark node DRAINING |
 | POST | `/api/v1/cluster/nodes/{id}/resume` | Mark node READY |
-| DELETE | `/api/v1/cluster/nodes/{id}` | Remove voter |
+| POST | `/api/v1/cluster/nodes/{id}/promote` | Promote learner → voter |
+| DELETE | `/api/v1/cluster/nodes/{id}` | Remove voter (releases its stream owners) |
 
 Public `/api/v1/health` stays minimal (`{"status":"ok"}`).
 
@@ -178,10 +190,11 @@ ingress eligibility rapidly.
 
 - Media inject/export requires librtmp2 ≥ 0.7 APIs (`enable_relay_export`,
   `drain_exported_relay_frames`, `inject_relay_frame`, `stream_init_snapshot`).
-- Control/media currently prefer cleartext + `CLUSTER_SECRET`; enable mTLS in
-  production when certificates are available.
-- Automatic learner→voter promotion is available via membership APIs but not
-  forced on every join (operators may promote after catch-up).
+- Control/media use shared-secret challenge-response auth; enable
+  `CLUSTER_TLS_ENABLED` with cert/key/CA for mTLS in production.
+- Invalid `CLUSTER_ENABLED=true` config fails startup hard (no silent standalone fallback).
+- Automatic learner→voter promotion is available via
+  `POST /api/v1/cluster/nodes/{id}/promote` but not forced on every join.
 - Interface bandwidth probing is best-effort (Linux sysfs; Windows may report 0).
 - Aggregate cluster Mbps in status is derived from local load × capacity until
   full cross-node metering lands.

@@ -50,6 +50,15 @@ impl SubscriptionTable {
             .collect()
     }
 
+    pub fn streams_for_peer(&self, peer: u64) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .iter()
+            .filter(|((p, _, _), _)| *p == peer)
+            .map(|((_, a, s), _)| (a.clone(), s.clone()))
+            .collect()
+    }
+
     pub fn count(&self) -> usize {
         self.inner.lock().len()
     }

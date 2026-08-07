@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::db::StreamOwner;
+
 #[derive(Default)]
 pub struct OwnershipTracker {
     /// stream_id -> (node_id, epoch)
@@ -29,10 +31,57 @@ impl OwnershipTracker {
         self.owners
             .lock()
             .insert(stream_id.to_string(), (node_id, epoch));
+        if epoch >= self.next_epoch.load(Ordering::Relaxed) {
+            self.next_epoch.store(epoch.saturating_add(1), Ordering::Relaxed);
+        }
     }
 
     pub fn clear(&self, stream_id: &str) {
         self.owners.lock().remove(stream_id);
+    }
+
+    pub fn clear_for_node(&self, node_id: u64) {
+        self.owners.lock().retain(|_, (nid, _)| *nid != node_id);
+    }
+
+    /// Replace tracker contents from durable `stream_owners` rows (followers / restart).
+    pub fn hydrate_from(&self, owners: &[StreamOwner]) {
+        let mut g = self.owners.lock();
+        g.clear();
+        let mut max_epoch = 0u64;
+        for o in owners {
+            g.insert(o.stream_id.clone(), (o.owner_node_id, o.epoch));
+            max_epoch = max_epoch.max(o.epoch);
+        }
+        drop(g);
+        let cur = self.next_epoch.load(Ordering::Relaxed);
+        if max_epoch >= cur {
+            self.next_epoch
+                .store(max_epoch.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Sync from DB list; returns stream ids whose (node, epoch) changed.
+    pub fn sync_from(&self, owners: &[StreamOwner]) -> Vec<String> {
+        let mut changed = Vec::new();
+        let mut next = HashMap::with_capacity(owners.len());
+        for o in owners {
+            next.insert(o.stream_id.clone(), (o.owner_node_id, o.epoch));
+        }
+        let mut g = self.owners.lock();
+        for (sid, new) in &next {
+            match g.get(sid) {
+                Some(old) if old == new => {}
+                _ => changed.push(sid.clone()),
+            }
+        }
+        for sid in g.keys() {
+            if !next.contains_key(sid) {
+                changed.push(sid.clone());
+            }
+        }
+        *g = next;
+        changed
     }
 
     pub fn get(&self, stream_id: &str) -> Option<(u64, u64)> {
@@ -45,11 +94,12 @@ impl OwnershipTracker {
         self.get(stream).map(|(_, e)| e)
     }
 
-    /// Accept a media frame only when epoch matches current owner epoch.
+    /// Accept a media frame only when epoch matches a known owner epoch.
+    /// Unknown ownership is denied so followers fence until Raft/SQLite catches up.
     pub fn accepts_epoch(&self, stream_id: &str, epoch: u64) -> bool {
         match self.owners.lock().get(stream_id) {
             Some((_, e)) => *e == epoch,
-            None => true, // no owner recorded yet — allow until acquire lands
+            None => false,
         }
     }
 }

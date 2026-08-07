@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
-use tokio::net::{TcpListener, TcpStream};
+use rustls::{ClientConfig, ServerConfig};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::cluster::NodeId;
@@ -52,6 +53,9 @@ pub struct MediaHub {
     inject_tx: mpsc::UnboundedSender<InjectedFrame>,
     inbound_tx: mpsc::UnboundedSender<MediaMessage>,
     shutdown: AtomicBool,
+    tls_server: Option<Arc<ServerConfig>>,
+    tls_client: Option<Arc<ClientConfig>>,
+    peer_reconnect_tx: mpsc::UnboundedSender<NodeId>,
 }
 
 impl MediaHub {
@@ -62,8 +66,11 @@ impl MediaHub {
         replicas: u32,
         ownership: Arc<OwnershipTracker>,
         inject_tx: mpsc::UnboundedSender<InjectedFrame>,
+        tls_server: Option<Arc<ServerConfig>>,
+        tls_client: Option<Arc<ClientConfig>>,
     ) -> Arc<Self> {
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<MediaMessage>();
+        let (peer_reconnect_tx, mut peer_reconnect_rx) = mpsc::unbounded_channel::<NodeId>();
         let hub = Arc::new(Self {
             local_id,
             secret,
@@ -77,11 +84,20 @@ impl MediaHub {
             inject_tx,
             inbound_tx,
             shutdown: AtomicBool::new(false),
+            tls_server,
+            tls_client,
+            peer_reconnect_tx,
         });
         let hub_c = Arc::clone(&hub);
         tokio::spawn(async move {
             while let Some(msg) = inbound_rx.recv().await {
                 hub_c.handle_inbound(msg);
+            }
+        });
+        let hub_r = Arc::clone(&hub);
+        tokio::spawn(async move {
+            while let Some(peer_id) = peer_reconnect_rx.recv().await {
+                hub_r.resubscribe_peer(peer_id);
             }
         });
         hub
@@ -98,17 +114,23 @@ impl MediaHub {
         self.peers.lock().len()
     }
 
+    pub fn disconnect_peer(&self, peer_id: NodeId) {
+        if let Some(p) = self.peers.lock().remove(&peer_id) {
+            p.close();
+        }
+    }
+
     pub async fn serve(self: Arc<Self>, bind: SocketAddr) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(bind).await?;
-        tracing::info!(%bind, "cluster media plane listening");
+        tracing::info!(%bind, tls = self.tls_server.is_some(), "cluster media plane listening");
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            let (mut stream, _) = listener.accept().await?;
+            let (stream, _) = listener.accept().await?;
             let hub = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(e) = hub.handle_inbound_conn(&mut stream).await {
+                if let Err(e) = hub.handle_inbound_conn(stream).await {
                     tracing::debug!(error=%e, "media inbound closed");
                 }
             });
@@ -118,14 +140,12 @@ impl MediaHub {
 
     async fn handle_inbound_conn(
         self: Arc<Self>,
-        stream: &mut TcpStream,
+        stream: tokio::net::TcpStream,
     ) -> Result<(), std::io::Error> {
-        let peer_id = peer::accept_auth(stream, &self.secret, self.local_id).await?;
-        let (mut rh, mut wh) = tokio::io::split(stream);
-        // Read loop — process subscribe/media; write init cache / frames as needed.
-        // For inbound server role we mainly receive SUBSCRIBE and reply with InitCache + frames
-        // when we are the owner. Outbound MediaPeer handles client role.
-        let subs_wanted: Arc<Mutex<Vec<(String, String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let (peer_id, io) =
+            peer::accept_tls_then_auth(stream, &self.secret, self.local_id, self.tls_server.clone())
+                .await?;
+        let (mut rh, mut wh) = tokio::io::split(io);
         loop {
             let msg = peer::read_media_frame(&mut rh).await?;
             match msg {
@@ -146,7 +166,6 @@ impl MediaHub {
                         )
                         .await;
                     }
-                    subs_wanted.lock().push((app, stream, epoch));
                 }
                 MediaMessage::Unsubscribe { app, stream } => {
                     self.subs.remove(peer_id, &app, &stream);
@@ -191,7 +210,6 @@ impl MediaHub {
                             epoch,
                         },
                     );
-                    // Inject init pieces as frames
                     if let Some(md) = metadata {
                         let _ = self.inject_tx.send(InjectedFrame {
                             app: app.clone(),
@@ -233,9 +251,7 @@ impl MediaHub {
                         });
                     }
                 }
-                MediaMessage::StatsReq { stream_id: _ } => {
-                    // Stats proxy uses the control plane; ignore on media.
-                }
+                MediaMessage::StatsReq { stream_id: _ } => {}
                 other => {
                     let _ = self.inbound_tx.send(other);
                 }
@@ -285,9 +301,25 @@ impl MediaHub {
             self.local_id,
             self.queue_mb,
             self.inbound_tx.clone(),
+            self.tls_client.clone(),
+            self.peer_reconnect_tx.clone(),
         ));
         peers.insert(peer_id, Arc::clone(&peer));
         peer
+    }
+
+    fn resubscribe_peer(&self, peer_id: NodeId) {
+        let Some(peer) = self.peers.lock().get(&peer_id).cloned() else {
+            return;
+        };
+        for (app, stream) in self.subs.streams_for_peer(peer_id) {
+            let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
+            let _ = peer.try_send(MediaMessage::Subscribe {
+                app,
+                stream,
+                epoch,
+            });
+        }
     }
 
     pub async fn subscribe_remote(
@@ -355,7 +387,6 @@ impl MediaHub {
             if peer.is_closed() {
                 continue;
             }
-            // Prefer peers that subscribed; also push to first N as replicas.
             let subscribed = self
                 .subs
                 .peers_for_stream(&frame.app, &frame.stream)
@@ -385,6 +416,15 @@ impl MediaHub {
 
     pub fn subscribed_nodes_for(&self, app: &str, stream: &str) -> Vec<NodeId> {
         self.subs.peers_for_stream(app, stream)
+    }
+
+    /// Reset timeline remappers for streams whose ownership epoch changed.
+    pub fn reset_timelines_for(&self, stream_ids: &[String]) {
+        let mut maps = self.timelines.lock();
+        maps.retain(|(app, sid), _| {
+            let _ = app;
+            !stream_ids.iter().any(|s| s == sid)
+        });
     }
 
     /// Start media listener in a background task.

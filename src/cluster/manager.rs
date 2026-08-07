@@ -20,16 +20,19 @@ use crate::cluster::media::hub::{ExportedFrame, InjectedFrame, MediaHub};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::membership::{
     add_learner, bootstrap_single_node, check_join_reseed, promote_learners, remove_node,
-    seed_from_local_db,
+    seed_from_local_db, JoinReseedAction,
 };
 use crate::cluster::metrics::{ClusterMetrics, ClusterStreamInfo, NodeInfo};
-use crate::cluster::network::{self, NetworkFactory};
+use crate::cluster::network::{self, JoinPeerInfo, NetworkFactory};
 use crate::cluster::raft::Raft;
 use crate::cluster::raft::log_store::SqliteLogStore;
 use crate::cluster::raft::state_machine::SqliteStateMachine;
+use crate::cluster::security::{build_client_tls, build_server_tls};
 use crate::cluster::state::ClusterMeta;
 use crate::db::{Db, Stream, StreamViewer};
 use crate::state::CoordError;
+
+use rustls::ClientConfig;
 
 const CLUSTER_ID_SETTING: &str = "cluster_id";
 
@@ -46,6 +49,7 @@ pub struct ClusterManager {
     inject_rx: Mutex<mpsc::UnboundedReceiver<InjectedFrame>>,
     rt_handle: tokio::runtime::Handle,
     last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
+    tls_client: Option<Arc<ClientConfig>>,
 }
 
 impl ClusterManager {
@@ -60,7 +64,23 @@ impl ClusterManager {
         config.validate()?;
 
         let joining = config.join.is_some();
-        check_join_reseed(&db, joining)?;
+        let join_action = check_join_reseed(&db, joining)?;
+
+        let (tls_server, tls_client) = if config.tls_enabled {
+            let server = build_server_tls(
+                &config.tls_cert_file,
+                &config.tls_key_file,
+                &config.tls_ca_file,
+            )?;
+            let client = build_client_tls(
+                &config.tls_cert_file,
+                &config.tls_key_file,
+                &config.tls_ca_file,
+            )?;
+            (Some(server), Some(client))
+        } else {
+            (None, None)
+        };
 
         let raft_cfg = RaftConfig {
             heartbeat_interval: config.heartbeat.as_millis() as u64,
@@ -80,8 +100,16 @@ impl ClusterManager {
 
         let log_store = SqliteLogStore::new(Arc::clone(&db));
         let state_machine = SqliteStateMachine::new(Arc::clone(&db));
-        let network = Arc::new(NetworkFactory::new(config.node_id, config.secret.clone()));
-        let mut net_factory = NetworkFactory::new(config.node_id, config.secret.clone());
+        let network = Arc::new(NetworkFactory::new(
+            config.node_id,
+            config.secret.clone(),
+            tls_client.clone(),
+        ));
+        let mut net_factory = NetworkFactory::new(
+            config.node_id,
+            config.secret.clone(),
+            tls_client.clone(),
+        );
         net_factory.nodes = Arc::clone(&network.nodes);
 
         let raft = openraft::Raft::new(
@@ -97,6 +125,7 @@ impl ClusterManager {
         let health = HealthTracker::new(config.heartbeat);
         let admission = AdmissionController::new(config.clone(), Arc::clone(&health));
         let ownership = Arc::new(OwnershipTracker::new());
+        ownership.hydrate_from(&db.stream_owner_list());
         let (inject_tx, inject_rx) = mpsc::unbounded_channel();
         let media = MediaHub::new(
             config.node_id,
@@ -105,6 +134,8 @@ impl ClusterManager {
             config.media_replicas,
             Arc::clone(&ownership),
             inject_tx,
+            tls_server.clone(),
+            tls_client.clone(),
         );
         let meta = Arc::new(ClusterMeta::new());
 
@@ -126,19 +157,20 @@ impl ClusterManager {
             inject_rx: Mutex::new(inject_rx),
             rt_handle,
             last_metrics: Mutex::new(None),
+            tls_client: tls_client.clone(),
         });
 
         // Control + media listeners
         {
             let mgr_join = Arc::clone(&mgr);
-            let on_join: Arc<dyn Fn(NodeId, String, String) -> Result<(), String> + Send + Sync> =
-                Arc::new(move |nid, ctrl, media_addr| {
-                    let mgr = Arc::clone(&mgr_join);
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(async move { mgr.accept_join(nid, ctrl, media_addr).await })
+            let on_join: network::JoinAcceptFn = Arc::new(move |nid, ctrl, media_addr| {
+                let mgr = Arc::clone(&mgr_join);
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        mgr.accept_join(nid, ctrl, media_addr).await
                     })
-                });
+                })
+            });
             let health_hb = Arc::clone(&mgr.health);
             let on_heartbeat: Arc<dyn Fn(NodeId, String, f64) + Send + Sync> =
                 Arc::new(move |nid, health_s, load| {
@@ -159,6 +191,7 @@ impl ClusterManager {
             let raft_c = mgr.raft.clone();
             let secret = config.secret.clone();
             let local_id = config.node_id;
+            let tls_srv = tls_server.clone();
             tokio::spawn(async move {
                 if let Err(e) = network::serve_control_plane(
                     bind,
@@ -169,6 +202,7 @@ impl ClusterManager {
                     on_heartbeat,
                     on_admin,
                     on_stats,
+                    tls_srv,
                 )
                 .await
                 {
@@ -187,7 +221,9 @@ impl ClusterManager {
             tokio::time::sleep(Duration::from_millis(300)).await;
             if db.setting_get(CLUSTER_ID_SETTING).is_none() {
                 let cid = uuid::Uuid::new_v4().to_string();
-                let _ = db.setting_set(CLUSTER_ID_SETTING, &cid);
+                raft.client_write(ClusterCommand::SetClusterId { id: cid })
+                    .await
+                    .map_err(|e| format!("set cluster_id: {e}"))?;
             }
             seed_from_local_db(&raft, &db).await?;
             health.set_local(NodeHealthState::Ready);
@@ -196,20 +232,55 @@ impl ClusterManager {
                 config.node_id
             );
         } else if let Some(ref join_addr) = config.join {
-            health.set_local(NodeHealthState::Joining);
-            network::send_join(
-                join_addr,
-                &config.secret,
-                config.node_id,
-                advertise.clone(),
-                media_advertise.clone(),
-            )
-            .await?;
-            health.set_local(NodeHealthState::Learner);
-            crate::log_info!(
-                "Cluster: node {} joined as learner via {join_addr}",
-                config.node_id
-            );
+            match join_action {
+                JoinReseedAction::ResumeExisting => {
+                    health.set_local(NodeHealthState::Ready);
+                    crate::log_info!(
+                        "Cluster: resuming existing member node {} (CLUSTER_JOIN set but local raft state present)",
+                        config.node_id
+                    );
+                }
+                JoinReseedAction::FreshJoin => {
+                    health.set_local(NodeHealthState::Joining);
+                    let (cluster_id, peers) = network::send_join(
+                        join_addr,
+                        &config.secret,
+                        config.node_id,
+                        advertise.clone(),
+                        media_advertise.clone(),
+                        tls_client.clone(),
+                    )
+                    .await?;
+                    if !cluster_id.is_empty() {
+                        let _ = db.setting_set(CLUSTER_ID_SETTING, &cluster_id);
+                    }
+                    for p in peers {
+                        if p.node_id == config.node_id {
+                            continue;
+                        }
+                        mgr.network
+                            .upsert_node(p.node_id, p.control_addr.clone());
+                        mgr.meta.set_addrs(
+                            p.node_id,
+                            p.control_addr.clone(),
+                            p.media_addr.clone(),
+                        );
+                        let _ = mgr.media.connect_peer(p.node_id, &p.media_addr).await;
+                        mgr.health.note_peer(
+                            p.node_id,
+                            NodeHealthState::Ready,
+                            0.0,
+                            Some(p.control_addr),
+                            Some(p.media_addr),
+                        );
+                    }
+                    health.set_local(NodeHealthState::Learner);
+                    crate::log_info!(
+                        "Cluster: node {} joined as learner via {join_addr}",
+                        config.node_id
+                    );
+                }
+            }
         }
 
         let bg = Arc::clone(&mgr);
@@ -354,6 +425,7 @@ impl ClusterManager {
         })?;
         let epoch = resp.into_owner_epoch()?;
         self.ownership.set(stream_id, node_id, epoch);
+        self.refresh_subscriptions_for(&[stream_id.to_string()]);
         crate::log_info!("Cluster: stream {stream_id} acquired by node {node_id} epoch={epoch}");
         Ok(epoch)
     }
@@ -365,12 +437,24 @@ impl ClusterManager {
         })?
         .into_coord_result()?;
         self.ownership.clear(stream_id);
+        self.refresh_subscriptions_for(&[stream_id.to_string()]);
         Ok(())
     }
 
     pub fn release_owners_for_node(&self, node_id: u64) -> Result<(), CoordError> {
+        let affected: Vec<String> = self
+            .db
+            .stream_owner_list()
+            .into_iter()
+            .filter(|o| o.owner_node_id == node_id)
+            .map(|o| o.stream_id)
+            .collect();
         self.block_on_write(ClusterCommand::ReleaseOwnersForNode { node_id })?
-            .into_coord_result()
+            .into_coord_result()?;
+        self.ownership.clear_for_node(node_id);
+        self.ownership.hydrate_from(&self.db.stream_owner_list());
+        self.refresh_subscriptions_for(&affected);
+        Ok(())
     }
 
     fn block_on_write(&self, cmd: ClusterCommand) -> Result<ClusterResponse, CoordError> {
@@ -378,6 +462,7 @@ impl ClusterManager {
         let secret = self.config.secret.clone();
         let local_id = self.config.node_id;
         let meta = Arc::clone(&self.meta);
+        let tls_client = self.tls_client.clone();
         let fut = async move {
             use openraft::error::{ClientWriteError, RaftError};
 
@@ -394,7 +479,7 @@ impl ClusterManager {
                         .ok_or_else(|| {
                             CoordError::Cluster("no leader available to forward write".into())
                         })?;
-                    network::send_client_write(&addr, &secret, local_id, cmd)
+                    network::send_client_write(&addr, &secret, local_id, cmd, tls_client)
                         .await
                         .map_err(CoordError::Cluster)
                 }
@@ -427,9 +512,13 @@ impl ClusterManager {
     }
 
     pub async fn remove_peer(&self, node_id: NodeId) -> Result<(), String> {
+        let _ = self.release_owners_for_node(node_id);
         remove_node(&self.raft, node_id)
             .await
             .map_err(|e| format!("remove node: {e}"))?;
+        self.media.disconnect_peer(node_id);
+        self.meta.remove(node_id);
+        self.network.nodes.write().remove(&node_id);
         crate::log_info!("Cluster: removed node {node_id}");
         Ok(())
     }
@@ -459,7 +548,14 @@ impl ClusterManager {
                     .map(|n| n.addr.clone())
             })
             .ok_or_else(|| format!("unknown node {node_id}"))?;
-        network::send_admin(&addr, &self.config.secret, self.config.node_id, msg).await
+        network::send_admin(
+            &addr,
+            &self.config.secret,
+            self.config.node_id,
+            msg,
+            self.tls_client.clone(),
+        )
+        .await
     }
 
     pub async fn accept_join(
@@ -467,7 +563,7 @@ impl ClusterManager {
         node_id: NodeId,
         control_addr: String,
         media_addr: String,
-    ) -> Result<(), String> {
+    ) -> Result<(String, Vec<JoinPeerInfo>), String> {
         self.network.upsert_node(node_id, control_addr.clone());
         self.meta
             .set_addrs(node_id, control_addr.clone(), media_addr.clone());
@@ -479,11 +575,21 @@ impl ClusterManager {
             node_id,
             NodeHealthState::Learner,
             0.0,
-            Some(control_addr),
-            Some(media_addr),
+            Some(control_addr.clone()),
+            Some(media_addr.clone()),
         );
+        let peers: Vec<JoinPeerInfo> = self
+            .meta
+            .all()
+            .into_iter()
+            .map(|(id, ctrl, media)| JoinPeerInfo {
+                node_id: id,
+                control_addr: ctrl,
+                media_addr: media,
+            })
+            .collect();
         crate::log_info!("Cluster: node {node_id} joined as learner");
-        Ok(())
+        Ok((self.cluster_id(), peers))
     }
 
     fn handle_admin_control(&self, msg: network::ControlMessage) -> network::ControlMessage {
@@ -534,6 +640,7 @@ impl ClusterManager {
             &self.config.secret,
             self.config.node_id,
             stream_id.to_string(),
+            self.tls_client.clone(),
         )
         .await
         .ok()
@@ -560,6 +667,55 @@ impl ClusterManager {
                 .subscribe_remote(&media_addr, peer, &app, &stream, epoch)
                 .await;
         });
+    }
+
+    /// Drop remote media subscription when the last local player for a stream leaves.
+    pub fn notify_play_unsubscribe(&self, app: &str, stream_id: &str) {
+        let Some(owner) = self
+            .ownership
+            .get(stream_id)
+            .or_else(|| {
+                self.db
+                    .stream_owner_get(stream_id)
+                    .map(|o| (o.owner_node_id, o.epoch))
+            })
+        else {
+            return;
+        };
+        let (owner_node, _) = owner;
+        if owner_node == self.config.node_id {
+            return;
+        }
+        let media = Arc::clone(&self.media);
+        let app = app.to_string();
+        let stream = stream_id.to_string();
+        self.rt_handle.spawn(async move {
+            media.unsubscribe_remote(owner_node, &app, &stream).await;
+        });
+    }
+
+    /// Re-subscribe local players after ownership epoch/node changes.
+    fn refresh_subscriptions_for(&self, stream_ids: &[String]) {
+        self.media.reset_timelines_for(stream_ids);
+        for sid in stream_ids {
+            let app = match self.db.stream_get(sid) {
+                crate::db::DbLookup::Ok(s) => s.app,
+                _ => "live".to_string(),
+            };
+            self.notify_play_unsubscribe(&app, sid);
+            if self.db.player_list(Some(sid)).iter().any(|p| p.active) {
+                self.notify_play_subscription(&app, sid);
+            }
+        }
+    }
+
+    /// Sync in-memory ownership from SQLite (followers apply Raft → DB).
+    fn sync_ownership_from_db(&self) {
+        let owners = self.db.stream_owner_list();
+        let changed = self.ownership.sync_from(&owners);
+        if !changed.is_empty() {
+            self.refresh_subscriptions_for(&changed);
+        }
     }
 
     async fn metrics_loop(self: Arc<Self>) {
@@ -610,6 +766,8 @@ impl ClusterManager {
                     let _ = self.release_owners_for_node(id);
                 }
             }
+            // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
+            self.sync_ownership_from_db();
             // Emit heartbeats to known peers
             for (id, ctrl, _) in self.meta.all() {
                 if id == self.config.node_id {
@@ -621,6 +779,7 @@ impl ClusterManager {
                     self.config.node_id,
                     self.health.local().as_str(),
                     self.admission.current_load(),
+                    self.tls_client.clone(),
                 )
                 .await;
             }

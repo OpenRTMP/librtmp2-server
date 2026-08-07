@@ -1,4 +1,4 @@
-//! Length-prefixed JSON framing over TCP for Raft RPC + admin/join.
+//! Length-prefixed JSON framing over TCP (optional mTLS) for Raft RPC + admin/join.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -13,20 +13,39 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use parking_lot::RwLock;
+use rustls::{ClientConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cluster::raft::{NodeId, Raft, TypeConfig, typ};
 use crate::cluster::security::{auth_response, secrets_equal};
 
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
+/// Bound unauthenticated frames (challenge/auth) to limit DoS before AuthOk.
+const MAX_AUTH_FRAME: u32 = 8 * 1024;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Combined IO trait so we can box plain TCP or rustls streams.
+trait ClusterIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ClusterIo for T {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinPeerInfo {
+    pub node_id: NodeId,
+    pub control_addr: String,
+    pub media_addr: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
+    /// Server-issued anti-replay nonce; first frame on a new connection.
+    AuthChallenge {
+        nonce: Vec<u8>,
+    },
     Auth {
         node_id: NodeId,
-        nonce: Vec<u8>,
         response: String,
     },
     AuthOk {
@@ -50,6 +69,10 @@ pub enum ControlMessage {
     JoinResponse {
         ok: bool,
         message: String,
+        #[serde(default)]
+        cluster_id: String,
+        #[serde(default)]
+        peers: Vec<JoinPeerInfo>,
     },
     AdminDrain {
         node_id: NodeId,
@@ -98,8 +121,15 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
 pub async fn read_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<ControlMessage, std::io::Error> {
+    read_frame_max(r, MAX_FRAME).await
+}
+
+async fn read_frame_max<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    max: u32,
+) -> Result<ControlMessage, std::io::Error> {
     let len = r.read_u32().await?;
-    if len > MAX_FRAME {
+    if len > max {
         return Err(std::io::Error::other("frame too large"));
     }
     let mut buf = vec![0u8; len as usize];
@@ -107,18 +137,28 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
     serde_json::from_slice(&buf).map_err(|e| std::io::Error::other(e))
 }
 
+async fn read_auth_frame<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+) -> Result<ControlMessage, std::io::Error> {
+    tokio::time::timeout(AUTH_TIMEOUT, read_frame_max(r, MAX_AUTH_FRAME))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "auth timeout"))?
+}
+
 pub struct NetworkFactory {
     pub nodes: Arc<RwLock<BTreeMap<NodeId, BasicNode>>>,
     pub secret: String,
     pub local_id: NodeId,
+    pub tls_client: Option<Arc<ClientConfig>>,
 }
 
 impl NetworkFactory {
-    pub fn new(local_id: NodeId, secret: String) -> Self {
+    pub fn new(local_id: NodeId, secret: String, tls_client: Option<Arc<ClientConfig>>) -> Self {
         Self {
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
             secret,
             local_id,
+            tls_client,
         }
     }
 
@@ -136,6 +176,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             target_node: node.clone(),
             secret: self.secret.clone(),
             local_id: self.local_id,
+            tls_client: self.tls_client.clone(),
         }
     }
 }
@@ -145,50 +186,24 @@ pub struct NetworkConnection {
     target_node: BasicNode,
     secret: String,
     local_id: NodeId,
+    tls_client: Option<Arc<ClientConfig>>,
 }
 
 impl NetworkConnection {
-    async fn connect_authed(
-        &self,
-    ) -> Result<TcpStream, RPCError<NodeId, BasicNode, typ::RaftError>> {
-        let addr = &self.target_node.addr;
-        let mut stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
-        let response = auth_response(&self.secret, &nonce);
-        write_frame(
-            &mut stream,
-            &ControlMessage::Auth {
-                node_id: self.local_id,
-                nonce,
-                response,
-            },
-        )
-        .await
-        .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        match read_frame(&mut stream)
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
-        {
-            ControlMessage::AuthOk { .. } => Ok(stream),
-            _ => Err(RPCError::Network(NetworkError::new(
-                &std::io::Error::other("auth failed"),
-            ))),
-        }
-    }
-
     async fn roundtrip(
         &mut self,
         req: ControlMessage,
     ) -> Result<ControlMessage, RPCError<NodeId, BasicNode, typ::RaftError>> {
-        let mut stream = self.connect_authed().await?;
-        write_frame(&mut stream, &req)
+        let addr = &self.target_node.addr;
+        authed_roundtrip_inner(addr, &self.secret, self.local_id, self.tls_client.clone(), req)
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        read_frame(&mut stream)
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
+            .map_err(|e| {
+                if e.contains("connect") || e.contains("tcp") {
+                    RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e)))
+                } else {
+                    RPCError::Network(NetworkError::new(&std::io::Error::other(e)))
+                }
+            })
     }
 }
 
@@ -285,73 +300,128 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     }
 }
 
+/// Result of accepting a join request (topology for the joiner).
+pub type JoinAcceptFn =
+    Arc<dyn Fn(NodeId, String, String) -> Result<(String, Vec<JoinPeerInfo>), String> + Send + Sync>;
+
 /// Accept control-plane connections and dispatch Raft / admin messages.
 pub async fn serve_control_plane(
     bind: SocketAddr,
     secret: String,
     local_id: NodeId,
     raft: Raft,
-    on_join: Arc<dyn Fn(NodeId, String, String) -> Result<(), String> + Send + Sync>,
+    on_join: JoinAcceptFn,
     on_heartbeat: Arc<dyn Fn(NodeId, String, f64) + Send + Sync>,
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+    tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(bind).await?;
-    tracing::info!(%bind, "cluster control plane listening");
+    let acceptor = tls_server.map(TlsAcceptor::from);
+    tracing::info!(%bind, tls = acceptor.is_some(), "cluster control plane listening");
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let secret = secret.clone();
         let raft = raft.clone();
         let on_join = Arc::clone(&on_join);
         let on_heartbeat = Arc::clone(&on_heartbeat);
         let on_admin = Arc::clone(&on_admin);
         let on_stats = Arc::clone(&on_stats);
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_control_conn(
-                &mut stream,
-                &secret,
-                local_id,
-                raft,
-                on_join,
-                on_heartbeat,
-                on_admin,
-                on_stats,
-            )
-            .await
-            {
+            let result = async {
+                if let Some(ref acc) = acceptor {
+                    let mut tls = acc.accept(stream).await?;
+                    handle_control_conn(
+                        &mut tls,
+                        &secret,
+                        local_id,
+                        raft,
+                        on_join,
+                        on_heartbeat,
+                        on_admin,
+                        on_stats,
+                    )
+                    .await
+                } else {
+                    let mut tcp = stream;
+                    handle_control_conn(
+                        &mut tcp,
+                        &secret,
+                        local_id,
+                        raft,
+                        on_join,
+                        on_heartbeat,
+                        on_admin,
+                        on_stats,
+                    )
+                    .await
+                }
+            }
+            .await;
+            if let Err(e) = result {
                 tracing::debug!(%peer, error=%e, "control connection closed");
             }
         });
     }
 }
 
-async fn handle_control_conn(
-    stream: &mut TcpStream,
+async fn server_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     secret: &str,
     local_id: NodeId,
-    raft: Raft,
-    on_join: Arc<dyn Fn(NodeId, String, String) -> Result<(), String> + Send + Sync>,
-    on_heartbeat: Arc<dyn Fn(NodeId, String, f64) + Send + Sync>,
-    on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
-    on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
-) -> Result<(), std::io::Error> {
-    // First frame must be Auth.
-    let first = read_frame(stream).await?;
-    let ControlMessage::Auth {
-        node_id: _peer_id,
-        nonce,
-        response,
-    } = first
-    else {
+) -> Result<NodeId, std::io::Error> {
+    let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
+    write_frame(stream, &ControlMessage::AuthChallenge { nonce: nonce.clone() }).await?;
+    let auth = read_auth_frame(stream).await?;
+    let ControlMessage::Auth { node_id, response } = auth else {
         write_frame(stream, &ControlMessage::AuthFail).await?;
-        return Ok(());
+        return Err(std::io::Error::other("expected Auth"));
     };
     let expected = auth_response(secret, &nonce);
     if !secrets_equal(&expected, &response) {
         write_frame(stream, &ControlMessage::AuthFail).await?;
-        return Ok(());
+        return Err(std::io::Error::other("auth fail"));
     }
     write_frame(stream, &ControlMessage::AuthOk { node_id: local_id }).await?;
+    Ok(node_id)
+}
+
+async fn client_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    secret: &str,
+    local_id: NodeId,
+) -> Result<(), std::io::Error> {
+    let challenge = read_auth_frame(stream).await?;
+    let ControlMessage::AuthChallenge { nonce } = challenge else {
+        return Err(std::io::Error::other("expected AuthChallenge"));
+    };
+    let response = auth_response(secret, &nonce);
+    write_frame(
+        stream,
+        &ControlMessage::Auth {
+            node_id: local_id,
+            response,
+        },
+    )
+    .await?;
+    match read_auth_frame(stream).await? {
+        ControlMessage::AuthOk { .. } => Ok(()),
+        _ => Err(std::io::Error::other("auth failed")),
+    }
+}
+
+async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    secret: &str,
+    local_id: NodeId,
+    raft: Raft,
+    on_join: JoinAcceptFn,
+    on_heartbeat: Arc<dyn Fn(NodeId, String, f64) + Send + Sync>,
+    on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
+    on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+) -> Result<(), std::io::Error> {
+    let _peer_id = server_auth_handshake(stream, secret, local_id).await?;
 
     // One-shot request/response for this connection (matches client roundtrip).
     let msg = read_frame(stream).await?;
@@ -385,11 +455,18 @@ async fn handle_control_conn(
             control_addr,
             media_addr,
         } => match on_join(node_id, control_addr, media_addr) {
-            Ok(()) => ControlMessage::JoinResponse {
+            Ok((cluster_id, peers)) => ControlMessage::JoinResponse {
                 ok: true,
                 message: "joined as learner".into(),
+                cluster_id,
+                peers,
             },
-            Err(message) => ControlMessage::JoinResponse { ok: false, message },
+            Err(message) => ControlMessage::JoinResponse {
+                ok: false,
+                message,
+                cluster_id: String::new(),
+                peers: Vec::new(),
+            },
         },
         ControlMessage::Heartbeat {
             node_id,
@@ -432,46 +509,81 @@ async fn handle_control_conn(
     Ok(())
 }
 
+async fn connect_raw(
+    addr: &str,
+    tls_client: Option<Arc<ClientConfig>>,
+) -> Result<Box<dyn ClusterIo>, String> {
+    let tcp = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    if let Some(cfg) = tls_client {
+        let connector = TlsConnector::from(cfg);
+        let server_name = rustls::pki_types::ServerName::try_from(
+            addr.split(':')
+                .next()
+                .unwrap_or("localhost")
+                .to_string(),
+        )
+        .map_err(|e| format!("tls server name: {e}"))?;
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| format!("tls connect: {e}"))?;
+        Ok(Box::new(tls))
+    } else {
+        Ok(Box::new(tcp))
+    }
+}
+
+async fn authed_roundtrip_inner(
+    addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    tls_client: Option<Arc<ClientConfig>>,
+    msg: ControlMessage,
+) -> Result<ControlMessage, String> {
+    let mut stream = connect_raw(addr, tls_client).await?;
+    client_auth_handshake(&mut stream, secret, local_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    write_frame(&mut stream, &msg)
+        .await
+        .map_err(|e| e.to_string())?;
+    read_frame(&mut stream).await.map_err(|e| e.to_string())
+}
+
 /// Client helper: authenticated join against a bootstrap/leader node.
+/// Returns `(cluster_id, peers)` on success.
 pub async fn send_join(
     leader_addr: &str,
     secret: &str,
     local_id: NodeId,
     control_addr: String,
     media_addr: String,
-) -> Result<(), String> {
-    let mut stream = TcpStream::connect(leader_addr)
-        .await
-        .map_err(|e| format!("connect join target: {e}"))?;
-    let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
-    let response = auth_response(secret, &nonce);
-    write_frame(
-        &mut stream,
-        &ControlMessage::Auth {
-            node_id: local_id,
-            nonce,
-            response,
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    match read_frame(&mut stream).await.map_err(|e| e.to_string())? {
-        ControlMessage::AuthOk { .. } => {}
-        _ => return Err("join auth failed".into()),
-    }
-    write_frame(
-        &mut stream,
-        &ControlMessage::JoinRequest {
+    tls_client: Option<Arc<ClientConfig>>,
+) -> Result<(String, Vec<JoinPeerInfo>), String> {
+    match authed_roundtrip_inner(
+        leader_addr,
+        secret,
+        local_id,
+        tls_client,
+        ControlMessage::JoinRequest {
             node_id: local_id,
             control_addr,
             media_addr,
         },
     )
-    .await
-    .map_err(|e| e.to_string())?;
-    match read_frame(&mut stream).await.map_err(|e| e.to_string())? {
-        ControlMessage::JoinResponse { ok: true, .. } => Ok(()),
-        ControlMessage::JoinResponse { ok: false, message } => Err(message),
+    .await?
+    {
+        ControlMessage::JoinResponse {
+            ok: true,
+            cluster_id,
+            peers,
+            ..
+        } => Ok((cluster_id, peers)),
+        ControlMessage::JoinResponse {
+            ok: false, message, ..
+        } => Err(message),
         _ => Err("unexpected join response".into()),
     }
 }
@@ -482,69 +594,23 @@ pub async fn send_heartbeat(
     local_id: NodeId,
     health: &str,
     load: f64,
+    tls_client: Option<Arc<ClientConfig>>,
 ) {
-    let Ok(mut stream) = TcpStream::connect(peer_addr).await else {
-        return;
-    };
     let _ = tokio::time::timeout(Duration::from_millis(500), async {
-        let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
-        let response = auth_response(secret, &nonce);
-        write_frame(
-            &mut stream,
-            &ControlMessage::Auth {
-                node_id: local_id,
-                nonce,
-                response,
-            },
-        )
-        .await
-        .ok()?;
-        read_frame(&mut stream).await.ok()?;
-        write_frame(
-            &mut stream,
-            &ControlMessage::Heartbeat {
+        let _ = authed_roundtrip_inner(
+            peer_addr,
+            secret,
+            local_id,
+            tls_client,
+            ControlMessage::Heartbeat {
                 node_id: local_id,
                 health: health.to_string(),
                 load,
             },
         )
-        .await
-        .ok()?;
-        let _ = read_frame(&mut stream).await;
-        Some(())
+        .await;
     })
     .await;
-}
-
-async fn authed_roundtrip(
-    addr: &str,
-    secret: &str,
-    local_id: NodeId,
-    msg: ControlMessage,
-) -> Result<ControlMessage, String> {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
-    let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
-    let response = auth_response(secret, &nonce);
-    write_frame(
-        &mut stream,
-        &ControlMessage::Auth {
-            node_id: local_id,
-            nonce,
-            response,
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    match read_frame(&mut stream).await.map_err(|e| e.to_string())? {
-        ControlMessage::AuthOk { .. } => {}
-        _ => return Err("auth failed".into()),
-    }
-    write_frame(&mut stream, &msg)
-        .await
-        .map_err(|e| e.to_string())?;
-    read_frame(&mut stream).await.map_err(|e| e.to_string())
 }
 
 pub async fn send_admin(
@@ -552,8 +618,9 @@ pub async fn send_admin(
     secret: &str,
     local_id: NodeId,
     msg: ControlMessage,
+    tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(), String> {
-    match authed_roundtrip(peer_addr, secret, local_id, msg).await? {
+    match authed_roundtrip_inner(peer_addr, secret, local_id, tls_client, msg).await? {
         ControlMessage::AdminOk => Ok(()),
         ControlMessage::AdminErr { message } => Err(message),
         _ => Err("unexpected admin response".into()),
@@ -565,11 +632,13 @@ pub async fn send_stats_proxy(
     secret: &str,
     local_id: NodeId,
     stream_id: String,
+    tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<serde_json::Value, String> {
-    match authed_roundtrip(
+    match authed_roundtrip_inner(
         peer_addr,
         secret,
         local_id,
+        tls_client,
         ControlMessage::StatsProxyReq { stream_id },
     )
     .await?
@@ -586,12 +655,14 @@ pub async fn send_client_write(
     secret: &str,
     local_id: NodeId,
     cmd: crate::cluster::command::ClusterCommand,
+    tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<crate::cluster::command::ClusterResponse, String> {
     let req = serde_json::to_value(&cmd).map_err(|e| e.to_string())?;
-    match authed_roundtrip(
+    match authed_roundtrip_inner(
         leader_addr,
         secret,
         local_id,
+        tls_client,
         ControlMessage::ClientWrite(req),
     )
     .await?

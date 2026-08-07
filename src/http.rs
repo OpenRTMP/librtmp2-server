@@ -83,6 +83,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(handle_cluster_resume_node),
         )
         .route(
+            "/api/v1/cluster/nodes/{id}/promote",
+            post(handle_cluster_promote_node),
+        )
+        .route(
             "/api/v1/cluster/nodes/{id}",
             delete(handle_cluster_remove_node),
         )
@@ -1937,6 +1941,35 @@ async fn handle_cluster_resume_node(
         if let Some(mgr) = state.coordinator.cluster_manager() {
             return match mgr.resume_node(id).await {
                 Ok(()) => Json(json!({"status": "ready", "node_id": id})).into_response(),
+                Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "CLUSTER_ERROR", &e),
+            };
+        }
+    }
+    let _ = id;
+    err_json(
+        StatusCode::BAD_REQUEST,
+        "CLUSTER_DISABLED",
+        "Clustering is not enabled",
+    )
+}
+
+async fn handle_cluster_promote_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return match mgr.promote_learner(id).await {
+                Ok(()) => Json(json!({"status": "promoted", "node_id": id})).into_response(),
                 Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "CLUSTER_ERROR", &e),
             };
         }

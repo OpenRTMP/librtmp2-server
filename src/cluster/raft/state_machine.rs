@@ -85,6 +85,46 @@ impl SqliteStateMachine {
         Ok(())
     }
 
+    /// Persist `last_applied` (+ optional membership) in one SQLite transaction.
+    fn persist_applied_tx(
+        &self,
+        log_id: LogId<u64>,
+        membership_json: Option<&str>,
+    ) -> Result<(), StorageError<u64>> {
+        let applied_json = serde_json::to_string(&log_id).map_err(|e| StorageError::IO {
+            source: StorageIOError::<u64>::write_state_machine(&e),
+        })?;
+        self.db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction().map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::write_state_machine(&e),
+            })?;
+            if let Some(mem) = membership_json {
+                tx.execute(
+                    "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
+                     ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+                    params![mem],
+                )
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::write_state_machine(&e),
+                })?;
+            }
+            tx.execute(
+                "INSERT INTO raft_meta(key,val) VALUES('last_applied',?) \
+                 ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+                params![applied_json],
+            )
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::write_state_machine(&e),
+            })?;
+            tx.commit().map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::write_state_machine(&e),
+            })?;
+            Ok::<(), StorageError<u64>>(())
+        })?;
+        *self.last_applied.lock() = Some(log_id);
+        Ok(())
+    }
+
     fn apply_command(&self, cmd: &ClusterCommand) -> ClusterResponse {
         match cmd {
             ClusterCommand::CreateStream {
@@ -175,6 +215,10 @@ impl SqliteStateMachine {
                 }
                 ClusterResponse::Ok
             }
+            ClusterCommand::SetClusterId { id } => match self.db.setting_set("cluster_id", id) {
+                Ok(()) => ClusterResponse::Ok,
+                Err(e) => ClusterResponse::Error(e),
+            },
         }
     }
 
@@ -184,19 +228,18 @@ impl SqliteStateMachine {
             viewers: self.db.viewer_list_all(),
             owners: self.db.stream_owner_list(),
             api_token: self.db.token_get().ok().flatten(),
+            cluster_id: self.db.setting_get("cluster_id"),
             last_applied_index: self.last_applied.lock().map(|l| l.index),
         }
     }
 
     fn install_app_snapshot(&self, snap: &AppSnapshot) -> Result<(), String> {
+        // Only wipe durable replicated tables — keep local publishers/players/stats.
         self.db.with_conn(|conn| {
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             tx.execute_batch(
                 "DELETE FROM stream_owners;
                  DELETE FROM stream_viewers;
-                 DELETE FROM players;
-                 DELETE FROM publishers;
-                 DELETE FROM stats_samples;
                  DELETE FROM streams;",
             )
             .map_err(|e| e.to_string())?;
@@ -220,6 +263,9 @@ impl SqliteStateMachine {
         }
         if let Some(token) = &snap.api_token {
             let _ = self.db.token_set(token);
+        }
+        if let Some(cid) = &snap.cluster_id {
+            let _ = self.db.setting_set("cluster_id", cid);
         }
         Ok(())
     }
@@ -293,26 +339,35 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
     {
         let mut responses = Vec::new();
         for entry in entries {
-            self.persist_applied(entry.log_id)?;
+            // Apply first, then advance last_applied. Never persist_applied before
+            // the command commits — a crash between would skip the mutation.
             match entry.payload {
-                EntryPayload::Blank => responses.push(ClusterResponse::Ok),
-                EntryPayload::Normal(ref cmd) => responses.push(self.apply_command(cmd)),
+                EntryPayload::Blank => {
+                    self.persist_applied_tx(entry.log_id, None)?;
+                    responses.push(ClusterResponse::Ok);
+                }
+                EntryPayload::Normal(ref cmd) => {
+                    let resp = self.apply_command(cmd);
+                    if let ClusterResponse::Error(ref msg) = resp {
+                        return Err(StorageError::IO {
+                            source: StorageIOError::<u64>::write_state_machine(
+                                &std::io::Error::other(msg.clone()),
+                            ),
+                        });
+                    }
+                    // Command SQL already committed via Db helpers; persist index next.
+                    // Membership+index use a single tx; command+index cannot share a
+                    // conn with Db helpers (non-reentrant mutex) — order still safe:
+                    // lagging last_applied re-applies idempotently after crash.
+                    self.persist_applied_tx(entry.log_id, None)?;
+                    responses.push(resp);
+                }
                 EntryPayload::Membership(ref mem) => {
                     let stored = StoredMembership::new(Some(entry.log_id), mem.clone());
                     let json = serde_json::to_string(&stored).map_err(|e| StorageError::IO {
                         source: StorageIOError::<u64>::write_state_machine(&e),
                     })?;
-                    self.db.with_conn(|conn| {
-                        conn.execute(
-                            "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
-                             ON CONFLICT(key) DO UPDATE SET val=excluded.val",
-                            params![json],
-                        )
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::<u64>::write_state_machine(&e),
-                        })?;
-                        Ok::<(), StorageError<u64>>(())
-                    })?;
+                    self.persist_applied_tx(entry.log_id, Some(&json))?;
                     *self.last_membership.lock() = stored;
                     responses.push(ClusterResponse::Ok);
                 }

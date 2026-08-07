@@ -31,4 +31,8 @@ impl ClusterMeta {
             .map(|(id, (c, m))| (*id, c.clone(), m.clone()))
             .collect()
     }
+
+    pub fn remove(&self, id: NodeId) {
+        self.addrs.lock().remove(&id);
+    }
 }

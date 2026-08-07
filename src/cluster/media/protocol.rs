@@ -10,8 +10,12 @@ pub enum MediaMessage {
         version: u16,
         node_id: u64,
     },
-    Auth {
+    /// Server-issued anti-replay nonce (first frame on a new connection).
+    AuthChallenge {
         nonce: Vec<u8>,
+    },
+    Auth {
+        node_id: u64,
         response: String,
     },
     AuthOk,

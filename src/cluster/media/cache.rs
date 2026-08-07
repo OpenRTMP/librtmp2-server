@@ -45,25 +45,26 @@ impl InitCacheStore {
         timestamp: u32,
         payload: &[u8],
     ) {
+        let Some(ft) =
+            crate::cluster::media::protocol::MediaMessage::frame_type_to_librtmp2(frame_type)
+        else {
+            return;
+        };
+        use librtmp2::media::{CacheFrameKind, classify_cache_frame};
+        let kind = classify_cache_frame(ft, payload);
         let mut g = self.inner.lock();
         let e = g.entry((app.to_string(), stream.to_string())).or_default();
         e.epoch = epoch;
-        match frame_type {
-            2 | 3 => e.metadata = Some(payload.to_vec()),
-            1 => {
-                // Heuristic: small early video = header; keyframe flag not available here.
-                if payload.len() < 256 && e.avc_header.is_none() {
-                    e.avc_header = Some(payload.to_vec());
-                } else {
-                    e.keyframe = Some((timestamp, payload.to_vec()));
+        match kind {
+            CacheFrameKind::VideoSequenceHeader => e.avc_header = Some(payload.to_vec()),
+            CacheFrameKind::VideoKeyframe => e.keyframe = Some((timestamp, payload.to_vec())),
+            CacheFrameKind::AudioSequenceHeader => e.aac_header = Some(payload.to_vec()),
+            CacheFrameKind::LiveOnly => {
+                // Metadata/script frames (types 2/3) still stage as metadata.
+                if matches!(frame_type, 2 | 3) {
+                    e.metadata = Some(payload.to_vec());
                 }
             }
-            0 => {
-                if payload.len() < 128 && e.aac_header.is_none() {
-                    e.aac_header = Some(payload.to_vec());
-                }
-            }
-            _ => {}
         }
     }
 

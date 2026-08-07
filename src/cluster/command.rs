@@ -55,6 +55,10 @@ pub enum ClusterCommand {
         viewers: Vec<StreamViewer>,
         api_token: Option<String>,
     },
+    /// Replicated cluster identity (UUID); written on bootstrap, restored via snapshot.
+    SetClusterId {
+        id: String,
+    },
 }
 
 /// Response returned by the state machine after applying a command.

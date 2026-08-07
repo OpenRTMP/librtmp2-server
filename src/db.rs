@@ -1080,8 +1080,9 @@ impl Db {
         .unwrap_or(0)
     }
 
-    /// True when this DB already has raft log/vote state (joining a cluster
-    /// with leftover raft state from another cluster is refused).
+    /// True when this DB already has raft log/vote/meta/snapshot state (joining a
+    /// cluster with leftover raft state from another cluster is refused unless
+    /// `check_join_reseed` treats it as same-cluster resume).
     pub fn raft_has_state(&self) -> bool {
         let conn = self.conn.lock();
         let vote: i64 = conn
@@ -1090,7 +1091,13 @@ impl Db {
         let logs: i64 = conn
             .query_row("SELECT COUNT(*) FROM raft_log", [], |r| r.get(0))
             .unwrap_or(0);
-        vote > 0 || logs > 0
+        let meta: i64 = conn
+            .query_row("SELECT COUNT(*) FROM raft_meta", [], |r| r.get(0))
+            .unwrap_or(0);
+        let snaps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM raft_snapshots", [], |r| r.get(0))
+            .unwrap_or(0);
+        vote > 0 || logs > 0 || meta > 0 || snaps > 0
     }
 
     /// True when durable app tables have content that would conflict with a
@@ -1104,8 +1111,8 @@ impl Db {
     }
 
     /// Low-level access for Raft storage (same mutex as the rest of `Db`).
-    #[cfg(feature = "cluster")]
-    pub(crate) fn with_conn<F, R>(&self, f: F) -> R
+    #[cfg(any(feature = "cluster", feature = "test-support"))]
+    pub fn with_conn<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Connection) -> R,
     {

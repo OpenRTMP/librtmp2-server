@@ -8,26 +8,43 @@ use openraft::{BasicNode, ChangeMembers};
 use crate::cluster::raft::{NodeId, Raft};
 use crate::db::Db;
 
+/// How a joining node should proceed given local DB state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinReseedAction {
+    /// Empty DB — perform join handshake.
+    FreshJoin,
+    /// Local raft state already belongs to this deployment; skip join, resume.
+    ResumeExisting,
+}
+
 /// Refuse join when local DB has unrelated raft or standalone conflict.
-pub fn check_join_reseed(db: &Db, joining: bool) -> Result<(), String> {
+///
+/// Allow restart of an existing member that still has `CLUSTER_JOIN` set when
+/// local raft state already exists (same cluster resume). Only refuse an
+/// unrelated populated DB / wrong-cluster leftover without raft membership.
+pub fn check_join_reseed(db: &Db, joining: bool) -> Result<JoinReseedAction, String> {
     if !joining {
-        return Ok(());
+        return Ok(JoinReseedAction::FreshJoin);
     }
     if db.raft_has_state() {
-        return Err(
-            "local database already has raft_* state from another cluster; \
-             reseed with an empty DB (delete server.db*) before joining"
-                .into(),
-        );
+        // Existing member restart with CLUSTER_JOIN still configured.
+        return Ok(JoinReseedAction::ResumeExisting);
     }
     if db.has_populated_app_state() {
         return Err(
-            "local database already has streams; joining as learner would conflict. \
+            "local database already has streams without raft_* state; joining as learner would conflict. \
              Use an empty DB or bootstrap this node instead (see docs/clustering.md#reseed)"
                 .into(),
         );
     }
-    Ok(())
+    if db.setting_get("cluster_id").is_some() {
+        return Err(
+            "local database has a cluster_id but no raft state; refuse join of unrelated leftover. \
+             Reseed with an empty DB (see docs/clustering.md#reseed)"
+                .into(),
+        );
+    }
+    Ok(JoinReseedAction::FreshJoin)
 }
 
 pub async fn bootstrap_single_node(

@@ -489,6 +489,13 @@ impl DbRtmpBridge {
             pub_row.id
         );
 
+        #[cfg(feature = "cluster")]
+        if let Some((stream_id, epoch)) = self.ownership_epochs.lock().remove(&conn)
+            && let Some(coord) = self.coordinator.lock().clone()
+        {
+            let _ = coord.release_stream_owner(&stream_id, epoch);
+        }
+
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
             return;
@@ -543,6 +550,10 @@ impl DbRtmpBridge {
             player_row.stream_id,
             player_row.id
         );
+
+        let stream_id_for_unsub = player_row.stream_id.clone();
+        #[cfg(feature = "cluster")]
+        self.maybe_unsubscribe_remote_play(&stream_id_for_unsub);
 
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -963,6 +974,8 @@ impl DbRtmpBridge {
                 );
                 return Err(AuthFailureKind::Operational);
             }
+            #[cfg(feature = "cluster")]
+            self.maybe_unsubscribe_remote_play(&prior.stream_id);
         }
 
         if !self.db.player_try_acquire(&player_row) {
@@ -1012,6 +1025,19 @@ impl DbRtmpBridge {
             stream.id
         );
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn maybe_unsubscribe_remote_play(&self, stream_id: &str) {
+        let app = match self.db.stream_get(stream_id) {
+            DbLookup::Ok(s) => s.app,
+            _ => "live".to_string(),
+        };
+        if let Some(coord) = self.coordinator.lock().clone()
+            && let Some(mgr) = coord.cluster_manager()
+        {
+            mgr.notify_play_unsubscribe(&app, stream_id);
+        }
     }
 }
 
@@ -1129,6 +1155,8 @@ impl RtmpEventHandler for DbRtmpBridge {
         }
 
         if let Some(mut player_row) = cs.player {
+            #[cfg(feature = "cluster")]
+            self.maybe_unsubscribe_remote_play(&player_row.stream_id);
             player_row.active = false;
             if self.db.player_update(&player_row.id, &player_row) {
                 crate::log_info!(

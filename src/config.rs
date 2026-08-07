@@ -417,7 +417,11 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
         // Re-read file for cluster keys (same path).
         match crate::cluster::ClusterConfig::load(path) {
             Ok(c) => config.cluster = c,
-            Err(e) => crate::log_warn!("Cluster config: {e}"),
+            Err(e) => {
+                return Err(format!(
+                    "Invalid cluster config (CLUSTER_ENABLED requires a valid cluster block): {e}"
+                ));
+            }
         }
     }
 
@@ -427,11 +431,11 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
 /// Environment variables override config file values.
 /// `LRTMP2_API_TOKEN` is read during server bootstrap (see `ServerApp::bootstrap`),
 /// not here — it is persisted to the database on first startup when the DB is empty.
-pub fn config_apply_env(config: &mut ServerConfig) {
-    config_apply_env_from(config, |key| std::env::var(key).ok());
+pub fn config_apply_env(config: &mut ServerConfig) -> Result<(), String> {
+    config_apply_env_from(config, |key| std::env::var(key).ok())
 }
 
-fn config_apply_env_from<F>(config: &mut ServerConfig, mut get: F)
+fn config_apply_env_from<F>(config: &mut ServerConfig, mut get: F) -> Result<(), String>
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -587,10 +591,15 @@ where
         if has_cluster_env {
             match crate::cluster::ClusterConfig::load_from_kv(|key| get(key)) {
                 Ok(c) => config.cluster = c,
-                Err(e) => crate::log_warn!("Cluster env config: {e}"),
+                Err(e) => {
+                    return Err(format!(
+                        "Invalid cluster env config (CLUSTER_ENABLED requires valid settings): {e}"
+                    ));
+                }
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -733,7 +742,7 @@ mod tests {
         ]);
 
         let mut config = ServerConfig::default();
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
 
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/env/cert.pem");
@@ -745,7 +754,7 @@ mod tests {
             tls_enabled: true,
             ..Default::default()
         };
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
         assert!(
             config.tls_enabled,
             "invalid value should leave TLS unchanged"
@@ -776,7 +785,7 @@ mod tests {
             ("LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR", "6"),
         ]);
         let mut config = ServerConfig::default();
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
         assert_eq!(config.rtmp_max_connections_per_addr, 8);
         assert_eq!(config.rtmp_max_pending_tls_per_addr, 6);
     }
@@ -845,7 +854,7 @@ mod tests {
         ]);
 
         let mut config = ServerConfig::default();
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
 
         assert_eq!(config.http_rate_limit_window_secs, 120);
         assert_eq!(config.http_rate_limit_api, 50);

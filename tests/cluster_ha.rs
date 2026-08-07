@@ -252,7 +252,23 @@ fn reseed_refuses_populated_join() {
     };
     db.stream_add(&s).unwrap();
     let err = check_join_reseed(&db, true).unwrap_err();
-    assert!(err.contains("reseed") || err.contains("empty"));
+    assert!(err.contains("reseed") || err.contains("empty") || err.contains("conflict"));
+}
+
+#[test]
+fn reseed_allows_resume_when_raft_state_present() {
+    use librtmp2_server::cluster::membership::JoinReseedAction;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(dir.path().join("resume.db").to_str().unwrap()).unwrap();
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO raft_meta(key,val) VALUES('last_applied','{}')",
+            [],
+        )
+        .unwrap();
+    });
+    let action = check_join_reseed(&db, true).unwrap();
+    assert_eq!(action, JoinReseedAction::ResumeExisting);
 }
 
 #[tokio::test]
