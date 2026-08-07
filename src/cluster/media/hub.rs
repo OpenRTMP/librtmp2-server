@@ -123,6 +123,10 @@ impl MediaHub {
     pub async fn serve(self: Arc<Self>, bind: SocketAddr) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(bind).await?;
         tracing::info!(%bind, tls = self.tls_server.is_some(), "cluster media plane listening");
+        self.accept_loop(listener).await
+    }
+
+    async fn accept_loop(self: Arc<Self>, listener: TcpListener) -> Result<(), std::io::Error> {
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -180,12 +184,19 @@ impl MediaHub {
                     ..
                 } => {
                     if self.ownership.accepts_epoch(&stream, epoch) {
+                        // Remap on the receiving node so ownership failover cannot
+                        // reset player timelines when the new owner starts at ts=0.
+                        let timestamp = {
+                            let mut maps = self.timelines.lock();
+                            let key = (app.clone(), stream.clone());
+                            maps.entry(key).or_default().map(epoch, timeline_ts)
+                        };
                         let _ = self.inject_tx.send(InjectedFrame {
                             app,
                             stream,
                             epoch,
                             frame_type,
-                            timestamp: timeline_ts,
+                            timestamp,
                             payload,
                         });
                     }
@@ -273,12 +284,17 @@ impl MediaHub {
                 if !self.ownership.accepts_epoch(&stream, epoch) {
                     return;
                 }
+                let timestamp = {
+                    let mut maps = self.timelines.lock();
+                    let key = (app.clone(), stream.clone());
+                    maps.entry(key).or_default().map(epoch, timeline_ts)
+                };
                 let _ = self.inject_tx.send(InjectedFrame {
                     app,
                     stream,
                     epoch,
                     frame_type,
-                    timestamp: timeline_ts,
+                    timestamp,
                     payload,
                 });
             }
@@ -382,7 +398,7 @@ impl MediaHub {
         };
 
         let peers: Vec<_> = self.peers.lock().values().cloned().collect();
-        let mut sent = 0u32;
+        let mut standby_sent = 0u32;
         for peer in peers {
             if peer.is_closed() {
                 continue;
@@ -391,9 +407,12 @@ impl MediaHub {
                 .subs
                 .peers_for_stream(&frame.app, &frame.stream)
                 .contains(&peer.peer_id);
-            if subscribed || sent < self.replicas {
+            if subscribed {
+                let _ = peer.try_send(msg.clone());
+            } else if standby_sent < self.replicas {
+                // Standby replicas are additional nodes beyond active subscribers.
                 if peer.try_send(msg.clone()).is_ok() {
-                    sent = sent.saturating_add(1);
+                    standby_sent = standby_sent.saturating_add(1);
                 }
             }
         }
@@ -427,11 +446,15 @@ impl MediaHub {
         });
     }
 
-    /// Start media listener in a background task.
+    /// Bind the media port before spawning accept so startup fails hard on conflict.
     pub async fn start(self: &Arc<Self>, bind: SocketAddr) -> Result<(), String> {
+        let listener = TcpListener::bind(bind)
+            .await
+            .map_err(|e| format!("cluster media bind {bind}: {e}"))?;
+        tracing::info!(%bind, tls = self.tls_server.is_some(), "cluster media plane listening");
         let hub = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = hub.serve(bind).await {
+            if let Err(e) = hub.accept_loop(listener).await {
                 tracing::error!(error = %e, "cluster media plane stopped");
             }
         });

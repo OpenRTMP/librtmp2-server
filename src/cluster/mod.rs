@@ -19,7 +19,7 @@ pub mod state;
 pub use command::{ClusterCommand, ClusterResponse};
 pub use config::ClusterConfig;
 pub use health::NodeHealthState;
-pub use manager::ClusterManager;
+pub use manager::{ClusterManager, SessionHooks};
 pub use raft::TypeConfig;
 
 pub type NodeId = u64;

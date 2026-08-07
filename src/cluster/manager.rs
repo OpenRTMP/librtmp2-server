@@ -19,8 +19,8 @@ use crate::cluster::health::{HealthTracker, NodeHealthState};
 use crate::cluster::media::hub::{ExportedFrame, InjectedFrame, MediaHub};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::membership::{
-    add_learner, bootstrap_single_node, check_join_reseed, promote_learners, remove_node,
-    seed_from_local_db, JoinReseedAction,
+    bootstrap_single_node, check_join_reseed, promote_learners, remove_node, seed_from_local_db,
+    JoinReseedAction,
 };
 use crate::cluster::metrics::{ClusterMetrics, ClusterStreamInfo, NodeInfo};
 use crate::cluster::network::{self, JoinPeerInfo, NetworkFactory};
@@ -50,6 +50,25 @@ pub struct ClusterManager {
     rt_handle: tokio::runtime::Handle,
     last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
     tls_client: Option<Arc<ClientConfig>>,
+    /// Optional hooks into HTTP/RTMP markers + live API bearer.
+    session_hooks: Mutex<Option<SessionHooks>>,
+    /// Per-peer publisher/player counts from heartbeats.
+    peer_session_counts: Mutex<std::collections::HashMap<NodeId, (u64, u64)>>,
+    /// Raft state-machine side-effect channel (drain/revoke/token).
+    effects_rx: Mutex<
+        Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>,
+    >,
+}
+
+/// Shared with AppState so Raft applies can mark deleted streams / revoked viewers
+/// and refresh the in-memory bearer token on every node.
+#[derive(Clone)]
+pub struct SessionHooks {
+    pub deleted_streams: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    pub revoked_viewers: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    pub api_token: Arc<parking_lot::RwLock<String>>,
+    /// Optional local live-session counter for drain wait aggregation.
+    pub local_stream_sessions: Arc<dyn Fn(&str) -> u64 + Send + Sync>,
 }
 
 impl ClusterManager {
@@ -100,6 +119,9 @@ impl ClusterManager {
 
         let log_store = SqliteLogStore::new(Arc::clone(&db));
         let state_machine = SqliteStateMachine::new(Arc::clone(&db));
+        let sm_handle = state_machine.clone();
+        let (effects_tx, effects_rx) = std::sync::mpsc::channel();
+        sm_handle.set_effects_tx(effects_tx);
         let network = Arc::new(NetworkFactory::new(
             config.node_id,
             config.secret.clone(),
@@ -158,6 +180,9 @@ impl ClusterManager {
             rt_handle,
             last_metrics: Mutex::new(None),
             tls_client: tls_client.clone(),
+            session_hooks: Mutex::new(None),
+            peer_session_counts: Mutex::new(std::collections::HashMap::new()),
+            effects_rx: Mutex::new(Some(effects_rx)),
         });
 
         // Control + media listeners
@@ -172,10 +197,44 @@ impl ClusterManager {
                 })
             });
             let health_hb = Arc::clone(&mgr.health);
-            let on_heartbeat: Arc<dyn Fn(NodeId, String, f64) + Send + Sync> =
-                Arc::new(move |nid, health_s, load| {
-                    let state = NodeHealthState::parse(&health_s).unwrap_or(NodeHealthState::Ready);
-                    health_hb.note_peer(nid, state, load, None, None);
+            let meta_hb = Arc::clone(&mgr.meta);
+            let media_hb = Arc::clone(&mgr.media);
+            let network_hb = Arc::clone(&mgr.network);
+            let counts_hb = Arc::clone(&mgr);
+            let on_heartbeat: Arc<dyn Fn(network::HeartbeatInfo) + Send + Sync> =
+                Arc::new(move |info: network::HeartbeatInfo| {
+                    let state =
+                        NodeHealthState::parse(&info.health).unwrap_or(NodeHealthState::Ready);
+                    let ctrl = if info.control_addr.is_empty() {
+                        None
+                    } else {
+                        Some(info.control_addr.clone())
+                    };
+                    let media_a = if info.media_addr.is_empty() {
+                        None
+                    } else {
+                        Some(info.media_addr.clone())
+                    };
+                    health_hb.note_peer(
+                        info.node_id,
+                        state,
+                        info.load,
+                        ctrl.clone(),
+                        media_a.clone(),
+                    );
+                    if let (Some(c), Some(m)) = (ctrl, media_a) {
+                        meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
+                        network_hb.upsert_node(info.node_id, c);
+                        let hub = Arc::clone(&media_hb);
+                        let mid = info.node_id;
+                        tokio::spawn(async move {
+                            let _ = hub.connect_peer(mid, &m).await;
+                        });
+                    }
+                    counts_hb
+                        .peer_session_counts
+                        .lock()
+                        .insert(info.node_id, (info.publishers, info.players));
                 });
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
@@ -216,24 +275,40 @@ impl ClusterManager {
             .map_err(|e| format!("CLUSTER_MEDIA_BIND: {e}"))?;
         media.start(media_bind).await?;
 
+        // Restore control/media peers from persisted Raft membership when resuming.
+        mgr.restore_topology_from_membership(&sm_handle);
+
         if config.bootstrap {
-            bootstrap_single_node(&raft, config.node_id, advertise.clone()).await?;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if db.setting_get(CLUSTER_ID_SETTING).is_none() {
-                let cid = uuid::Uuid::new_v4().to_string();
-                raft.client_write(ClusterCommand::SetClusterId { id: cid })
-                    .await
-                    .map_err(|e| format!("set cluster_id: {e}"))?;
+            if db.raft_has_state() {
+                // Existing voter restart — do not re-initialize OpenRaft storage.
+                if let Some(ref join_addr) = config.join {
+                    let _ = mgr.refresh_topology_from(join_addr).await;
+                }
+                health.set_local(NodeHealthState::Ready);
+                crate::log_info!(
+                    "Cluster: resumed bootstrap node {} with existing Raft state",
+                    config.node_id
+                );
+            } else {
+                bootstrap_single_node(&raft, config.node_id, advertise.clone()).await?;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if db.setting_get(CLUSTER_ID_SETTING).is_none() {
+                    let cid = uuid::Uuid::new_v4().to_string();
+                    raft.client_write(ClusterCommand::SetClusterId { id: cid })
+                        .await
+                        .map_err(|e| format!("set cluster_id: {e}"))?;
+                }
+                seed_from_local_db(&raft, &db).await?;
+                health.set_local(NodeHealthState::Ready);
+                crate::log_info!(
+                    "Cluster: initialized new cluster (node_id={})",
+                    config.node_id
+                );
             }
-            seed_from_local_db(&raft, &db).await?;
-            health.set_local(NodeHealthState::Ready);
-            crate::log_info!(
-                "Cluster: initialized new cluster (node_id={})",
-                config.node_id
-            );
         } else if let Some(ref join_addr) = config.join {
             match join_action {
                 JoinReseedAction::ResumeExisting => {
+                    let _ = mgr.refresh_topology_from(join_addr).await;
                     health.set_local(NodeHealthState::Ready);
                     crate::log_info!(
                         "Cluster: resuming existing member node {} (CLUSTER_JOIN set but local raft state present)",
@@ -425,6 +500,7 @@ impl ClusterManager {
         })?;
         let epoch = resp.into_owner_epoch()?;
         self.ownership.set(stream_id, node_id, epoch);
+        self.ownership.advance_past(epoch);
         self.refresh_subscriptions_for(&[stream_id.to_string()]);
         crate::log_info!("Cluster: stream {stream_id} acquired by node {node_id} epoch={epoch}");
         Ok(epoch)
@@ -567,9 +643,45 @@ impl ClusterManager {
         self.network.upsert_node(node_id, control_addr.clone());
         self.meta
             .set_addrs(node_id, control_addr.clone(), media_addr.clone());
-        add_learner(&self.raft, node_id, control_addr.clone())
+
+        use openraft::error::{ClientWriteError, RaftError};
+        match self
+            .raft
+            .add_learner(node_id, BasicNode { addr: control_addr.clone() }, true)
             .await
-            .map_err(|e| format!("add_learner: {e}"))?;
+        {
+            Ok(_) => {}
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                let leader_addr = ftl
+                    .leader_node
+                    .map(|n| n.addr)
+                    .or_else(|| {
+                        ftl.leader_id
+                            .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
+                    })
+                    .ok_or_else(|| {
+                        "forward_to_leader: no leader address available".to_string()
+                    })?;
+                return network::forward_join(
+                    &leader_addr,
+                    &self.config.secret,
+                    self.config.node_id,
+                    node_id,
+                    control_addr,
+                    media_addr,
+                    self.tls_client.clone(),
+                )
+                .await;
+            }
+            Err(e) => {
+                // Already a member / idempotent learner add — continue with topology.
+                let msg = e.to_string();
+                if !(msg.contains("already") || msg.contains("Exists") || msg.contains("exist")) {
+                    return Err(format!("add_learner: {e}"));
+                }
+            }
+        }
+
         let _ = self.media.connect_peer(node_id, &media_addr).await;
         self.health.note_peer(
             node_id,
@@ -603,10 +715,39 @@ impl ClusterManager {
                 network::ControlMessage::AdminOk
             }
             network::ControlMessage::AdminRemove { node_id } => {
-                // Removals must go through Raft on the leader; acknowledge only.
                 let _ = node_id;
                 network::ControlMessage::AdminErr {
                     message: "use DELETE /api/v1/cluster/nodes/{id} on a voter".into(),
+                }
+            }
+            network::ControlMessage::DrainStream { stream_id } => {
+                self.mark_stream_draining(&stream_id);
+                network::ControlMessage::AdminOk
+            }
+            network::ControlMessage::RevokeViewer { viewer_id } => {
+                self.mark_viewer_revoked(&viewer_id);
+                network::ControlMessage::AdminOk
+            }
+            network::ControlMessage::SessionCountReq { stream_id } => {
+                let count = self.local_live_sessions(&stream_id);
+                network::ControlMessage::SessionCountResp { count }
+            }
+            network::ControlMessage::TopologyReq => {
+                let peers: Vec<JoinPeerInfo> = self
+                    .meta
+                    .all()
+                    .into_iter()
+                    .map(|(id, ctrl, media)| JoinPeerInfo {
+                        node_id: id,
+                        control_addr: ctrl,
+                        media_addr: media,
+                    })
+                    .collect();
+                network::ControlMessage::TopologyResp {
+                    ok: true,
+                    message: "ok".into(),
+                    cluster_id: self.cluster_id(),
+                    peers,
                 }
             }
             _ => network::ControlMessage::AdminErr {
@@ -626,6 +767,176 @@ impl ClusterManager {
             "publisher_rows": pubs,
             "player_rows": players,
         })
+    }
+
+    pub fn register_session_hooks(&self, hooks: SessionHooks) {
+        *self.session_hooks.lock() = Some(hooks);
+    }
+
+    fn mark_stream_draining(&self, stream_id: &str) {
+        if let Some(hooks) = self.session_hooks.lock().as_ref() {
+            hooks.deleted_streams.lock().insert(stream_id.to_string());
+        }
+    }
+
+    fn mark_stream_drain_clear(&self, stream_id: &str) {
+        if let Some(hooks) = self.session_hooks.lock().as_ref() {
+            hooks.deleted_streams.lock().remove(stream_id);
+        }
+    }
+
+    fn mark_viewer_revoked(&self, viewer_id: &str) {
+        if let Some(hooks) = self.session_hooks.lock().as_ref() {
+            hooks.revoked_viewers.lock().insert(viewer_id.to_string());
+        }
+    }
+
+    fn apply_api_token(&self, token: &str) {
+        if let Some(hooks) = self.session_hooks.lock().as_ref() {
+            *hooks.api_token.write() = token.to_string();
+        }
+    }
+
+    fn local_live_sessions(&self, stream_id: &str) -> u64 {
+        if let Some(hooks) = self.session_hooks.lock().as_ref() {
+            return (hooks.local_stream_sessions)(stream_id);
+        }
+        0
+    }
+
+    fn process_state_effects(&self) {
+        let Some(rx) = self.effects_rx.lock().as_ref() else {
+            return;
+        };
+        use crate::cluster::raft::state_machine::StateEffect;
+        while let Ok(effect) = rx.try_recv() {
+            match effect {
+                StateEffect::DrainStream(id) => self.mark_stream_draining(&id),
+                StateEffect::ClearDrainStream(id) => self.mark_stream_drain_clear(&id),
+                StateEffect::RevokeViewer(id) => self.mark_viewer_revoked(&id),
+                StateEffect::ApiToken(token) => self.apply_api_token(&token),
+            }
+        }
+    }
+
+    fn restore_topology_from_membership(&self, sm: &SqliteStateMachine) {
+        let membership = sm.last_membership();
+        for (id, node) in membership.membership().nodes() {
+            if *id == self.config.node_id {
+                continue;
+            }
+            let ctrl = node.addr.clone();
+            self.network.upsert_node(*id, ctrl.clone());
+            // Media addr unknown until topology/heartbeat; seed control only.
+            let media = self
+                .meta
+                .get(*id)
+                .map(|(_, m)| m)
+                .unwrap_or_default();
+            self.meta.set_addrs(*id, ctrl.clone(), media);
+            self.health.note_peer(
+                *id,
+                NodeHealthState::Ready,
+                0.0,
+                Some(ctrl),
+                None,
+            );
+        }
+    }
+
+    async fn refresh_topology_from(&self, peer_addr: &str) -> Result<(), String> {
+        let (cluster_id, peers) = network::send_topology(
+            peer_addr,
+            &self.config.secret,
+            self.config.node_id,
+            self.tls_client.clone(),
+        )
+        .await?;
+        if !cluster_id.is_empty() {
+            let _ = self.db.setting_set(CLUSTER_ID_SETTING, &cluster_id);
+        }
+        for p in peers {
+            if p.node_id == self.config.node_id {
+                continue;
+            }
+            self.network
+                .upsert_node(p.node_id, p.control_addr.clone());
+            self.meta.set_addrs(
+                p.node_id,
+                p.control_addr.clone(),
+                p.media_addr.clone(),
+            );
+            let _ = self.media.connect_peer(p.node_id, &p.media_addr).await;
+            self.health.note_peer(
+                p.node_id,
+                NodeHealthState::Ready,
+                0.0,
+                Some(p.control_addr),
+                Some(p.media_addr),
+            );
+        }
+        Ok(())
+    }
+
+    /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
+    pub async fn remote_stream_session_count(&self, stream_id: &str) -> u64 {
+        let mut total = 0u64;
+        for (id, ctrl, _) in self.meta.all() {
+            if id == self.config.node_id {
+                continue;
+            }
+            if let Ok(n) = network::send_session_count(
+                &ctrl,
+                &self.config.secret,
+                self.config.node_id,
+                stream_id.to_string(),
+                self.tls_client.clone(),
+            )
+            .await
+            {
+                total = total.saturating_add(n);
+            }
+        }
+        total
+    }
+
+    /// Best-effort broadcast of drain/revoke markers to peers (Raft apply also marks locally).
+    pub async fn broadcast_drain_stream(&self, stream_id: &str) {
+        self.mark_stream_draining(stream_id);
+        for (id, ctrl, _) in self.meta.all() {
+            if id == self.config.node_id {
+                continue;
+            }
+            let _ = network::send_admin(
+                &ctrl,
+                &self.config.secret,
+                self.config.node_id,
+                network::ControlMessage::DrainStream {
+                    stream_id: stream_id.to_string(),
+                },
+                self.tls_client.clone(),
+            )
+            .await;
+        }
+    }
+
+    pub async fn broadcast_revoke_viewer(&self, viewer_id: &str) {
+        self.mark_viewer_revoked(viewer_id);
+        for (id, ctrl, _) in self.meta.all() {
+            if id == self.config.node_id {
+                continue;
+            }
+            let _ = network::send_admin(
+                &ctrl,
+                &self.config.secret,
+                self.config.node_id,
+                network::ControlMessage::RevokeViewer {
+                    viewer_id: viewer_id.to_string(),
+                },
+                self.tls_client.clone(),
+            )
+            .await;
+        }
     }
 
     /// Proxy stats from the owning node when this node is not the owner.
@@ -696,7 +1007,8 @@ impl ClusterManager {
 
     /// Re-subscribe local players after ownership epoch/node changes.
     fn refresh_subscriptions_for(&self, stream_ids: &[String]) {
-        self.media.reset_timelines_for(stream_ids);
+        // Keep receive-side timeline remappers across owner changes so players
+        // see a monotonic handoff (new owner often restarts timestamps at 0).
         for sid in stream_ids {
             let app = match self.db.stream_get(sid) {
                 crate::db::DbLookup::Ok(s) => s.app,
@@ -745,10 +1057,12 @@ impl ClusterManager {
         let mut ticker = tokio::time::interval(self.config.heartbeat);
         loop {
             ticker.tick().await;
+            self.process_state_effects();
             if !self.config.bandwidth_interface.is_empty() {
                 match measure_interface_utilization(
                     &self.config.bandwidth_interface,
                     self.config.bandwidth_max_mbps,
+                    self.config.bandwidth_mode,
                 ) {
                     Ok(load) => self.admission.update_load(load),
                     Err(e) => {
@@ -768,6 +1082,20 @@ impl ClusterManager {
             }
             // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
             self.sync_ownership_from_db();
+            let local_pubs = self
+                .db
+                .publisher_list_all()
+                .iter()
+                .filter(|p| p.active)
+                .count() as u64;
+            let local_players = self
+                .db
+                .player_list_all()
+                .iter()
+                .filter(|p| p.active)
+                .count() as u64;
+            let advertise = self.config.advertise_control();
+            let media_advertise = self.config.advertise_media();
             // Emit heartbeats to known peers
             for (id, ctrl, _) in self.meta.all() {
                 if id == self.config.node_id {
@@ -779,6 +1107,10 @@ impl ClusterManager {
                     self.config.node_id,
                     self.health.local().as_str(),
                     self.admission.current_load(),
+                    advertise.clone(),
+                    media_advertise.clone(),
+                    local_pubs,
+                    local_players,
                     self.tls_client.clone(),
                 )
                 .await;
@@ -865,13 +1197,19 @@ impl ClusterManager {
             .publisher_list_all()
             .iter()
             .filter(|p| p.active)
-            .count();
+            .count() as u64;
         let players = self
             .db
             .player_list_all()
             .iter()
             .filter(|p| p.active)
-            .count();
+            .count() as u64;
+        let peer_counts = self.peer_session_counts.lock();
+        let peer_pubs: u64 = peer_counts.values().map(|(p, _)| *p).sum();
+        let peer_players: u64 = peer_counts.values().map(|(_, pl)| *pl).sum();
+        drop(peer_counts);
+        let total_publishers = pubs.saturating_add(peer_pubs);
+        let total_players = players.saturating_add(peer_players);
         let load = self.admission.current_load();
         let cap = if self.config.bandwidth_max_mbps > 0.0 {
             self.config.bandwidth_max_mbps
@@ -897,8 +1235,10 @@ impl ClusterManager {
             "learner_count": m.learner_count,
             "healthy_nodes": healthy,
             "unavailable_nodes": unavailable,
-            "total_publishers": pubs,
-            "total_players": players,
+            "total_publishers": total_publishers,
+            "total_players": total_players,
+            "local_publishers": pubs,
+            "local_players": players,
             "total_rx_mbps": approx_mbps,
             "total_tx_mbps": approx_mbps,
             "load": {

@@ -17,6 +17,17 @@ use crate::cluster::raft::TypeConfig;
 use crate::cluster::raft::snapshot::AppSnapshot;
 use crate::db::{Db, StreamAddError};
 
+/// Side effects that must run after a Raft apply on every node (session markers,
+/// in-memory bearer refresh). Delivered via an optional channel set by
+/// [`ClusterManager`](crate::cluster::ClusterManager).
+#[derive(Debug, Clone)]
+pub enum StateEffect {
+    DrainStream(String),
+    ClearDrainStream(String),
+    RevokeViewer(String),
+    ApiToken(String),
+}
+
 #[derive(Clone)]
 pub struct SqliteStateMachine {
     db: Arc<Db>,
@@ -24,6 +35,7 @@ pub struct SqliteStateMachine {
     last_membership: Arc<Mutex<StoredMembership<u64, openraft::BasicNode>>>,
     current_snapshot: Arc<Mutex<Option<StoredSnapshot>>>,
     snapshot_idx: Arc<AtomicU64>,
+    effects: Arc<Mutex<Option<std::sync::mpsc::Sender<StateEffect>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,11 +71,27 @@ impl SqliteStateMachine {
             last_membership: Arc::new(Mutex::new(last_membership)),
             current_snapshot: Arc::new(Mutex::new(None)),
             snapshot_idx: Arc::new(AtomicU64::new(0)),
+            effects: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn db(&self) -> &Arc<Db> {
         &self.db
+    }
+
+    /// Register a channel for post-apply session/token side effects.
+    pub fn set_effects_tx(&self, tx: std::sync::mpsc::Sender<StateEffect>) {
+        *self.effects.lock() = Some(tx);
+    }
+
+    pub fn last_membership(&self) -> StoredMembership<u64, openraft::BasicNode> {
+        self.last_membership.lock().clone()
+    }
+
+    fn emit_effect(&self, effect: StateEffect) {
+        if let Some(tx) = self.effects.lock().as_ref() {
+            let _ = tx.send(effect);
+        }
     }
 
     fn persist_applied(&self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
@@ -136,12 +164,18 @@ impl SqliteStateMachine {
                 Err(StreamAddError::Db) => ClusterResponse::Error("db".into()),
             },
             ClusterCommand::BeginDeleteStream { id } => match self.db.stream_disable(id) {
-                Some(true) => ClusterResponse::Ok,
+                Some(true) => {
+                    self.emit_effect(StateEffect::DrainStream(id.clone()));
+                    ClusterResponse::Ok
+                }
                 Some(false) => ClusterResponse::NotFound,
                 None => ClusterResponse::Error("db".into()),
             },
             ClusterCommand::FinalizeDeleteStream { id } => match self.db.stream_delete(id) {
-                Some(true) => ClusterResponse::Ok,
+                Some(true) => {
+                    self.emit_effect(StateEffect::ClearDrainStream(id.clone()));
+                    ClusterResponse::Ok
+                }
                 Some(false) => ClusterResponse::NotFound,
                 None => ClusterResponse::Error("db".into()),
             },
@@ -165,13 +199,17 @@ impl SqliteStateMachine {
             } => match self.db.viewer_delete(stream_id, viewer_id) {
                 Some(true) => {
                     self.db.players_deactivate_for_viewer(viewer_id);
+                    self.emit_effect(StateEffect::RevokeViewer(viewer_id.clone()));
                     ClusterResponse::Ok
                 }
                 Some(false) => ClusterResponse::NotFound,
                 None => ClusterResponse::Error("db".into()),
             },
-            ClusterCommand::SetApiToken { token } => match self.db.token_set(token) {
-                Ok(_) => ClusterResponse::Ok,
+            ClusterCommand::SetApiToken { token } => match self.db.token_replace(token) {
+                Ok(()) => {
+                    self.emit_effect(StateEffect::ApiToken(token.clone()));
+                    ClusterResponse::Ok
+                }
                 Err(e) => ClusterResponse::Error(e),
             },
             ClusterCommand::AcquireStreamOwner {
@@ -211,7 +249,10 @@ impl SqliteStateMachine {
                     let _ = self.db.viewer_add(v);
                 }
                 if let Some(token) = api_token {
-                    let _ = self.db.token_set(token);
+                    if let Err(e) = self.db.token_replace(token) {
+                        return ClusterResponse::Error(e);
+                    }
+                    self.emit_effect(StateEffect::ApiToken(token.clone()));
                 }
                 ClusterResponse::Ok
             }
@@ -262,7 +303,8 @@ impl SqliteStateMachine {
                 .map_err(|_| "owner restore failed".to_string())?;
         }
         if let Some(token) = &snap.api_token {
-            let _ = self.db.token_set(token);
+            self.db.token_replace(token)?;
+            self.emit_effect(StateEffect::ApiToken(token.clone()));
         }
         if let Some(cid) = &snap.cluster_id {
             let _ = self.db.setting_set("cluster_id", cid);
@@ -347,7 +389,31 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     responses.push(ClusterResponse::Ok);
                 }
                 EntryPayload::Normal(ref cmd) => {
-                    let resp = self.apply_command(cmd);
+                    let resp = match cmd {
+                        ClusterCommand::AcquireStreamOwner {
+                            stream_id,
+                            node_id,
+                            epoch: _,
+                            acquired_at,
+                        } => {
+                            // Raft log index is cluster-wide monotonic — use it as
+                            // the fencing epoch so release cannot recycle tokens.
+                            let epoch = entry.log_id.index.max(1);
+                            match self.db.stream_owner_acquire(
+                                stream_id,
+                                *node_id,
+                                epoch,
+                                *acquired_at,
+                            ) {
+                                Ok(ep) => ClusterResponse::OwnerEpoch(ep),
+                                Err(crate::db::OwnerError::Conflict) => ClusterResponse::Conflict,
+                                Err(crate::db::OwnerError::Db) => {
+                                    ClusterResponse::Error("db".into())
+                                }
+                            }
+                        }
+                        other => self.apply_command(other),
+                    };
                     if let ClusterResponse::Error(ref msg) = resp {
                         return Err(StorageError::IO {
                             source: StorageIOError::<u64>::write_state_machine(

@@ -35,6 +35,8 @@ use crate::state::{CoordError, StateCoordinator};
 pub struct AppState {
     pub db: Arc<Db>,
     pub config: ServerConfig,
+    /// Live bearer token (may be refreshed when a joiner installs the cluster token).
+    pub api_token: Arc<parking_lot::RwLock<String>>,
     pub rtmp_bridge: Arc<DbRtmpBridge>,
     /// Durable mutations (standalone DB or Raft).
     pub coordinator: Arc<StateCoordinator>,
@@ -50,7 +52,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let limiter = RateLimiter::new(
         state.config.http_rate_limit_config(),
         state.config.http_trusted_proxies.clone(),
-        &state.config.api_token,
+        Arc::clone(&state.api_token),
     );
     Router::new()
         .route("/api/v1/health", get(handle_health))
@@ -230,7 +232,8 @@ fn xml_escape(s: &str) -> String {
 /// uses (to preview auth status for bucket selection) — sharing one
 /// implementation keeps the two checks from drifting apart.
 fn bearer_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    rate_limit::bearer_authenticated(headers, &state.config.api_token)
+    let token = state.api_token.read().clone();
+    rate_limit::bearer_authenticated(headers, &token)
 }
 
 fn stats_key_lookup(
@@ -1204,12 +1207,26 @@ const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
     let started = Instant::now();
     let mut last_warn = started;
-    while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
+    loop {
+        let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
+        #[cfg(feature = "cluster")]
+        let remote = {
+            if let Some(mgr) = state.coordinator.cluster_manager() {
+                mgr.remote_stream_session_count(&id).await
+            } else {
+                0
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let remote = 0u64;
+        if local == 0 && remote == 0 {
+            break;
+        }
         if last_warn.elapsed() >= DELETE_DRAIN_WARN_AFTER {
             crate::log_warn!(
                 "Still deleting stream '{id}' — stream stays disabled; \
-                 waiting for {} active RTMP session(s) to drain",
-                state.rtmp_bridge.live_conn_count_for_stream(&id)
+                 waiting for {} local + {remote} remote RTMP session(s) to drain",
+                local
             );
             last_warn = Instant::now();
         }
@@ -1309,8 +1326,23 @@ async fn handle_stream_delete(
             "Failed to disable stream",
         );
     }
+    #[cfg(feature = "cluster")]
+    if let Some(mgr) = state.coordinator.cluster_manager() {
+        mgr.broadcast_drain_stream(&id).await;
+    }
 
-    if state.rtmp_bridge.live_conn_count_for_stream(&id) == 0 {
+    let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
+    #[cfg(feature = "cluster")]
+    let remote = {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            mgr.remote_stream_session_count(&id).await
+        } else {
+            0
+        }
+    };
+    #[cfg(not(feature = "cluster"))]
+    let remote = 0u64;
+    if local == 0 && remote == 0 {
         return match finalize_stream_delete(&state, &id).await {
             Ok(()) => {
                 crate::log_info!(
@@ -1687,6 +1719,10 @@ async fn handle_stream_player_delete(
         Ok(()) => {
             state.revoked_viewers.lock().insert(player_id.clone());
             state.db.players_deactivate_for_viewer(&player_id);
+            #[cfg(feature = "cluster")]
+            if let Some(mgr) = state.coordinator.cluster_manager() {
+                mgr.broadcast_revoke_viewer(&player_id).await;
+            }
             crate::log_info!(
                 "HTTP: DELETE /api/v1/streams/{id}/players/{player_id} from {peer} → 200 play key revoked"
             );
@@ -2033,9 +2069,11 @@ mod tests {
             Arc::clone(&db),
             Arc::clone(&deleted_streams),
         ));
+        let api_token = Arc::new(parking_lot::RwLock::new(config.api_token.clone()));
         Arc::new(AppState {
             db: Arc::clone(&db),
             config,
+            api_token,
             rtmp_bridge,
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
@@ -2135,6 +2173,7 @@ mod tests {
         ));
         let state = Arc::new(AppState {
             db: Arc::clone(&db),
+            api_token: Arc::new(parking_lot::RwLock::new(config.api_token.clone())),
             config,
             rtmp_bridge,
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),

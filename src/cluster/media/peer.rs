@@ -209,10 +209,9 @@ async fn connect_and_run(
     let tcp = TcpStream::connect(addr).await?;
     let mut stream: Box<dyn MediaIo> = if let Some(cfg) = tls_client {
             let connector = TlsConnector::from(cfg);
-            let host = addr.split(':').next().unwrap_or("localhost").to_string();
-            let server_name = rustls::pki_types::ServerName::try_from(host)
-                .map_err(|e| std::io::Error::other(e))?;
-            let tls = connector.connect(server_name, tcp).await?;
+            let host = crate::cluster::network::tls_server_name_from_addr(addr)
+                .map_err(std::io::Error::other)?;
+            let tls = connector.connect(host, tcp).await?;
             Box::new(tls)
         } else {
             Box::new(tcp)

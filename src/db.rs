@@ -430,6 +430,19 @@ impl Db {
         Ok(rows > 0)
     }
 
+    /// Unconditionally replace the API token (Raft apply / snapshot install).
+    /// Unlike [`token_set`], a non-empty local seed does not block the write.
+    pub fn token_replace(&self, token: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings(key,val) VALUES('api_token',?) \
+             ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+            rusqlite::params![token],
+        )
+        .map_err(|e| format!("DB error replacing API token: {e}"))?;
+        Ok(())
+    }
+
     // ==================== STREAMS ====================
 
     /// True when `key` is already used as any publish/play/stats key on a stream

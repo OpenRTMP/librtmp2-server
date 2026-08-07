@@ -606,6 +606,29 @@ impl ServerApp {
         #[cfg(not(feature = "cluster"))]
         let coordinator = Arc::clone(&self.coordinator);
 
+        // After cluster join/snapshot, prefer the replicated API token.
+        let mut live_token = self.config.api_token.clone();
+        if let Ok(Some(t)) = self.db.token_get() {
+            live_token = t;
+        }
+        let api_token = Arc::new(parking_lot::RwLock::new(live_token));
+
+        #[cfg(feature = "cluster")]
+        if let Some(mgr) = coordinator.cluster_manager() {
+            let deleted = Arc::clone(&self.deleted_streams);
+            let revoked = Arc::clone(&self.revoked_viewers);
+            let token = Arc::clone(&api_token);
+            let bridge = Arc::clone(&self.rtmp_bridge);
+            mgr.register_session_hooks(crate::cluster::SessionHooks {
+                deleted_streams: deleted,
+                revoked_viewers: revoked,
+                api_token: token,
+                local_stream_sessions: Arc::new(move |sid: &str| {
+                    bridge.live_conn_count_for_stream(sid) as u64
+                }),
+            });
+        }
+
         if self.config.tls_enabled {
             if self.config.tls_cert_file.is_empty() || self.config.tls_key_file.is_empty() {
                 return Err("TLS enabled but tls.cert_file / tls.key_file not configured".into());
@@ -621,6 +644,7 @@ impl ServerApp {
         let state = Arc::new(AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
+            api_token,
             rtmp_bridge: Arc::clone(&self.rtmp_bridge),
             coordinator: Arc::clone(&coordinator),
             deleted_streams: Arc::clone(&self.deleted_streams),

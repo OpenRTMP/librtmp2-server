@@ -92,9 +92,13 @@ impl IngressEligibility for AdmissionController {
     }
 }
 
-/// Measure interface RX+TX bytes/sec when possible. Returns utilization vs
-/// `bandwidth_max_mbps` (0.0 if interface missing / unsupported).
-pub fn measure_interface_utilization(iface: &str, max_mbps: f64) -> Result<f64, String> {
+/// Measure interface utilization vs `bandwidth_max_mbps` using `mode` to
+/// combine RX/TX byte rates (0.0 if interface missing / unsupported).
+pub fn measure_interface_utilization(
+    iface: &str,
+    max_mbps: f64,
+    mode: crate::cluster::config::BandwidthMode,
+) -> Result<f64, String> {
     if iface.is_empty() || max_mbps <= 0.0 {
         return Ok(0.0);
     }
@@ -121,12 +125,15 @@ pub fn measure_interface_utilization(iface: &str, max_mbps: f64) -> Result<f64, 
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(tx1);
-        let bytes_per_sec = (rx2.saturating_sub(rx1) + tx2.saturating_sub(tx1)) as f64 / 0.2;
+        let rx_bps = rx2.saturating_sub(rx1) as f64 / 0.2;
+        let tx_bps = tx2.saturating_sub(tx1) as f64 / 0.2;
+        let bytes_per_sec = mode.combine(rx_bps, tx_bps);
         let mbps = bytes_per_sec * 8.0 / 1_000_000.0;
         return Ok((mbps / max_mbps).clamp(0.0, 1.0));
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = mode;
         // Best-effort via Get-NetAdapterStatistics; clear error if missing.
         let output = std::process::Command::new("powershell")
             .args([
@@ -153,6 +160,7 @@ pub fn measure_interface_utilization(iface: &str, max_mbps: f64) -> Result<f64, 
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
+        let _ = mode;
         Err(format!(
             "bandwidth measurement unsupported on this OS (interface '{iface}')"
         ))

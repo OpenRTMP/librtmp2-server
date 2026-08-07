@@ -4,6 +4,42 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// How [`measure_interface_utilization`](super::admission::measure_interface_utilization)
+/// combines RX and TX byte counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BandwidthMode {
+    /// Transmit only (default).
+    #[default]
+    Tx,
+    /// Receive only.
+    Rx,
+    /// `max(rx, tx)`.
+    Max,
+    /// `rx + tx` (can double-count relay traffic).
+    Sum,
+}
+
+impl BandwidthMode {
+    pub fn parse(val: &str) -> Option<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "tx" => Some(Self::Tx),
+            "rx" => Some(Self::Rx),
+            "max" => Some(Self::Max),
+            "sum" => Some(Self::Sum),
+            _ => None,
+        }
+    }
+
+    pub fn combine(self, rx_bps: f64, tx_bps: f64) -> f64 {
+        match self {
+            Self::Tx => tx_bps,
+            Self::Rx => rx_bps,
+            Self::Max => rx_bps.max(tx_bps),
+            Self::Sum => rx_bps + tx_bps,
+        }
+    }
+}
+
 /// Parsed cluster settings. Validated only when `enabled` is true.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -23,6 +59,8 @@ pub struct ClusterConfig {
     pub drain_threshold: f64,
     pub resume_threshold: f64,
     pub bandwidth_interface: String,
+    /// How to combine RX/TX when measuring interface utilization (`tx` default).
+    pub bandwidth_mode: BandwidthMode,
     pub bandwidth_max_mbps: f64,
     pub media_replicas: u32,
     pub media_queue_mb: u32,
@@ -49,6 +87,7 @@ impl Default for ClusterConfig {
             drain_threshold: 0.85,
             resume_threshold: 0.70,
             bandwidth_interface: String::new(),
+            bandwidth_mode: BandwidthMode::Tx,
             bandwidth_max_mbps: 0.0,
             media_replicas: 0,
             media_queue_mb: 64,
@@ -89,6 +128,24 @@ impl ClusterConfig {
             cfg.validate()?;
         }
         Ok(cfg)
+    }
+
+    /// Apply `LRTMP2_CLUSTER_*` process overrides on top of an already-loaded
+    /// cluster block (file / previous defaults). Does not rebuild from
+    /// [`ClusterConfig::default`], so unspecified keys keep file values.
+    pub fn apply_env_overrides_from<F>(&mut self, mut get: F) -> Result<(), String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        for (env_key, file_key) in CLUSTER_ENV_OVERRIDES {
+            if let Some(val) = get(env_key).filter(|v| !v.is_empty()) {
+                apply_cluster_kv(self, file_key, &val);
+            }
+        }
+        if self.enabled {
+            self.validate()?;
+        }
+        Ok(())
     }
 
     /// Load from a config file path (same format as server `.env`).
@@ -261,6 +318,38 @@ const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Process-env keys that may override a file-loaded [`ClusterConfig`].
+pub const CLUSTER_ENV_OVERRIDE_KEYS: &[&str] = &[
+    "LRTMP2_CLUSTER_ENABLED",
+    "LRTMP2_CLUSTER_NODE_ID",
+    "LRTMP2_CLUSTER_NODE_NAME",
+    "LRTMP2_CLUSTER_BIND",
+    "LRTMP2_CLUSTER_MEDIA_BIND",
+    "LRTMP2_CLUSTER_BOOTSTRAP",
+    "LRTMP2_CLUSTER_JOIN",
+    "LRTMP2_CLUSTER_SECRET",
+    "LRTMP2_CLUSTER_TLS_ENABLED",
+    "LRTMP2_CLUSTER_TLS_CERT_FILE",
+    "LRTMP2_CLUSTER_TLS_KEY_FILE",
+    "LRTMP2_CLUSTER_TLS_CA_FILE",
+    "LRTMP2_CLUSTER_HEARTBEAT_MS",
+    "LRTMP2_CLUSTER_HEARTBEAT_INTERVAL_MS",
+    "LRTMP2_CLUSTER_NODE_TIMEOUT_MS",
+    "LRTMP2_CLUSTER_CAPACITY",
+    "LRTMP2_CLUSTER_CAPACITY_MBPS",
+    "LRTMP2_CLUSTER_DRAIN_THRESHOLD",
+    "LRTMP2_CLUSTER_DRAIN_AT_MBPS",
+    "LRTMP2_CLUSTER_RESUME_THRESHOLD",
+    "LRTMP2_CLUSTER_RESUME_AT_MBPS",
+    "LRTMP2_CLUSTER_BANDWIDTH_INTERFACE",
+    "LRTMP2_CLUSTER_BANDWIDTH_MODE",
+    "LRTMP2_CLUSTER_BANDWIDTH_MAX_MBPS",
+    "LRTMP2_CLUSTER_MEDIA_REPLICAS",
+    "LRTMP2_CLUSTER_MEDIA_QUEUE_MB",
+    "LRTMP2_CLUSTER_ADVERTISE_ADDR",
+    "LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR",
+];
+
 fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
     match key {
         "CLUSTER_ENABLED" => cfg.enabled = parse_bool(val, false),
@@ -335,8 +424,9 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
             }
         }
         "CLUSTER_BANDWIDTH_MODE" => {
-            // tx|rx|max|sum — stored via capacity measurement path; accept for forward compat.
-            let _ = val;
+            if let Some(mode) = BandwidthMode::parse(val) {
+                cfg.bandwidth_mode = mode;
+            }
         }
         "CLUSTER_BANDWIDTH_INTERFACE" => cfg.bandwidth_interface = val.to_string(),
         "CLUSTER_BANDWIDTH_MAX_MBPS" => {

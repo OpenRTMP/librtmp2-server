@@ -573,30 +573,21 @@ where
 
     #[cfg(feature = "cluster")]
     {
-        // `ClusterConfig::load_from_kv` always applies `LRTMP2_CLUSTER_*` process
-        // env. Only replace the file-derived cluster block when at least one
-        // override is present, so a bare `config_apply_env` does not wipe
-        // `.env` cluster settings.
-        let has_cluster_env = [
-            "LRTMP2_CLUSTER_ENABLED",
-            "LRTMP2_CLUSTER_NODE_ID",
-            "LRTMP2_CLUSTER_SECRET",
-            "LRTMP2_CLUSTER_BOOTSTRAP",
-            "LRTMP2_CLUSTER_JOIN",
-            "LRTMP2_CLUSTER_BIND",
-            "LRTMP2_CLUSTER_MEDIA_BIND",
-        ]
-        .iter()
-        .any(|k| get(k).filter(|v| !v.is_empty()).is_some());
+        // Merge `LRTMP2_CLUSTER_*` process overrides into the already-loaded
+        // file cluster block. Never rebuild from defaults — a lone
+        // `LRTMP2_CLUSTER_BIND` must not wipe enabled/node_id/secret/join.
+        let has_cluster_env = crate::cluster::config::CLUSTER_ENV_OVERRIDE_KEYS
+            .iter()
+            .any(|k| get(k).filter(|v| !v.is_empty()).is_some());
         if has_cluster_env {
-            match crate::cluster::ClusterConfig::load_from_kv(|key| get(key)) {
-                Ok(c) => config.cluster = c,
-                Err(e) => {
-                    return Err(format!(
+            config
+                .cluster
+                .apply_env_overrides_from(|key| get(key))
+                .map_err(|e| {
+                    format!(
                         "Invalid cluster env config (CLUSTER_ENABLED requires valid settings): {e}"
-                    ));
-                }
-            }
+                    )
+                })?;
         }
     }
     Ok(())

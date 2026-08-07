@@ -87,6 +87,31 @@ pub enum ControlMessage {
     AdminErr {
         message: String,
     },
+    /// Kick live RTMP sessions for a stream being deleted (every node).
+    DrainStream {
+        stream_id: String,
+    },
+    /// Revoke a viewer play key on every RTMP bridge.
+    RevokeViewer {
+        viewer_id: String,
+    },
+    /// Query how many live RTMP sessions reference `stream_id` on this node.
+    SessionCountReq {
+        stream_id: String,
+    },
+    SessionCountResp {
+        count: u64,
+    },
+    /// Idempotent topology refresh (no membership change).
+    TopologyReq,
+    TopologyResp {
+        ok: bool,
+        message: String,
+        #[serde(default)]
+        cluster_id: String,
+        #[serde(default)]
+        peers: Vec<JoinPeerInfo>,
+    },
     StatsProxyReq {
         stream_id: String,
     },
@@ -97,6 +122,14 @@ pub enum ControlMessage {
         node_id: NodeId,
         health: String,
         load: f64,
+        #[serde(default)]
+        control_addr: String,
+        #[serde(default)]
+        media_addr: String,
+        #[serde(default)]
+        publishers: u64,
+        #[serde(default)]
+        players: u64,
     },
     /// Follower-forwarded durable mutation (`ClusterCommand` as JSON).
     ClientWrite(serde_json::Value),
@@ -304,6 +337,18 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
 pub type JoinAcceptFn =
     Arc<dyn Fn(NodeId, String, String) -> Result<(String, Vec<JoinPeerInfo>), String> + Send + Sync>;
 
+/// Peer heartbeat payload (addrs + session counts for aggregation).
+#[derive(Debug, Clone)]
+pub struct HeartbeatInfo {
+    pub node_id: NodeId,
+    pub health: String,
+    pub load: f64,
+    pub control_addr: String,
+    pub media_addr: String,
+    pub publishers: u64,
+    pub players: u64,
+}
+
 /// Accept control-plane connections and dispatch Raft / admin messages.
 pub async fn serve_control_plane(
     bind: SocketAddr,
@@ -311,7 +356,7 @@ pub async fn serve_control_plane(
     local_id: NodeId,
     raft: Raft,
     on_join: JoinAcceptFn,
-    on_heartbeat: Arc<dyn Fn(NodeId, String, f64) + Send + Sync>,
+    on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
     tls_server: Option<Arc<ServerConfig>>,
@@ -417,7 +462,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     local_id: NodeId,
     raft: Raft,
     on_join: JoinAcceptFn,
-    on_heartbeat: Arc<dyn Fn(NodeId, String, f64) + Send + Sync>,
+    on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
 ) -> Result<(), std::io::Error> {
@@ -468,12 +513,25 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 peers: Vec::new(),
             },
         },
+        ControlMessage::TopologyReq => on_admin(ControlMessage::TopologyReq),
         ControlMessage::Heartbeat {
             node_id,
             health,
             load,
+            control_addr,
+            media_addr,
+            publishers,
+            players,
         } => {
-            on_heartbeat(node_id, health, load);
+            on_heartbeat(HeartbeatInfo {
+                node_id,
+                health,
+                load,
+                control_addr,
+                media_addr,
+                publishers,
+                players,
+            });
             ControlMessage::AdminOk
         }
         ControlMessage::StatsProxyReq { stream_id } => ControlMessage::StatsProxyResp {
@@ -497,7 +555,10 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
         }
         admin @ (ControlMessage::AdminDrain { .. }
         | ControlMessage::AdminResume { .. }
-        | ControlMessage::AdminRemove { .. }) => on_admin(admin),
+        | ControlMessage::AdminRemove { .. }
+        | ControlMessage::DrainStream { .. }
+        | ControlMessage::RevokeViewer { .. }
+        | ControlMessage::SessionCountReq { .. }) => on_admin(admin),
         other => {
             let _ = other;
             ControlMessage::AdminErr {
@@ -509,6 +570,27 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Extract TLS server name (host/IP without brackets or port) from an authority.
+pub fn tls_server_name_from_addr(addr: &str) -> Result<rustls::pki_types::ServerName<'static>, String> {
+    let host = if let Ok(sock) = addr.parse::<SocketAddr>() {
+        match sock.ip() {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => v6.to_string(),
+        }
+    } else if let Some(rest) = addr.strip_prefix('[') {
+        // [ipv6]:port
+        rest.split(']')
+            .next()
+            .unwrap_or("localhost")
+            .to_string()
+    } else {
+        addr.rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| addr.to_string())
+    };
+    rustls::pki_types::ServerName::try_from(host).map_err(|e| format!("tls server name: {e}"))
+}
+
 async fn connect_raw(
     addr: &str,
     tls_client: Option<Arc<ClientConfig>>,
@@ -518,13 +600,7 @@ async fn connect_raw(
         .map_err(|e| format!("connect {addr}: {e}"))?;
     if let Some(cfg) = tls_client {
         let connector = TlsConnector::from(cfg);
-        let server_name = rustls::pki_types::ServerName::try_from(
-            addr.split(':')
-                .next()
-                .unwrap_or("localhost")
-                .to_string(),
-        )
-        .map_err(|e| format!("tls server name: {e}"))?;
+        let server_name = tls_server_name_from_addr(addr)?;
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -566,9 +642,64 @@ pub async fn send_join(
         leader_addr,
         secret,
         local_id,
-        tls_client,
+        tls_client.clone(),
         ControlMessage::JoinRequest {
             node_id: local_id,
+            control_addr: control_addr.clone(),
+            media_addr: media_addr.clone(),
+        },
+    )
+    .await?
+    {
+        ControlMessage::JoinResponse {
+            ok: true,
+            cluster_id,
+            peers,
+            ..
+        } => Ok((cluster_id, peers)),
+        ControlMessage::JoinResponse {
+            ok: false,
+            message,
+            peers,
+            ..
+        } if message.contains("forward_to_leader") => {
+            let Some(leader) = peers.first() else {
+                return Err(message);
+            };
+            Box::pin(send_join(
+                &leader.control_addr,
+                secret,
+                local_id,
+                control_addr,
+                media_addr,
+                tls_client,
+            ))
+            .await
+        }
+        ControlMessage::JoinResponse {
+            ok: false, message, ..
+        } => Err(message),
+        _ => Err("unexpected join response".into()),
+    }
+}
+
+/// Forward a join for `joiner_id` while authenticating as `local_id` (follower proxy).
+pub async fn forward_join(
+    leader_addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    joiner_id: NodeId,
+    control_addr: String,
+    media_addr: String,
+    tls_client: Option<Arc<ClientConfig>>,
+) -> Result<(String, Vec<JoinPeerInfo>), String> {
+    match authed_roundtrip_inner(
+        leader_addr,
+        secret,
+        local_id,
+        tls_client,
+        ControlMessage::JoinRequest {
+            node_id: joiner_id,
             control_addr,
             media_addr,
         },
@@ -588,12 +719,44 @@ pub async fn send_join(
     }
 }
 
+pub async fn send_topology(
+    peer_addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    tls_client: Option<Arc<ClientConfig>>,
+) -> Result<(String, Vec<JoinPeerInfo>), String> {
+    match authed_roundtrip_inner(
+        peer_addr,
+        secret,
+        local_id,
+        tls_client,
+        ControlMessage::TopologyReq,
+    )
+    .await?
+    {
+        ControlMessage::TopologyResp {
+            ok: true,
+            cluster_id,
+            peers,
+            ..
+        } => Ok((cluster_id, peers)),
+        ControlMessage::TopologyResp {
+            ok: false, message, ..
+        } => Err(message),
+        _ => Err("unexpected topology response".into()),
+    }
+}
+
 pub async fn send_heartbeat(
     peer_addr: &str,
     secret: &str,
     local_id: NodeId,
     health: &str,
     load: f64,
+    control_addr: String,
+    media_addr: String,
+    publishers: u64,
+    players: u64,
     tls_client: Option<Arc<ClientConfig>>,
 ) {
     let _ = tokio::time::timeout(Duration::from_millis(500), async {
@@ -606,11 +769,37 @@ pub async fn send_heartbeat(
                 node_id: local_id,
                 health: health.to_string(),
                 load,
+                control_addr,
+                media_addr,
+                publishers,
+                players,
             },
         )
         .await;
     })
     .await;
+}
+
+pub async fn send_session_count(
+    peer_addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    stream_id: String,
+    tls_client: Option<Arc<ClientConfig>>,
+) -> Result<u64, String> {
+    match authed_roundtrip_inner(
+        peer_addr,
+        secret,
+        local_id,
+        tls_client,
+        ControlMessage::SessionCountReq { stream_id },
+    )
+    .await?
+    {
+        ControlMessage::SessionCountResp { count } => Ok(count),
+        ControlMessage::AdminErr { message } => Err(message),
+        _ => Err("unexpected session count response".into()),
+    }
 }
 
 pub async fn send_admin(

@@ -62,11 +62,15 @@ impl OwnershipTracker {
     }
 
     /// Sync from DB list; returns stream ids whose (node, epoch) changed.
+    /// Advances the local epoch counter past the highest observed epoch so a
+    /// follower never reallocates a stale fencing token after release.
     pub fn sync_from(&self, owners: &[StreamOwner]) -> Vec<String> {
         let mut changed = Vec::new();
         let mut next = HashMap::with_capacity(owners.len());
+        let mut max_epoch = 0u64;
         for o in owners {
             next.insert(o.stream_id.clone(), (o.owner_node_id, o.epoch));
+            max_epoch = max_epoch.max(o.epoch);
         }
         let mut g = self.owners.lock();
         for (sid, new) in &next {
@@ -81,7 +85,22 @@ impl OwnershipTracker {
             }
         }
         *g = next;
+        drop(g);
+        let cur = self.next_epoch.load(Ordering::Relaxed);
+        if max_epoch >= cur {
+            self.next_epoch
+                .store(max_epoch.saturating_add(1), Ordering::Relaxed);
+        }
         changed
+    }
+
+    /// Ensure local counter is past `epoch` (e.g. after Raft-assigned log index).
+    pub fn advance_past(&self, epoch: u64) {
+        let cur = self.next_epoch.load(Ordering::Relaxed);
+        if epoch >= cur {
+            self.next_epoch
+                .store(epoch.saturating_add(1), Ordering::Relaxed);
+        }
     }
 
     pub fn get(&self, stream_id: &str) -> Option<(u64, u64)> {
