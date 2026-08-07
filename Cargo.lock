@@ -1230,7 +1230,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "librtmp2"
 version = "0.7.0"
-source = "git+https://github.com/OpenRTMP/librtmp2?rev=094501dd5b7e00cb51cc7f8500cb9f995bb8abc3#094501dd5b7e00cb51cc7f8500cb9f995bb8abc3"
+source = "git+https://github.com/OpenRTMP/librtmp2?rev=e492933c3e0fbad49f3ddb2f1094fe47b9672180#e492933c3e0fbad49f3ddb2f1094fe47b9672180"
 dependencies = [
  "cc",
  "libc",
