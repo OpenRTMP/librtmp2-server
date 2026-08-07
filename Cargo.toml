@@ -19,7 +19,7 @@ path = "src/main.rs"
 # `version = "0.7.0"` once published. Local sibling override:
 #   [patch."https://github.com/OpenRTMP/librtmp2"]
 #   librtmp2 = { path = "../librtmp2" }
-librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", rev = "3cda1d1833c339d36ab3c057e55ea93a0f4dab14", features = ["tls"] }
+librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", rev = "ce12f0a6ae0084a20320ff62dc521eebf800282a", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
