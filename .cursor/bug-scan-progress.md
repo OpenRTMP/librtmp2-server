@@ -1,16 +1,25 @@
 # Bug scan progress
 
-Last scanned: db (2026-08-06)
+Last scanned: http (2026-08-07)
 
 ## Modules
 
 - [x] config — .env loader, env overrides
 - [x] db — SQLite persistence, stream/publisher/player CRUD
-- [ ] http — REST API, auth, stats endpoints
+- [x] http — REST API, auth, stats endpoints
 - [ ] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [ ] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [ ] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-08-07 http pass)
+
+- **Critical (fixed):** `wait_and_finalize_stream_delete()` removed the stream from
+  `deleted_streams` after a 30s timeout and returned without finalizing. The RTMP
+  poll loop only kicks connections whose stream id is still in that set, so a
+  publisher that outlived the timeout kept broadcasting indefinitely on a
+  disabled/pending-delete stream. The drain loop now logs periodically but never
+  clears `deleted_streams` early; duplicate DELETE while draining returns 202.
 
 ## Findings (2026-08-06 db pass)
 
