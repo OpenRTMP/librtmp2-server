@@ -299,6 +299,7 @@ fn parse_max_body_bytes(val: &str) -> usize {
 }
 
 /// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
+#[cfg(feature = "cluster")]
 pub(crate) fn parse_env_line_public(line: &str) -> Option<(String, String)> {
     parse_env_line(line)
 }

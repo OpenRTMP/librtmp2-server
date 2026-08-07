@@ -1003,9 +1003,9 @@ impl Db {
 
     pub fn stream_owner_list(&self) -> Vec<StreamOwner> {
         let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(
-            "SELECT stream_id, owner_node_id, epoch, acquired_at FROM stream_owners",
-        ) {
+        let mut stmt = match conn
+            .prepare("SELECT stream_id, owner_node_id, epoch, acquired_at FROM stream_owners")
+        {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -1031,9 +1031,7 @@ impl Db {
         acquired_at: i64,
     ) -> Result<u64, OwnerError> {
         let conn = self.conn.lock();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| OwnerError::Db)?;
+        let tx = conn.unchecked_transaction().map_err(|_| OwnerError::Db)?;
         let existing: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT owner_node_id, epoch FROM stream_owners WHERE stream_id=?",
@@ -1106,6 +1104,7 @@ impl Db {
     }
 
     /// Low-level access for Raft storage (same mutex as the rest of `Db`).
+    #[cfg(feature = "cluster")]
     pub(crate) fn with_conn<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Connection) -> R,

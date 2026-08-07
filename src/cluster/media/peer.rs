@@ -1,7 +1,7 @@
 //! Outbound/inbound media peer connection.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -9,9 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::cluster::NodeId;
 use crate::cluster::media::protocol::MediaMessage;
 use crate::cluster::security::{auth_response, secrets_equal};
-use crate::cluster::NodeId;
 
 const MAX_FRAME: u32 = 32 * 1024 * 1024;
 
@@ -59,7 +59,9 @@ impl MediaPeer {
         max_queue_mb: u32,
         inbound: mpsc::UnboundedSender<MediaMessage>,
     ) -> Self {
-        let max_queue_bytes = (max_queue_mb as usize).saturating_mul(1024 * 1024).max(1024 * 1024);
+        let max_queue_bytes = (max_queue_mb as usize)
+            .saturating_mul(1024 * 1024)
+            .max(1024 * 1024);
         let (tx, mut rx) = mpsc::channel::<MediaMessage>(256);
         let queue_bytes = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
@@ -174,11 +176,7 @@ async fn connect_and_run(
     .await?;
     let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
     let response = auth_response(secret, &nonce);
-    write_media_frame(
-        &mut stream,
-        &MediaMessage::Auth { nonce, response },
-    )
-    .await?;
+    write_media_frame(&mut stream, &MediaMessage::Auth { nonce, response }).await?;
     match read_media_frame(&mut stream).await? {
         MediaMessage::AuthOk => {}
         _ => return Err(std::io::Error::other("media auth failed")),

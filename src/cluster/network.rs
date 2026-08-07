@@ -5,19 +5,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use parking_lot::RwLock;
 
-use crate::cluster::raft::{typ, NodeId, Raft, TypeConfig};
+use crate::cluster::raft::{NodeId, Raft, TypeConfig, typ};
 use crate::cluster::security::{auth_response, secrets_equal};
 
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
@@ -148,11 +148,13 @@ pub struct NetworkConnection {
 }
 
 impl NetworkConnection {
-    async fn connect_authed(&self) -> Result<TcpStream, RPCError<NodeId, BasicNode, typ::RaftError>> {
+    async fn connect_authed(
+        &self,
+    ) -> Result<TcpStream, RPCError<NodeId, BasicNode, typ::RaftError>> {
         let addr = &self.target_node.addr;
-        let mut stream = TcpStream::connect(addr).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&e))
-        })?;
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
         let response = auth_response(&self.secret, &nonce);
         write_frame(
@@ -170,9 +172,9 @@ impl NetworkConnection {
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
         {
             ControlMessage::AuthOk { .. } => Ok(stream),
-            _ => Err(RPCError::Network(NetworkError::new(&std::io::Error::other(
-                "auth failed",
-            )))),
+            _ => Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other("auth failed"),
+            ))),
         }
     }
 
@@ -211,21 +213,21 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, typ::RPCError> {
-        let req = serde_json::to_value(&rpc).map_err(|e| {
-            RPCError::Network(NetworkError::new(&e))
-        })?;
+        let req =
+            serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         match self.roundtrip(ControlMessage::RaftAppend(req)).await? {
             ControlMessage::RaftAppendResp(v) => {
                 let parsed: Result<AppendEntriesResponse<NodeId>, typ::RaftError> =
-                    serde_json::from_value(v).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+                    serde_json::from_value(v)
+                        .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
                 match parsed {
                     Ok(r) => Ok(r),
                     Err(e) => Err(RPCError::RemoteError(RemoteError::new(self.target, e))),
                 }
             }
-            _ => Err(RPCError::Network(NetworkError::new(&std::io::Error::other(
-                "unexpected response",
-            )))),
+            _ => Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other("unexpected response"),
+            ))),
         }
     }
 
@@ -235,9 +237,8 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         _option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, typ::RPCError<openraft::error::InstallSnapshotError>>
     {
-        let req = serde_json::to_value(&rpc).map_err(|e| {
-            RPCError::Network(NetworkError::new(&e))
-        })?;
+        let req =
+            serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let msg = self
             .roundtrip(ControlMessage::RaftSnapshot(req))
             .await
@@ -254,9 +255,9 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
                     Err(e) => Err(RPCError::RemoteError(RemoteError::new(self.target, e))),
                 }
             }
-            _ => Err(RPCError::Network(NetworkError::new(&std::io::Error::other(
-                "unexpected response",
-            )))),
+            _ => Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other("unexpected response"),
+            ))),
         }
     }
 
@@ -265,21 +266,21 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, typ::RPCError> {
-        let req = serde_json::to_value(&rpc).map_err(|e| {
-            RPCError::Network(NetworkError::new(&e))
-        })?;
+        let req =
+            serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         match self.roundtrip(ControlMessage::RaftVote(req)).await? {
             ControlMessage::RaftVoteResp(v) => {
                 let parsed: Result<VoteResponse<NodeId>, typ::RaftError> =
-                    serde_json::from_value(v).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+                    serde_json::from_value(v)
+                        .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
                 match parsed {
                     Ok(r) => Ok(r),
                     Err(e) => Err(RPCError::RemoteError(RemoteError::new(self.target, e))),
                 }
             }
-            _ => Err(RPCError::Network(NetworkError::new(&std::io::Error::other(
-                "unexpected response",
-            )))),
+            _ => Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other("unexpected response"),
+            ))),
         }
     }
 }
@@ -356,24 +357,27 @@ async fn handle_control_conn(
     let msg = read_frame(stream).await?;
     let resp = match msg {
         ControlMessage::RaftAppend(req) => {
-            let parsed: AppendEntriesRequest<TypeConfig> = serde_json::from_value(req)
-                .map_err(|e| std::io::Error::other(e))?;
+            let parsed: AppendEntriesRequest<TypeConfig> =
+                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.append_entries(parsed).await;
-            let v = serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
+            let v =
+                serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
             ControlMessage::RaftAppendResp(v)
         }
         ControlMessage::RaftVote(req) => {
             let parsed: VoteRequest<NodeId> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.vote(parsed).await;
-            let v = serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
+            let v =
+                serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
             ControlMessage::RaftVoteResp(v)
         }
         ControlMessage::RaftSnapshot(req) => {
-            let parsed: InstallSnapshotRequest<TypeConfig> = serde_json::from_value(req)
-                .map_err(|e| std::io::Error::other(e))?;
+            let parsed: InstallSnapshotRequest<TypeConfig> =
+                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.install_snapshot(parsed).await;
-            let v = serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
+            let v =
+                serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
             ControlMessage::RaftSnapshotResp(v)
         }
         ControlMessage::JoinRequest {
@@ -400,8 +404,8 @@ async fn handle_control_conn(
         },
         ControlMessage::ClientWrite(req) => {
             use crate::cluster::command::ClusterCommand;
-            let cmd: ClusterCommand = serde_json::from_value(req)
-                .map_err(|e| std::io::Error::other(e))?;
+            let cmd: ClusterCommand =
+                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let body = match raft.client_write(cmd).await {
                 Ok(resp) => serde_json::json!({
                     "ok": true,
@@ -540,9 +544,7 @@ async fn authed_roundtrip(
     write_frame(&mut stream, &msg)
         .await
         .map_err(|e| e.to_string())?;
-    read_frame(&mut stream)
-        .await
-        .map_err(|e| e.to_string())
+    read_frame(&mut stream).await.map_err(|e| e.to_string())
 }
 
 pub async fn send_admin(

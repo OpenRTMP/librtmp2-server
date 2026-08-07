@@ -9,8 +9,9 @@ use openraft::RaftMetrics;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use crate::cluster::NodeId;
 use crate::cluster::admission::{
-    measure_interface_utilization, AdmissionController, IngressEligibility,
+    AdmissionController, IngressEligibility, measure_interface_utilization,
 };
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::config::ClusterConfig;
@@ -23,11 +24,10 @@ use crate::cluster::membership::{
 };
 use crate::cluster::metrics::{ClusterMetrics, ClusterStreamInfo, NodeInfo};
 use crate::cluster::network::{self, NetworkFactory};
+use crate::cluster::raft::Raft;
 use crate::cluster::raft::log_store::SqliteLogStore;
 use crate::cluster::raft::state_machine::SqliteStateMachine;
-use crate::cluster::raft::Raft;
 use crate::cluster::state::ClusterMeta;
-use crate::cluster::NodeId;
 use crate::db::{Db, Stream, StreamViewer};
 use crate::state::CoordError;
 
@@ -146,8 +146,9 @@ impl ClusterManager {
                     health_hb.note_peer(nid, state, load, None, None);
                 });
             let mgr_admin = Arc::clone(&mgr);
-            let on_admin: Arc<dyn Fn(network::ControlMessage) -> network::ControlMessage + Send + Sync> =
-                Arc::new(move |msg| mgr_admin.handle_admin_control(msg));
+            let on_admin: Arc<
+                dyn Fn(network::ControlMessage) -> network::ControlMessage + Send + Sync,
+            > = Arc::new(move |msg| mgr_admin.handle_admin_control(msg));
             let mgr_stats = Arc::clone(&mgr);
             let on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync> =
                 Arc::new(move |stream_id| mgr_stats.local_stream_stats_json(&stream_id));
@@ -286,17 +287,13 @@ impl ClusterManager {
     }
 
     pub fn begin_delete_stream(&self, id: &str) -> Result<(), CoordError> {
-        self.block_on_write(ClusterCommand::BeginDeleteStream {
-            id: id.to_string(),
-        })?
-        .into_coord_result()
+        self.block_on_write(ClusterCommand::BeginDeleteStream { id: id.to_string() })?
+            .into_coord_result()
     }
 
     pub fn finalize_delete_stream(&self, id: &str) -> Result<(), CoordError> {
-        self.block_on_write(ClusterCommand::FinalizeDeleteStream {
-            id: id.to_string(),
-        })?
-        .into_coord_result()
+        self.block_on_write(ClusterCommand::FinalizeDeleteStream { id: id.to_string() })?
+            .into_coord_result()
     }
 
     pub fn set_stream_enabled(&self, id: &str, enabled: bool) -> Result<(), CoordError> {
@@ -605,8 +602,8 @@ impl ClusterManager {
             }
             let down = self.health.sweep_stale();
             let metrics = self.last_metrics.lock().clone();
-            let is_leader = metrics.as_ref().and_then(|m| m.current_leader)
-                == Some(self.config.node_id);
+            let is_leader =
+                metrics.as_ref().and_then(|m| m.current_leader) == Some(self.config.node_id);
             if is_leader {
                 for id in down {
                     crate::log_info!("Cluster: node {id} DOWN — releasing owners");
@@ -699,11 +696,7 @@ impl ClusterManager {
             .iter()
             .filter(|(_, p)| p.state != NodeHealthState::Down)
             .count()
-            + if m.health != "DOWN" {
-                1
-            } else {
-                0
-            };
+            + if m.health != "DOWN" { 1 } else { 0 };
         let unavailable = peers
             .iter()
             .filter(|(_, p)| p.state == NodeHealthState::Down)
@@ -784,12 +777,7 @@ impl ClusterManager {
             .last_metrics
             .lock()
             .as_ref()
-            .map(|rm| {
-                rm.membership_config
-                    .membership()
-                    .voter_ids()
-                    .collect()
-            })
+            .map(|rm| rm.membership_config.membership().voter_ids().collect())
             .unwrap_or_default();
 
         let local_state = self.health.local();

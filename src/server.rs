@@ -763,18 +763,16 @@ impl ServerApp {
                             };
                             let epoch = rtmp_bridge
                                 .ownership_epoch_for_stream(&stream_id)
-                                .or_else(|| {
-                                    mgr.db()
-                                        .stream_owner_get(&stream_id)
-                                        .map(|o| o.epoch)
-                                })
+                                .or_else(|| mgr.db().stream_owner_get(&stream_id).map(|o| o.epoch))
                                 .unwrap_or(0);
                             use crate::cluster::media::protocol::MediaMessage;
                             mgr.enqueue_export(crate::cluster::ExportedFrame {
                                 app: frame.app.clone(),
                                 stream: stream_id,
                                 epoch,
-                                frame_type: MediaMessage::frame_type_from_librtmp2(frame.frame_type),
+                                frame_type: MediaMessage::frame_type_from_librtmp2(
+                                    frame.frame_type,
+                                ),
                                 timestamp: frame.timestamp,
                                 payload: frame.payload,
                             });

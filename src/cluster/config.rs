@@ -106,7 +106,9 @@ impl ClusterConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.node_id == 0 {
-            return Err("CLUSTER_NODE_ID must be a positive integer when CLUSTER_ENABLED=true".into());
+            return Err(
+                "CLUSTER_NODE_ID must be a positive integer when CLUSTER_ENABLED=true".into(),
+            );
         }
         if self.secret.len() < 16 {
             return Err(
@@ -120,7 +122,8 @@ impl ClusterConfig {
         }
         if !self.bootstrap && self.join.is_none() {
             return Err(
-                "When CLUSTER_ENABLED=true set CLUSTER_BOOTSTRAP=true or CLUSTER_JOIN=<addr>".into(),
+                "When CLUSTER_ENABLED=true set CLUSTER_BOOTSTRAP=true or CLUSTER_JOIN=<addr>"
+                    .into(),
             );
         }
         if self.tls_enabled {
@@ -139,12 +142,17 @@ impl ClusterConfig {
                 ("CLUSTER_TLS_CA_FILE", &self.tls_ca_file),
             ] {
                 if !path.is_file() {
-                    return Err(format!("{label} does not exist or is not a file: {}", path.display()));
+                    return Err(format!(
+                        "{label} does not exist or is not a file: {}",
+                        path.display()
+                    ));
                 }
             }
         }
         if self.drain_threshold <= self.resume_threshold {
-            return Err("CLUSTER_DRAIN_THRESHOLD must be greater than CLUSTER_RESUME_THRESHOLD".into());
+            return Err(
+                "CLUSTER_DRAIN_THRESHOLD must be greater than CLUSTER_RESUME_THRESHOLD".into(),
+            );
         }
         if !(0.0..=1.0).contains(&self.capacity) {
             return Err("CLUSTER_CAPACITY must be between 0.0 and 1.0".into());
@@ -221,21 +229,36 @@ const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
     ("LRTMP2_CLUSTER_TLS_KEY_FILE", "CLUSTER_TLS_KEY_FILE"),
     ("LRTMP2_CLUSTER_TLS_CA_FILE", "CLUSTER_TLS_CA_FILE"),
     ("LRTMP2_CLUSTER_HEARTBEAT_MS", "CLUSTER_HEARTBEAT_MS"),
-    ("LRTMP2_CLUSTER_HEARTBEAT_INTERVAL_MS", "CLUSTER_HEARTBEAT_INTERVAL_MS"),
+    (
+        "LRTMP2_CLUSTER_HEARTBEAT_INTERVAL_MS",
+        "CLUSTER_HEARTBEAT_INTERVAL_MS",
+    ),
     ("LRTMP2_CLUSTER_NODE_TIMEOUT_MS", "CLUSTER_NODE_TIMEOUT_MS"),
     ("LRTMP2_CLUSTER_CAPACITY", "CLUSTER_CAPACITY"),
     ("LRTMP2_CLUSTER_CAPACITY_MBPS", "CLUSTER_CAPACITY_MBPS"),
     ("LRTMP2_CLUSTER_DRAIN_THRESHOLD", "CLUSTER_DRAIN_THRESHOLD"),
     ("LRTMP2_CLUSTER_DRAIN_AT_MBPS", "CLUSTER_DRAIN_AT_MBPS"),
-    ("LRTMP2_CLUSTER_RESUME_THRESHOLD", "CLUSTER_RESUME_THRESHOLD"),
+    (
+        "LRTMP2_CLUSTER_RESUME_THRESHOLD",
+        "CLUSTER_RESUME_THRESHOLD",
+    ),
     ("LRTMP2_CLUSTER_RESUME_AT_MBPS", "CLUSTER_RESUME_AT_MBPS"),
-    ("LRTMP2_CLUSTER_BANDWIDTH_INTERFACE", "CLUSTER_BANDWIDTH_INTERFACE"),
+    (
+        "LRTMP2_CLUSTER_BANDWIDTH_INTERFACE",
+        "CLUSTER_BANDWIDTH_INTERFACE",
+    ),
     ("LRTMP2_CLUSTER_BANDWIDTH_MODE", "CLUSTER_BANDWIDTH_MODE"),
-    ("LRTMP2_CLUSTER_BANDWIDTH_MAX_MBPS", "CLUSTER_BANDWIDTH_MAX_MBPS"),
+    (
+        "LRTMP2_CLUSTER_BANDWIDTH_MAX_MBPS",
+        "CLUSTER_BANDWIDTH_MAX_MBPS",
+    ),
     ("LRTMP2_CLUSTER_MEDIA_REPLICAS", "CLUSTER_MEDIA_REPLICAS"),
     ("LRTMP2_CLUSTER_MEDIA_QUEUE_MB", "CLUSTER_MEDIA_QUEUE_MB"),
     ("LRTMP2_CLUSTER_ADVERTISE_ADDR", "CLUSTER_ADVERTISE_ADDR"),
-    ("LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR", "CLUSTER_MEDIA_ADVERTISE_ADDR"),
+    (
+        "LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR",
+        "CLUSTER_MEDIA_ADVERTISE_ADDR",
+    ),
 ];
 
 fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
@@ -379,7 +402,8 @@ mod tests {
             ("CLUSTER_BOOTSTRAP", "true"),
             ("CLUSTER_SECRET", "short"),
         ]);
-        let err = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap_err();
+        let err =
+            ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap_err();
         assert!(err.contains("CLUSTER_SECRET"));
     }
 

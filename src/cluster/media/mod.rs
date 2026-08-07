@@ -10,4 +10,4 @@ pub mod timeline;
 
 pub use hub::MediaHub;
 pub use ownership::OwnershipTracker;
-pub use protocol::{MediaMessage, MEDIA_PROTOCOL_VERSION};
+pub use protocol::{MEDIA_PROTOCOL_VERSION, MediaMessage};

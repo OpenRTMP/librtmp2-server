@@ -1,8 +1,8 @@
 //! Raft state machine: applies ClusterCommand to local SQLite app tables.
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use openraft::storage::{RaftStateMachine, Snapshot};
 use openraft::{
@@ -10,11 +10,11 @@ use openraft::{
     StoredMembership,
 };
 use parking_lot::Mutex;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
-use crate::cluster::raft::snapshot::AppSnapshot;
 use crate::cluster::raft::TypeConfig;
+use crate::cluster::raft::snapshot::AppSnapshot;
 use crate::db::{Db, StreamAddError};
 
 #[derive(Clone)]
@@ -190,9 +190,7 @@ impl SqliteStateMachine {
 
     fn install_app_snapshot(&self, snap: &AppSnapshot) -> Result<(), String> {
         self.db.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| e.to_string())?;
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             tx.execute_batch(
                 "DELETE FROM stream_owners;
                  DELETE FROM stream_viewers;
@@ -276,8 +274,13 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, openraft::BasicNode>), StorageError<u64>>
-    {
+    ) -> Result<
+        (
+            Option<LogId<u64>>,
+            StoredMembership<u64, openraft::BasicNode>,
+        ),
+        StorageError<u64>,
+    > {
         Ok((
             *self.last_applied.lock(),
             self.last_membership.lock().clone(),
@@ -335,7 +338,10 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         })?;
         self.install_app_snapshot(&app)
             .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), &std::io::Error::other(e)),
+                source: StorageIOError::<u64>::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e),
+                ),
             })?;
         *self.last_applied.lock() = meta.last_log_id;
         *self.last_membership.lock() = meta.last_membership.clone();
@@ -384,8 +390,8 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
             .flatten()
         });
         if let Some((meta_json, data)) = loaded {
-            let meta: SnapshotMeta<u64, openraft::BasicNode> =
-                serde_json::from_str(&meta_json).map_err(|e| StorageError::IO {
+            let meta: SnapshotMeta<u64, openraft::BasicNode> = serde_json::from_str(&meta_json)
+                .map_err(|e| StorageError::IO {
                     source: StorageIOError::<u64>::read_snapshot(None, &e),
                 })?;
             *self.current_snapshot.lock() = Some(StoredSnapshot {

@@ -1754,9 +1754,7 @@ async fn handle_stream_stats(
                             .as_ref()
                             .map(|o| o.owner_node_id == mgr.node_id())
                             .unwrap_or(true);
-                        if !local_owner
-                            && let Some(proxied) = mgr.proxy_stream_stats(&id).await
-                        {
+                        if !local_owner && let Some(proxied) = mgr.proxy_stream_stats(&id).await {
                             let mut body = build_json_stats(&state.db, Some(&id));
                             if let Some(obj) = body.as_object_mut() {
                                 obj.insert("cluster_proxy".into(), proxied);
@@ -1857,7 +1855,10 @@ async fn handle_cluster_nodes(State(state): State<Arc<AppState>>, headers: Heade
     Json(json!([])).into_response()
 }
 
-async fn handle_cluster_streams(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn handle_cluster_streams(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
     if !bearer_ok(&state, &headers) {
         return err_json(
             StatusCode::UNAUTHORIZED,

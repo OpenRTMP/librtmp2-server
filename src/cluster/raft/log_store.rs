@@ -134,11 +134,9 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
         self.db.with_conn(|conn| {
             let json: Option<String> = conn
-                .query_row(
-                    "SELECT val FROM raft_meta WHERE key='committed'",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT val FROM raft_meta WHERE key='committed'", [], |r| {
+                    r.get(0)
+                })
                 .ok();
             match json {
                 Some(j) => Ok(serde_json::from_str(&j).map_err(Self::read_err)?),

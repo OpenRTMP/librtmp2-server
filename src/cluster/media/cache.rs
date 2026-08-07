@@ -46,9 +46,7 @@ impl InitCacheStore {
         payload: &[u8],
     ) {
         let mut g = self.inner.lock();
-        let e = g
-            .entry((app.to_string(), stream.to_string()))
-            .or_default();
+        let e = g.entry((app.to_string(), stream.to_string())).or_default();
         e.epoch = epoch;
         match frame_type {
             2 | 3 => e.metadata = Some(payload.to_vec()),
@@ -78,7 +76,8 @@ impl InitCacheStore {
         timestamp: u32,
         payload: &[u8],
     ) {
-        let ft = crate::cluster::media::protocol::MediaMessage::frame_type_from_librtmp2(frame_type);
+        let ft =
+            crate::cluster::media::protocol::MediaMessage::frame_type_from_librtmp2(frame_type);
         self.update_from_frame(app, stream, epoch, ft, timestamp, payload);
     }
 

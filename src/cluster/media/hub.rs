@@ -2,20 +2,20 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use crate::cluster::NodeId;
 use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::media::peer::{self, MediaPeer};
 use crate::cluster::media::protocol::MediaMessage;
 use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
-use crate::cluster::NodeId;
 
 /// Frame exported from local librtmp2 for mesh fan-out.
 #[derive(Debug, Clone)]
@@ -116,7 +116,10 @@ impl MediaHub {
         Ok(())
     }
 
-    async fn handle_inbound_conn(self: Arc<Self>, stream: &mut TcpStream) -> Result<(), std::io::Error> {
+    async fn handle_inbound_conn(
+        self: Arc<Self>,
+        stream: &mut TcpStream,
+    ) -> Result<(), std::io::Error> {
         let peer_id = peer::accept_auth(stream, &self.secret, self.local_id).await?;
         let (mut rh, mut wh) = tokio::io::split(stream);
         // Read loop — process subscribe/media; write init cache / frames as needed.

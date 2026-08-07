@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use librtmp2_server::cluster::ClusterManager;
 use librtmp2_server::cluster::command::ClusterCommand;
 use librtmp2_server::cluster::config::ClusterConfig;
 use librtmp2_server::cluster::media::subscription::SubscriptionTable;
 use librtmp2_server::cluster::media::timeline::TimelineRemapper;
 use librtmp2_server::cluster::membership::check_join_reseed;
-use librtmp2_server::cluster::ClusterManager;
 use librtmp2_server::db::{Db, Stream, StreamViewer};
 use librtmp2_server::state::StateCoordinator;
 use tempfile::TempDir;
@@ -41,7 +41,11 @@ fn cluster_cfg(node_id: u64, bootstrap: bool, join: Option<String>) -> (ClusterC
     (cfg, control, media)
 }
 
-async fn start_node(node_id: u64, bootstrap: bool, join: Option<String>) -> (Arc<ClusterManager>, TempDir) {
+async fn start_node(
+    node_id: u64,
+    bootstrap: bool,
+    join: Option<String>,
+) -> (Arc<ClusterManager>, TempDir) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join(format!("n{node_id}.db"));
     let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
@@ -123,7 +127,10 @@ async fn create_stream_via_leader_replicates() {
     };
     n1.create_stream(&stream).expect("create");
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(matches!(n2.db().stream_get("s1"), librtmp2_server::db::DbLookup::Ok(_)));
+    assert!(matches!(
+        n2.db().stream_get("s1"),
+        librtmp2_server::db::DbLookup::Ok(_)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -184,9 +191,7 @@ async fn ownership_conflict_and_release() {
         created_at: 1,
     };
     n1.create_stream(&stream).unwrap();
-    let ep = n1
-        .acquire_stream_owner("own", 1, 10, 1)
-        .expect("acquire");
+    let ep = n1.acquire_stream_owner("own", 1, 10, 1).expect("acquire");
     assert_eq!(ep, 10);
     let err = n1.acquire_stream_owner("own", 2, 11, 1);
     assert!(err.is_err());
@@ -294,7 +299,5 @@ async fn client_write_command_roundtrip() {
         librtmp2_server::db::DbLookup::Ok(s) => assert!(!s.enabled),
         other => panic!("unexpected {other:?}"),
     }
-    let _ = ClusterCommand::SetApiToken {
-        token: "x".into(),
-    };
+    let _ = ClusterCommand::SetApiToken { token: "x".into() };
 }

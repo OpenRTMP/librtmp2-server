@@ -59,9 +59,7 @@ pub fn build_server_tls(
     let key = load_private_key(key_path)?;
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path)? {
-        roots
-            .add(cert)
-            .map_err(|e| format!("add CA cert: {e}"))?;
+        roots.add(cert).map_err(|e| format!("add CA cert: {e}"))?;
     }
     let mut cfg = ServerConfig::builder()
         .with_client_cert_verifier(
@@ -84,9 +82,7 @@ pub fn build_client_tls(
     let key = load_private_key(key_path)?;
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_path)? {
-        roots
-            .add(cert)
-            .map_err(|e| format!("add CA cert: {e}"))?;
+        roots.add(cert).map_err(|e| format!("add CA cert: {e}"))?;
     }
     let mut cfg = ClientConfig::builder()
         .with_root_certificates(roots)
