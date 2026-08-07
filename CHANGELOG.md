@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-08
+
 ### Added
 - Optional high-availability clustering behind Cargo feature `cluster`
   (OpenRaft 0.9.24 control plane, SQLite state machine, media mesh on
@@ -359,7 +361,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.6...v0.1.7

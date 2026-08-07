@@ -192,10 +192,11 @@ async fn ownership_conflict_and_release() {
     };
     n1.create_stream(&stream).unwrap();
     let ep = n1.acquire_stream_owner("own", 1, 10, 1).expect("acquire");
-    assert_eq!(ep, 10);
+    // Raft assigns fencing epoch from log index, not the proposed value.
+    assert!(ep >= 1);
     let err = n1.acquire_stream_owner("own", 2, 11, 1);
     assert!(err.is_err());
-    n1.release_stream_owner("own", 10).unwrap();
+    n1.release_stream_owner("own", ep).unwrap();
     assert!(n1.acquire_stream_owner("own", 2, 12, 1).is_ok());
 }
 

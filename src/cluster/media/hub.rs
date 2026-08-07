@@ -157,6 +157,9 @@ pub struct MediaHub {
     local_id: NodeId,
     secret: String,
     queue_mb: u32,
+    /// Configured standby replica slots (cluster inventory); MediaFrame fanout
+    /// is subscriber-only so this is unused for continuous media push.
+    #[allow(dead_code)]
     replicas: u32,
     ownership: Arc<OwnershipTracker>,
     peers: Mutex<HashMap<NodeId, Arc<MediaPeer>>>,
@@ -351,6 +354,9 @@ impl MediaHub {
                         aac_header,
                         keyframe,
                     } => {
+                        if !self.ownership.accepts_epoch(&stream, epoch) {
+                            continue;
+                        }
                         self.cache.put(
                             &app,
                             &stream,
@@ -464,6 +470,9 @@ impl MediaHub {
                 aac_header,
                 keyframe,
             } => {
+                if !self.ownership.accepts_epoch(&stream, epoch) {
+                    return;
+                }
                 self.cache.put(
                     &app,
                     &stream,
@@ -614,7 +623,6 @@ impl MediaHub {
         };
 
         let peers: Vec<_> = self.peers.lock().values().cloned().collect();
-        let mut standby_sent = 0u32;
         for peer in peers {
             if peer.is_closed() {
                 continue;
@@ -623,13 +631,11 @@ impl MediaHub {
                 .subs
                 .peers_for_stream(&frame.app, &frame.stream)
                 .contains(&peer.peer_id);
+            // Only push continuous media to active subscribers. Standby
+            // replicas get InitCache via Subscribe replies — flooding them
+            // with MediaFrames fills remote InjectQueues with no local players.
             if subscribed {
                 let _ = peer.try_send(msg.clone());
-            } else if standby_sent < self.replicas {
-                // Standby replicas are additional nodes beyond active subscribers.
-                if peer.try_send(msg.clone()).is_ok() {
-                    standby_sent = standby_sent.saturating_add(1);
-                }
             }
         }
     }

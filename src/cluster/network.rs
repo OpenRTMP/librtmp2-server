@@ -531,7 +531,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
 ) -> Result<(), std::io::Error> {
-    let _peer_id = server_auth_handshake(stream, secret, local_id).await?;
+    let peer_id = server_auth_handshake(stream, secret, local_id).await?;
 
     // One-shot request/response for this connection (matches client roundtrip).
     let msg = read_frame(stream).await?;
@@ -564,20 +564,25 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             node_id,
             control_addr,
             media_addr,
-        } => match on_join(node_id, control_addr, media_addr) {
-            Ok((cluster_id, peers)) => ControlMessage::JoinResponse {
-                ok: true,
-                message: "joined as learner".into(),
-                cluster_id,
-                peers,
-            },
-            Err(message) => ControlMessage::JoinResponse {
-                ok: false,
-                message,
-                cluster_id: String::new(),
-                peers: Vec::new(),
-            },
-        },
+        } => {
+            // Join may be forwarded by a follower authenticating as itself
+            // while carrying the joiner's node_id — allow message node_id.
+            let _ = peer_id;
+            match on_join(node_id, control_addr, media_addr) {
+                Ok((cluster_id, peers)) => ControlMessage::JoinResponse {
+                    ok: true,
+                    message: "joined as learner".into(),
+                    cluster_id,
+                    peers,
+                },
+                Err(message) => ControlMessage::JoinResponse {
+                    ok: false,
+                    message,
+                    cluster_id: String::new(),
+                    peers: Vec::new(),
+                },
+            }
+        }
         ControlMessage::TopologyReq => on_admin(ControlMessage::TopologyReq),
         ControlMessage::Heartbeat {
             node_id,
@@ -589,8 +594,13 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             players,
             stream_players,
         } => {
+            // Bind heartbeats to the authenticated peer — a secret-holder must
+            // not rewrite another member's addrs by spoofing node_id.
+            if node_id != peer_id {
+                return Err(std::io::Error::other("heartbeat node_id mismatch"));
+            }
             on_heartbeat(HeartbeatInfo {
-                node_id,
+                node_id: peer_id,
                 health,
                 load,
                 control_addr,
@@ -682,9 +692,9 @@ async fn connect_raw(
     if let Some(cfg) = tls_client {
         let connector = TlsConnector::from(cfg);
         let server_name = tls_server_name_from_addr(addr)?;
-        let tls = connector
-            .connect(server_name, tcp)
+        let tls = tokio::time::timeout(AUTH_TIMEOUT, connector.connect(server_name, tcp))
             .await
+            .map_err(|_| format!("tls connect to {addr} timed out"))?
             .map_err(|e| format!("tls connect: {e}"))?;
         Ok(Box::new(tls))
     } else {
@@ -734,6 +744,29 @@ pub async fn send_join(
     media_addr: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
+    send_join_with_hops(
+        leader_addr,
+        secret,
+        local_id,
+        control_addr,
+        media_addr,
+        tls_client,
+        0,
+    )
+    .await
+}
+
+const MAX_JOIN_FORWARD_HOPS: u8 = 3;
+
+async fn send_join_with_hops(
+    leader_addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    control_addr: String,
+    media_addr: String,
+    tls_client: Option<Arc<ClientConfig>>,
+    hops: u8,
+) -> Result<(String, Vec<JoinPeerInfo>), String> {
     match authed_roundtrip_inner(
         leader_addr,
         secret,
@@ -759,16 +792,25 @@ pub async fn send_join(
             peers,
             ..
         } if message.contains("forward_to_leader") => {
+            if hops >= MAX_JOIN_FORWARD_HOPS {
+                return Err(format!(
+                    "join forward hop limit ({MAX_JOIN_FORWARD_HOPS}) exceeded: {message}"
+                ));
+            }
             let Some(leader) = peers.first() else {
                 return Err(message);
             };
-            Box::pin(send_join(
+            if leader.control_addr == leader_addr {
+                return Err(format!("join forward cycle at {leader_addr}"));
+            }
+            Box::pin(send_join_with_hops(
                 &leader.control_addr,
                 secret,
                 local_id,
                 control_addr,
                 media_addr,
                 tls_client,
+                hops + 1,
             ))
             .await
         }

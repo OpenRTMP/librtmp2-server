@@ -187,7 +187,13 @@ impl SqliteStateMachine {
                 if self.db.stream_set_enabled(id, *enabled) {
                     ClusterResponse::Ok
                 } else {
-                    ClusterResponse::Error("db".into())
+                    // Missing stream is idempotent (e.g. delete-rollback after
+                    // finalize already removed the row). Do not return Error —
+                    // that stalls Raft apply for every follower.
+                    match self.db.stream_get(id) {
+                        crate::db::DbLookup::Missing => ClusterResponse::NotFound,
+                        _ => ClusterResponse::Error("db".into()),
+                    }
                 }
             }
             ClusterCommand::CreateViewer { viewer } => match self.db.viewer_add(viewer) {
@@ -551,30 +557,56 @@ impl SqliteStateMachine {
                 )
                 .map_err(|e| e.to_string())?;
             }
+            for v in &snap.viewers {
+                tx.execute(
+                    "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+                     VALUES (?,?,?,?,?,?)",
+                    params![
+                        v.id,
+                        v.stream_id,
+                        v.name,
+                        v.play_key,
+                        v.enabled,
+                        v.created_at
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            for o in &snap.owners {
+                tx.execute(
+                    "INSERT INTO stream_owners(stream_id, owner_node_id, epoch, acquired_at) \
+                     VALUES (?,?,?,?)",
+                    params![
+                        o.stream_id,
+                        o.owner_node_id as i64,
+                        o.epoch as i64,
+                        o.acquired_at
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            if let Some(token) = &snap.api_token {
+                tx.execute(
+                    "INSERT INTO settings(key, val) VALUES('api_token', ?) \
+                     ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+                    params![token],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            if let Some(cid) = &snap.cluster_id {
+                tx.execute(
+                    "INSERT INTO settings(key, val) VALUES('cluster_id', ?) \
+                     ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+                    params![cid],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             tx.commit().map_err(|e| e.to_string())?;
             Ok::<(), String>(())
         })?;
 
-        for v in &snap.viewers {
-            match self.db.viewer_add(v) {
-                Ok(()) => {}
-                Err(ViewerAddError::Duplicate) => {}
-                Err(ViewerAddError::Db) => {
-                    return Err("viewer_add failed during snapshot install".into());
-                }
-            }
-        }
-        for o in &snap.owners {
-            self.db
-                .stream_owner_acquire(&o.stream_id, o.owner_node_id, o.epoch, o.acquired_at)
-                .map_err(|_| "owner restore failed".to_string())?;
-        }
         if let Some(token) = &snap.api_token {
-            self.db.token_replace(token)?;
             self.emit_effect(StateEffect::ApiToken(token.clone()));
-        }
-        if let Some(cid) = &snap.cluster_id {
-            let _ = self.db.setting_set("cluster_id", cid);
         }
         Ok(())
     }

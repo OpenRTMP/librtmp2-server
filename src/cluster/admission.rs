@@ -76,6 +76,9 @@ impl AdmissionController {
 
     pub fn force_resume(&self) {
         self.manual_drain.store(false, Ordering::Relaxed);
+        // Operator resume also clears load-based draining — otherwise health
+        // flips to Ready while publish admission stays blocked on `draining`.
+        self.draining.store(false, Ordering::Relaxed);
         // Resume clears only an operator-requested drain; it must not
         // override a stronger unavailability state (ISOLATED/DOWN/LEAVING)
         // that reflects real cluster/network conditions the next health
@@ -210,5 +213,20 @@ mod tests {
         assert!(!adm.should_accept_new_publish());
         adm.update_load(0.4);
         assert!(adm.should_accept_new_publish());
+    }
+
+    #[test]
+    fn force_resume_clears_load_draining() {
+        let mut cfg = ClusterConfig::default();
+        cfg.drain_threshold = 0.8;
+        cfg.resume_threshold = 0.5;
+        let health = HealthTracker::new(Duration::from_millis(100));
+        health.set_local(NodeHealthState::Ready);
+        let adm = AdmissionController::new(cfg, health.clone());
+        adm.update_load(0.9);
+        assert!(!adm.should_accept_new_publish());
+        adm.force_resume();
+        assert!(adm.should_accept_new_publish());
+        assert_eq!(health.local(), NodeHealthState::Ready);
     }
 }

@@ -1191,8 +1191,18 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
             state.deleted_streams.lock().remove(id);
             Ok(())
         }
+        Err(CoordError::NotFound) => {
+            // Already gone — success. Do not propose SetStreamEnabled(true),
+            // which would Error-stall Raft when the row no longer exists.
+            state.deleted_streams.lock().remove(id);
+            Ok(())
+        }
         Err(_) => {
-            let _ = state.coordinator.set_stream_enabled(id, true);
+            // Only re-enable when the stream still exists (disable-not-delete
+            // failure). Skip when Missing so we don't write a stalling apply.
+            if matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
+                let _ = state.coordinator.set_stream_enabled(id, true);
+            }
             state.deleted_streams.lock().remove(id);
             Err(())
         }

@@ -98,7 +98,10 @@ impl StateCoordinator {
                 if db.stream_set_enabled(id, enabled) {
                     Ok(())
                 } else {
-                    Err(CoordError::Db)
+                    match db.stream_get(id) {
+                        crate::db::DbLookup::Missing => Err(CoordError::NotFound),
+                        _ => Err(CoordError::Db),
+                    }
                 }
             }
             #[cfg(feature = "cluster")]
