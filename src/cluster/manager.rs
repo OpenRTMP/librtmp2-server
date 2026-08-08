@@ -1656,7 +1656,11 @@ impl ClusterManager {
                 for id in self.health.peers_ready_for_ownership_release(grace) {
                     crate::log_info!("Cluster: node {id} DOWN for {:?} — releasing owners", grace);
                     match self.release_owners_for_node(id) {
-                        Ok(()) => self.health.mark_ownership_released(id),
+                        Ok(()) => {
+                            self.health.mark_ownership_released(id);
+                            self.peer_session_counts.lock().remove(&id);
+                            self.peer_stream_players.lock().remove(&id);
+                        }
                         Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
                     }
                 }
@@ -1676,10 +1680,9 @@ impl ClusterManager {
                     }
                 }
             }
-            for id in &down {
-                self.peer_session_counts.lock().remove(id);
-                self.peer_stream_players.lock().remove(id);
-            }
+            // Keep session caches through the DOWN fencing grace so delete
+            // finalize still sees remote sessions until ownership is released.
+            let _ = down;
             // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
             self.sync_ownership_from_db();
             self.reconcile_media_replicas();
@@ -2017,12 +2020,24 @@ impl ClusterManager {
         if self.config.media_replicas == 0 {
             return Vec::new();
         }
+        let peers = self.health.peers_snapshot();
+        let peer_state = |id: NodeId| -> Option<NodeHealthState> {
+            peers.iter().find(|(pid, _)| *pid == id).map(|(_, p)| p.state)
+        };
         let mut candidates: Vec<NodeId> = self
             .meta
             .all()
             .into_iter()
             .map(|(id, _, _)| id)
             .filter(|id| !exclude.contains(id) && owner_node.map(|o| o != *id).unwrap_or(true))
+            .filter(|id| {
+                // Local node is always eligible; peers must not be DOWN/ISOLATED.
+                *id == self.config.node_id
+                    || !matches!(
+                        peer_state(*id),
+                        Some(NodeHealthState::Down) | Some(NodeHealthState::Isolated) | None
+                    )
+            })
             .collect();
         candidates.sort_unstable();
         candidates.truncate(self.config.media_replicas as usize);

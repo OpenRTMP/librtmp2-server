@@ -1203,19 +1203,18 @@ impl Db {
     ) -> Result<u64, OwnerError> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction().map_err(|_| OwnerError::Db)?;
-        let stream_exists: bool = tx
+        let stream_ok: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT 1 FROM streams WHERE id=?",
+                "SELECT enabled, pending_delete FROM streams WHERE id=?",
                 params![stream_id],
-                |_| Ok(true),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|_| OwnerError::Db)?
-            .unwrap_or(false);
-        if !stream_exists {
-            // Semantic miss — must not surface as storage Error or Raft
-            // last_applied stalls on every replica.
-            return Err(OwnerError::NotFound);
+            .map_err(|_| OwnerError::Db)?;
+        match stream_ok {
+            Some((enabled, pending_delete)) if enabled != 0 && pending_delete == 0 => {}
+            // Missing, disabled, or mid-delete — semantic reject, not storage Error.
+            _ => return Err(OwnerError::NotFound),
         }
         let existing: Option<(i64, i64)> = tx
             .query_row(

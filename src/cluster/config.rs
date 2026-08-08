@@ -114,23 +114,27 @@ impl ClusterConfig {
         let mut drain_at_mbps: Option<f64> = None;
         let mut resume_at_mbps: Option<f64> = None;
 
-        let mut apply = |key: &str, val: &str| match key {
-            "CLUSTER_DRAIN_AT_MBPS" => {
-                if let Ok(mbps) = val.parse::<f64>() {
-                    drain_at_mbps = Some(mbps);
+        let mut apply = |key: &str, val: &str| -> Result<(), String> {
+            match key {
+                "CLUSTER_DRAIN_AT_MBPS" => {
+                    if let Ok(mbps) = val.parse::<f64>() {
+                        drain_at_mbps = Some(mbps);
+                    }
+                    Ok(())
                 }
-            }
-            "CLUSTER_RESUME_AT_MBPS" => {
-                if let Ok(mbps) = val.parse::<f64>() {
-                    resume_at_mbps = Some(mbps);
+                "CLUSTER_RESUME_AT_MBPS" => {
+                    if let Ok(mbps) = val.parse::<f64>() {
+                        resume_at_mbps = Some(mbps);
+                    }
+                    Ok(())
                 }
+                _ => apply_cluster_kv(&mut cfg, key, val),
             }
-            _ => apply_cluster_kv(&mut cfg, key, val),
         };
 
         for key in CLUSTER_FILE_KEYS {
             if let Some(val) = get_file(key) {
-                apply(key, &val);
+                apply(key, &val)?;
             }
         }
 
@@ -149,23 +153,27 @@ impl ClusterConfig {
         let mut drain_at_mbps: Option<f64> = None;
         let mut resume_at_mbps: Option<f64> = None;
 
-        let mut apply = |key: &str, val: &str| match key {
-            "CLUSTER_DRAIN_AT_MBPS" => {
-                if let Ok(mbps) = val.parse::<f64>() {
-                    drain_at_mbps = Some(mbps);
+        let mut apply = |key: &str, val: &str| -> Result<(), String> {
+            match key {
+                "CLUSTER_DRAIN_AT_MBPS" => {
+                    if let Ok(mbps) = val.parse::<f64>() {
+                        drain_at_mbps = Some(mbps);
+                    }
+                    Ok(())
                 }
-            }
-            "CLUSTER_RESUME_AT_MBPS" => {
-                if let Ok(mbps) = val.parse::<f64>() {
-                    resume_at_mbps = Some(mbps);
+                "CLUSTER_RESUME_AT_MBPS" => {
+                    if let Ok(mbps) = val.parse::<f64>() {
+                        resume_at_mbps = Some(mbps);
+                    }
+                    Ok(())
                 }
+                _ => apply_cluster_kv(&mut cfg, key, val),
             }
-            _ => apply_cluster_kv(&mut cfg, key, val),
         };
 
         for key in CLUSTER_FILE_KEYS {
             if let Some(val) = get_file(key) {
-                apply(key, &val);
+                apply(key, &val)?;
             }
         }
 
@@ -174,7 +182,7 @@ impl ClusterConfig {
             if let Ok(val) = std::env::var(env_key)
                 && !val.is_empty()
             {
-                apply(file_key, &val);
+                apply(file_key, &val)?;
             }
         }
 
@@ -208,7 +216,7 @@ impl ClusterConfig {
                             self.resume_at_mbps = Some(mbps);
                         }
                     }
-                    _ => apply_cluster_kv(self, file_key, &val),
+                    _ => apply_cluster_kv(self, file_key, &val)?,
                 }
             }
         }
@@ -430,9 +438,9 @@ pub const CLUSTER_ENV_OVERRIDE_KEYS: &[&str] = &[
     "LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR",
 ];
 
-fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
+fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(), String> {
     match key {
-        "CLUSTER_ENABLED" => cfg.enabled = parse_bool(val, false),
+        "CLUSTER_ENABLED" => cfg.enabled = parse_bool_strict(val, key)?,
         "CLUSTER_NODE_ID" => {
             if let Ok(v) = val.parse::<u64>() {
                 cfg.node_id = v;
@@ -440,7 +448,7 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
         }
         "CLUSTER_BIND" => cfg.bind = val.to_string(),
         "CLUSTER_MEDIA_BIND" => cfg.media_bind = val.to_string(),
-        "CLUSTER_BOOTSTRAP" => cfg.bootstrap = parse_bool(val, false),
+        "CLUSTER_BOOTSTRAP" => cfg.bootstrap = parse_bool_strict(val, key)?,
         "CLUSTER_JOIN" => {
             cfg.join = if val.is_empty() {
                 None
@@ -449,7 +457,7 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
             };
         }
         "CLUSTER_SECRET" => cfg.secret = val.to_string(),
-        "CLUSTER_TLS_ENABLED" => cfg.tls_enabled = parse_bool(val, false),
+        "CLUSTER_TLS_ENABLED" => cfg.tls_enabled = parse_bool_strict(val, key)?,
         "CLUSTER_TLS_CERT_FILE" => cfg.tls_cert_file = PathBuf::from(val),
         "CLUSTER_TLS_KEY_FILE" => cfg.tls_key_file = PathBuf::from(val),
         "CLUSTER_TLS_CA_FILE" => cfg.tls_ca_file = PathBuf::from(val),
@@ -522,13 +530,16 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) {
         "CLUSTER_MEDIA_ADVERTISE_ADDR" => cfg.media_advertise_addr = Some(val.to_string()),
         _ => {}
     }
+    Ok(())
 }
 
-fn parse_bool(val: &str, default: bool) -> bool {
+fn parse_bool_strict(val: &str, key: &str) -> Result<bool, String> {
     match val.trim() {
-        "1" | "true" | "TRUE" | "yes" | "YES" => true,
-        "0" | "false" | "FALSE" | "no" | "NO" => false,
-        _ => default,
+        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+        other => Err(format!(
+            "invalid boolean for {key}: '{other}' (expected true/false/1/0/yes/no)"
+        )),
     }
 }
 

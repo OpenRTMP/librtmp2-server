@@ -19,8 +19,10 @@ fn auth_response_binds_node_id() {
 }
 
 #[test]
-fn control_plane_rejects_admin_commands() {
-    assert!(!ClusterCommand::SetApiToken {
+fn control_plane_allows_member_forwarded_admin_commands() {
+    // Authenticated members may forward HTTP-authorized admin writes via
+    // ClientWrite so the any-node API works without leader discovery.
+    assert!(ClusterCommand::SetApiToken {
         token: "x".into()
     }
     .allowed_on_control_plane());

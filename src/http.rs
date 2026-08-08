@@ -1774,6 +1774,22 @@ async fn handle_stream_player_delete(
             );
             err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found")
         }
+        Err(CoordError::Conflict) => {
+            // Concurrent last-viewer delete races serialize in Raft; the loser
+            // must see the same client error as the precheck, not a 500.
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::BAD_REQUEST,
+                "cannot delete last play key",
+            );
+            err_json(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "Cannot delete the last play key for a stream",
+            )
+        }
         Err(_) => {
             log_http_access(
                 "DELETE",
