@@ -17,15 +17,93 @@ const NODE_ID_CERT_PREFIX: &[u8] = b"lrtmp2-node-";
 pub fn secrets_equal(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    let len_diff = a.len() ^ b.len();
     let max_len = a.len().max(b.len());
-    let mut diff = len_diff as u8;
+    let mut diff = u8::from(a.len() != b.len());
     for i in 0..max_len {
         let x = a.get(i).copied().unwrap_or(0);
         let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
     diff == 0
+}
+
+fn parse_node_id_from_identity_str(value: &str) -> Option<u64> {
+    let marker = "lrtmp2-node-";
+    let pos = value.find(marker)?;
+    let digits = &value[pos + marker.len()..];
+    let mut id = 0u64;
+    let mut digits_seen = 0usize;
+    for ch in digits.chars() {
+        if ch.is_ascii_digit() {
+            id = id.saturating_mul(10).saturating_add((ch as u8 - b'0') as u64);
+            digits_seen += 1;
+            if digits_seen > 20 {
+                return None;
+            }
+        } else {
+            break;
+        }
+    }
+    (digits_seen > 0 && id > 0).then_some(id)
+}
+
+fn node_id_from_cert_der(bytes: &[u8]) -> Option<u64> {
+    use x509_parser::prelude::*;
+    let Ok((_, cert)) = X509Certificate::from_der(bytes) else {
+        return None;
+    };
+    for cn in cert.subject().iter_common_name() {
+        if let Ok(cn_str) = cn.as_str()
+            && let Some(id) = parse_node_id_from_identity_str(cn_str)
+        {
+            return Some(id);
+        }
+    }
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in san.value.general_names.iter() {
+            let candidate = match name {
+                GeneralName::DNSName(s) | GeneralName::URI(s) => Some(*s),
+                _ => None,
+            };
+            if let Some(s) = candidate
+                && let Some(id) = parse_node_id_from_identity_str(s)
+            {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn node_id_from_cert_bytes_scan(bytes: &[u8]) -> Option<u64> {
+    let mut search_from = 0usize;
+    while let Some(rel) = bytes[search_from..]
+        .windows(NODE_ID_CERT_PREFIX.len())
+        .position(|w| w == NODE_ID_CERT_PREFIX)
+    {
+        let pos = search_from + rel + NODE_ID_CERT_PREFIX.len();
+        let mut id = 0u64;
+        let mut digits = 0usize;
+        for &b in &bytes[pos..] {
+            if b.is_ascii_digit() {
+                id = id.saturating_mul(10).saturating_add((b - b'0') as u64);
+                digits += 1;
+                if digits > 20 {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if digits > 0 && id > 0 {
+            return Some(id);
+        }
+        search_from = pos.saturating_add(1);
+        if search_from >= bytes.len() {
+            break;
+        }
+    }
+    None
 }
 
 /// CSPRNG nonce for cluster auth handshakes.
@@ -40,32 +118,11 @@ pub fn auth_nonce() -> Vec<u8> {
 pub fn node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Option<u64> {
     for cert in certs {
         let bytes = cert.as_ref();
-        let mut search_from = 0usize;
-        while let Some(rel) = bytes[search_from..]
-            .windows(NODE_ID_CERT_PREFIX.len())
-            .position(|w| w == NODE_ID_CERT_PREFIX)
-        {
-            let pos = search_from + rel + NODE_ID_CERT_PREFIX.len();
-            let mut id = 0u64;
-            let mut digits = 0usize;
-            for &b in &bytes[pos..] {
-                if b.is_ascii_digit() {
-                    id = id.saturating_mul(10).saturating_add((b - b'0') as u64);
-                    digits += 1;
-                    if digits > 20 {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if digits > 0 && id > 0 {
-                return Some(id);
-            }
-            search_from = pos.saturating_add(1);
-            if search_from >= bytes.len() {
-                break;
-            }
+        if let Some(id) = node_id_from_cert_der(bytes) {
+            return Some(id);
+        }
+        if let Some(id) = node_id_from_cert_bytes_scan(bytes) {
+            return Some(id);
         }
     }
     None
@@ -182,6 +239,10 @@ mod tests {
         assert!(secrets_equal("abcdef", "abcdef"));
         assert!(!secrets_equal("abcdef", "abcdeg"));
         assert!(!secrets_equal("abc", "abcd"));
+        let long_a = "a".repeat(256);
+        let long_b = "b".repeat(256);
+        assert!(!secrets_equal(&long_a, &long_b));
+        assert!(!secrets_equal(&long_a, ""));
     }
 
     #[test]

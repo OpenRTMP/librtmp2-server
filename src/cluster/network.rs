@@ -464,7 +464,7 @@ pub async fn serve_control_plane_listener(
     tracing::info!(%bind, tls = tls_required, "cluster control plane listening");
     loop {
         let (stream, peer) = listener.accept().await?;
-        if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) > MAX_CONTROL_CONN_INFLIGHT {
+        if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_CONTROL_CONN_INFLIGHT {
             CONTROL_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
             tracing::debug!(%peer, "control connection rejected: inflight limit");
             continue;

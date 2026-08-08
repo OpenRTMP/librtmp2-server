@@ -164,15 +164,23 @@ impl ClusterManager {
         let ownership = Arc::new(OwnershipTracker::new());
         ownership.hydrate_from(&db.stream_owner_list());
         let inject = InjectQueue::new(config.media_queue_mb);
+        let meta = Arc::new(ClusterMeta::new());
         let sm_for_media = sm_handle.clone();
         let local_node = config.node_id;
+        let meta_for_media = Arc::clone(&meta);
         let is_peer_allowed: crate::cluster::media::MediaMembershipFn = Arc::new(move |id| {
-            id == local_node
-                || sm_for_media
-                    .last_membership()
-                    .membership()
-                    .nodes()
-                    .any(|(nid, _)| *nid == id)
+            if id == local_node {
+                return true;
+            }
+            // Control-plane join records addresses before Raft membership is visible.
+            if meta_for_media.get(id).is_some() {
+                return true;
+            }
+            sm_for_media
+                .last_membership()
+                .membership()
+                .nodes()
+                .any(|(nid, _)| *nid == id)
         });
         let media = MediaHub::new(
             config.node_id,
@@ -199,8 +207,6 @@ impl ClusterManager {
                 }
             });
         }
-        let meta = Arc::new(ClusterMeta::new());
-
         let advertise = config.advertise_control();
         let media_advertise = config.advertise_media();
         meta.set_addrs(config.node_id, advertise.clone(), media_advertise.clone());
@@ -1004,9 +1010,9 @@ impl ClusterManager {
     /// exporting under an epoch a majority already released (and possibly
     /// reassigned) while this node was cut off. Reacquire ownership for each
     /// such stream so exports resume under a fresh, correctly fenced epoch.
-    /// A conflict (a replacement owner already claimed it) is logged for now
-    /// — there is no per-connection close hook here to also force that
-    /// publisher off; it self-corrects on reconnect.
+    /// A conflict (a replacement owner already claimed it) forces the local
+    /// publisher off via `session_hooks.force_unpublish_stream` when hooks are
+    /// registered (normal RTMP runtime); otherwise the conflict is only logged.
     fn reconcile_publishers_after_isolation(&self) {
         let node_id = self.config.node_id;
         for p in self.db.publisher_list_all() {
@@ -1209,14 +1215,14 @@ impl ClusterManager {
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
     pub async fn remote_stream_session_count(&self, stream_id: &str) -> u64 {
         let cached = self.remote_stream_session_count_cached(stream_id);
-        if cached > 0 {
-            return cached;
-        }
-        let mut total = 0u64;
+        let mut rpc_total = 0u64;
+        let mut rpc_peers = 0u64;
+        let mut rpc_ok = 0u64;
         for (id, ctrl, _) in self.meta.all() {
             if id == self.config.node_id {
                 continue;
             }
+            rpc_peers += 1;
             if let Ok(n) = network::send_session_count(
                 &ctrl,
                 &self.config.secret,
@@ -1226,10 +1232,18 @@ impl ClusterManager {
             )
             .await
             {
-                total = total.saturating_add(n);
+                rpc_ok += 1;
+                rpc_total = rpc_total.saturating_add(n);
             }
         }
-        total
+        if rpc_peers == 0 {
+            return 0;
+        }
+        if rpc_ok > 0 {
+            rpc_total
+        } else {
+            cached
+        }
     }
 
     /// Best-effort broadcast of drain/revoke markers to peers (Raft apply also marks locally).
@@ -1381,7 +1395,6 @@ impl ClusterManager {
             });
         }
         let ids: Vec<String> = changed.into_iter().map(|(id, _)| id).collect();
-        self.media.reset_timelines_for(&ids);
         for sid in &ids {
             let app = match self.db.stream_get(sid) {
                 crate::db::DbLookup::Ok(s) => s.app,

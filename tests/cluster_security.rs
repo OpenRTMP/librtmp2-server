@@ -47,8 +47,10 @@ fn verify_cluster_identity_empty_remote_fails() {
 }
 
 #[test]
-fn secrets_equal_is_constant_time_on_length() {
-    assert!(!secrets_equal("short", "much-longer-value"));
+fn secrets_equal_rejects_length_pairs_that_overflow_u8() {
+    let a = "x".repeat(256);
+    assert!(!secrets_equal(&a, ""));
+    assert!(!secrets_equal("", &a));
 }
 
 #[test]
