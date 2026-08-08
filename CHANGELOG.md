@@ -13,6 +13,10 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- A node pruned out of Raft membership enters `Leaving`, force-drains, and
+  force-unpublishes local streams so it does not keep serving after removal.
+
 ## [0.2.0] — 2026-08-08
 
 ### Added

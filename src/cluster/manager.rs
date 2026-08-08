@@ -1228,6 +1228,25 @@ impl ClusterManager {
         if members.is_empty() {
             return;
         }
+        // If Raft membership no longer includes this node (another member
+        // removed us), stop admitting and tear down local publishers — do not
+        // keep serving after ownership can be reassigned elsewhere.
+        if !members.contains(&self.config.node_id)
+            && self.health.local() != NodeHealthState::Leaving
+        {
+            crate::log_warn!(
+                "Cluster: this node {} is no longer in Raft membership; entering Leaving",
+                self.config.node_id
+            );
+            self.health.set_local(NodeHealthState::Leaving);
+            self.admission.force_drain();
+            if let Some(hooks) = self.session_hooks.lock().as_ref() {
+                for p in self.db.publisher_list_all() {
+                    (hooks.force_unpublish_stream)(&p.stream_id);
+                    self.mark_stream_draining(&p.stream_id);
+                }
+            }
+        }
         for (id, _, _) in self.meta.all() {
             if id == self.config.node_id || members.contains(&id) {
                 continue;
