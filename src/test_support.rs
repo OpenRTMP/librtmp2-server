@@ -182,8 +182,7 @@ impl TestServer {
                     rtmp_bridge.on_close(conn_id);
                 }
 
-                let live_stream_ids =
-                    live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
+                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
                 deleted_for_rtmp
                     .lock()
                     .retain(|id| live_stream_ids.contains(id));

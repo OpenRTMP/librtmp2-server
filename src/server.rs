@@ -170,11 +170,7 @@ pub(crate) struct TrackedConn {
 /// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
 /// bridge (authoritative for live publisher/player rows); fall back to the
 /// poll-loop tracker when the bridge has not been synced yet this tick.
-fn eviction_stream_id(
-    rtmp_bridge: &DbRtmpBridge,
-    conn_id: u64,
-    entry: &TrackedConn,
-) -> String {
+fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedConn) -> String {
     let bridge_sid = rtmp_bridge.stream_id_for_conn(conn_id);
     if !bridge_sid.is_empty() {
         return bridge_sid;
@@ -994,12 +990,12 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        eviction_stream_id, live_stream_ids_for_deleted_markers, ServerApp, TrackedConn,
-        bind_with_default_port, should_evict_idle_conn,
+        ServerApp, TrackedConn, bind_with_default_port, eviction_stream_id,
+        live_stream_ids_for_deleted_markers, should_evict_idle_conn,
     };
     use crate::config::ServerConfig;
     use crate::db::Db;
-    use crate::rtmp_bridge::DbRtmpBridge;
+    use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1078,7 +1074,7 @@ mod tests {
         };
         db.stream_add(&stream).unwrap();
 
-        let deleted = Arc::new(parking_lot::Mutex::new(HashSet::from(["s1".to_string()])));
+        let deleted = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::clone(&deleted));
         bridge.on_connect(1, "127.0.0.1:1000");
         assert!(
@@ -1086,6 +1082,9 @@ mod tests {
                 .authorize_publish(1, "live", &stream.publish_key)
                 .is_ok()
         );
+
+        // Simulate a delete request arriving while the publisher is still live.
+        deleted.lock().insert("s1".to_string());
 
         let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
         tracked.insert(
