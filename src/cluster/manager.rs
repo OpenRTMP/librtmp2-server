@@ -72,6 +72,7 @@ pub struct ClusterManager {
     /// RTMP poll loop reacted to the marker). Retried until local sessions
     /// actually drain — see `retry_pending_drain_clears`.
     pending_drain_clears: Mutex<std::collections::HashSet<String>>,
+    state_machine: SqliteStateMachine,
 }
 
 /// Shared with AppState so Raft applies can mark deleted streams / revoked viewers
@@ -212,6 +213,7 @@ impl ClusterManager {
             peer_stream_players: Mutex::new(std::collections::HashMap::new()),
             effects_rx: Mutex::new(Some(effects_rx)),
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
+            state_machine: sm_handle.clone(),
         });
 
         // Control + media listeners
@@ -231,18 +233,8 @@ impl ClusterManager {
             let counts_hb = Arc::clone(&mgr);
             let on_heartbeat: Arc<dyn Fn(network::HeartbeatInfo) + Send + Sync> =
                 Arc::new(move |info: network::HeartbeatInfo| {
-                    // Ignore heartbeats from nodes outside current Raft membership
-                    // once membership is known — prevents removed nodes from
-                    // re-entering meta/health/media via stale heartbeats.
-                    if let Some(rm) = counts_hb.last_metrics.lock().as_ref() {
-                        let in_membership = rm
-                            .membership_config
-                            .membership()
-                            .nodes()
-                            .any(|(id, _)| *id == info.node_id);
-                        if !in_membership {
-                            return;
-                        }
+                    if !counts_hb.peer_in_membership(info.node_id) {
+                        return;
                     }
                     let state =
                         NodeHealthState::parse(&info.health).unwrap_or(NodeHealthState::Ready);
@@ -300,6 +292,8 @@ impl ClusterManager {
             let secret = config.secret.clone();
             let local_id = config.node_id;
             let tls_srv = tls_server.clone();
+            let mgr_member = Arc::clone(&mgr);
+            let is_member: network::MembershipFn = Arc::new(move |id| mgr_member.peer_in_membership(id));
             tokio::spawn(async move {
                 if let Err(e) = network::serve_control_plane_listener(
                     listener,
@@ -310,6 +304,7 @@ impl ClusterManager {
                     on_heartbeat,
                     on_admin,
                     on_stats,
+                    is_member,
                     tls_srv,
                 )
                 .await
@@ -610,11 +605,32 @@ impl ClusterManager {
                 Err(e) => Err(CoordError::Cluster(format!("raft write: {e}"))),
             }
         };
+        const RAFT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+        let timed = async move {
+            tokio::time::timeout(RAFT_WRITE_TIMEOUT, fut)
+                .await
+                .map_err(|_| CoordError::Cluster("raft write timed out".into()))?
+        };
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.rt_handle.block_on(fut))
+            tokio::task::block_in_place(|| self.rt_handle.block_on(timed))
         } else {
-            self.rt_handle.block_on(fut)
+            self.rt_handle.block_on(timed)
         }
+    }
+
+    fn peer_in_membership(&self, node_id: NodeId) -> bool {
+        if let Some(rm) = self.last_metrics.lock().as_ref() {
+            return rm
+                .membership_config
+                .membership()
+                .nodes()
+                .any(|(id, _)| *id == node_id);
+        }
+        self.state_machine
+            .last_membership()
+            .membership()
+            .nodes()
+            .any(|(id, _)| *id == node_id)
     }
 
     pub async fn drain_node(&self, node_id: NodeId) -> Result<(), String> {
@@ -636,7 +652,8 @@ impl ClusterManager {
     }
 
     pub async fn remove_peer(&self, node_id: NodeId) -> Result<(), String> {
-        let _ = self.release_owners_for_node(node_id);
+        self.release_owners_for_node(node_id)
+            .map_err(|e| format!("release owners for node {node_id}: {e}"))?;
         self.change_membership_forwarded(ChangeMembers::RemoveVoters(
             std::collections::BTreeSet::from([node_id]),
         ))
@@ -973,6 +990,10 @@ impl ClusterManager {
             return (hooks.local_stream_sessions)(stream_id);
         }
         0
+    }
+
+    pub fn poll_side_effects(&self) {
+        self.process_state_effects();
     }
 
     fn process_state_effects(&self) {
@@ -1350,9 +1371,16 @@ impl ClusterManager {
             let is_leader =
                 metrics.as_ref().and_then(|m| m.current_leader) == Some(self.config.node_id);
             if is_leader {
-                for id in &down {
-                    crate::log_info!("Cluster: node {id} DOWN — releasing owners");
-                    let _ = self.release_owners_for_node(*id);
+                let grace = self.config.heartbeat.saturating_mul(5);
+                for id in self.health.peers_ready_for_ownership_release(grace) {
+                    crate::log_info!(
+                        "Cluster: node {id} DOWN for {:?} — releasing owners",
+                        grace
+                    );
+                    match self.release_owners_for_node(id) {
+                        Ok(()) => self.health.mark_ownership_released(id),
+                        Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e}"),
+                    }
                 }
             }
             for id in &down {

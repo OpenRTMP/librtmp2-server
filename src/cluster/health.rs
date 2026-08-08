@@ -61,6 +61,10 @@ pub struct HealthTracker {
     local: Mutex<NodeHealthState>,
     peers: Mutex<HashMap<NodeId, PeerHealth>>,
     miss_limit: Duration,
+    /// When each peer was first marked DOWN (for delayed ownership release).
+    down_since: Mutex<HashMap<NodeId, Instant>>,
+    /// Peers whose ownership was already released after the DOWN grace window.
+    ownership_released: Mutex<std::collections::HashSet<NodeId>>,
 }
 
 impl HealthTracker {
@@ -70,6 +74,8 @@ impl HealthTracker {
             peers: Mutex::new(HashMap::new()),
             // Quorum-aware: require several missed heartbeats before DOWN.
             miss_limit: heartbeat.saturating_mul(5).max(Duration::from_secs(2)),
+            down_since: Mutex::new(HashMap::new()),
+            ownership_released: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -100,6 +106,10 @@ impl HealthTracker {
         entry.state = state;
         entry.load = load;
         entry.last_seen = Instant::now();
+        if state != NodeHealthState::Down {
+            self.down_since.lock().remove(&id);
+            self.ownership_released.lock().remove(&id);
+        }
         if let Some(a) = control_addr {
             entry.control_addr = a;
         }
@@ -110,24 +120,45 @@ impl HealthTracker {
 
     pub fn remove(&self, id: NodeId) {
         self.peers.lock().remove(&id);
+        self.down_since.lock().remove(&id);
+        self.ownership_released.lock().remove(&id);
     }
 
-    /// Mark peers that have missed heartbeats as DOWN. Returns newly-down node ids
-    /// (callers may propose `ReleaseOwnersForNode` after quorum confirms).
+    /// Mark peers that have missed heartbeats as DOWN. Returns newly-down node ids.
     pub fn sweep_stale(&self) -> Vec<NodeId> {
         let now = Instant::now();
         let mut down = Vec::new();
         let mut peers = self.peers.lock();
+        let mut down_since = self.down_since.lock();
         for (id, peer) in peers.iter_mut() {
             if peer.state == NodeHealthState::Down {
                 continue;
             }
             if now.duration_since(peer.last_seen) > self.miss_limit {
                 peer.state = NodeHealthState::Down;
+                down_since.entry(*id).or_insert(now);
                 down.push(*id);
             }
         }
         down
+    }
+
+    /// Peers that have been DOWN for at least `grace` and not yet had ownership released.
+    pub fn peers_ready_for_ownership_release(&self, grace: Duration) -> Vec<NodeId> {
+        let now = Instant::now();
+        let down_since = self.down_since.lock();
+        let released = self.ownership_released.lock();
+        down_since
+            .iter()
+            .filter(|(id, since)| {
+                !released.contains(*id) && now.duration_since(**since) >= grace
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    pub fn mark_ownership_released(&self, id: NodeId) {
+        self.ownership_released.lock().insert(id);
     }
 
     pub fn peers_snapshot(&self) -> Vec<(NodeId, PeerHealth)> {

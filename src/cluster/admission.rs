@@ -96,7 +96,7 @@ impl IngressEligibility for AdmissionController {
             return false;
         }
         let state = self.health.local();
-        matches!(state, NodeHealthState::Ready | NodeHealthState::Learner)
+        matches!(state, NodeHealthState::Ready)
             && !self.draining.load(Ordering::Relaxed)
             && !self.manual_drain.load(Ordering::Relaxed)
     }

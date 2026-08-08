@@ -567,7 +567,7 @@ impl SqliteStateMachine {
                         v.name,
                         v.play_key,
                         v.enabled,
-                        v.created_at
+                        v.created_at,
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -580,7 +580,7 @@ impl SqliteStateMachine {
                         o.stream_id,
                         o.owner_node_id as i64,
                         o.epoch as i64,
-                        o.acquired_at
+                        o.acquired_at,
                     ],
                 )
                 .map_err(|e| e.to_string())?;

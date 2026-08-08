@@ -359,6 +359,9 @@ pub type JoinAcceptFn = Arc<
     dyn Fn(NodeId, String, String) -> Result<(String, Vec<JoinPeerInfo>), String> + Send + Sync,
 >;
 
+/// Returns true when `node_id` is in the current Raft membership.
+pub type MembershipFn = Arc<dyn Fn(NodeId) -> bool + Send + Sync>;
+
 /// Peer heartbeat payload (addrs + session counts for aggregation).
 #[derive(Debug, Clone)]
 pub struct HeartbeatInfo {
@@ -382,6 +385,7 @@ pub async fn serve_control_plane(
     on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+    is_member: MembershipFn,
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(bind).await?;
@@ -394,6 +398,7 @@ pub async fn serve_control_plane(
         on_heartbeat,
         on_admin,
         on_stats,
+        is_member,
         tls_server,
     )
     .await
@@ -409,6 +414,7 @@ pub async fn serve_control_plane_listener(
     on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+    is_member: MembershipFn,
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let acceptor = tls_server.map(TlsAcceptor::from);
@@ -424,6 +430,7 @@ pub async fn serve_control_plane_listener(
         let on_heartbeat = Arc::clone(&on_heartbeat);
         let on_admin = Arc::clone(&on_admin);
         let on_stats = Arc::clone(&on_stats);
+        let is_member = Arc::clone(&is_member);
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let result = async {
@@ -445,6 +452,7 @@ pub async fn serve_control_plane_listener(
                         on_heartbeat,
                         on_admin,
                         on_stats,
+                        is_member,
                     )
                     .await
                 } else {
@@ -458,6 +466,7 @@ pub async fn serve_control_plane_listener(
                         on_heartbeat,
                         on_admin,
                         on_stats,
+                        is_member,
                     )
                     .await
                 }
@@ -530,6 +539,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+    is_member: MembershipFn,
 ) -> Result<(), std::io::Error> {
     let peer_id = server_auth_handshake(stream, secret, local_id).await?;
 
@@ -537,6 +547,9 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     let msg = read_frame(stream).await?;
     let resp = match msg {
         ControlMessage::RaftAppend(req) => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
             let parsed: AppendEntriesRequest<TypeConfig> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.append_entries(parsed).await;
@@ -545,6 +558,9 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             ControlMessage::RaftAppendResp(v)
         }
         ControlMessage::RaftVote(req) => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
             let parsed: VoteRequest<NodeId> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.vote(parsed).await;
@@ -553,6 +569,9 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             ControlMessage::RaftVoteResp(v)
         }
         ControlMessage::RaftSnapshot(req) => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
             let parsed: InstallSnapshotRequest<TypeConfig> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.install_snapshot(parsed).await;
@@ -583,7 +602,12 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 },
             }
         }
-        ControlMessage::TopologyReq => on_admin(ControlMessage::TopologyReq),
+        ControlMessage::TopologyReq => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
+            on_admin(ControlMessage::TopologyReq)
+        }
         ControlMessage::Heartbeat {
             node_id,
             health,
@@ -596,8 +620,8 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
         } => {
             // Bind heartbeats to the authenticated peer — a secret-holder must
             // not rewrite another member's addrs by spoofing node_id.
-            if node_id != peer_id {
-                return Err(std::io::Error::other("heartbeat node_id mismatch"));
+            if node_id != peer_id || !is_member(peer_id) {
+                return Err(std::io::Error::other("heartbeat identity rejected"));
             }
             on_heartbeat(HeartbeatInfo {
                 node_id: peer_id,
@@ -611,10 +635,18 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             });
             ControlMessage::AdminOk
         }
-        ControlMessage::StatsProxyReq { stream_id } => ControlMessage::StatsProxyResp {
+        ControlMessage::StatsProxyReq { stream_id } => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
+            ControlMessage::StatsProxyResp {
             body: on_stats(stream_id),
-        },
+        }
+        }
         ControlMessage::ClientWrite(req) => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
             use crate::cluster::command::ClusterCommand;
             let cmd: ClusterCommand =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
@@ -631,6 +663,9 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             ControlMessage::ClientWriteResp(body)
         }
         ControlMessage::ChangeMembership(req) => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
             use openraft::ChangeMembers;
             let change: ChangeMembers<NodeId, BasicNode> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
@@ -650,7 +685,12 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
         | ControlMessage::AdminRemove { .. }
         | ControlMessage::DrainStream { .. }
         | ControlMessage::RevokeViewer { .. }
-        | ControlMessage::SessionCountReq { .. }) => on_admin(admin),
+        | ControlMessage::SessionCountReq { .. }) => {
+            if !is_member(peer_id) {
+                return Err(std::io::Error::other("peer not in membership"));
+            }
+            on_admin(admin)
+        }
         other => {
             let _ = other;
             ControlMessage::AdminErr {
