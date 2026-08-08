@@ -1,16 +1,32 @@
 # Bug scan progress
 
-Last scanned: http (2026-08-07)
+Last scanned: server (2026-08-08)
 
 ## Modules
 
 - [x] config — .env loader, env overrides
 - [x] db — SQLite persistence, stream/publisher/player CRUD
 - [x] http — REST API, auth, stats endpoints
-- [ ] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
+- [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [ ] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [ ] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-08-08 server pass)
+
+- **Critical (fixed):** `deleted_streams` retention keyed only on
+  `TrackedConn.stream_id`, while `revoked_viewers` already used the bridge.
+  When the bridge held a live publisher/player but the poll tracker had not
+  yet copied `stream_id` (same-tick authorize before `current_stream` is
+  observed), the retain pass dropped the deletion marker while sessions were
+  still live. Subsequent poll ticks no longer kicked those connections, so a
+  publisher could keep broadcasting on a disabled/pending-delete stream until
+  manual disconnect. Retention and delete kicks now prefer the bridge stream
+  id (with tracker fallback).
+- **High (fixed):** If the RTMP poll loop exited on an internal error while
+  HTTP kept serving, the process stayed half-alive — API/health looked fine but
+  all publish/play was dead until restart. Unexpected RTMP thread exit now
+  triggers HTTP graceful shutdown.
 
 ## Findings (2026-08-07 http pass)
 
