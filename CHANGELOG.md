@@ -64,6 +64,11 @@ begin at `1.0.0`.
   peer heartbeat load; snapshot control RPCs use a 120s round-trip budget;
   member-forwarded admin `ClientWrite` commands are accepted on the control
   plane; Docker monorepo builds `[patch]` the sibling `librtmp2` path.
+- Ownership acquire rejects disabled/pending-delete streams; peer session
+  caches survive DOWN until ownership release; standby placement skips
+  unavailable peers; invalid cluster boolean env overrides error; concurrent
+  last-viewer delete races return 400; security test matches control-plane
+  policy.
 
 ## [0.2.0] — 2026-08-08
 
