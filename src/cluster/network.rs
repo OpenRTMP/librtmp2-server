@@ -656,7 +656,10 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             control_addr,
             media_addr,
         } => {
-            if node_id != peer_id {
+            // Direct joins must authenticate as the joining node. Existing
+            // members may proxy a JoinRequest for a fresh learner (follower
+            // forwarding to the leader after ForwardToLeader).
+            if node_id != peer_id && !is_member(peer_id) {
                 return Err(std::io::Error::other(
                     "join node_id must match authenticated peer",
                 ));

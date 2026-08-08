@@ -77,7 +77,15 @@ impl AdmissionController {
 
     pub fn force_drain(&self) {
         self.manual_drain.store(true, Ordering::Relaxed);
-        self.health.set_local(NodeHealthState::Draining);
+        // Do not weaken stronger lifecycle states (ISOLATED/DOWN/LEARNER/
+        // LEAVING) to DRAINING — plays are still admitted while Draining.
+        let state = self.health.local();
+        if matches!(
+            state,
+            NodeHealthState::Ready | NodeHealthState::Draining
+        ) {
+            self.health.set_local(NodeHealthState::Draining);
+        }
     }
 
     pub fn force_resume(&self) {

@@ -1326,7 +1326,28 @@ async fn handle_stream_delete(
     }
 
     state.deleted_streams.lock().insert(id.clone());
-    if state.coordinator.begin_delete_stream(&id).is_err() {
+    if let Err(e) = state.coordinator.begin_delete_stream(&id) {
+        #[cfg(feature = "cluster")]
+        let ambiguous_timeout = matches!(
+            &e,
+            CoordError::Cluster(msg) if msg == "raft write timed out"
+        );
+        #[cfg(not(feature = "cluster"))]
+        let ambiguous_timeout = false;
+        if ambiguous_timeout {
+            // BeginDeleteStream may still commit after the caller timed out —
+            // keep the local marker and schedule finalize reconciliation.
+            crate::log_warn!(
+                "HTTP: DELETE /api/v1/streams/{id} begin_delete timed out; \
+                 reconciling via background finalize"
+            );
+            let state_bg = Arc::clone(&state);
+            let id_bg = id.clone();
+            tokio::spawn(async move {
+                wait_and_finalize_stream_delete(state_bg, id_bg).await;
+            });
+            return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
+        }
         state.deleted_streams.lock().remove(&id);
         log_http_access(
             "DELETE",

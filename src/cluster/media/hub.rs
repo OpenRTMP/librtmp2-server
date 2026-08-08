@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rustls::{ClientConfig, ServerConfig};
@@ -19,6 +19,10 @@ use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
 
 const MEDIA_INBOUND_QUEUE: usize = 4096;
+/// Cap concurrent inbound media connections (auth + frame reader tasks),
+/// matching the control-plane inflight guard pattern.
+const MAX_MEDIA_CONN_INFLIGHT: usize = 512;
+static MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Frame exported from local librtmp2 for mesh fan-out.
 #[derive(Debug, Clone)]
@@ -261,9 +265,17 @@ impl MediaHub {
                 break;
             }
             let (stream, _) = listener.accept().await?;
+            if MEDIA_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_MEDIA_CONN_INFLIGHT {
+                MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+                tracing::warn!("media inbound connection cap reached; dropping accept");
+                drop(stream);
+                continue;
+            }
             let hub = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(e) = hub.handle_inbound_conn(stream).await {
+                let result = hub.handle_inbound_conn(stream).await;
+                MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+                if let Err(e) = result {
                     tracing::debug!(error=%e, "media inbound closed");
                 }
             });

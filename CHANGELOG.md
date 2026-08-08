@@ -16,6 +16,18 @@ begin at `1.0.0`.
 ### Fixed
 - A node pruned out of Raft membership enters `Leaving`, force-drains, and
   force-unpublishes local streams so it does not keep serving after removal.
+- `force_drain` sets the manual-drain flag without weakening stronger health
+  states (`Leaving`/`Isolated`/`Down`/`Learner`) to `Draining`.
+- Raft state-machine apply treats every `ClusterResponse::Error` as a storage
+  failure so `last_applied` cannot advance past a partial mutation.
+- Followers that are already members may proxy `JoinRequest` for a fresh
+  learner to the leader (join via non-leader `CLUSTER_JOIN` address).
+- Outbound media TLS handshakes are bounded by the same auth timeout as the
+  control plane.
+- Timed-out `BeginDeleteStream` keeps the local delete marker and schedules
+  finalize reconciliation instead of abandoning the workflow.
+- Inbound media accepts are capped (`MAX_MEDIA_CONN_INFLIGHT`) like control
+  connections.
 
 ## [0.2.0] — 2026-08-08
 

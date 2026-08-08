@@ -744,14 +744,15 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                         }
                         other => self.apply_command(other),
                     };
+                    // Any apply-time Error (not only the literal "db") must
+                    // fail the storage apply so last_applied does not advance
+                    // past a partially omitted mutation.
                     if let ClusterResponse::Error(ref msg) = resp {
-                        if msg == "db" {
-                            return Err(StorageError::IO {
-                                source: StorageIOError::<u64>::write_state_machine(
-                                    &std::io::Error::other(msg.clone()),
-                                ),
-                            });
-                        }
+                        return Err(StorageError::IO {
+                            source: StorageIOError::<u64>::write_state_machine(
+                                &std::io::Error::other(msg.clone()),
+                            ),
+                        });
                     }
                     // Command SQL already committed via Db helpers; persist index next.
                     // Membership+index use a single tx; command+index cannot share a

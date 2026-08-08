@@ -218,7 +218,11 @@ async fn connect_and_run(
         let connector = TlsConnector::from(cfg);
         let host = crate::cluster::network::tls_server_name_from_addr(addr)
             .map_err(std::io::Error::other)?;
-        let tls = connector.connect(host, tcp).await?;
+        let tls = tokio::time::timeout(AUTH_TIMEOUT, connector.connect(host, tcp))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tls connect timeout")
+            })??;
         Box::new(tls)
     } else {
         Box::new(tcp)
