@@ -150,9 +150,7 @@ impl HealthTracker {
         let released = self.ownership_released.lock();
         down_since
             .iter()
-            .filter(|(id, since)| {
-                !released.contains(*id) && now.duration_since(**since) >= grace
-            })
+            .filter(|(id, since)| !released.contains(*id) && now.duration_since(**since) >= grace)
             .map(|(id, _)| *id)
             .collect()
     }

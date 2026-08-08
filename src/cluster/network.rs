@@ -640,8 +640,8 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 return Err(std::io::Error::other("peer not in membership"));
             }
             ControlMessage::StatsProxyResp {
-            body: on_stats(stream_id),
-        }
+                body: on_stats(stream_id),
+            }
         }
         ControlMessage::ClientWrite(req) => {
             if !is_member(peer_id) {
