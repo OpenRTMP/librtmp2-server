@@ -26,6 +26,8 @@ pub enum StateEffect {
     ClearDrainStream(String),
     RevokeViewer(String),
     ApiToken(String),
+    /// Ownership rows changed — refresh in-memory tracker immediately.
+    OwnershipChanged,
 }
 
 #[derive(Clone)]
@@ -250,14 +252,20 @@ impl SqliteStateMachine {
             ClusterCommand::ReleaseStreamOwner { stream_id, epoch } => {
                 match self.db.stream_owner_release(stream_id, *epoch) {
                     // Idempotent: already released or epoch mismatch on follower catch-up.
-                    Ok(_) => ClusterResponse::Ok,
+                    Ok(_) => {
+                        self.emit_effect(StateEffect::OwnershipChanged);
+                        ClusterResponse::Ok
+                    }
                     Err(OwnerError::Db) => ClusterResponse::Error("db".into()),
                     Err(OwnerError::Conflict) => ClusterResponse::Error("db".into()),
                 }
             }
             ClusterCommand::ReleaseOwnersForNode { node_id } => {
                 match self.db.stream_owners_release_for_node(*node_id) {
-                    Ok(_) => ClusterResponse::Ok,
+                    Ok(_) => {
+                        self.emit_effect(StateEffect::OwnershipChanged);
+                        ClusterResponse::Ok
+                    }
                     Err(OwnerError::Db) => ClusterResponse::Error("db".into()),
                     Err(OwnerError::Conflict) => ClusterResponse::Error("db".into()),
                 }
@@ -724,7 +732,10 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                                 epoch,
                                 *acquired_at,
                             ) {
-                                Ok(ep) => ClusterResponse::OwnerEpoch(ep),
+                                Ok(ep) => {
+                                    self.emit_effect(StateEffect::OwnershipChanged);
+                                    ClusterResponse::OwnerEpoch(ep)
+                                }
                                 Err(crate::db::OwnerError::Conflict) => ClusterResponse::Conflict,
                                 Err(crate::db::OwnerError::Db) => {
                                     ClusterResponse::Error("db".into())
@@ -734,11 +745,13 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                         other => self.apply_command(other),
                     };
                     if let ClusterResponse::Error(ref msg) = resp {
-                        return Err(StorageError::IO {
-                            source: StorageIOError::<u64>::write_state_machine(
-                                &std::io::Error::other(msg.clone()),
-                            ),
-                        });
+                        if msg == "db" {
+                            return Err(StorageError::IO {
+                                source: StorageIOError::<u64>::write_state_machine(
+                                    &std::io::Error::other(msg.clone()),
+                                ),
+                            });
+                        }
                     }
                     // Command SQL already committed via Db helpers; persist index next.
                     // Membership+index use a single tx; command+index cannot share a

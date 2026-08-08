@@ -18,6 +18,8 @@ use crate::cluster::media::protocol::MediaMessage;
 use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
 
+const MEDIA_INBOUND_QUEUE: usize = 4096;
+
 /// Frame exported from local librtmp2 for mesh fan-out.
 #[derive(Debug, Clone)]
 pub struct ExportedFrame {
@@ -60,6 +62,13 @@ impl InjectQueue {
     pub fn try_send(&self, frame: InjectedFrame) -> Result<(), ()> {
         let size = frame.payload.len().saturating_add(64);
         let mut st = self.state.lock();
+        while st.1.saturating_add(size) > self.max_bytes && !st.0.is_empty() {
+            if let Some(dropped) = st.0.pop_front() {
+                st.1 = st
+                    .1
+                    .saturating_sub(dropped.payload.len().saturating_add(64));
+            }
+        }
         if st.1.saturating_add(size) > self.max_bytes {
             tracing::warn!(
                 app = %frame.app,
@@ -167,11 +176,12 @@ pub struct MediaHub {
     cache: InitCacheStore,
     timelines: Mutex<HashMap<(String, String), TimelineRemapper>>,
     inject: Arc<InjectQueue>,
-    inbound_tx: mpsc::UnboundedSender<MediaMessage>,
+    inbound_tx: mpsc::Sender<MediaMessage>,
     shutdown: AtomicBool,
     tls_server: Option<Arc<ServerConfig>>,
     tls_client: Option<Arc<ClientConfig>>,
     peer_reconnect_tx: mpsc::UnboundedSender<NodeId>,
+    is_peer_allowed: MediaMembershipFn,
 }
 
 impl MediaHub {
@@ -184,8 +194,9 @@ impl MediaHub {
         inject: Arc<InjectQueue>,
         tls_server: Option<Arc<ServerConfig>>,
         tls_client: Option<Arc<ClientConfig>>,
+        is_peer_allowed: MediaMembershipFn,
     ) -> Arc<Self> {
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<MediaMessage>();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<MediaMessage>(MEDIA_INBOUND_QUEUE);
         let (peer_reconnect_tx, mut peer_reconnect_rx) = mpsc::unbounded_channel::<NodeId>();
         let hub = Arc::new(Self {
             local_id,
@@ -203,6 +214,7 @@ impl MediaHub {
             tls_server,
             tls_client,
             peer_reconnect_tx,
+            is_peer_allowed,
         });
         let hub_c = Arc::clone(&hub);
         tokio::spawn(async move {
@@ -268,6 +280,7 @@ impl MediaHub {
             &self.secret,
             self.local_id,
             self.tls_server.clone(),
+            Arc::clone(&self.is_peer_allowed),
         )
         .await?;
         // Track Subscribe messages on this connection so a drop without Unsubscribe
@@ -421,7 +434,7 @@ impl MediaHub {
                     }
                     MediaMessage::StatsReq { stream_id: _ } => {}
                     other => {
-                        let _ = self.inbound_tx.send(other);
+                        let _ = self.inbound_tx.try_send(other);
                     }
                 }
             }
@@ -699,10 +712,11 @@ impl MediaHub {
     /// Reset timeline remappers for streams whose ownership epoch changed.
     pub fn reset_timelines_for(&self, stream_ids: &[String]) {
         let mut maps = self.timelines.lock();
-        maps.retain(|(app, sid), _| {
-            let _ = app;
-            !stream_ids.iter().any(|s| s == sid)
-        });
+        maps.retain(|(_app, sid), _| !stream_ids.iter().any(|s| s == sid));
+    }
+
+    pub fn evict_init_cache(&self, app: &str, stream: &str) {
+        self.cache.remove(app, stream);
     }
 
     /// Bind the media port before spawning accept so startup fails hard on conflict.

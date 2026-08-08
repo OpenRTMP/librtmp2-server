@@ -672,12 +672,17 @@ impl ServerApp {
             let revoked = Arc::clone(&self.revoked_viewers);
             let token = Arc::clone(&api_token);
             let bridge = Arc::clone(&self.rtmp_bridge);
+            let bridge_fp = Arc::clone(&bridge);
+            let bridge_sessions = Arc::clone(&bridge);
             mgr.register_session_hooks(crate::cluster::SessionHooks {
                 deleted_streams: deleted,
                 revoked_viewers: revoked,
                 api_token: token,
+                force_unpublish_stream: Arc::new(move |stream_id: &str| {
+                    bridge_fp.force_unpublish_stream(stream_id);
+                }),
                 local_stream_sessions: Arc::new(move |sid: &str| {
-                    bridge.live_conn_count_for_stream(sid) as u64
+                    bridge_sessions.live_conn_count_for_stream(sid) as u64
                 }),
             });
         }

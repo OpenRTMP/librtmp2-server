@@ -101,6 +101,8 @@ pub struct SessionHooks {
     pub deleted_streams: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     pub revoked_viewers: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     pub api_token: Arc<parking_lot::RwLock<String>>,
+    /// Force local RTMP publishers off a stream (stale epoch after partition).
+    pub force_unpublish_stream: Arc<dyn Fn(&str) + Send + Sync>,
     /// Optional local live-session counter for drain wait aggregation.
     pub local_stream_sessions: Arc<dyn Fn(&str) -> u64 + Send + Sync>,
 }
@@ -181,6 +183,24 @@ impl ClusterManager {
         let ownership = Arc::new(OwnershipTracker::new());
         ownership.hydrate_from(&db.stream_owner_list());
         let inject = InjectQueue::new(config.media_queue_mb);
+        let meta = Arc::new(ClusterMeta::new());
+        let sm_for_media = sm_handle.clone();
+        let local_node = config.node_id;
+        let meta_for_media = Arc::clone(&meta);
+        let is_peer_allowed: crate::cluster::media::MediaMembershipFn = Arc::new(move |id| {
+            if id == local_node {
+                return true;
+            }
+            // Control-plane join records addresses before Raft membership is visible.
+            if meta_for_media.get(id).is_some() {
+                return true;
+            }
+            sm_for_media
+                .last_membership()
+                .membership()
+                .nodes()
+                .any(|(nid, _)| *nid == id)
+        });
         let media = MediaHub::new(
             config.node_id,
             config.secret.clone(),
@@ -190,6 +210,7 @@ impl ClusterManager {
             Arc::clone(&inject),
             tls_server.clone(),
             tls_client.clone(),
+            is_peer_allowed,
         );
         // Byte-bounded ordered export (drop-oldest on overload) — see ExportQueue.
         let export_q = ExportQueue::new(config.media_queue_mb);
@@ -205,8 +226,6 @@ impl ClusterManager {
                 }
             });
         }
-        let meta = Arc::new(ClusterMeta::new());
-
         let advertise = config.advertise_control();
         let media_advertise = config.advertise_media();
         meta.set_addrs(config.node_id, advertise.clone(), media_advertise.clone());
@@ -316,6 +335,15 @@ impl ClusterManager {
             let mgr_member = Arc::clone(&mgr);
             let is_member: network::MembershipFn =
                 Arc::new(move |id| mgr_member.peer_in_membership(id));
+            let mgr_proof = Arc::clone(&mgr);
+            let verify_admin_proof: network::AdminProofFn =
+                Arc::new(move |proof, payload| mgr_proof.verify_admin_proof(proof, payload));
+            let write_forward = network::ClientWriteForwardCtx {
+                secret: config.secret.clone(),
+                local_id: config.node_id,
+                meta: Arc::clone(&mgr.meta),
+                tls_client: tls_client.clone(),
+            };
             tokio::spawn(async move {
                 if let Err(e) = network::serve_control_plane_listener(
                     listener,
@@ -327,6 +355,8 @@ impl ClusterManager {
                     on_admin,
                     on_stats,
                     is_member,
+                    verify_admin_proof,
+                    Some(write_forward),
                     tls_srv,
                 )
                 .await
@@ -412,6 +442,8 @@ impl ClusterManager {
                         tls_client.clone(),
                     )
                     .await?;
+                    let local_id = db.setting_get(CLUSTER_ID_SETTING);
+                    verify_cluster_identity(local_id.as_deref(), &cluster_id)?;
                     if !cluster_id.is_empty() {
                         let _ = db.setting_set(CLUSTER_ID_SETTING, &cluster_id);
                     }
@@ -750,6 +782,8 @@ impl ClusterManager {
     ) -> Result<(), String> {
         use openraft::error::{ClientWriteError, RaftError};
 
+        let proof = self.membership_admin_proof(&change)?;
+
         match self.raft.change_membership(change.clone(), false).await {
             Ok(_) => Ok(()),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
@@ -766,12 +800,42 @@ impl ClusterManager {
                     &self.config.secret,
                     self.config.node_id,
                     change,
+                    proof,
                     self.tls_client.clone(),
                 )
                 .await
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn membership_admin_proof(
+        &self,
+        change: &ChangeMembers<NodeId, BasicNode>,
+    ) -> Result<String, String> {
+        let req = serde_json::to_string(change).map_err(|e| e.to_string())?;
+        let token = self
+            .session_hooks
+            .lock()
+            .as_ref()
+            .map(|h| h.api_token.read().clone())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| "API token unavailable for membership change".to_string())?;
+        Ok(crate::cluster::security::admin_proof(&token, &req))
+    }
+
+    fn verify_admin_proof(&self, proof: &str, payload: &str) -> bool {
+        let Some(hooks) = self.session_hooks.lock().as_ref() else {
+            return false;
+        };
+        let token = hooks.api_token.read();
+        if token.is_empty() {
+            return false;
+        }
+        crate::cluster::security::secrets_equal(
+            &crate::cluster::security::admin_proof(&token, payload),
+            proof,
+        )
     }
 
     async fn forward_admin(
@@ -1044,9 +1108,9 @@ impl ClusterManager {
     /// exporting under an epoch a majority already released (and possibly
     /// reassigned) while this node was cut off. Reacquire ownership for each
     /// such stream so exports resume under a fresh, correctly fenced epoch.
-    /// A conflict (a replacement owner already claimed it) is logged for now
-    /// — there is no per-connection close hook here to also force that
-    /// publisher off; it self-corrects on reconnect.
+    /// A conflict (a replacement owner already claimed it) forces the local
+    /// publisher off via `session_hooks.force_unpublish_stream` when hooks are
+    /// registered (normal RTMP runtime); otherwise the conflict is only logged.
     fn reconcile_publishers_after_isolation(&self) {
         let node_id = self.config.node_id;
         for p in self.db.publisher_list_all() {
@@ -1064,9 +1128,13 @@ impl ClusterManager {
                 Err(e) => {
                     crate::log_warn!(
                         "Cluster: could not reacquire ownership of stream {} after isolation cleared ({e:?}); \
-                         local publisher may export under a stale/conflicting epoch until it reconnects",
+                         forcing local publisher off",
                         p.stream_id
                     );
+                    if let Some(hooks) = self.session_hooks.lock().as_ref() {
+                        (hooks.force_unpublish_stream)(&p.stream_id);
+                        self.mark_stream_draining(&p.stream_id);
+                    }
                 }
             }
         }
@@ -1107,6 +1175,7 @@ impl ClusterManager {
                 StateEffect::ClearDrainStream(id) => self.mark_stream_drain_clear(&id),
                 StateEffect::RevokeViewer(id) => self.mark_viewer_revoked(&id),
                 StateEffect::ApiToken(token) => self.apply_api_token(&token),
+                StateEffect::OwnershipChanged => self.sync_ownership_from_db(),
             }
         }
     }
@@ -1232,12 +1301,26 @@ impl ClusterManager {
     }
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
+    /// Uses heartbeat-cached per-stream player counts to avoid control-plane RPC storms.
+    pub fn remote_stream_session_count_cached(&self, stream_id: &str) -> u64 {
+        let counts = self.peer_stream_players.lock();
+        counts
+            .values()
+            .map(|m| m.get(stream_id).copied().unwrap_or(0))
+            .sum()
+    }
+
+    /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
     pub async fn remote_stream_session_count(&self, stream_id: &str) -> u64 {
-        let mut total = 0u64;
+        let cached = self.remote_stream_session_count_cached(stream_id);
+        let mut rpc_total = 0u64;
+        let mut rpc_peers = 0u64;
+        let mut rpc_ok = 0u64;
         for (id, ctrl, _) in self.meta.all() {
             if id == self.config.node_id {
                 continue;
             }
+            rpc_peers += 1;
             if let Ok(n) = network::send_session_count(
                 &ctrl,
                 &self.config.secret,
@@ -1247,10 +1330,18 @@ impl ClusterManager {
             )
             .await
             {
-                total = total.saturating_add(n);
+                rpc_ok += 1;
+                rpc_total = rpc_total.saturating_add(n);
             }
         }
-        total
+        if rpc_peers == 0 {
+            return 0;
+        }
+        if rpc_ok > 0 {
+            rpc_total
+        } else {
+            cached
+        }
     }
 
     /// Best-effort broadcast of drain/revoke markers to peers (Raft apply also marks locally).
@@ -1402,6 +1493,13 @@ impl ClusterManager {
             });
         }
         let ids: Vec<String> = changed.into_iter().map(|(id, _)| id).collect();
+        for sid in &ids {
+            let app = match self.db.stream_get(sid) {
+                crate::db::DbLookup::Ok(s) => s.app,
+                _ => "live".to_string(),
+            };
+            self.media.evict_init_cache(&app, sid);
+        }
         self.resubscribe_active_players(&ids);
     }
 

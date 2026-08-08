@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -20,12 +21,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cluster::raft::{NodeId, Raft, TypeConfig, typ};
-use crate::cluster::security::{auth_response, secrets_equal};
+use crate::cluster::security::{
+    auth_nonce, auth_response, node_id_from_peer_certs, secrets_equal, verify_tls_node_identity,
+};
+use crate::cluster::state::ClusterMeta;
 
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
+/// Post-auth control-plane frames (Raft RPC, admin) — smaller than snapshot path.
+const MAX_CONTROL_FRAME: u32 = 8 * 1024 * 1024;
 /// Bound unauthenticated frames (challenge/auth) to limit DoS before AuthOk.
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap concurrent control-plane handshakes (pre-auth + one request).
+const MAX_CONTROL_CONN_INFLIGHT: usize = 512;
+static CONTROL_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Bounds an entire authenticated client round trip (connect + TLS + auth +
 /// write + response read). Callers like `ClusterManager::block_on_write`
 /// invoke this synchronously from the RTMP poll thread when forwarding a
@@ -145,7 +155,10 @@ pub enum ControlMessage {
     /// `{"ok":true,"data":...}` or `{"ok":false,"error":"..."}`.
     ClientWriteResp(serde_json::Value),
     /// Follower-forwarded OpenRaft membership change (JSON `ChangeMembers`).
-    ChangeMembership(serde_json::Value),
+    ChangeMembership {
+        req: serde_json::Value,
+        proof: String,
+    },
     ChangeMembershipResp {
         ok: bool,
         message: String,
@@ -169,7 +182,15 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
 pub async fn read_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<ControlMessage, std::io::Error> {
-    read_frame_max(r, MAX_FRAME).await
+    read_frame_max(r, MAX_CONTROL_FRAME).await
+}
+
+async fn read_control_frame<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+) -> Result<ControlMessage, std::io::Error> {
+    tokio::time::timeout(CONTROL_READ_TIMEOUT, read_frame_max(r, MAX_CONTROL_FRAME))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))?
 }
 
 async fn read_frame_max<R: AsyncReadExt + Unpin>(
@@ -362,6 +383,18 @@ pub type JoinAcceptFn = Arc<
 /// Returns true when `node_id` is in the current Raft membership.
 pub type MembershipFn = Arc<dyn Fn(NodeId) -> bool + Send + Sync>;
 
+/// Verifies an HTTP-API-signed membership change (`admin_proof`).
+pub type AdminProofFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// Leader-forward context for inter-node `ClientWrite` on followers.
+#[derive(Clone)]
+pub struct ClientWriteForwardCtx {
+    pub secret: String,
+    pub local_id: NodeId,
+    pub meta: Arc<ClusterMeta>,
+    pub tls_client: Option<Arc<ClientConfig>>,
+}
+
 /// Peer heartbeat payload (addrs + session counts for aggregation).
 #[derive(Debug, Clone)]
 pub struct HeartbeatInfo {
@@ -386,6 +419,8 @@ pub async fn serve_control_plane(
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
     is_member: MembershipFn,
+    verify_admin_proof: AdminProofFn,
+    write_forward: Option<ClientWriteForwardCtx>,
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(bind).await?;
@@ -399,6 +434,8 @@ pub async fn serve_control_plane(
         on_admin,
         on_stats,
         is_member,
+        verify_admin_proof,
+        write_forward,
         tls_server,
     )
     .await
@@ -415,15 +452,23 @@ pub async fn serve_control_plane_listener(
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
     is_member: MembershipFn,
+    verify_admin_proof: AdminProofFn,
+    write_forward: Option<ClientWriteForwardCtx>,
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let acceptor = tls_server.map(TlsAcceptor::from);
+    let tls_required = acceptor.is_some();
     let bind = listener
         .local_addr()
         .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static bind parse"));
-    tracing::info!(%bind, tls = acceptor.is_some(), "cluster control plane listening");
+    tracing::info!(%bind, tls = tls_required, "cluster control plane listening");
     loop {
         let (stream, peer) = listener.accept().await?;
+        if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_CONTROL_CONN_INFLIGHT {
+            CONTROL_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+            tracing::debug!(%peer, "control connection rejected: inflight limit");
+            continue;
+        }
         let secret = secret.clone();
         let raft = raft.clone();
         let on_join = Arc::clone(&on_join);
@@ -431,18 +476,29 @@ pub async fn serve_control_plane_listener(
         let on_admin = Arc::clone(&on_admin);
         let on_stats = Arc::clone(&on_stats);
         let is_member = Arc::clone(&is_member);
+        let verify_admin_proof = Arc::clone(&verify_admin_proof);
+        let write_forward = write_forward.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            struct InflightGuard;
+            impl Drop for InflightGuard {
+                fn drop(&mut self) {
+                    CONTROL_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _inflight = InflightGuard;
             let result = async {
                 if let Some(ref acc) = acceptor {
-                    // Bound the TLS handshake itself — a client that opens
-                    // the connection and never sends ClientHello would
-                    // otherwise stall this per-connection task forever.
                     let mut tls = tokio::time::timeout(AUTH_TIMEOUT, acc.accept(stream))
                         .await
                         .map_err(|_| {
                             std::io::Error::new(std::io::ErrorKind::TimedOut, "tls accept timeout")
                         })??;
+                    let cert_node_id = tls
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(node_id_from_peer_certs);
                     handle_control_conn(
                         &mut tls,
                         &secret,
@@ -453,6 +509,10 @@ pub async fn serve_control_plane_listener(
                         on_admin,
                         on_stats,
                         is_member,
+                        verify_admin_proof,
+                        write_forward,
+                        tls_required,
+                        cert_node_id,
                     )
                     .await
                 } else {
@@ -467,6 +527,10 @@ pub async fn serve_control_plane_listener(
                         on_admin,
                         on_stats,
                         is_member,
+                        verify_admin_proof,
+                        write_forward,
+                        tls_required,
+                        None,
                     )
                     .await
                 }
@@ -483,8 +547,10 @@ async fn server_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     secret: &str,
     local_id: NodeId,
+    tls_required: bool,
+    cert_node_id: Option<u64>,
 ) -> Result<NodeId, std::io::Error> {
-    let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
+    let nonce = auth_nonce();
     write_frame(
         stream,
         &ControlMessage::AuthChallenge {
@@ -497,11 +563,12 @@ async fn server_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         write_frame(stream, &ControlMessage::AuthFail).await?;
         return Err(std::io::Error::other("expected Auth"));
     };
-    let expected = auth_response(secret, &nonce);
+    let expected = auth_response(secret, node_id, &nonce);
     if !secrets_equal(&expected, &response) {
         write_frame(stream, &ControlMessage::AuthFail).await?;
         return Err(std::io::Error::other("auth fail"));
     }
+    verify_tls_node_identity(tls_required, cert_node_id, node_id)?;
     write_frame(stream, &ControlMessage::AuthOk { node_id: local_id }).await?;
     Ok(node_id)
 }
@@ -515,7 +582,7 @@ async fn client_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let ControlMessage::AuthChallenge { nonce } = challenge else {
         return Err(std::io::Error::other("expected AuthChallenge"));
     };
-    let response = auth_response(secret, &nonce);
+    let response = auth_response(secret, local_id, &nonce);
     write_frame(
         stream,
         &ControlMessage::Auth {
@@ -540,11 +607,16 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
     is_member: MembershipFn,
+    verify_admin_proof: AdminProofFn,
+    write_forward: Option<ClientWriteForwardCtx>,
+    tls_required: bool,
+    cert_node_id: Option<u64>,
 ) -> Result<(), std::io::Error> {
-    let peer_id = server_auth_handshake(stream, secret, local_id).await?;
+    let peer_id =
+        server_auth_handshake(stream, secret, local_id, tls_required, cert_node_id).await?;
 
     // One-shot request/response for this connection (matches client roundtrip).
-    let msg = read_frame(stream).await?;
+    let msg = read_control_frame(stream).await?;
     let resp = match msg {
         ControlMessage::RaftAppend(req) => {
             if !is_member(peer_id) {
@@ -584,9 +656,11 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             control_addr,
             media_addr,
         } => {
-            // Join may be forwarded by a follower authenticating as itself
-            // while carrying the joiner's node_id — allow message node_id.
-            let _ = peer_id;
+            if node_id != peer_id {
+                return Err(std::io::Error::other(
+                    "join node_id must match authenticated peer",
+                ));
+            }
             match on_join(node_id, control_addr, media_addr) {
                 Ok((cluster_id, peers)) => ControlMessage::JoinResponse {
                     ok: true,
@@ -650,11 +724,56 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             use crate::cluster::command::ClusterCommand;
             let cmd: ClusterCommand =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
-            let body = match raft.client_write(cmd).await {
+            if !cmd.allowed_on_control_plane() {
+                return Err(std::io::Error::other(
+                    "cluster command not allowed on control plane",
+                ));
+            }
+            use openraft::error::{ClientWriteError, RaftError};
+            let body = match raft.client_write(cmd.clone()).await {
                 Ok(resp) => serde_json::json!({
                     "ok": true,
                     "data": resp.data,
                 }),
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                    let Some(ctx) = write_forward.as_ref() else {
+                        return Err(std::io::Error::other(
+                            "client write forward unavailable on this node",
+                        ));
+                    };
+                    let leader_addr = ftl
+                        .leader_node
+                        .as_ref()
+                        .map(|n| n.addr.clone())
+                        .or_else(|| {
+                            ftl.leader_id
+                                .and_then(|id| ctx.meta.get(id).map(|(ctrl, _)| ctrl))
+                        });
+                    match leader_addr {
+                        Some(addr) => match send_client_write(
+                            &addr,
+                            &ctx.secret,
+                            ctx.local_id,
+                            cmd,
+                            ctx.tls_client.clone(),
+                        )
+                        .await
+                        {
+                            Ok(data) => serde_json::json!({
+                                "ok": true,
+                                "data": data,
+                            }),
+                            Err(e) => serde_json::json!({
+                                "ok": false,
+                                "error": e,
+                            }),
+                        },
+                        None => serde_json::json!({
+                            "ok": false,
+                            "error": "no leader available to forward write",
+                        }),
+                    }
+                }
                 Err(e) => serde_json::json!({
                     "ok": false,
                     "error": e.to_string(),
@@ -662,9 +781,14 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             };
             ControlMessage::ClientWriteResp(body)
         }
-        ControlMessage::ChangeMembership(req) => {
+        ControlMessage::ChangeMembership { req, proof } => {
             if !is_member(peer_id) {
                 return Err(std::io::Error::other("peer not in membership"));
+            }
+            let req_str =
+                serde_json::to_string(&req).map_err(|e| std::io::Error::other(e.to_string()))?;
+            if !verify_admin_proof(&proof, &req_str) {
+                return Err(std::io::Error::other("invalid membership admin proof"));
             }
             use openraft::ChangeMembers;
             let change: ChangeMembers<NodeId, BasicNode> =
@@ -1063,6 +1187,7 @@ pub async fn send_change_membership(
     secret: &str,
     local_id: NodeId,
     change: openraft::ChangeMembers<NodeId, BasicNode>,
+    proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(), String> {
     let req = serde_json::to_value(&change).map_err(|e| e.to_string())?;
@@ -1071,7 +1196,7 @@ pub async fn send_change_membership(
         secret,
         local_id,
         tls_client,
-        ControlMessage::ChangeMembership(req),
+        ControlMessage::ChangeMembership { req, proof },
     )
     .await?
     {

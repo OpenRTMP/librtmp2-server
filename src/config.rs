@@ -414,15 +414,18 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
 
     #[cfg(feature = "cluster")]
     {
-        // Re-read file for cluster keys (same path).
-        match crate::cluster::ClusterConfig::load(path) {
-            Ok(c) => config.cluster = c,
-            Err(e) => {
-                return Err(format!(
-                    "Invalid cluster config (CLUSTER_ENABLED requires a valid cluster block): {e}"
-                ));
+        // Parse file cluster keys without validating — env may disable cluster
+        // or supply missing fields after `config_apply_env`.
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot open config file: {path} ({e})"))?;
+        let mut map = std::collections::HashMap::new();
+        for line in text.lines() {
+            if let Some((k, v)) = parse_env_line(line) {
+                map.insert(k, v);
             }
         }
+        config.cluster =
+            crate::cluster::ClusterConfig::load_file_only_from_kv(|k| map.get(k).cloned())?;
     }
 
     Ok(config)
@@ -588,6 +591,9 @@ where
                         "Invalid cluster env config (CLUSTER_ENABLED requires valid settings): {e}"
                     )
                 })?;
+        }
+        if config.cluster.enabled {
+            config.cluster.validate()?;
         }
     }
     Ok(())

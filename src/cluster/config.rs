@@ -98,6 +98,39 @@ impl Default for ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Load cluster keys from a file map only (no process env, no validation).
+    pub fn load_file_only_from_kv<F>(mut get_file: F) -> Result<Self, String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut cfg = ClusterConfig::default();
+        let mut drain_at_mbps: Option<f64> = None;
+        let mut resume_at_mbps: Option<f64> = None;
+
+        let mut apply = |key: &str, val: &str| match key {
+            "CLUSTER_DRAIN_AT_MBPS" => {
+                if let Ok(mbps) = val.parse::<f64>() {
+                    drain_at_mbps = Some(mbps);
+                }
+            }
+            "CLUSTER_RESUME_AT_MBPS" => {
+                if let Ok(mbps) = val.parse::<f64>() {
+                    resume_at_mbps = Some(mbps);
+                }
+            }
+            _ => apply_cluster_kv(&mut cfg, key, val),
+        };
+
+        for key in CLUSTER_FILE_KEYS {
+            if let Some(val) = get_file(key) {
+                apply(key, &val);
+            }
+        }
+
+        normalize_absolute_bandwidth_thresholds(&mut cfg, drain_at_mbps, resume_at_mbps);
+        Ok(cfg)
+    }
+
     /// Load from an already-parsed `.env` key map plus process environment.
     pub fn load_from_kv<F>(mut get_file: F) -> Result<Self, String>
     where

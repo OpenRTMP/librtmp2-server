@@ -36,6 +36,12 @@ impl InitCacheStore {
             .cloned()
     }
 
+    pub fn remove(&self, app: &str, stream: &str) {
+        self.inner
+            .lock()
+            .remove(&(app.to_string(), stream.to_string()));
+    }
+
     pub fn update_from_frame(
         &self,
         app: &str,
