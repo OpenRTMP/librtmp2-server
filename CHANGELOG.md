@@ -28,6 +28,19 @@ begin at `1.0.0`.
   finalize reconciliation instead of abandoning the workflow.
 - Inbound media accepts are capped (`MAX_MEDIA_CONN_INFLIGHT`) like control
   connections.
+- Quorum recovery counts reachable `ISOLATED` peers so a restored majority can
+  leave isolation.
+- Snapshot restore emits `DrainStream` for pending-delete streams and
+  `RevokeViewer` for players whose viewer row did not survive.
+- Stream-switch publish rejects when prior ownership release fails (keeps the
+  prior epoch; rolls back the new claim) instead of leaking the old owner.
+- Ownership changes preserve media subscription refcounts per active player;
+  unreachable peers keep their last cached session counts individually.
+- Init-cache fields are cleared when the ownership epoch changes.
+- Exported relay frames are stamped only with the publisher connection's
+  claimed epoch (no durable/current-stream fallback).
+- File-based absolute drain/resume Mbps thresholds re-ratio when
+  `BANDWIDTH_MAX` is overridden via process env.
 
 ## [0.2.0] — 2026-08-08
 

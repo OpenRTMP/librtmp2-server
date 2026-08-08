@@ -183,9 +183,11 @@ impl HealthTracker {
                 }
                 continue;
             }
+            // Reachable peers still advertising ISOLATED must count too —
+            // otherwise every node in a restored majority filters every
+            // other recovering voter out and never transitions back to READY.
             if let Some(p) = peers.get(id)
                 && p.state != NodeHealthState::Down
-                && p.state != NodeHealthState::Isolated
             {
                 n += 1;
             }

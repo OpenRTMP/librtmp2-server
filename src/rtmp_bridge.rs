@@ -232,6 +232,14 @@ impl DbRtmpBridge {
             .map(|(_, ep)| *ep)
     }
 
+    /// Per-connection ownership epoch claimed for this publisher socket.
+    /// Used when stamping exported relay frames — never fall back to a
+    /// durable/current stream epoch (that can label frames with a peer's
+    /// fencing token after a local release).
+    pub fn ownership_epoch_for_conn(&self, conn: ConnId) -> Option<u64> {
+        self.ownership_epochs.lock().get(&conn).map(|(_, ep)| *ep)
+    }
+
     /// Map RTMP relay route key (URL stream name / publish key) to DB stream id.
     pub fn stream_id_for_publish_route(&self, stream_key: &str) -> Option<String> {
         match self.db.stream_find_by_publish_key_any(stream_key) {
@@ -899,12 +907,37 @@ impl DbRtmpBridge {
         }
 
         if let Some(ep) = acquired_epoch {
-            // Successful A→B switch: release prior stream ownership so it is not leaked.
+            // Successful A→B switch: release prior ownership. On failure keep
+            // the prior map entry (do not overwrite with B), drop the new
+            // claim, and reject so close/retry can release A later.
             if let Some((prior_sid, prior_ep)) = prior_ownership
                 && prior_sid != stream.id
                 && let Some(coord) = self.coordinator.lock().clone()
             {
-                let _ = coord.release_stream_owner(&prior_sid, prior_ep);
+                if let Err(e) = coord.release_stream_owner(&prior_sid, prior_ep) {
+                    if let Err(e2) = coord.release_stream_owner(&stream.id, ep) {
+                        crate::log_error!(
+                            "RTMP: failed to roll back new ownership for '{}' after prior \
+                             release failure from {peer}: {e2:?}",
+                            stream.id
+                        );
+                    }
+                    let mut failed = pub_row.clone();
+                    failed.active = false;
+                    let _ = self.db.publisher_update(&failed.id, &failed);
+                    if let Some(ref prior) = old_pub
+                        && !self.restore_publisher_row(prior)
+                    {
+                        crate::log_error!(
+                            "RTMP: publish rollback failed — prior publisher row remains inactive from {peer}"
+                        );
+                    }
+                    crate::log_warn!(
+                        "RTMP: publish rejected — prior ownership release failed for '{prior_sid}' \
+                         (epoch={prior_ep}) from {peer}: {e:?}"
+                    );
+                    return Err(AuthFailureKind::Operational);
+                }
             }
             self.ownership_epochs
                 .lock()

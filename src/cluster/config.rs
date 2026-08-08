@@ -62,6 +62,11 @@ pub struct ClusterConfig {
     /// How to combine RX/TX when measuring interface utilization (`tx` default).
     pub bandwidth_mode: BandwidthMode,
     pub bandwidth_max_mbps: f64,
+    /// Absolute Mbps drain/resume targets from config (kept so a later
+    /// `BANDWIDTH_MAX` override can recompute `drain_threshold` /
+    /// `resume_threshold` ratios against the new capacity).
+    pub drain_at_mbps: Option<f64>,
+    pub resume_at_mbps: Option<f64>,
     pub media_replicas: u32,
     pub media_queue_mb: u32,
     pub advertise_addr: Option<String>,
@@ -89,6 +94,8 @@ impl Default for ClusterConfig {
             bandwidth_interface: String::new(),
             bandwidth_mode: BandwidthMode::Tx,
             bandwidth_max_mbps: 0.0,
+            drain_at_mbps: None,
+            resume_at_mbps: None,
             media_replicas: 0,
             media_queue_mb: 64,
             advertise_addr: None,
@@ -127,7 +134,9 @@ impl ClusterConfig {
             }
         }
 
-        normalize_absolute_bandwidth_thresholds(&mut cfg, drain_at_mbps, resume_at_mbps);
+        cfg.drain_at_mbps = drain_at_mbps;
+        cfg.resume_at_mbps = resume_at_mbps;
+        normalize_absolute_bandwidth_thresholds(&mut cfg, cfg.drain_at_mbps, cfg.resume_at_mbps);
         Ok(cfg)
     }
 
@@ -169,7 +178,9 @@ impl ClusterConfig {
             }
         }
 
-        normalize_absolute_bandwidth_thresholds(&mut cfg, drain_at_mbps, resume_at_mbps);
+        cfg.drain_at_mbps = drain_at_mbps;
+        cfg.resume_at_mbps = resume_at_mbps;
+        normalize_absolute_bandwidth_thresholds(&mut cfg, cfg.drain_at_mbps, cfg.resume_at_mbps);
 
         if cfg.enabled {
             cfg.validate()?;
@@ -184,26 +195,27 @@ impl ClusterConfig {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let mut drain_at_mbps: Option<f64> = None;
-        let mut resume_at_mbps: Option<f64> = None;
         for (env_key, file_key) in CLUSTER_ENV_OVERRIDES {
             if let Some(val) = get(env_key).filter(|v| !v.is_empty()) {
                 match *file_key {
                     "CLUSTER_DRAIN_AT_MBPS" => {
                         if let Ok(mbps) = val.parse::<f64>() {
-                            drain_at_mbps = Some(mbps);
+                            self.drain_at_mbps = Some(mbps);
                         }
                     }
                     "CLUSTER_RESUME_AT_MBPS" => {
                         if let Ok(mbps) = val.parse::<f64>() {
-                            resume_at_mbps = Some(mbps);
+                            self.resume_at_mbps = Some(mbps);
                         }
                     }
                     _ => apply_cluster_kv(self, file_key, &val),
                 }
             }
         }
-        normalize_absolute_bandwidth_thresholds(self, drain_at_mbps, resume_at_mbps);
+        // Re-ratio retained absolute Mbps targets whenever capacity (or the
+        // absolutes themselves) change via env — file load already collapsed
+        // them once against the file `BANDWIDTH_MAX`.
+        normalize_absolute_bandwidth_thresholds(self, self.drain_at_mbps, self.resume_at_mbps);
         if self.enabled {
             self.validate()?;
         }
@@ -606,5 +618,27 @@ mod tests {
         let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
         assert!((cfg.drain_threshold - 0.8).abs() < f64::EPSILON);
         assert!((cfg.resume_threshold - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn absolute_thresholds_reratio_when_max_overridden() {
+        let map = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef"),
+            ("CLUSTER_DRAIN_AT_MBPS", "800"),
+            ("CLUSTER_RESUME_AT_MBPS", "500"),
+            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
+        ]);
+        let mut cfg =
+            ClusterConfig::load_file_only_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!((cfg.drain_threshold - 0.8).abs() < f64::EPSILON);
+        let env = HashMap::from([("LRTMP2_CLUSTER_BANDWIDTH_MAX_MBPS", "2000")]);
+        cfg.apply_env_overrides_from(|k| env.get(k).map(|s| (*s).to_string()))
+            .unwrap();
+        assert!((cfg.bandwidth_max_mbps - 2000.0).abs() < f64::EPSILON);
+        assert!((cfg.drain_threshold - 0.4).abs() < f64::EPSILON);
+        assert!((cfg.resume_threshold - 0.25).abs() < f64::EPSILON);
     }
 }

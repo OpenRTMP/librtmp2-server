@@ -845,10 +845,14 @@ impl ServerApp {
                             } else {
                                 sid
                             };
-                            let epoch = rtmp_bridge
-                                .ownership_epoch_for_stream(&stream_id)
-                                .or_else(|| mgr.db().stream_owner_get(&stream_id).map(|o| o.epoch))
-                                .unwrap_or(0);
+                            // Stamp only with this publisher socket's claimed
+                            // epoch — durable/current stream epoch can belong
+                            // to another node after a local release/failover.
+                            let Some(epoch) =
+                                rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
+                            else {
+                                continue;
+                            };
                             use crate::cluster::media::protocol::MediaMessage;
                             mgr.enqueue_export(crate::cluster::ExportedFrame {
                                 app: frame.app.clone(),

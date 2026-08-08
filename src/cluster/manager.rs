@@ -1331,16 +1331,15 @@ impl ClusterManager {
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
     pub async fn remote_stream_session_count(&self, stream_id: &str) -> u64 {
-        let cached = self.remote_stream_session_count_cached(stream_id);
-        let mut rpc_total = 0u64;
+        let cached = self.peer_stream_players.lock().clone();
+        let mut total = 0u64;
         let mut rpc_peers = 0u64;
-        let mut rpc_ok = 0u64;
         for (id, ctrl, _) in self.meta.all() {
             if id == self.config.node_id {
                 continue;
             }
             rpc_peers += 1;
-            if let Ok(n) = network::send_session_count(
+            match network::send_session_count(
                 &ctrl,
                 &self.config.secret,
                 self.config.node_id,
@@ -1349,18 +1348,22 @@ impl ClusterManager {
             )
             .await
             {
-                rpc_ok += 1;
-                rpc_total = rpc_total.saturating_add(n);
+                Ok(n) => total = total.saturating_add(n),
+                // Per-peer fallback: a reachable peer returning zero must not
+                // discard the last heartbeat count for an unreachable peer.
+                Err(_) => {
+                    let n = cached
+                        .get(&id)
+                        .and_then(|m| m.get(stream_id).copied())
+                        .unwrap_or(0);
+                    total = total.saturating_add(n);
+                }
             }
         }
         if rpc_peers == 0 {
             return 0;
         }
-        if rpc_ok > 0 {
-            rpc_total
-        } else {
-            cached
-        }
+        total
     }
 
     /// Best-effort broadcast of drain/revoke markers to peers (Raft apply also marks locally).
@@ -1473,8 +1476,19 @@ impl ClusterManager {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
             };
-            self.notify_play_unsubscribe(&app, sid);
-            if self.db.player_list(Some(sid)).iter().any(|p| p.active) {
+            let n = self
+                .db
+                .player_list(Some(sid))
+                .iter()
+                .filter(|p| p.active)
+                .count();
+            // One SubscriptionTable ref per active player — drop and re-add
+            // the same count so the first disconnect doesn't Unsubscribe for
+            // everyone else still watching.
+            for _ in 0..n {
+                self.notify_play_unsubscribe(&app, sid);
+            }
+            for _ in 0..n {
                 self.notify_play_subscription(&app, sid);
             }
         }
@@ -1504,11 +1518,19 @@ impl ClusterManager {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
             };
+            let n = self
+                .db
+                .player_list(Some(stream_id))
+                .iter()
+                .filter(|p| p.active)
+                .count();
             let media = Arc::clone(&self.media);
             let owner_node = *old_node;
             let stream = stream_id.clone();
             self.rt_handle.spawn(async move {
-                media.unsubscribe_remote(owner_node, &app, &stream).await;
+                for _ in 0..n {
+                    media.unsubscribe_remote(owner_node, &app, &stream).await;
+                }
             });
         }
         let ids: Vec<String> = changed.into_iter().map(|(id, _)| id).collect();
@@ -1527,11 +1549,20 @@ impl ClusterManager {
     /// unsubscribe from it explicitly first (see `sync_ownership_from_db`).
     fn resubscribe_active_players(&self, stream_ids: &[String]) {
         for sid in stream_ids {
-            if self.db.player_list(Some(sid)).iter().any(|p| p.active) {
-                let app = match self.db.stream_get(sid) {
-                    crate::db::DbLookup::Ok(s) => s.app,
-                    _ => "live".to_string(),
-                };
+            let n = self
+                .db
+                .player_list(Some(sid))
+                .iter()
+                .filter(|p| p.active)
+                .count();
+            if n == 0 {
+                continue;
+            }
+            let app = match self.db.stream_get(sid) {
+                crate::db::DbLookup::Ok(s) => s.app,
+                _ => "live".to_string(),
+            };
+            for _ in 0..n {
                 self.notify_play_subscription(&app, sid);
             }
         }

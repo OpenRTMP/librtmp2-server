@@ -336,7 +336,13 @@ impl SqliteStateMachine {
         // holds the connection mutex for the whole closure, which is what
         // actually provides that exclusion — every other `db.rs` accessor
         // goes through the same mutex.
-        self.db.with_conn(|conn| -> Result<(), String> {
+        //
+        // Side effects collected here are emitted after commit so the RTMP
+        // poll loop drains/revokes in-memory sessions that SQLite no longer
+        // (or no longer fully) authorizes.
+        let (revoke_viewers, drain_streams) = self.db.with_conn(|conn| -> Result<(Vec<String>, Vec<String>), String> {
+            let mut revoke_viewers = Vec::new();
+            let mut drain_streams = Vec::new();
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
             // Snapshot local session children before deleting `streams` — FK
@@ -455,6 +461,11 @@ impl SqliteStateMachine {
                     params![stream_id],
                 )
                 .map_err(|e| e.to_string())?;
+                // Mirror BeginDeleteStream: lagging nodes that install a
+                // snapshot taken mid-delete must populate deleted_streams so
+                // local sessions are kicked and heartbeats stop advertising
+                // them (otherwise the leader waits forever to finalize).
+                drain_streams.push(stream_id.clone());
             }
             // Viewers must be reinserted before local player rows are
             // reconsidered below, so the players loop can check that a
@@ -543,6 +554,12 @@ impl SqliteStateMachine {
                     .map_err(|e| e.to_string())?
                     .unwrap_or(false);
                 if !stream_keep || !viewer_keep {
+                    // Skipping the SQLite row is not enough — DbRtmpBridge may
+                    // still hold the authenticated socket. RevokeViewer makes
+                    // the RTMP poll loop kick it.
+                    if stream_keep && !viewer_keep {
+                        revoke_viewers.push(p.viewer_id.clone());
+                    }
                     continue;
                 }
                 let bytes_out = i64::try_from(p.bytes_out).unwrap_or(i64::MAX);
@@ -628,9 +645,15 @@ impl SqliteStateMachine {
                 .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
-            Ok::<(), String>(())
+            Ok((revoke_viewers, drain_streams))
         })?;
 
+        for stream_id in drain_streams {
+            self.emit_effect(StateEffect::DrainStream(stream_id));
+        }
+        for viewer_id in revoke_viewers {
+            self.emit_effect(StateEffect::RevokeViewer(viewer_id));
+        }
         if let Some(token) = &snap.api_token {
             self.emit_effect(StateEffect::ApiToken(token.clone()));
         }
