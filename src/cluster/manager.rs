@@ -293,7 +293,8 @@ impl ClusterManager {
             let local_id = config.node_id;
             let tls_srv = tls_server.clone();
             let mgr_member = Arc::clone(&mgr);
-            let is_member: network::MembershipFn = Arc::new(move |id| mgr_member.peer_in_membership(id));
+            let is_member: network::MembershipFn =
+                Arc::new(move |id| mgr_member.peer_in_membership(id));
             tokio::spawn(async move {
                 if let Err(e) = network::serve_control_plane_listener(
                     listener,
@@ -1373,10 +1374,7 @@ impl ClusterManager {
             if is_leader {
                 let grace = self.config.heartbeat.saturating_mul(5);
                 for id in self.health.peers_ready_for_ownership_release(grace) {
-                    crate::log_info!(
-                        "Cluster: node {id} DOWN for {:?} — releasing owners",
-                        grace
-                    );
+                    crate::log_info!("Cluster: node {id} DOWN for {:?} — releasing owners", grace);
                     match self.release_owners_for_node(id) {
                         Ok(()) => self.health.mark_ownership_released(id),
                         Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e}"),
