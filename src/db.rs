@@ -799,6 +799,31 @@ impl Db {
     /// Cascade: remove dependent rows so deleted streams cannot leave ghost
     /// active publishers/players that pollute stats after stream re-creation.
     ///
+    /// Like [`Self::stream_delete`], but only when `pending_delete=1`.
+    /// Returns `Some(false)` when the row is missing or not pending (stale
+    /// finalize must be a no-op).
+    pub fn stream_delete_if_pending(&self, id: &str) -> Option<bool> {
+        let pending = {
+            let conn = self.conn.lock();
+            match conn.query_row(
+                "SELECT pending_delete FROM streams WHERE id=?",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            ) {
+                Ok(v) => Some(v != 0),
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Some(false),
+                Err(e) => {
+                    crate::log_error!("stream_delete_if_pending: lookup failed for {id}: {e}");
+                    return None;
+                }
+            }
+        };
+        if pending != Some(true) {
+            return Some(false);
+        }
+        self.stream_delete(id)
+    }
+
     /// Returns `Some(true)` = deleted, `Some(false)` = not found, `None` = DB error.
     pub fn stream_delete(&self, id: &str) -> Option<bool> {
         let conn = self.conn.lock();

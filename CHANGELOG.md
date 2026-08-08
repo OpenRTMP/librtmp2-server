@@ -41,6 +41,21 @@ begin at `1.0.0`.
   claimed epoch (no durable/current-stream fallback).
 - File-based absolute drain/resume Mbps thresholds re-ratio when
   `BANDWIDTH_MAX` is overridden via process env.
+- Ambiguous timed-out acquires stay queued until the ownership row appears
+  (or is superseded) instead of being dropped on the first empty lookup.
+- Ownership sync force-unpublishes local publishers when the applied owner
+  moves away from this node after Raft catch-up.
+- Failed ownership releases on publisher close are retried from the RTMP poll
+  loop; removed-node ownership cleanup is queued when the release write fails.
+- `FinalizeDeleteStream` deletes only while `pending_delete=1`, so stale
+  recovery cannot wipe a re-enabled stream.
+- Snapshot restore drains live sessions for streams fully absent from the
+  snapshot (not only pending-delete ids).
+- Media peer reconnect aborts a blocked reader; control-plane snapshot RPCs
+  accept up to the 64 MiB frame limit.
+- Cluster status `healthy_nodes` excludes `ISOLATED` peers (same predicate as
+  per-node `healthy`).
+- `scripts/docker_cargo_test.py` exits nonzero when any cargo suite fails.
 
 ## [0.2.0] — 2026-08-08
 

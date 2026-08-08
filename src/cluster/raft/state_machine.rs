@@ -177,14 +177,19 @@ impl SqliteStateMachine {
                 Some(false) => ClusterResponse::NotFound,
                 None => ClusterResponse::Error("db".into()),
             },
-            ClusterCommand::FinalizeDeleteStream { id } => match self.db.stream_delete(id) {
-                Some(true) => {
-                    self.emit_effect(StateEffect::ClearDrainStream(id.clone()));
-                    ClusterResponse::Ok
+            ClusterCommand::FinalizeDeleteStream { id } => {
+                // Only delete while still pending — a stale recovery proposal
+                // from a lagging replica must not wipe a stream that was
+                // re-enabled (or never deleted) on the leader.
+                match self.db.stream_delete_if_pending(id) {
+                    Some(true) => {
+                        self.emit_effect(StateEffect::ClearDrainStream(id.clone()));
+                        ClusterResponse::Ok
+                    }
+                    Some(false) => ClusterResponse::NotFound,
+                    None => ClusterResponse::Error("db".into()),
                 }
-                Some(false) => ClusterResponse::NotFound,
-                None => ClusterResponse::Error("db".into()),
-            },
+            }
             ClusterCommand::SetStreamEnabled { id, enabled } => {
                 if self.db.stream_set_enabled(id, *enabled) {
                     ClusterResponse::Ok
@@ -499,6 +504,9 @@ impl SqliteStateMachine {
                     .map_err(|e| e.to_string())?
                     .unwrap_or(false);
                 if !keep {
+                    // Fully deleted streams are absent from pending_delete_ids;
+                    // still drain the live RTMP publisher socket.
+                    drain_streams.push(p.stream_id.clone());
                     continue;
                 }
                 let bytes_in = i64::try_from(p.bytes_in).unwrap_or(i64::MAX);
@@ -556,8 +564,11 @@ impl SqliteStateMachine {
                 if !stream_keep || !viewer_keep {
                     // Skipping the SQLite row is not enough — DbRtmpBridge may
                     // still hold the authenticated socket. RevokeViewer makes
-                    // the RTMP poll loop kick it.
-                    if stream_keep && !viewer_keep {
+                    // the RTMP poll loop kick it; DrainStream covers a stream
+                    // that the snapshot fully removed.
+                    if !stream_keep {
+                        drain_streams.push(p.stream_id.clone());
+                    } else if !viewer_keep {
                         revoke_viewers.push(p.viewer_id.clone());
                     }
                     continue;

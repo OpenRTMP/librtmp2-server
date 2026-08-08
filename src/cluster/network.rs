@@ -188,9 +188,29 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
 async fn read_control_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<ControlMessage, std::io::Error> {
-    tokio::time::timeout(CONTROL_READ_TIMEOUT, read_frame_max(r, MAX_CONTROL_FRAME))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))?
+    // Authenticated traffic may carry RaftSnapshot payloads up to MAX_FRAME;
+    // non-snapshot control messages stay capped at MAX_CONTROL_FRAME after
+    // decode so a peer cannot inflate ordinary RPCs to snapshot size.
+    tokio::time::timeout(CONTROL_READ_TIMEOUT, async {
+        let len = r.read_u32().await?;
+        if len > MAX_FRAME {
+            return Err(std::io::Error::other("frame too large"));
+        }
+        let mut buf = vec![0u8; len as usize];
+        r.read_exact(&mut buf).await?;
+        let msg: ControlMessage =
+            serde_json::from_slice(&buf).map_err(|e| std::io::Error::other(e))?;
+        let allow_large = matches!(
+            msg,
+            ControlMessage::RaftSnapshot(_) | ControlMessage::RaftSnapshotResp(_)
+        );
+        if !allow_large && len > MAX_CONTROL_FRAME {
+            return Err(std::io::Error::other("frame too large"));
+        }
+        Ok(msg)
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))?
 }
 
 async fn read_frame_max<R: AsyncReadExt + Unpin>(

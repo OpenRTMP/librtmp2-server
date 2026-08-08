@@ -85,6 +85,11 @@ pub struct ClusterManager {
     /// afterward; reconciled on the next health tick — see
     /// `reconcile_ambiguous_acquires`.
     pending_ambiguous_acquires: Mutex<Vec<(String, u64, i64)>>,
+    /// Nodes whose membership removal committed but
+    /// [`Self::release_owners_for_node`] has not yet succeeded. Retried on
+    /// the leader health tick — a removed node has no `down_since`, so the
+    /// normal DOWN sweep will not pick this up.
+    pending_node_cleanups: Mutex<std::collections::HashSet<NodeId>>,
     /// (app, stream_id) -> owner node this node currently holds a
     /// standby-replica media subscription against. Reconciled every health
     /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
@@ -252,6 +257,7 @@ impl ClusterManager {
             effects_rx: Mutex::new(Some(effects_rx)),
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
+            pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
             standby_subs: Mutex::new(std::collections::HashMap::new()),
             state_machine: sm_handle.clone(),
         });
@@ -754,9 +760,11 @@ impl ClusterManager {
         if let Err(e) = self.release_owners_for_node(node_id) {
             crate::log_warn!(
                 "Cluster: node {node_id} removed from membership but releasing its stream \
-                 ownership failed ({e:?}); affected streams stay assigned to the removed node \
-                 until the next health sweep or a manual retry"
+                 ownership failed ({e:?}); queuing pending cleanup until release succeeds"
             );
+            self.pending_node_cleanups.lock().insert(node_id);
+        } else {
+            self.pending_node_cleanups.lock().remove(&node_id);
         }
         self.media.disconnect_peer(node_id);
         self.meta.remove(node_id);
@@ -1079,6 +1087,12 @@ impl ClusterManager {
             self.pending_ambiguous_acquires.lock().drain(..).collect();
         for (stream_id, node_id, acquired_at) in pending {
             let Some(owner) = self.db.stream_owner_get(&stream_id) else {
+                // Timed-out write may still commit on a later tick — keep the
+                // record until the row appears (and is released) or a different
+                // acquire supersedes it.
+                self.pending_ambiguous_acquires
+                    .lock()
+                    .push((stream_id, node_id, acquired_at));
                 continue;
             };
             if owner.owner_node_id != node_id || owner.acquired_at != acquired_at {
@@ -1508,6 +1522,23 @@ impl ClusterManager {
         // directly from the (node, epoch) sync_from captured before the
         // swap.
         for (stream_id, old_owner) in &changed {
+            let still_ours = self.ownership.get(stream_id).map(|(n, _)| n)
+                == Some(self.config.node_id);
+            if !still_ours
+                && self
+                    .db
+                    .publisher_list(Some(stream_id.as_str()))
+                    .iter()
+                    .any(|p| p.active)
+            {
+                // Applied owner moved away (or cleared) while we still have a
+                // local publisher — kick it so we don't serve under a stale
+                // epoch after isolation catch-up.
+                if let Some(hooks) = self.session_hooks.lock().as_ref() {
+                    (hooks.force_unpublish_stream)(stream_id);
+                    self.mark_stream_draining(stream_id);
+                }
+            }
             let Some((old_node, _)) = old_owner else {
                 continue;
             };
@@ -1625,6 +1656,21 @@ impl ClusterManager {
                     match self.release_owners_for_node(id) {
                         Ok(()) => self.health.mark_ownership_released(id),
                         Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
+                    }
+                }
+                let pending_cleanups: Vec<NodeId> =
+                    self.pending_node_cleanups.lock().iter().copied().collect();
+                for id in pending_cleanups {
+                    match self.release_owners_for_node(id) {
+                        Ok(()) => {
+                            self.pending_node_cleanups.lock().remove(&id);
+                            crate::log_info!(
+                                "Cluster: finished pending ownership cleanup for removed node {id}"
+                            );
+                        }
+                        Err(e) => crate::log_warn!(
+                            "Cluster: pending ownership cleanup for removed node {id}: {e:?}"
+                        ),
                     }
                 }
             }
@@ -1764,15 +1810,21 @@ impl ClusterManager {
     pub fn cluster_status_json(&self) -> serde_json::Value {
         let m = self.snapshot_metrics();
         let peers = self.health.peers_snapshot();
+        // Match per-node `healthy` in `nodes_info`: ISOLATED (and DOWN) are
+        // unavailable even though heartbeats may still arrive during a partition.
+        let peer_unavail =
+            |s: NodeHealthState| matches!(s, NodeHealthState::Down | NodeHealthState::Isolated);
         let healthy = peers
             .iter()
-            .filter(|(_, p)| p.state != NodeHealthState::Down)
+            .filter(|(_, p)| !peer_unavail(p.state))
             .count()
-            + if m.health != "DOWN" { 1 } else { 0 };
-        let unavailable = peers
-            .iter()
-            .filter(|(_, p)| p.state == NodeHealthState::Down)
-            .count();
+            + if !peer_unavail(self.health.local()) {
+                1
+            } else {
+                0
+            };
+        let unavailable = peers.iter().filter(|(_, p)| peer_unavail(p.state)).count()
+            + usize::from(peer_unavail(self.health.local()));
         let pubs = self
             .db
             .publisher_list_all()

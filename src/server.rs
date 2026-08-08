@@ -836,6 +836,7 @@ impl ServerApp {
                 if cluster_enabled {
                     if let Some(mgr) = rtmp_bridge.cluster_manager() {
                         mgr.poll_side_effects();
+                        rtmp_bridge.retry_pending_ownership_releases();
                         for frame in server.drain_exported_relay_frames() {
                             let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
                             let stream_id = if sid.is_empty() {

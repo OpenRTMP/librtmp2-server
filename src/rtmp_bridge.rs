@@ -146,6 +146,11 @@ pub struct DbRtmpBridge {
     coordinator: Mutex<Option<Arc<StateCoordinator>>>,
     /// Per-connection acquired ownership epoch (cluster fencing).
     ownership_epochs: Mutex<HashMap<ConnId, (String, u64)>>,
+    /// Ownership releases that failed on connection close. Retried from the
+    /// RTMP poll loop — once `on_close` finishes there is no later conn
+    /// lifecycle event that would retry otherwise.
+    #[cfg(feature = "cluster")]
+    pending_ownership_releases: Mutex<Vec<(String, u64)>>,
 }
 
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
@@ -209,6 +214,8 @@ impl DbRtmpBridge {
             auth_failures: Mutex::new(HashMap::new()),
             coordinator: Mutex::new(None),
             ownership_epochs: Mutex::new(HashMap::new()),
+            #[cfg(feature = "cluster")]
+            pending_ownership_releases: Mutex::new(Vec::new()),
         }
     }
 
@@ -1233,6 +1240,37 @@ impl RtmpEventHandler for DbRtmpBridge {
                 crate::log_error!(
                     "RTMP: failed to release stream ownership conn={conn} stream={stream_id}: {e}"
                 );
+                self.ownership_epochs.lock().remove(&conn);
+                self.pending_ownership_releases
+                    .lock()
+                    .push((stream_id, epoch));
+            }
+        }
+    }
+
+    /// Retry ownership releases that failed during `on_close`.
+    #[cfg(feature = "cluster")]
+    pub fn retry_pending_ownership_releases(&self) {
+        let pending: Vec<(String, u64)> = self.pending_ownership_releases.lock().drain(..).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(coord) = self.coordinator.lock().clone() else {
+            self.pending_ownership_releases.lock().extend(pending);
+            return;
+        };
+        for (stream_id, epoch) in pending {
+            match coord.release_stream_owner(&stream_id, epoch) {
+                Ok(()) => {}
+                Err(e) => {
+                    crate::log_warn!(
+                        "RTMP: pending ownership release still failing for stream={stream_id} \
+                         epoch={epoch}: {e}"
+                    );
+                    self.pending_ownership_releases
+                        .lock()
+                        .push((stream_id, epoch));
+                }
             }
         }
     }

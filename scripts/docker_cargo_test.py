@@ -30,21 +30,38 @@ def main() -> int:
     refresh_copy()
     mount = DEST.replace("\\", "/")
     bash = r"""
-set -eux
+set -euxo pipefail
 export PATH=/usr/local/cargo/bin:$PATH
 export CARGO_TERM_COLOR=never
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq pkg-config libssl-dev >/dev/null
+status=0
 {
   echo '=== cargo test (default) ==='
-  cargo test --all-targets 2>&1 || echo DEFAULT_FAIL=$?
+  if ! cargo test --all-targets 2>&1; then
+    echo DEFAULT_FAIL=1
+    status=1
+  fi
   echo '=== cargo test --features cluster,test-support ==='
-  cargo test --features cluster,test-support --all-targets 2>&1 || echo CLUSTER_FAIL=$?
+  if ! cargo test --features cluster,test-support --all-targets 2>&1; then
+    echo CLUSTER_FAIL=1
+    status=1
+  fi
   echo '=== cargo clippy --features cluster ==='
-  cargo clippy --all-targets --features cluster -- -D warnings 2>&1 || echo CLIPPY_FAIL=$?
+  if ! cargo clippy --all-targets --features cluster -- -D warnings 2>&1; then
+    echo CLIPPY_FAIL=1
+    status=1
+  fi
+  echo OVERALL_STATUS=$status
 } | tee /src/cargo-test-full.log
 tail -n 80 /src/cargo-test-full.log
+# `tee` masks pipeline status without pipefail; also refuse success when the
+# log records an explicit suite failure marker.
+if grep -qE 'DEFAULT_FAIL=|CLUSTER_FAIL=|CLIPPY_FAIL=' /src/cargo-test-full.log; then
+  exit 1
+fi
+exit 0
 """
     cmd = [
         "docker",

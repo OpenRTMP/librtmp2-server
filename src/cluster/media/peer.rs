@@ -287,7 +287,12 @@ async fn connect_and_run(
     if closed.load(Ordering::Relaxed) {
         end = ConnectEnd::Shutdown;
     }
+    // Drop the write half and abort the reader — setting `read_closed` alone
+    // does not cancel a pending `read_media_frame`, which would otherwise
+    // block reconnect forever when the peer has gone silent.
     read_closed.store(true, Ordering::Relaxed);
+    drop(wh);
+    reader.abort();
     let _ = reader.await;
     let _ = BytesMut::new(); // keep bytes dep used
     Ok(end)
