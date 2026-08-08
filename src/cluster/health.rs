@@ -172,10 +172,13 @@ impl HealthTracker {
         let mut n = 0;
         for id in voter_ids {
             if *id == local_id {
-                if matches!(
-                    *self.local.lock(),
-                    NodeHealthState::Ready | NodeHealthState::Draining | NodeHealthState::Learner
-                ) {
+                // The local voter is always "alive" for this purpose — it's
+                // the process doing the counting. In particular it must
+                // still count while ISOLATED, or a node can never observe
+                // its own recovery: two isolated voters in a three-voter
+                // cluster would each undercount themselves and neither could
+                // recognize the majority the two of them already form.
+                if !matches!(*self.local.lock(), NodeHealthState::Down) {
                     n += 1;
                 }
                 continue;

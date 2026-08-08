@@ -36,9 +36,11 @@ def main() -> int:
         "apt-get install -y -qq pkg-config libssl-dev >/dev/null; "
         "export CARGO_TERM_COLOR=never; "
         "cargo check --features cluster > /src/cargo-check-full.log 2>&1; "
-        "echo CARGO_EXIT=$? >> /src/cargo-check-full.log; "
+        "CARGO_EXIT=$?; "
+        "echo CARGO_EXIT=$CARGO_EXIT >> /src/cargo-check-full.log; "
         "grep -E '^error(\\[|:)' /src/cargo-check-full.log | head -n 80; "
-        "tail -n 40 /src/cargo-check-full.log"
+        "tail -n 40 /src/cargo-check-full.log; "
+        "exit $CARGO_EXIT"
     )
     cmd = [
         "docker",

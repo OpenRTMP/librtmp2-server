@@ -548,28 +548,41 @@ impl MediaHub {
         }
     }
 
-    fn ensure_peer(&self, peer_id: NodeId, addr: &str) -> Arc<MediaPeer> {
-        let mut peers = self.peers.lock();
-        if let Some(p) = peers.get(&peer_id) {
-            if !p.is_closed() && p.addr == addr {
-                return Arc::clone(p);
+    /// Returns the live `MediaPeer` for `peer_id`, and whether a fresh
+    /// connection was just created (either none existed, or the previous one
+    /// was closed / pointed at a stale address). A fresh connection has
+    /// already had every subscription this hub tracks for `peer_id` resent
+    /// on it — the `SubscriptionTable` refcounts survive the swap, but the
+    /// wire-level `Subscribe` state on the old connection does not, and
+    /// without resending it the new connection carries none.
+    fn ensure_peer(&self, peer_id: NodeId, addr: &str) -> (Arc<MediaPeer>, bool) {
+        let (peer, fresh) = {
+            let mut peers = self.peers.lock();
+            if let Some(p) = peers.get(&peer_id) {
+                if !p.is_closed() && p.addr == addr {
+                    return (Arc::clone(p), false);
+                }
+                // Closed, or advertised address changed — drop and redial.
+                p.close();
+                peers.remove(&peer_id);
             }
-            // Closed, or advertised address changed — drop and redial.
-            p.close();
-            peers.remove(&peer_id);
+            let peer = Arc::new(MediaPeer::spawn(
+                peer_id,
+                addr.to_string(),
+                self.secret.clone(),
+                self.local_id,
+                self.queue_mb,
+                self.inbound_tx.clone(),
+                self.tls_client.clone(),
+                self.peer_reconnect_tx.clone(),
+            ));
+            peers.insert(peer_id, Arc::clone(&peer));
+            (peer, true)
+        };
+        if fresh {
+            self.resubscribe_peer(peer_id);
         }
-        let peer = Arc::new(MediaPeer::spawn(
-            peer_id,
-            addr.to_string(),
-            self.secret.clone(),
-            self.local_id,
-            self.queue_mb,
-            self.inbound_tx.clone(),
-            self.tls_client.clone(),
-            self.peer_reconnect_tx.clone(),
-        ));
-        peers.insert(peer_id, Arc::clone(&peer));
-        peer
+        (peer, fresh)
     }
 
     fn resubscribe_peer(&self, peer_id: NodeId) {
@@ -593,12 +606,17 @@ impl MediaHub {
         if !self.subs.add(peer_id, app, stream) {
             return; // already subscribed (refcount)
         }
-        let peer = self.ensure_peer(peer_id, media_addr);
-        let _ = peer.try_send(MediaMessage::Subscribe {
-            app: app.to_string(),
-            stream: stream.to_string(),
-            epoch,
-        });
+        let (peer, fresh) = self.ensure_peer(peer_id, media_addr);
+        // A fresh connection already resent every tracked subscription for
+        // this peer, including the one just added above — sending it again
+        // here would just double the owner's per-connection subscribe tally.
+        if !fresh {
+            let _ = peer.try_send(MediaMessage::Subscribe {
+                app: app.to_string(),
+                stream: stream.to_string(),
+                epoch,
+            });
+        }
     }
 
     pub async fn unsubscribe_remote(&self, peer_id: NodeId, app: &str, stream: &str) {

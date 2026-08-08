@@ -800,8 +800,27 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         }
         *self.current_snapshot.lock() = Some(StoredSnapshot {
             meta: meta.clone(),
-            data,
+            data: data.clone(),
         });
+        // Persist the received snapshot the same way build_snapshot() does —
+        // otherwise a restart before this node next builds its own snapshot
+        // would lose it even though last_applied already records the newer
+        // boundary and the corresponding logs may already be compacted,
+        // leaving this node unable to supply a lagging peer's recovery point.
+        let meta_json = serde_json::to_string(meta).map_err(|e| StorageError::IO {
+            source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), &e),
+        })?;
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO raft_snapshots(id, meta_json, data) VALUES(1, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET meta_json=excluded.meta_json, data=excluded.data",
+                params![meta_json, data],
+            )
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), &e),
+            })?;
+            Ok::<(), StorageError<u64>>(())
+        })?;
         Ok(())
     }
 

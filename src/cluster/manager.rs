@@ -1915,11 +1915,12 @@ impl ClusterManager {
                     .values()
                     .map(|m| m.get(&s.id).copied().unwrap_or(0))
                     .sum();
-                // Standby = configured replica slots we are pushing to beyond subscribers.
-                let mut exclude = subscribed.clone();
-                exclude.push(self.config.node_id);
-                let standby =
-                    self.standby_candidates(owner.as_ref().map(|o| o.owner_node_id), &exclude);
+                // Standby placement must match reconcile_media_replicas()'s own
+                // computation exactly (no extra exclusions) — a standby node
+                // subscribes through the same SubscriptionTable as an ordinary
+                // viewer, so excluding `subscribed` here would silently report
+                // a different node than the one actually replicating.
+                let standby = self.standby_candidates(owner.as_ref().map(|o| o.owner_node_id), &[]);
                 ClusterStreamInfo {
                     stream_id: s.id,
                     owner_node_id: owner.as_ref().map(|o| o.owner_node_id),
