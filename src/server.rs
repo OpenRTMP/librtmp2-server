@@ -168,6 +168,33 @@ pub(crate) struct TrackedConn {
 
 /// Returns true when a connection has no authorized publish/play session and
 /// has exceeded the configured pre-auth idle window.
+/// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
+/// bridge (authoritative for live publisher/player rows); fall back to the
+/// poll-loop tracker when the bridge has not been synced yet this tick.
+fn eviction_stream_id(
+    rtmp_bridge: &DbRtmpBridge,
+    conn_id: u64,
+    entry: &TrackedConn,
+) -> String {
+    let bridge_sid = rtmp_bridge.stream_id_for_conn(conn_id);
+    if !bridge_sid.is_empty() {
+        return bridge_sid;
+    }
+    entry.stream_id.clone()
+}
+
+pub(crate) fn live_stream_ids_for_deleted_markers(
+    tracked: &HashMap<u64, TrackedConn>,
+    rtmp_bridge: &DbRtmpBridge,
+) -> HashSet<String> {
+    tracked
+        .keys()
+        .copied()
+        .map(|conn_id| eviction_stream_id(rtmp_bridge, conn_id, &tracked[conn_id]))
+        .filter(|sid| !sid.is_empty())
+        .collect()
+}
+
 fn should_evict_idle_conn(
     entry: &TrackedConn,
     has_authorized_session: bool,
@@ -351,11 +378,11 @@ pub(crate) fn process_server_connections(
         }
 
         // Kick connections whose stream was deleted.
-        if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
+        let evict_stream_id = eviction_stream_id(rtmp_bridge, conn_id, entry);
+        if !evict_stream_id.is_empty() && deleted_now.contains(&evict_stream_id) {
             crate::log_info!(
-                "RTMP: kicking conn={conn_id} from {} — stream '{}' was deleted",
-                conn.remote_addr,
-                entry.stream_id
+                "RTMP: kicking conn={conn_id} from {} — stream '{evict_stream_id}' was deleted",
+                conn.remote_addr
             );
             reject_indices.push(idx);
             continue;
@@ -634,6 +661,7 @@ impl ServerApp {
         let rtmp_stop_clone = Arc::clone(&rtmp_stop);
 
         let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
+        let (rtmp_dead_tx, rtmp_dead_rx) = tokio::sync::oneshot::channel();
         let rtmp_thread = std::thread::spawn(move || {
             use librtmp2::server::Server as RtmpServer;
             use librtmp2::types::ServerConfig as RtmpConfig;
@@ -728,11 +756,7 @@ impl ServerApp {
                 }
 
                 // Drain deletion/revocation markers no live connection still references.
-                let live_stream_ids: HashSet<String> = tracked
-                    .values()
-                    .filter(|c| !c.stream_id.is_empty())
-                    .map(|c| c.stream_id.clone())
-                    .collect();
+                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
                 deleted_streams
                     .lock()
                     .retain(|id| live_stream_ids.contains(id));
@@ -753,6 +777,10 @@ impl ServerApp {
             // Notify the bridge about connections that never got an explicit close event.
             for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
                 rtmp_bridge.on_close(conn_id);
+            }
+
+            if !rtmp_stop_clone.load(Ordering::Relaxed) {
+                let _ = rtmp_dead_tx.send(());
             }
         });
 
@@ -775,7 +803,16 @@ impl ServerApp {
             http_listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async {
+            tokio::select! {
+                () = shutdown_signal() => {},
+                _ = rtmp_dead_rx => {
+                    crate::log_error!(
+                        "RTMP thread exited unexpectedly; shutting down HTTP so the process does not keep serving a half-dead API"
+                    );
+                }
+            }
+        })
         .await
         .map_err(|e| format!("HTTP server error: {e}"));
 
@@ -814,8 +851,15 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerApp, TrackedConn, bind_with_default_port, should_evict_idle_conn};
+    use super::{
+        eviction_stream_id, live_stream_ids_for_deleted_markers, ServerApp, TrackedConn,
+        bind_with_default_port, should_evict_idle_conn,
+    };
     use crate::config::ServerConfig;
+    use crate::db::Db;
+    use crate::rtmp_bridge::DbRtmpBridge;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn stale_first_seen(now: Instant) -> Option<Instant> {
@@ -875,6 +919,44 @@ mod tests {
         assert_eq!(bind_with_default_port("0.0.0.0", 1936), "0.0.0.0:1936");
         assert_eq!(bind_with_default_port("::1", 1936), "[::1]:1936");
         assert_eq!(bind_with_default_port("[::1]", 1936), "[::1]:1936");
+    }
+
+    #[test]
+    fn deleted_markers_retain_bridge_stream_id_before_tracker_sync() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let stream = crate::db::Stream {
+            id: "s1".to_string(),
+            name: "S1".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_key_with_sufficient_length_here01".to_string(),
+            play_key: "play_key_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&stream).unwrap();
+
+        let deleted = Arc::new(parking_lot::Mutex::new(HashSet::from(["s1".to_string()])));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::clone(&deleted));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &stream.publish_key)
+                .is_ok()
+        );
+
+        let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked.insert(1, TrackedConn {
+            connected: true,
+            ..Default::default()
+        });
+
+        let live = live_stream_ids_for_deleted_markers(&tracked, &bridge);
+        assert!(
+            live.contains("s1"),
+            "bridge stream_id must keep deleted marker until RTMP drain even when TrackedConn is not synced"
+        );
+        assert_eq!(eviction_stream_id(&bridge, 1, &tracked[1]), "s1");
     }
 
     #[test]

@@ -17,8 +17,9 @@ use crate::http::{self, AppState};
 use crate::logger;
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 use crate::server::{
-    POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn, clear_rtmp_poll_server, process_server_connections,
-    rtmp_media_cb, rtmp_play_cb, rtmp_publish_cb, set_rtmp_poll_server,
+    POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn, clear_rtmp_poll_server,
+    live_stream_ids_for_deleted_markers, process_server_connections, rtmp_media_cb, rtmp_play_cb,
+    rtmp_publish_cb, set_rtmp_poll_server,
 };
 
 static TEST_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -174,6 +175,22 @@ impl TestServer {
                     tracked.remove(&conn_id);
                     rtmp_bridge.on_close(conn_id);
                 }
+
+                let live_stream_ids =
+                    live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
+                deleted_for_rtmp
+                    .lock()
+                    .retain(|id| live_stream_ids.contains(id));
+
+                let live_viewer_ids: HashSet<String> = tracked
+                    .keys()
+                    .copied()
+                    .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
+                    .filter(|viewer_id| !viewer_id.is_empty())
+                    .collect();
+                revoked_for_rtmp
+                    .lock()
+                    .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
 
                 thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             }
