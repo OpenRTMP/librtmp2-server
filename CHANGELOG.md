@@ -56,6 +56,14 @@ begin at `1.0.0`.
 - Cluster status `healthy_nodes` excludes `ISOLATED` peers (same predicate as
   per-node `healthy`).
 - `scripts/docker_cargo_test.py` exits nonzero when any cargo suite fails.
+- `AcquireStreamOwner` on a missing stream returns `NotFound` (not storage
+  `Error`) so Raft apply cannot stall after a racing finalize-delete.
+- Inbound media frames require the authenticated peer to be the recorded owner
+  (node id + epoch), not epoch alone.
+- Topology resume fallbacks skip the local node; cluster Mbps totals include
+  peer heartbeat load; snapshot control RPCs use a 120s round-trip budget;
+  member-forwarded admin `ClientWrite` commands are accepted on the control
+  plane; Docker monorepo builds `[patch]` the sibling `librtmp2` path.
 
 ## [0.2.0] — 2026-08-08
 

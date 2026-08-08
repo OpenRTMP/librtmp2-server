@@ -126,4 +126,12 @@ impl OwnershipTracker {
             None => false,
         }
     }
+
+    /// Accept inbound media only from the recorded owner node at `epoch`.
+    pub fn accepts_owner(&self, stream_id: &str, node_id: u64, epoch: u64) -> bool {
+        match self.owners.lock().get(stream_id) {
+            Some((n, e)) => *n == node_id && *e == epoch,
+            None => false,
+        }
+    }
 }

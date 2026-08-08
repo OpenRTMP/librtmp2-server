@@ -42,6 +42,9 @@ static CONTROL_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// write to the leader, so an unbounded call here can stall every
 /// connection's poll for as long as the OS TCP timeout.
 const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(8);
+/// Snapshots may be tens of MiB; the synchronous control-write bound is too
+/// tight for serialize + transfer + install on a slow link.
+const SNAPSHOT_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Combined IO trait so we can box plain TCP or rustls streams.
 trait ClusterIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -896,8 +899,14 @@ async fn authed_roundtrip_inner(
     tls_client: Option<Arc<ClientConfig>>,
     msg: ControlMessage,
 ) -> Result<ControlMessage, String> {
+    let timeout = match &msg {
+        ControlMessage::RaftSnapshot(_) | ControlMessage::RaftSnapshotResp(_) => {
+            SNAPSHOT_ROUNDTRIP_TIMEOUT
+        }
+        _ => ROUNDTRIP_TIMEOUT,
+    };
     tokio::time::timeout(
-        ROUNDTRIP_TIMEOUT,
+        timeout,
         authed_roundtrip_unbounded(addr, secret, local_id, tls_client, msg),
     )
     .await

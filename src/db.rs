@@ -52,6 +52,8 @@ pub struct StreamOwner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerError {
     Conflict,
+    /// Parent stream row is missing (e.g. delete finalized during acquire).
+    NotFound,
     Db,
 }
 
@@ -1201,6 +1203,20 @@ impl Db {
     ) -> Result<u64, OwnerError> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction().map_err(|_| OwnerError::Db)?;
+        let stream_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM streams WHERE id=?",
+                params![stream_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|_| OwnerError::Db)?
+            .unwrap_or(false);
+        if !stream_exists {
+            // Semantic miss — must not surface as storage Error or Raft
+            // last_applied stalls on every replica.
+            return Err(OwnerError::NotFound);
+        }
         let existing: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT owner_node_id, epoch FROM stream_owners WHERE stream_id=?",

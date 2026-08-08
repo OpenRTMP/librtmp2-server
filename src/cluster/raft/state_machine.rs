@@ -252,6 +252,7 @@ impl SqliteStateMachine {
             {
                 Ok(ep) => ClusterResponse::OwnerEpoch(ep),
                 Err(crate::db::OwnerError::Conflict) => ClusterResponse::Conflict,
+                Err(crate::db::OwnerError::NotFound) => ClusterResponse::NotFound,
                 Err(crate::db::OwnerError::Db) => ClusterResponse::Error("db".into()),
             },
             ClusterCommand::ReleaseStreamOwner { stream_id, epoch } => {
@@ -771,6 +772,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                                     ClusterResponse::OwnerEpoch(ep)
                                 }
                                 Err(crate::db::OwnerError::Conflict) => ClusterResponse::Conflict,
+                                Err(crate::db::OwnerError::NotFound) => ClusterResponse::NotFound,
                                 Err(crate::db::OwnerError::Db) => {
                                     ClusterResponse::Error("db".into())
                                 }

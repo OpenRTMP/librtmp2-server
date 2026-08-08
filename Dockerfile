@@ -30,7 +30,12 @@ RUN set -eu; \
     fi
 
 WORKDIR /build/librtmp2-server
-RUN cargo build --release --features cluster
+# Monorepo builds must resolve the sibling checkout, not the pinned git rev.
+RUN set -eu; \
+    if [ -f /build/librtmp2/Cargo.toml ]; then \
+      printf '\n[patch."https://github.com/OpenRTMP/librtmp2"]\nlibrtmp2 = { path = "../librtmp2" }\n' >> Cargo.toml; \
+    fi; \
+    cargo build --release --features cluster
 
 ARG APP_VERSION=""
 RUN version="$APP_VERSION" && \

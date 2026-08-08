@@ -1318,10 +1318,12 @@ impl ClusterManager {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
+        let local_id = self.config.node_id;
         let fallbacks: Vec<String> = self
             .meta
             .all()
             .into_iter()
+            .filter(|(id, _, _)| *id != local_id)
             .map(|(_, ctrl, _)| ctrl)
             .filter(|ctrl| ctrl != primary_addr)
             .collect();
@@ -1850,6 +1852,11 @@ impl ClusterManager {
             0.0
         };
         let approx_mbps = load * cap;
+        // Heartbeats carry each peer's load ratio; assume shared capacity
+        // config when summing cluster-wide Mbps (per-node capacity overrides
+        // are not replicated).
+        let peer_mbps: f64 = peers.iter().map(|(_, p)| p.load * cap).sum();
+        let total_mbps = approx_mbps + peer_mbps;
         serde_json::json!({
             "enabled": true,
             "cluster_id": self.cluster_id(),
@@ -1872,8 +1879,8 @@ impl ClusterManager {
             "total_players": total_players,
             "local_publishers": pubs,
             "local_players": players,
-            "total_rx_mbps": approx_mbps,
-            "total_tx_mbps": approx_mbps,
+            "total_rx_mbps": total_mbps,
+            "total_tx_mbps": total_mbps,
             "load": {
                 "rx_mbps": approx_mbps,
                 "tx_mbps": approx_mbps,

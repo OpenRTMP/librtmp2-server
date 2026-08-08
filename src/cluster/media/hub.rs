@@ -352,7 +352,9 @@ impl MediaHub {
                         payload,
                         ..
                     } => {
-                        if self.ownership.accepts_epoch(&stream, epoch) {
+                        // Require sender node + epoch — epoch alone lets any
+                        // member inject under a stolen fencing token.
+                        if self.ownership.accepts_owner(&stream, peer_id, epoch) {
                             // Remap on the receiving node so ownership failover cannot
                             // reset player timelines when the new owner starts at ts=0.
                             let timestamp = {
@@ -379,7 +381,7 @@ impl MediaHub {
                         aac_header,
                         keyframe,
                     } => {
-                        if !self.ownership.accepts_epoch(&stream, epoch) {
+                        if !self.ownership.accepts_owner(&stream, peer_id, epoch) {
                             continue;
                         }
                         self.cache.put(

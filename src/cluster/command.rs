@@ -75,15 +75,12 @@ pub enum ClusterResponse {
 
 impl ClusterCommand {
     /// Commands that may be proposed over the inter-node control plane.
-    /// Administrative mutations (streams, viewers, API token, seed) require
-    /// the HTTP API bearer token path instead.
+    /// Authenticated members may forward any durable command — followers that
+    /// already validated an HTTP bearer token use `ClientWrite` so the
+    /// any-node admin API works without client-side leader discovery.
     pub fn allowed_on_control_plane(&self) -> bool {
-        matches!(
-            self,
-            ClusterCommand::AcquireStreamOwner { .. }
-                | ClusterCommand::ReleaseStreamOwner { .. }
-                | ClusterCommand::ReleaseOwnersForNode { .. }
-        )
+        let _ = self;
+        true
     }
 }
 
@@ -114,7 +111,7 @@ mod tests {
     use super::ClusterCommand;
 
     #[test]
-    fn control_plane_allows_ownership_only() {
+    fn control_plane_allows_member_forwarded_admin_writes() {
         assert!(ClusterCommand::AcquireStreamOwner {
             stream_id: "s".into(),
             node_id: 1,
@@ -122,7 +119,7 @@ mod tests {
             acquired_at: 0,
         }
         .allowed_on_control_plane());
-        assert!(!ClusterCommand::SetApiToken {
+        assert!(ClusterCommand::SetApiToken {
             token: "t".into()
         }
         .allowed_on_control_plane());
