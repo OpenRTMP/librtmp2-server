@@ -80,5 +80,10 @@ name = "cluster_ha"
 path = "tests/cluster_ha.rs"
 required-features = ["cluster", "test-support"]
 
+[[test]]
+name = "cluster_security"
+path = "tests/cluster_security.rs"
+required-features = ["cluster"]
+
 [profile.release]
 opt-level = 3

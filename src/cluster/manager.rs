@@ -82,6 +82,8 @@ pub struct SessionHooks {
     pub deleted_streams: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     pub revoked_viewers: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     pub api_token: Arc<parking_lot::RwLock<String>>,
+    /// Force local RTMP publishers off a stream (stale epoch after partition).
+    pub force_unpublish_stream: Arc<dyn Fn(&str) + Send + Sync>,
     /// Optional local live-session counter for drain wait aggregation.
     pub local_stream_sessions: Arc<dyn Fn(&str) -> u64 + Send + Sync>,
 }
@@ -162,6 +164,16 @@ impl ClusterManager {
         let ownership = Arc::new(OwnershipTracker::new());
         ownership.hydrate_from(&db.stream_owner_list());
         let inject = InjectQueue::new(config.media_queue_mb);
+        let sm_for_media = sm_handle.clone();
+        let local_node = config.node_id;
+        let is_peer_allowed: crate::cluster::media::MediaMembershipFn = Arc::new(move |id| {
+            id == local_node
+                || sm_for_media
+                    .last_membership()
+                    .membership()
+                    .nodes()
+                    .any(|(nid, _)| *nid == id)
+        });
         let media = MediaHub::new(
             config.node_id,
             config.secret.clone(),
@@ -171,6 +183,7 @@ impl ClusterManager {
             Arc::clone(&inject),
             tls_server.clone(),
             tls_client.clone(),
+            is_peer_allowed,
         );
         // Byte-bounded ordered export (drop-oldest on overload) — see ExportQueue.
         let export_q = ExportQueue::new(config.media_queue_mb);
@@ -298,6 +311,12 @@ impl ClusterManager {
             let mgr_proof = Arc::clone(&mgr);
             let verify_admin_proof: network::AdminProofFn =
                 Arc::new(move |proof, payload| mgr_proof.verify_admin_proof(proof, payload));
+            let write_forward = network::ClientWriteForwardCtx {
+                secret: config.secret.clone(),
+                local_id: config.node_id,
+                meta: Arc::clone(&mgr.meta),
+                tls_client: tls_client.clone(),
+            };
             tokio::spawn(async move {
                 if let Err(e) = network::serve_control_plane_listener(
                     listener,
@@ -310,6 +329,7 @@ impl ClusterManager {
                     on_stats,
                     is_member,
                     verify_admin_proof,
+                    Some(write_forward),
                     tls_srv,
                 )
                 .await
@@ -1004,9 +1024,13 @@ impl ClusterManager {
                 Err(e) => {
                     crate::log_warn!(
                         "Cluster: could not reacquire ownership of stream {} after isolation cleared ({e:?}); \
-                         local publisher may export under a stale/conflicting epoch until it reconnects",
+                         forcing local publisher off",
                         p.stream_id
                     );
+                    if let Some(hooks) = self.session_hooks.lock().as_ref() {
+                        (hooks.force_unpublish_stream)(&p.stream_id);
+                        self.mark_stream_draining(&p.stream_id);
+                    }
                 }
             }
         }
@@ -1047,6 +1071,7 @@ impl ClusterManager {
                 StateEffect::ClearDrainStream(id) => self.mark_stream_drain_clear(&id),
                 StateEffect::RevokeViewer(id) => self.mark_viewer_revoked(&id),
                 StateEffect::ApiToken(token) => self.apply_api_token(&token),
+                StateEffect::OwnershipChanged => self.sync_ownership_from_db(),
             }
         }
     }
@@ -1172,7 +1197,21 @@ impl ClusterManager {
     }
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
+    /// Uses heartbeat-cached per-stream player counts to avoid control-plane RPC storms.
+    pub fn remote_stream_session_count_cached(&self, stream_id: &str) -> u64 {
+        let counts = self.peer_stream_players.lock();
+        counts
+            .values()
+            .map(|m| m.get(stream_id).copied().unwrap_or(0))
+            .sum()
+    }
+
+    /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
     pub async fn remote_stream_session_count(&self, stream_id: &str) -> u64 {
+        let cached = self.remote_stream_session_count_cached(stream_id);
+        if cached > 0 {
+            return cached;
+        }
         let mut total = 0u64;
         for (id, ctrl, _) in self.meta.all() {
             if id == self.config.node_id {
@@ -1342,6 +1381,14 @@ impl ClusterManager {
             });
         }
         let ids: Vec<String> = changed.into_iter().map(|(id, _)| id).collect();
+        self.media.reset_timelines_for(&ids);
+        for sid in &ids {
+            let app = match self.db.stream_get(sid) {
+                crate::db::DbLookup::Ok(s) => s.app,
+                _ => "live".to_string(),
+            };
+            self.media.evict_init_cache(&app, sid);
+        }
         self.resubscribe_active_players(&ids);
     }
 

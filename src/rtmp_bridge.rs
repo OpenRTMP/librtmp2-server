@@ -456,6 +456,24 @@ impl DbRtmpBridge {
         (remote_ip, peer)
     }
 
+    /// Force all active local publishers on `stream_id` off (cluster heal).
+    pub fn force_unpublish_stream(&self, stream_id: &str) {
+        let conns: Vec<ConnId> = self
+            .conns
+            .lock()
+            .iter()
+            .filter_map(|(id, cs)| {
+                cs.publisher
+                    .as_ref()
+                    .filter(|p| p.stream_id == stream_id && p.active)
+                    .map(|_| *id)
+            })
+            .collect();
+        for conn in conns {
+            self.release_publisher(conn);
+        }
+    }
+
     /// Deactivate the publisher row for this connection without dropping the
     /// whole ConnState (player role / auth rate-limit bookkeeping may remain).
     ///
@@ -1182,8 +1200,6 @@ impl RtmpEventHandler for DbRtmpBridge {
         // IP (not ConnId) precisely so a client can't reset the brute-force
         // window by reconnecting. Entries expire naturally via the sliding
         // window in is_auth_rate_limited/record_auth_failure.
-        #[cfg(feature = "cluster")]
-        self.try_release_ownership_for_conn(conn);
         let cs = self.conns.lock().remove(&conn);
         let Some(cs) = cs else {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");
@@ -1208,6 +1224,9 @@ impl RtmpEventHandler for DbRtmpBridge {
                 );
             }
         }
+
+        #[cfg(feature = "cluster")]
+        self.try_release_ownership_for_conn(conn);
 
         if let Some(mut player_row) = cs.player {
             #[cfg(feature = "cluster")]

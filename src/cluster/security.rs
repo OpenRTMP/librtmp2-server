@@ -1,26 +1,96 @@
 //! Constant-time secret comparison and TLS helpers for the cluster plane.
 
 use std::fs::File;
+use std::io;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use rand::RngCore;
+use rand::rngs::SysRng;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
-/// Compare two secrets in constant time relative to their common length.
-/// Length mismatches return false without comparing contents.
+const NODE_ID_CERT_PREFIX: &[u8] = b"lrtmp2-node-";
+
+/// Compare two secrets in constant time (length included via padded XOR).
 pub fn secrets_equal(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    let len_diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    let mut diff = len_diff as u8;
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// CSPRNG nonce for cluster auth handshakes.
+pub fn auth_nonce() -> Vec<u8> {
+    let mut nonce = vec![0u8; 16];
+    SysRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+/// Extract `node_id` embedded in a peer client certificate (SAN/CN string
+/// `lrtmp2-node-{id}`). Returns `None` when TLS is off or the pattern is absent.
+pub fn node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Option<u64> {
+    for cert in certs {
+        let bytes = cert.as_ref();
+        let mut search_from = 0usize;
+        while let Some(rel) = bytes[search_from..]
+            .windows(NODE_ID_CERT_PREFIX.len())
+            .position(|w| w == NODE_ID_CERT_PREFIX)
+        {
+            let pos = search_from + rel + NODE_ID_CERT_PREFIX.len();
+            let mut id = 0u64;
+            let mut digits = 0usize;
+            for &b in &bytes[pos..] {
+                if b.is_ascii_digit() {
+                    id = id.saturating_mul(10).saturating_add((b - b'0') as u64);
+                    digits += 1;
+                    if digits > 20 {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if digits > 0 && id > 0 {
+                return Some(id);
+            }
+            search_from = pos.saturating_add(1);
+            if search_from >= bytes.len() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// When mTLS is active, the authenticated `node_id` must match the client cert.
+pub fn verify_tls_node_identity(
+    tls_active: bool,
+    cert_node_id: Option<u64>,
+    claimed_node_id: u64,
+) -> Result<(), io::Error> {
+    if !tls_active {
+        return Ok(());
+    }
+    let Some(cert_id) = cert_node_id else {
+        return Err(io::Error::other(
+            "mTLS required but peer certificate missing lrtmp2-node-{id} identity",
+        ));
+    };
+    if cert_id != claimed_node_id {
+        return Err(io::Error::other(
+            "mTLS peer certificate node_id does not match authenticated node_id",
+        ));
+    }
+    Ok(())
 }
 
 /// Derive a hex-encoded SHA-256 challenge response (never log the secret).
@@ -112,6 +182,22 @@ mod tests {
         assert!(secrets_equal("abcdef", "abcdef"));
         assert!(!secrets_equal("abcdef", "abcdeg"));
         assert!(!secrets_equal("abc", "abcd"));
+    }
+
+    #[test]
+    fn node_id_from_cert_prefix_scan() {
+        let mut der = vec![0u8; 64];
+        der.extend_from_slice(b"prefix-lrtmp2-node-42-suffix");
+        let id = node_id_from_peer_certs(&[CertificateDer::from(der)]);
+        assert_eq!(id, Some(42));
+    }
+
+    #[test]
+    fn verify_tls_node_identity_rejects_mismatch() {
+        assert!(verify_tls_node_identity(true, Some(2), 2).is_ok());
+        assert!(verify_tls_node_identity(false, None, 2).is_ok());
+        assert!(verify_tls_node_identity(true, Some(1), 2).is_err());
+        assert!(verify_tls_node_identity(true, None, 2).is_err());
     }
 
     #[test]

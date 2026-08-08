@@ -12,8 +12,11 @@ use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cluster::NodeId;
+use crate::cluster::media::MediaMembershipFn;
 use crate::cluster::media::protocol::MediaMessage;
-use crate::cluster::security::{auth_response, secrets_equal};
+use crate::cluster::security::{
+    auth_nonce, auth_response, node_id_from_peer_certs, secrets_equal, verify_tls_node_identity,
+};
 
 const MAX_FRAME: u32 = 32 * 1024 * 1024;
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
@@ -79,7 +82,7 @@ impl MediaPeer {
         secret: String,
         local_id: NodeId,
         max_queue_mb: u32,
-        inbound: mpsc::UnboundedSender<MediaMessage>,
+        inbound: mpsc::Sender<MediaMessage>,
         tls_client: Option<Arc<ClientConfig>>,
         on_reconnected: mpsc::UnboundedSender<NodeId>,
     ) -> Self {
@@ -199,7 +202,7 @@ async fn connect_and_run(
     local_id: NodeId,
     _peer_id: NodeId,
     outbound: &mut mpsc::Receiver<MediaMessage>,
-    inbound: &mpsc::UnboundedSender<MediaMessage>,
+    inbound: &mpsc::Sender<MediaMessage>,
     queue_bytes: &AtomicUsize,
     _max_queue: usize,
     closed: &AtomicBool,
@@ -234,7 +237,9 @@ async fn connect_and_run(
         while !rc.load(Ordering::Relaxed) {
             match read_media_frame(&mut rh).await {
                 Ok(msg) => {
-                    let _ = inbound_c.send(msg);
+                    if inbound_c.try_send(msg).is_err() {
+                        tracing::warn!("media inbound queue full — dropping frame");
+                    }
                 }
                 Err(_) => break,
             }
@@ -307,8 +312,10 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     secret: &str,
     local_id: NodeId,
+    tls_required: bool,
+    cert_node_id: Option<u64>,
 ) -> Result<NodeId, std::io::Error> {
-    let nonce: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
+    let nonce = auth_nonce();
     write_media_frame(
         stream,
         &MediaMessage::AuthChallenge {
@@ -326,6 +333,7 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
         write_media_frame(stream, &MediaMessage::AuthFail).await?;
         return Err(std::io::Error::other("auth fail"));
     }
+    verify_tls_node_identity(tls_required, cert_node_id, node_id)?;
     let _ = local_id;
     write_media_frame(stream, &MediaMessage::AuthOk).await?;
 
@@ -360,22 +368,40 @@ pub(crate) async fn accept_tls_then_auth(
     secret: &str,
     local_id: NodeId,
     tls_server: Option<Arc<ServerConfig>>,
+    is_peer_allowed: MediaMembershipFn,
 ) -> Result<(NodeId, Box<dyn MediaIo>), std::io::Error> {
+    let tls_required = tls_server.is_some();
     let mut io: Box<dyn MediaIo> = if let Some(cfg) = tls_server {
         let acceptor = TlsAcceptor::from(cfg);
-        // A client that opens the TCP connection and never sends a
-        // ClientHello would otherwise hang this accept indefinitely; every
-        // accepted socket gets its own task, so repeated stalls could
-        // exhaust resources. Reuse the same deadline as the auth handshake.
         let tls = tokio::time::timeout(AUTH_TIMEOUT, acceptor.accept(stream))
             .await
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "tls accept timeout")
             })??;
-        Box::new(tls)
+        let cert_node_id = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(node_id_from_peer_certs);
+        let mut boxed: Box<dyn MediaIo> = Box::new(tls);
+        let peer_id = accept_auth(
+            &mut boxed,
+            secret,
+            local_id,
+            tls_required,
+            cert_node_id,
+        )
+        .await?;
+        if !(is_peer_allowed)(peer_id) {
+            return Err(std::io::Error::other("media peer not in cluster membership"));
+        }
+        return Ok((peer_id, boxed));
     } else {
         Box::new(stream)
     };
-    let peer_id = accept_auth(&mut io, secret, local_id).await?;
+    let peer_id = accept_auth(&mut io, secret, local_id, tls_required, None).await?;
+    if !(is_peer_allowed)(peer_id) {
+        return Err(std::io::Error::other("media peer not in cluster membership"));
+    }
     Ok((peer_id, io))
 }

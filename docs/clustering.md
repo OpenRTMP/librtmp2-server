@@ -192,6 +192,13 @@ ingress eligibility rapidly.
   `drain_exported_relay_frames`, `inject_relay_frame`, `stream_init_snapshot`).
 - Control/media use shared-secret challenge-response auth; enable
   `CLUSTER_TLS_ENABLED` with cert/key/CA for mTLS in production.
+- When mTLS is enabled, each node client certificate must embed its
+  `CLUSTER_NODE_ID` as the printable string `lrtmp2-node-{id}` in the
+  subject CN or SAN (the server scans the DER for this marker). The
+  authenticated control/media `node_id` must match the certificate.
+- HA relay export carries live frames only. Peers that join after export
+  starts must also fetch `stream_init_snapshot` (or receive init-cache via
+  the media mesh `InitCache` subscribe path) before playing.
 - Invalid `CLUSTER_ENABLED=true` config fails startup hard (no silent standalone fallback).
 - Automatic learner→voter promotion is available via
   `POST /api/v1/cluster/nodes/{id}/promote` but not forced on every join.
