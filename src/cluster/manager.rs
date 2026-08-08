@@ -38,6 +38,13 @@ use crate::state::CoordError;
 use rustls::ClientConfig;
 
 const CLUSTER_ID_SETTING: &str = "cluster_id";
+/// Written only after a bootstrap node's cluster-ID init and standalone-data
+/// seed both complete. Lets a restart tell a genuinely-already-seeded node
+/// apart from one that crashed between `raft.initialize()` (which already
+/// left durable Raft state, so `raft_has_state()` alone can't tell) and the
+/// seed actually landing.
+const BOOTSTRAP_SEEDED_SETTING: &str = "bootstrap_seeded";
+const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
 
 pub struct ClusterManager {
     pub config: ClusterConfig,
@@ -72,6 +79,18 @@ pub struct ClusterManager {
     /// RTMP poll loop reacted to the marker). Retried until local sessions
     /// actually drain — see `retry_pending_drain_clears`.
     pending_drain_clears: Mutex<std::collections::HashSet<String>>,
+    /// (stream_id, node_id, acquired_at) for `AcquireStreamOwner` writes whose
+    /// client-side 2s deadline elapsed before Raft answered. Dropping that
+    /// future does not cancel an in-flight write, so it can still commit
+    /// afterward; reconciled on the next health tick — see
+    /// `reconcile_ambiguous_acquires`.
+    pending_ambiguous_acquires: Mutex<Vec<(String, u64, i64)>>,
+    /// (app, stream_id) -> owner node this node currently holds a
+    /// standby-replica media subscription against. Reconciled every health
+    /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
+    /// actually causes standby nodes to receive continuous media, not just be
+    /// reported as replicas with no data behind them.
+    standby_subs: Mutex<std::collections::HashMap<(String, String), NodeId>>,
     state_machine: SqliteStateMachine,
 }
 
@@ -213,6 +232,8 @@ impl ClusterManager {
             peer_stream_players: Mutex::new(std::collections::HashMap::new()),
             effects_rx: Mutex::new(Some(effects_rx)),
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
+            pending_ambiguous_acquires: Mutex::new(Vec::new()),
+            standby_subs: Mutex::new(std::collections::HashMap::new()),
             state_machine: sm_handle.clone(),
         });
 
@@ -329,6 +350,25 @@ impl ClusterManager {
                 if let Some(ref join_addr) = config.join {
                     mgr.refresh_topology_from_any(join_addr).await?;
                 }
+                if db.setting_get(BOOTSTRAP_SEEDED_SETTING).is_none() {
+                    // raft_has_state() only proves raft.initialize() ran; a
+                    // crash between that and the seed landing would otherwise
+                    // permanently strand this node's pre-existing standalone
+                    // streams/credentials outside the cluster. Finish the
+                    // interrupted bootstrap — both steps are idempotent.
+                    crate::log_warn!(
+                        "Cluster: bootstrap node {} has Raft state but never finished seeding — completing it now",
+                        config.node_id
+                    );
+                    if db.setting_get(CLUSTER_ID_SETTING).is_none() {
+                        let cid = uuid::Uuid::new_v4().to_string();
+                        raft.client_write(ClusterCommand::SetClusterId { id: cid })
+                            .await
+                            .map_err(|e| format!("set cluster_id: {e}"))?;
+                    }
+                    seed_from_local_db(&raft, &db).await?;
+                    let _ = db.setting_set(BOOTSTRAP_SEEDED_SETTING, "1");
+                }
                 health.set_local(NodeHealthState::Ready);
                 crate::log_info!(
                     "Cluster: resumed bootstrap node {} with existing Raft state",
@@ -344,6 +384,7 @@ impl ClusterManager {
                         .map_err(|e| format!("set cluster_id: {e}"))?;
                 }
                 seed_from_local_db(&raft, &db).await?;
+                let _ = db.setting_set(BOOTSTRAP_SEEDED_SETTING, "1");
                 health.set_local(NodeHealthState::Ready);
                 crate::log_info!(
                     "Cluster: initialized new cluster (node_id={})",
@@ -536,12 +577,27 @@ impl ClusterManager {
                 "node is draining; refusing new publish ownership".into(),
             ));
         }
-        let resp = self.block_on_write(ClusterCommand::AcquireStreamOwner {
+        let resp = match self.block_on_write(ClusterCommand::AcquireStreamOwner {
             stream_id: stream_id.to_string(),
             node_id,
             epoch,
             acquired_at,
-        })?;
+        }) {
+            Ok(resp) => resp,
+            Err(CoordError::Cluster(msg)) if msg == RAFT_WRITE_TIMEOUT_MSG => {
+                // The caller gives up on this acquire, but the write may
+                // still commit later; check on the next health tick and
+                // release it if it does, rather than leaving a ghost owner
+                // no local publisher is actually using.
+                self.pending_ambiguous_acquires.lock().push((
+                    stream_id.to_string(),
+                    node_id,
+                    acquired_at,
+                ));
+                return Err(CoordError::Cluster(msg));
+            }
+            Err(e) => return Err(e),
+        };
         let epoch = resp.into_owner_epoch()?;
         self.ownership.set(stream_id, node_id, epoch);
         self.ownership.advance_past(epoch);
@@ -610,7 +666,7 @@ impl ClusterManager {
         let timed = async move {
             tokio::time::timeout(RAFT_WRITE_TIMEOUT, fut)
                 .await
-                .map_err(|_| CoordError::Cluster("raft write timed out".into()))?
+                .map_err(|_| CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))?
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| self.rt_handle.block_on(timed))
@@ -653,13 +709,23 @@ impl ClusterManager {
     }
 
     pub async fn remove_peer(&self, node_id: NodeId) -> Result<(), String> {
-        self.release_owners_for_node(node_id)
-            .map_err(|e| format!("release owners for node {node_id}: {e:?}"))?;
+        // Commit the membership removal first. Releasing ownership before
+        // this could commit lets other nodes reclaim (and start publishing)
+        // streams while a failed membership change left `node_id` still a
+        // full cluster member — possibly still publishing them locally under
+        // its now-stale epoch.
         self.change_membership_forwarded(ChangeMembers::RemoveVoters(
             std::collections::BTreeSet::from([node_id]),
         ))
         .await
         .map_err(|e| format!("remove node: {e}"))?;
+        if let Err(e) = self.release_owners_for_node(node_id) {
+            crate::log_warn!(
+                "Cluster: node {node_id} removed from membership but releasing its stream \
+                 ownership failed ({e:?}); affected streams stay assigned to the removed node \
+                 until the next health sweep or a manual retry"
+            );
+        }
         self.media.disconnect_peer(node_id);
         self.meta.remove(node_id);
         self.network.nodes.write().remove(&node_id);
@@ -937,6 +1003,38 @@ impl ClusterManager {
                 if let Some(hooks) = self.session_hooks.lock().as_ref() {
                     hooks.deleted_streams.lock().remove(&stream_id);
                 }
+            }
+        }
+    }
+
+    /// Check each acquire whose client-side deadline elapsed for whether the
+    /// write actually landed after all; if it did, release it — the caller
+    /// already gave up and no local publisher is using that reservation.
+    fn reconcile_ambiguous_acquires(&self) {
+        let pending: Vec<(String, u64, i64)> =
+            self.pending_ambiguous_acquires.lock().drain(..).collect();
+        for (stream_id, node_id, acquired_at) in pending {
+            let Some(owner) = self.db.stream_owner_get(&stream_id) else {
+                continue;
+            };
+            if owner.owner_node_id != node_id || owner.acquired_at != acquired_at {
+                // Either it never committed, or a different (later, genuine)
+                // acquire has since taken the route — leave it alone.
+                continue;
+            }
+            crate::log_warn!(
+                "Cluster: acquire for stream {stream_id} timed out client-side but later \
+                 committed at epoch={}; releasing the unclaimed reservation",
+                owner.epoch
+            );
+            if let Err(e) = self.release_stream_owner(&stream_id, owner.epoch) {
+                crate::log_warn!(
+                    "Cluster: failed to release ambiguously-committed acquire for {stream_id}: {e:?}"
+                );
+                // Still ambiguous — retry on the next tick.
+                self.pending_ambiguous_acquires
+                    .lock()
+                    .push((stream_id, node_id, acquired_at));
             }
         }
     }
@@ -1352,6 +1450,7 @@ impl ClusterManager {
             ticker.tick().await;
             self.process_state_effects();
             self.retry_pending_drain_clears();
+            self.reconcile_ambiguous_acquires();
             if !self.config.bandwidth_interface.is_empty() {
                 let iface = self.config.bandwidth_interface.clone();
                 let max = self.config.bandwidth_max_mbps;
@@ -1387,6 +1486,7 @@ impl ClusterManager {
             }
             // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
             self.sync_ownership_from_db();
+            self.reconcile_media_replicas();
             let local_pubs = self
                 .db
                 .publisher_list_all()
@@ -1701,6 +1801,102 @@ impl ClusterManager {
         out
     }
 
+    /// Deterministic replica placement: the first `media_replicas` other
+    /// member node IDs (excluding `owner_node` and anything in `exclude`),
+    /// sorted by ID so every node computes the same set independently —
+    /// `meta.all()`'s HashMap iteration order is not consistent across
+    /// processes and cannot be used directly for a cluster-wide agreement.
+    fn standby_candidates(&self, owner_node: Option<NodeId>, exclude: &[NodeId]) -> Vec<NodeId> {
+        if self.config.media_replicas == 0 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<NodeId> = self
+            .meta
+            .all()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .filter(|id| !exclude.contains(id) && owner_node.map(|o| o != *id).unwrap_or(true))
+            .collect();
+        candidates.sort_unstable();
+        candidates.truncate(self.config.media_replicas as usize);
+        candidates
+    }
+
+    /// Subscribe to (or drop) each stream's owner as a standby replica when
+    /// this node enters or leaves the deterministic replica placement,
+    /// reusing the normal Subscribe/InitCache/MediaFrame path so standbys
+    /// actually receive continuous media instead of just being reported.
+    fn reconcile_media_replicas(&self) {
+        if self.config.media_replicas == 0 {
+            return;
+        }
+        let mut desired: std::collections::HashMap<(String, String), NodeId> =
+            std::collections::HashMap::new();
+        for s in self.db.stream_list() {
+            let Some(owner) = self.db.stream_owner_get(&s.id) else {
+                continue;
+            };
+            if owner.owner_node_id == self.config.node_id {
+                continue;
+            }
+            let candidates = self.standby_candidates(Some(owner.owner_node_id), &[]);
+            if candidates.contains(&self.config.node_id) {
+                desired.insert((s.app, s.id), owner.owner_node_id);
+            }
+        }
+
+        // (app, stream, old_owner_to_drop, new_owner_to_subscribe)
+        let mut ops: Vec<(String, String, Option<NodeId>, Option<NodeId>)> = Vec::new();
+        {
+            let mut current = self.standby_subs.lock();
+            for (key, &new_owner) in &desired {
+                match current.get(key) {
+                    Some(&old_owner) if old_owner == new_owner => {}
+                    Some(&old_owner) => ops.push((
+                        key.0.clone(),
+                        key.1.clone(),
+                        Some(old_owner),
+                        Some(new_owner),
+                    )),
+                    None => ops.push((key.0.clone(), key.1.clone(), None, Some(new_owner))),
+                }
+            }
+            for (key, &old_owner) in current.iter() {
+                if !desired.contains_key(key) {
+                    ops.push((key.0.clone(), key.1.clone(), Some(old_owner), None));
+                }
+            }
+            *current = desired;
+        }
+
+        for (app, stream_id, old_owner, new_owner) in ops {
+            if let Some(old) = old_owner {
+                let media = Arc::clone(&self.media);
+                let app_u = app.clone();
+                let stream_u = stream_id.clone();
+                self.rt_handle.spawn(async move {
+                    media.unsubscribe_remote(old, &app_u, &stream_u).await;
+                });
+            }
+            if let Some(new_owner) = new_owner {
+                let Some((_, media_addr)) = self.meta.get(new_owner) else {
+                    continue;
+                };
+                let epoch = self
+                    .db
+                    .stream_owner_get(&stream_id)
+                    .map(|o| o.epoch)
+                    .unwrap_or(0);
+                let media = Arc::clone(&self.media);
+                self.rt_handle.spawn(async move {
+                    media
+                        .subscribe_remote(&media_addr, new_owner, &app, &stream_id, epoch)
+                        .await;
+                });
+            }
+        }
+    }
+
     pub fn streams_info(&self) -> Vec<ClusterStreamInfo> {
         let peer_stream = self.peer_stream_players.lock().clone();
         self.db
@@ -1720,24 +1916,10 @@ impl ClusterManager {
                     .map(|m| m.get(&s.id).copied().unwrap_or(0))
                     .sum();
                 // Standby = configured replica slots we are pushing to beyond subscribers.
-                let standby: Vec<NodeId> = if self.config.media_replicas > 0 {
-                    self.meta
-                        .all()
-                        .into_iter()
-                        .map(|(id, _, _)| id)
-                        .filter(|id| {
-                            *id != self.config.node_id
-                                && !subscribed.contains(id)
-                                && owner
-                                    .as_ref()
-                                    .map(|o| o.owner_node_id != *id)
-                                    .unwrap_or(true)
-                        })
-                        .take(self.config.media_replicas as usize)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                let mut exclude = subscribed.clone();
+                exclude.push(self.config.node_id);
+                let standby =
+                    self.standby_candidates(owner.as_ref().map(|o| o.owner_node_id), &exclude);
                 ClusterStreamInfo {
                     stream_id: s.id,
                     owner_node_id: owner.as_ref().map(|o| o.owner_node_id),

@@ -951,13 +951,19 @@ impl ServerApp {
         .map_err(|e| format!("HTTP server error: {e}"));
 
         crate::log_info!("Shutting down...");
+        // Stop and join the RTMP thread before tearing down Raft: its
+        // on_close callbacks release publisher ownership through the
+        // coordinator, and running them after `shutdown_blocking()` would
+        // have those releases fail against an already-shut-down cluster
+        // manager, leaving durable ownership rows behind that block
+        // publishers routed to other nodes until the next failure sweep.
+        rtmp_stop.store(true, Ordering::Relaxed);
+        let _ = rtmp_thread.join();
+        crate::log_info!("RTMP thread joined.");
         #[cfg(feature = "cluster")]
         if let Some(mgr) = coordinator.cluster_manager() {
             mgr.shutdown_blocking();
         }
-        rtmp_stop.store(true, Ordering::Relaxed);
-        let _ = rtmp_thread.join();
-        crate::log_info!("RTMP thread joined.");
         http_result?;
         Ok(())
     }

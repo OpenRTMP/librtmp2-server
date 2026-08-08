@@ -44,7 +44,13 @@ impl AdmissionController {
         let load = *self.load.lock();
         if !self.draining.load(Ordering::Relaxed) && load >= self.config.drain_threshold {
             self.draining.store(true, Ordering::Relaxed);
-            self.health.set_local(NodeHealthState::Draining);
+            // Only a healthy, actively-serving node should be pulled into
+            // DRAINING by load; overwriting a stronger unavailability state
+            // (ISOLATED/DOWN/LEARNER/LEAVING) would both admit plays that
+            // state was blocking and misreport this node's real condition.
+            if self.health.local() == NodeHealthState::Ready {
+                self.health.set_local(NodeHealthState::Draining);
+            }
             crate::log_info!(
                 "Cluster admission: entering DRAINING (load={load:.2} >= {:.2})",
                 self.config.drain_threshold

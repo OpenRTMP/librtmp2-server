@@ -18,6 +18,11 @@ use crate::cluster::security::{auth_response, secrets_equal};
 const MAX_FRAME: u32 = 32 * 1024 * 1024;
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on a single frame write to a peer. Without this, a peer that stops
+/// reading (backpressure with no consumer) leaves the write stuck forever —
+/// the task and socket never clean up, and heartbeat-driven peer replacement
+/// just keeps adding more of them.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub(crate) trait MediaIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> MediaIo for T {}
@@ -259,8 +264,9 @@ async fn connect_and_run(
                 // this way (which would eventually make try_send() report
                 // the queue full even though the real channel is empty).
                 queue_bytes.fetch_sub(size.min(queue_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
-                if write_media_frame(&mut wh, &msg).await.is_err() {
-                    break;
+                match tokio::time::timeout(WRITE_TIMEOUT, write_media_frame(&mut wh, &msg)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => break,
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {

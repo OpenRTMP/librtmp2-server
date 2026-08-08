@@ -448,6 +448,25 @@ impl SqliteStateMachine {
                 )
                 .map_err(|e| e.to_string())?;
             }
+            // Viewers must be reinserted before local player rows are
+            // reconsidered below, so the players loop can check that a
+            // player's viewer_id actually survived the snapshot (and not
+            // just its stream) before preserving it.
+            for v in &snap.viewers {
+                tx.execute(
+                    "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+                     VALUES (?,?,?,?,?,?)",
+                    params![
+                        v.id,
+                        v.stream_id,
+                        v.name,
+                        v.play_key,
+                        v.enabled,
+                        v.created_at,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
 
             // Reinsert local session rows whose parent stream survived the snapshot.
             for p in &local_pubs {
@@ -492,7 +511,7 @@ impl SqliteStateMachine {
                 .map_err(|e| e.to_string())?;
             }
             for p in &local_players {
-                let keep: bool = tx
+                let stream_keep: bool = tx
                     .query_row(
                         "SELECT 1 FROM streams WHERE id=?",
                         params![p.stream_id],
@@ -501,7 +520,21 @@ impl SqliteStateMachine {
                     .optional()
                     .map_err(|e| e.to_string())?
                     .unwrap_or(false);
-                if !keep {
+                // A viewer deleted through the snapshot (e.g. a concurrent
+                // DeleteViewer that committed before this snapshot) must not
+                // let its still-connected player session survive reinsertion
+                // — that would keep a revoked play key authenticated and
+                // relaying media until the connection happens to drop.
+                let viewer_keep: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM stream_viewers WHERE id=?",
+                        params![p.viewer_id],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                if !stream_keep || !viewer_keep {
                     continue;
                 }
                 let bytes_out = i64::try_from(p.bytes_out).unwrap_or(i64::MAX);
@@ -553,21 +586,6 @@ impl SqliteStateMachine {
                         s.audio_codec,
                         s.player_count,
                         s.ts,
-                    ],
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            for v in &snap.viewers {
-                tx.execute(
-                    "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
-                     VALUES (?,?,?,?,?,?)",
-                    params![
-                        v.id,
-                        v.stream_id,
-                        v.name,
-                        v.play_key,
-                        v.enabled,
-                        v.created_at,
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -796,17 +814,23 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                 snapshot: Box::new(Cursor::new(snap.data)),
             }));
         }
-        // Try load from DB.
-        let loaded = self.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT meta_json, data FROM raft_snapshots WHERE id=1",
-                [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-            .ok()
-            .flatten()
-        });
+        // Try load from DB. A genuine read failure (I/O, corruption,
+        // row-decoding) must not be swallowed into "no snapshot" — that
+        // would make OpenRaft believe recovery data is absent instead of
+        // surfacing the underlying storage failure.
+        let loaded = self
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT meta_json, data FROM raft_snapshots WHERE id=1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()
+            })
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::read_snapshot(None, &e),
+            })?;
         if let Some((meta_json, data)) = loaded {
             let meta: SnapshotMeta<u64, openraft::BasicNode> = serde_json::from_str(&meta_json)
                 .map_err(|e| StorageError::IO {

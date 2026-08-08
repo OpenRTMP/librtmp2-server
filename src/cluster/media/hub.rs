@@ -399,12 +399,22 @@ impl MediaHub {
                             });
                         }
                         if let Some((ts, kf)) = keyframe {
+                            // Route the cached keyframe through the same
+                            // per-stream timeline as subsequent MediaFrames —
+                            // its raw timestamp was captured under the prior
+                            // publisher's epoch and can otherwise jump
+                            // backward relative to what a player already saw.
+                            let timestamp = {
+                                let mut maps = self.timelines.lock();
+                                let key = (app.clone(), stream.clone());
+                                maps.entry(key).or_default().map(epoch, ts)
+                            };
                             let _ = self.inject.try_send(InjectedFrame {
                                 app,
                                 stream,
                                 epoch,
                                 frame_type: 1,
-                                timestamp: ts,
+                                timestamp,
                                 payload: kf,
                             });
                         }
@@ -515,12 +525,21 @@ impl MediaHub {
                     });
                 }
                 if let Some((ts, kf)) = keyframe {
+                    // Same reasoning as the inbound-connection InitCache
+                    // branch: remap through the per-stream timeline so a
+                    // player that already saw the previous epoch doesn't get
+                    // a keyframe timestamp that jumps backward.
+                    let timestamp = {
+                        let mut maps = self.timelines.lock();
+                        let key = (app.clone(), stream.clone());
+                        maps.entry(key).or_default().map(epoch, ts)
+                    };
                     let _ = self.inject.try_send(InjectedFrame {
                         app,
                         stream,
                         epoch,
                         frame_type: 1,
-                        timestamp: ts,
+                        timestamp,
                         payload: kf,
                     });
                 }
