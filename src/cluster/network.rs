@@ -23,9 +23,12 @@ use crate::cluster::raft::{NodeId, Raft, TypeConfig, typ};
 use crate::cluster::security::{auth_response, secrets_equal};
 
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
+/// Post-auth control-plane frames (Raft RPC, admin) — smaller than snapshot path.
+const MAX_CONTROL_FRAME: u32 = 8 * 1024 * 1024;
 /// Bound unauthenticated frames (challenge/auth) to limit DoS before AuthOk.
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds an entire authenticated client round trip (connect + TLS + auth +
 /// write + response read). Callers like `ClusterManager::block_on_write`
 /// invoke this synchronously from the RTMP poll thread when forwarding a
@@ -145,7 +148,10 @@ pub enum ControlMessage {
     /// `{"ok":true,"data":...}` or `{"ok":false,"error":"..."}`.
     ClientWriteResp(serde_json::Value),
     /// Follower-forwarded OpenRaft membership change (JSON `ChangeMembers`).
-    ChangeMembership(serde_json::Value),
+    ChangeMembership {
+        req: serde_json::Value,
+        proof: String,
+    },
     ChangeMembershipResp {
         ok: bool,
         message: String,
@@ -169,7 +175,15 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
 pub async fn read_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<ControlMessage, std::io::Error> {
-    read_frame_max(r, MAX_FRAME).await
+    read_frame_max(r, MAX_CONTROL_FRAME).await
+}
+
+async fn read_control_frame<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+) -> Result<ControlMessage, std::io::Error> {
+    tokio::time::timeout(CONTROL_READ_TIMEOUT, read_frame_max(r, MAX_CONTROL_FRAME))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))?
 }
 
 async fn read_frame_max<R: AsyncReadExt + Unpin>(
@@ -362,6 +376,9 @@ pub type JoinAcceptFn = Arc<
 /// Returns true when `node_id` is in the current Raft membership.
 pub type MembershipFn = Arc<dyn Fn(NodeId) -> bool + Send + Sync>;
 
+/// Verifies an HTTP-API-signed membership change (`admin_proof`).
+pub type AdminProofFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// Peer heartbeat payload (addrs + session counts for aggregation).
 #[derive(Debug, Clone)]
 pub struct HeartbeatInfo {
@@ -386,6 +403,7 @@ pub async fn serve_control_plane(
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
     is_member: MembershipFn,
+    verify_admin_proof: AdminProofFn,
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(bind).await?;
@@ -399,6 +417,7 @@ pub async fn serve_control_plane(
         on_admin,
         on_stats,
         is_member,
+        verify_admin_proof,
         tls_server,
     )
     .await
@@ -415,6 +434,7 @@ pub async fn serve_control_plane_listener(
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
     is_member: MembershipFn,
+    verify_admin_proof: AdminProofFn,
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let acceptor = tls_server.map(TlsAcceptor::from);
@@ -431,6 +451,7 @@ pub async fn serve_control_plane_listener(
         let on_admin = Arc::clone(&on_admin);
         let on_stats = Arc::clone(&on_stats);
         let is_member = Arc::clone(&is_member);
+        let verify_admin_proof = Arc::clone(&verify_admin_proof);
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let result = async {
@@ -453,6 +474,7 @@ pub async fn serve_control_plane_listener(
                         on_admin,
                         on_stats,
                         is_member,
+                        verify_admin_proof,
                     )
                     .await
                 } else {
@@ -467,6 +489,7 @@ pub async fn serve_control_plane_listener(
                         on_admin,
                         on_stats,
                         is_member,
+                        verify_admin_proof,
                     )
                     .await
                 }
@@ -497,7 +520,7 @@ async fn server_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         write_frame(stream, &ControlMessage::AuthFail).await?;
         return Err(std::io::Error::other("expected Auth"));
     };
-    let expected = auth_response(secret, &nonce);
+    let expected = auth_response(secret, node_id, &nonce);
     if !secrets_equal(&expected, &response) {
         write_frame(stream, &ControlMessage::AuthFail).await?;
         return Err(std::io::Error::other("auth fail"));
@@ -515,7 +538,7 @@ async fn client_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let ControlMessage::AuthChallenge { nonce } = challenge else {
         return Err(std::io::Error::other("expected AuthChallenge"));
     };
-    let response = auth_response(secret, &nonce);
+    let response = auth_response(secret, local_id, &nonce);
     write_frame(
         stream,
         &ControlMessage::Auth {
@@ -540,11 +563,12 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
     on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
     is_member: MembershipFn,
+    verify_admin_proof: AdminProofFn,
 ) -> Result<(), std::io::Error> {
     let peer_id = server_auth_handshake(stream, secret, local_id).await?;
 
     // One-shot request/response for this connection (matches client roundtrip).
-    let msg = read_frame(stream).await?;
+    let msg = read_control_frame(stream).await?;
     let resp = match msg {
         ControlMessage::RaftAppend(req) => {
             if !is_member(peer_id) {
@@ -584,9 +608,11 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             control_addr,
             media_addr,
         } => {
-            // Join may be forwarded by a follower authenticating as itself
-            // while carrying the joiner's node_id — allow message node_id.
-            let _ = peer_id;
+            if node_id != peer_id {
+                return Err(std::io::Error::other(
+                    "join node_id must match authenticated peer",
+                ));
+            }
             match on_join(node_id, control_addr, media_addr) {
                 Ok((cluster_id, peers)) => ControlMessage::JoinResponse {
                     ok: true,
@@ -650,6 +676,11 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             use crate::cluster::command::ClusterCommand;
             let cmd: ClusterCommand =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
+            if !cmd.allowed_on_control_plane() {
+                return Err(std::io::Error::other(
+                    "cluster command not allowed on control plane",
+                ));
+            }
             let body = match raft.client_write(cmd).await {
                 Ok(resp) => serde_json::json!({
                     "ok": true,
@@ -662,9 +693,14 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             };
             ControlMessage::ClientWriteResp(body)
         }
-        ControlMessage::ChangeMembership(req) => {
+        ControlMessage::ChangeMembership { req, proof } => {
             if !is_member(peer_id) {
                 return Err(std::io::Error::other("peer not in membership"));
+            }
+            let req_str =
+                serde_json::to_string(&req).map_err(|e| std::io::Error::other(e.to_string()))?;
+            if !verify_admin_proof(&proof, &req_str) {
+                return Err(std::io::Error::other("invalid membership admin proof"));
             }
             use openraft::ChangeMembers;
             let change: ChangeMembers<NodeId, BasicNode> =
@@ -1063,6 +1099,7 @@ pub async fn send_change_membership(
     secret: &str,
     local_id: NodeId,
     change: openraft::ChangeMembers<NodeId, BasicNode>,
+    proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(), String> {
     let req = serde_json::to_value(&change).map_err(|e| e.to_string())?;
@@ -1071,7 +1108,7 @@ pub async fn send_change_membership(
         secret,
         local_id,
         tls_client,
-        ControlMessage::ChangeMembership(req),
+        ControlMessage::ChangeMembership { req, proof },
     )
     .await?
     {

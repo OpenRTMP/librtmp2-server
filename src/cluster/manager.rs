@@ -295,6 +295,9 @@ impl ClusterManager {
             let mgr_member = Arc::clone(&mgr);
             let is_member: network::MembershipFn =
                 Arc::new(move |id| mgr_member.peer_in_membership(id));
+            let mgr_proof = Arc::clone(&mgr);
+            let verify_admin_proof: network::AdminProofFn =
+                Arc::new(move |proof, payload| mgr_proof.verify_admin_proof(proof, payload));
             tokio::spawn(async move {
                 if let Err(e) = network::serve_control_plane_listener(
                     listener,
@@ -306,6 +309,7 @@ impl ClusterManager {
                     on_admin,
                     on_stats,
                     is_member,
+                    verify_admin_proof,
                     tls_srv,
                 )
                 .await
@@ -371,6 +375,8 @@ impl ClusterManager {
                         tls_client.clone(),
                     )
                     .await?;
+                    let local_id = db.setting_get(CLUSTER_ID_SETTING);
+                    verify_cluster_identity(local_id.as_deref(), &cluster_id)?;
                     if !cluster_id.is_empty() {
                         let _ = db.setting_set(CLUSTER_ID_SETTING, &cluster_id);
                     }
@@ -684,6 +690,8 @@ impl ClusterManager {
     ) -> Result<(), String> {
         use openraft::error::{ClientWriteError, RaftError};
 
+        let proof = self.membership_admin_proof(&change)?;
+
         match self.raft.change_membership(change.clone(), false).await {
             Ok(_) => Ok(()),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
@@ -700,12 +708,42 @@ impl ClusterManager {
                     &self.config.secret,
                     self.config.node_id,
                     change,
+                    proof,
                     self.tls_client.clone(),
                 )
                 .await
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn membership_admin_proof(
+        &self,
+        change: &ChangeMembers<NodeId, BasicNode>,
+    ) -> Result<String, String> {
+        let req = serde_json::to_string(change).map_err(|e| e.to_string())?;
+        let token = self
+            .session_hooks
+            .lock()
+            .as_ref()
+            .map(|h| h.api_token.read().clone())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| "API token unavailable for membership change".to_string())?;
+        Ok(crate::cluster::security::admin_proof(&token, &req))
+    }
+
+    fn verify_admin_proof(&self, proof: &str, payload: &str) -> bool {
+        let Some(hooks) = self.session_hooks.lock().as_ref() else {
+            return false;
+        };
+        let token = hooks.api_token.read();
+        if token.is_empty() {
+            return false;
+        }
+        crate::cluster::security::secrets_equal(
+            &crate::cluster::security::admin_proof(&token, payload),
+            proof,
+        )
     }
 
     async fn forward_admin(

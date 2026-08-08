@@ -148,13 +148,12 @@ impl MediaPeer {
         let approx = approx_size(&msg);
         let cur = self.queue_bytes.load(Ordering::Relaxed);
         if cur.saturating_add(approx) > self.max_queue_bytes {
-            tracing::warn!(peer = self.peer_id, "media queue full — resetting peer");
-            self.closed.store(true, Ordering::Relaxed);
+            tracing::warn!(peer = self.peer_id, "media queue full — dropping frame");
             return Err(());
         }
         self.queue_bytes.fetch_add(approx, Ordering::Relaxed);
         self.tx.try_send(msg).map_err(|_| {
-            self.closed.store(true, Ordering::Relaxed);
+            self.queue_bytes.fetch_sub(approx, Ordering::Relaxed);
         })
     }
 
@@ -288,7 +287,7 @@ async fn client_media_auth<S: AsyncRead + AsyncWrite + Unpin>(
     let MediaMessage::AuthChallenge { nonce } = challenge else {
         return Err(std::io::Error::other("expected AuthChallenge"));
     };
-    let response = auth_response(secret, &nonce);
+    let response = auth_response(secret, local_id, &nonce);
     write_media_frame(
         stream,
         &MediaMessage::Auth {
@@ -322,7 +321,7 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
         write_media_frame(stream, &MediaMessage::AuthFail).await?;
         return Err(std::io::Error::other("expected AUTH"));
     };
-    let expected = auth_response(secret, &nonce);
+    let expected = auth_response(secret, node_id, &nonce);
     if !secrets_equal(&expected, &response) {
         write_media_frame(stream, &MediaMessage::AuthFail).await?;
         return Err(std::io::Error::other("auth fail"));

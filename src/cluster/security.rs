@@ -24,11 +24,24 @@ pub fn secrets_equal(a: &str, b: &str) -> bool {
 }
 
 /// Derive a hex-encoded SHA-256 challenge response (never log the secret).
-pub fn auth_response(secret: &str, nonce: &[u8]) -> String {
+///
+/// `node_id` is mixed into the digest so a holder of the cluster secret cannot
+/// authenticate as a different member by reusing another node's response.
+pub fn auth_response(secret: &str, node_id: u64, nonce: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
+    hasher.update(node_id.to_le_bytes());
     hasher.update(nonce);
+    hex::encode(hasher.finalize())
+}
+
+/// Proof that a membership change was initiated via the HTTP API (bearer token).
+pub fn admin_proof(api_token: &str, payload: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(api_token.as_bytes());
+    hasher.update(payload.as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -109,10 +122,11 @@ mod tests {
         let nonce: Vec<u8> = (0u8..16)
             .map(|i| i.wrapping_mul(17).wrapping_add(3))
             .collect();
-        let a = auth_response(&secret, &nonce);
-        let b = auth_response(&secret, &nonce);
+        let a = auth_response(&secret, 42, &nonce);
+        let b = auth_response(&secret, 42, &nonce);
         assert_eq!(a, b);
         let other: String = (0u8..24).map(|i| char::from(b'z' - (i % 26))).collect();
-        assert_ne!(a, auth_response(&other, &nonce));
+        assert_ne!(a, auth_response(&other, 42, &nonce));
+        assert_ne!(a, auth_response(&secret, 43, &nonce));
     }
 }

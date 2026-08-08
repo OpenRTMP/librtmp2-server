@@ -73,6 +73,20 @@ pub enum ClusterResponse {
     Error(String),
 }
 
+impl ClusterCommand {
+    /// Commands that may be proposed over the inter-node control plane.
+    /// Administrative mutations (streams, viewers, API token, seed) require
+    /// the HTTP API bearer token path instead.
+    pub fn allowed_on_control_plane(&self) -> bool {
+        matches!(
+            self,
+            ClusterCommand::AcquireStreamOwner { .. }
+                | ClusterCommand::ReleaseStreamOwner { .. }
+                | ClusterCommand::ReleaseOwnersForNode { .. }
+        )
+    }
+}
+
 impl ClusterResponse {
     pub fn into_coord_result(self) -> Result<(), crate::state::CoordError> {
         match self {
@@ -92,5 +106,25 @@ impl ClusterResponse {
             )),
             other => other.into_coord_result().map(|()| 0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClusterCommand;
+
+    #[test]
+    fn control_plane_allows_ownership_only() {
+        assert!(ClusterCommand::AcquireStreamOwner {
+            stream_id: "s".into(),
+            node_id: 1,
+            epoch: 1,
+            acquired_at: 0,
+        }
+        .allowed_on_control_plane());
+        assert!(!ClusterCommand::SetApiToken {
+            token: "t".into()
+        }
+        .allowed_on_control_plane());
     }
 }

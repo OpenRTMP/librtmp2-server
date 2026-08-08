@@ -56,7 +56,10 @@ pub fn check_join_reseed(db: &Db, joining: bool) -> Result<JoinReseedAction, Str
 /// Fail when a persisted node would resume against a different cluster identity.
 pub fn verify_cluster_identity(local: Option<&str>, remote: &str) -> Result<(), String> {
     match local {
-        Some(local) if !remote.is_empty() && local != remote => Err(format!(
+        Some(local) if remote.is_empty() => Err(
+            "target cluster returned an empty cluster_id; refuse to join or resume".into(),
+        ),
+        Some(local) if local != remote => Err(format!(
             "local cluster_id '{local}' does not match target cluster_id '{remote}'; \
              refuse to mix deployments. Reseed with an empty DB \
              (see docs/clustering.md#reseed)"
@@ -131,3 +134,20 @@ pub async fn seed_from_local_db(raft: &Raft, db: &Arc<Db>) -> Result<(), String>
 }
 
 pub type MembershipError = crate::cluster::raft::typ::ClientWriteError;
+
+#[cfg(test)]
+mod tests {
+    use super::verify_cluster_identity;
+
+    #[test]
+    fn verify_cluster_identity_rejects_empty_remote_when_local_set() {
+        let err = verify_cluster_identity(Some("cluster-a"), "").unwrap_err();
+        assert!(err.contains("empty cluster_id"));
+    }
+
+    #[test]
+    fn verify_cluster_identity_rejects_mismatch() {
+        let err = verify_cluster_identity(Some("cluster-a"), "cluster-b").unwrap_err();
+        assert!(err.contains("does not match"));
+    }
+}

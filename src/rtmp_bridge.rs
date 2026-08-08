@@ -490,11 +490,7 @@ impl DbRtmpBridge {
         );
 
         #[cfg(feature = "cluster")]
-        if let Some((stream_id, epoch)) = self.ownership_epochs.lock().remove(&conn)
-            && let Some(coord) = self.coordinator.lock().clone()
-        {
-            let _ = coord.release_stream_owner(&stream_id, epoch);
-        }
+        self.try_release_ownership_for_conn(conn);
 
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -1154,16 +1150,40 @@ impl RtmpEventHandler for DbRtmpBridge {
         true
     }
 
+    #[cfg(feature = "cluster")]
+    fn try_release_ownership_for_conn(&self, conn: ConnId) {
+        let release = {
+            let epochs = self.ownership_epochs.lock();
+            let Some((stream_id, epoch)) = epochs.get(&conn).map(|(s, e)| (s.clone(), *e)) else {
+                return;
+            };
+            let Some(coord) = self.coordinator.lock().clone() else {
+                return;
+            };
+            Some((stream_id, epoch, coord))
+        };
+        let Some((stream_id, epoch, coord)) = release else {
+            return;
+        };
+        match coord.release_stream_owner(&stream_id, epoch) {
+            Ok(()) => {
+                self.ownership_epochs.lock().remove(&conn);
+            }
+            Err(e) => {
+                crate::log_error!(
+                    "RTMP: failed to release stream ownership conn={conn} stream={stream_id}: {e}"
+                );
+            }
+        }
+    }
+
     fn on_close(&self, conn: ConnId) {
         // Deliberately do NOT clear auth_failures here: it is keyed by remote
         // IP (not ConnId) precisely so a client can't reset the brute-force
         // window by reconnecting. Entries expire naturally via the sliding
         // window in is_auth_rate_limited/record_auth_failure.
-        if let Some((stream_id, epoch)) = self.ownership_epochs.lock().remove(&conn)
-            && let Some(coord) = self.coordinator.lock().clone()
-        {
-            let _ = coord.release_stream_owner(&stream_id, epoch);
-        }
+        #[cfg(feature = "cluster")]
+        self.try_release_ownership_for_conn(conn);
         let cs = self.conns.lock().remove(&conn);
         let Some(cs) = cs else {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");
