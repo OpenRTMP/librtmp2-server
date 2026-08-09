@@ -35,7 +35,9 @@ fn parse_node_id_from_identity_str(value: &str) -> Option<u64> {
     let mut digits_seen = 0usize;
     for ch in digits.chars() {
         if ch.is_ascii_digit() {
-            id = id.saturating_mul(10).saturating_add((ch as u8 - b'0') as u64);
+            id = id
+                .saturating_mul(10)
+                .saturating_add((ch as u8 - b'0') as u64);
             digits_seen += 1;
             if digits_seen > 20 {
                 return None;

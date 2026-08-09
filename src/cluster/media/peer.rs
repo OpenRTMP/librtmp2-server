@@ -401,16 +401,11 @@ pub(crate) async fn accept_tls_then_auth(
             .peer_certificates()
             .and_then(node_id_from_peer_certs);
         let mut boxed: Box<dyn MediaIo> = Box::new(tls);
-        let peer_id = accept_auth(
-            &mut boxed,
-            secret,
-            local_id,
-            tls_required,
-            cert_node_id,
-        )
-        .await?;
+        let peer_id = accept_auth(&mut boxed, secret, local_id, tls_required, cert_node_id).await?;
         if !(is_peer_allowed)(peer_id) {
-            return Err(std::io::Error::other("media peer not in cluster membership"));
+            return Err(std::io::Error::other(
+                "media peer not in cluster membership",
+            ));
         }
         return Ok((peer_id, boxed));
     } else {
@@ -418,7 +413,9 @@ pub(crate) async fn accept_tls_then_auth(
     };
     let peer_id = accept_auth(&mut io, secret, local_id, tls_required, None).await?;
     if !(is_peer_allowed)(peer_id) {
-        return Err(std::io::Error::other("media peer not in cluster membership"));
+        return Err(std::io::Error::other(
+            "media peer not in cluster membership",
+        ));
     }
     Ok((peer_id, io))
 }

@@ -112,16 +112,15 @@ mod tests {
 
     #[test]
     fn control_plane_allows_member_forwarded_admin_writes() {
-        assert!(ClusterCommand::AcquireStreamOwner {
-            stream_id: "s".into(),
-            node_id: 1,
-            epoch: 1,
-            acquired_at: 0,
-        }
-        .allowed_on_control_plane());
-        assert!(ClusterCommand::SetApiToken {
-            token: "t".into()
-        }
-        .allowed_on_control_plane());
+        assert!(
+            ClusterCommand::AcquireStreamOwner {
+                stream_id: "s".into(),
+                node_id: 1,
+                epoch: 1,
+                acquired_at: 0,
+            }
+            .allowed_on_control_plane()
+        );
+        assert!(ClusterCommand::SetApiToken { token: "t".into() }.allowed_on_control_plane());
     }
 }

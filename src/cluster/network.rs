@@ -773,14 +773,14 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                             "client write forward unavailable on this node",
                         ));
                     };
-                    let leader_addr = ftl
-                        .leader_node
-                        .as_ref()
-                        .map(|n| n.addr.clone())
-                        .or_else(|| {
-                            ftl.leader_id
-                                .and_then(|id| ctx.meta.get(id).map(|(ctrl, _)| ctrl))
-                        });
+                    let leader_addr =
+                        ftl.leader_node
+                            .as_ref()
+                            .map(|n| n.addr.clone())
+                            .or_else(|| {
+                                ftl.leader_id
+                                    .and_then(|id| ctx.meta.get(id).map(|(ctrl, _)| ctrl))
+                            });
                     match leader_addr {
                         Some(addr) => match send_client_write(
                             &addr,

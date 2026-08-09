@@ -13,6 +13,25 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-09
+
+### Added
+- Optional high-availability clustering behind Cargo feature `cluster`
+  (OpenRaft 0.9.24 control plane, SQLite state machine, media mesh on
+  ports 1940/1941). Runtime default remains `CLUSTER_ENABLED=false`
+  (standalone unchanged). See `docs/clustering.md`.
+- `StateCoordinator` routes durable stream/viewer/token/ownership
+  mutations through local SQLite or Raft.
+- Authenticated cluster APIs: `GET /api/v1/cluster`, `/nodes`, `/streams`,
+  `POST .../nodes/{id}/drain|resume`, `DELETE .../nodes/{id}`; health
+  includes panel-shaped `cluster` block when enabled.
+- Raft `CreateStream` carries a pre-generated default viewer for identical
+  replica applies; StatsProxy for non-owner stream stats.
+- Multi-node loopback tests in `tests/cluster_ha.rs`.
+- Depends on `librtmp2` 0.7 path (relay export / inject / init snapshot).
+- Follower durable writes forward to the Raft leader over the authenticated
+  control plane (`ClientWrite`); clients never need leader discovery.
+
 ### Fixed
 - Outbound media-peer readers stamp the authenticated peer id so inbound
   `MediaFrame`/`InitCache` require `accepts_owner` (same fence as direct accepts).
@@ -84,25 +103,6 @@ begin at `1.0.0`.
   unavailable peers; invalid cluster boolean env overrides error; concurrent
   last-viewer delete races return 400; security test matches control-plane
   policy.
-
-## [0.2.0] — 2026-08-08
-
-### Added
-- Optional high-availability clustering behind Cargo feature `cluster`
-  (OpenRaft 0.9.24 control plane, SQLite state machine, media mesh on
-  ports 1940/1941). Runtime default remains `CLUSTER_ENABLED=false`
-  (standalone unchanged). See `docs/clustering.md`.
-- `StateCoordinator` routes durable stream/viewer/token/ownership
-  mutations through local SQLite or Raft.
-- Authenticated cluster APIs: `GET /api/v1/cluster`, `/nodes`, `/streams`,
-  `POST .../nodes/{id}/drain|resume`, `DELETE .../nodes/{id}`; health
-  includes panel-shaped `cluster` block when enabled.
-- Raft `CreateStream` carries a pre-generated default viewer for identical
-  replica applies; StatsProxy for non-owner stream stats.
-- Multi-node loopback tests in `tests/cluster_ha.rs`.
-- Depends on `librtmp2` 0.7 path (relay export / inject / init snapshot).
-- Follower durable writes forward to the Raft leader over the authenticated
-  control plane (`ClientWrite`); clients never need leader discovery.
 
 ### Changed
 - Package version `0.1.9` → `0.2.0`.

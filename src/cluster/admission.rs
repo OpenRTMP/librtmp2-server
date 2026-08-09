@@ -80,10 +80,7 @@ impl AdmissionController {
         // Do not weaken stronger lifecycle states (ISOLATED/DOWN/LEARNER/
         // LEAVING) to DRAINING — plays are still admitted while Draining.
         let state = self.health.local();
-        if matches!(
-            state,
-            NodeHealthState::Ready | NodeHealthState::Draining
-        ) {
+        if matches!(state, NodeHealthState::Ready | NodeHealthState::Draining) {
             self.health.set_local(NodeHealthState::Draining);
         }
     }

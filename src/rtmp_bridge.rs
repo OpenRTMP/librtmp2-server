@@ -1281,7 +1281,8 @@ impl RtmpEventHandler for DbRtmpBridge {
     /// Retry ownership releases that failed during `on_close`.
     #[cfg(feature = "cluster")]
     pub fn retry_pending_ownership_releases(&self) {
-        let pending: Vec<(String, u64)> = self.pending_ownership_releases.lock().drain(..).collect();
+        let pending: Vec<(String, u64)> =
+            self.pending_ownership_releases.lock().drain(..).collect();
         if pending.is_empty() {
             return;
         }
