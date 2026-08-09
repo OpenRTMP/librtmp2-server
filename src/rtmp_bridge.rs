@@ -1071,9 +1071,7 @@ impl DbRtmpBridge {
             {
                 let local = self.db.player_active_count_for_viewer(&viewer.id);
                 let remote = mgr.remote_viewer_session_count_cached(&viewer.id);
-                if local.saturating_add(remote)
-                    >= crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64
-                {
+                if local.saturating_add(remote) >= crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64 {
                     if let Some(ref prior) = old_player
                         && !self.restore_player_row(prior)
                     {

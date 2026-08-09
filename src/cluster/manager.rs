@@ -1079,9 +1079,7 @@ impl ClusterManager {
         }
         let peers = self.health.peers_snapshot();
         match peers.into_iter().find(|(id, _)| *id == node_id) {
-            Some((_, h)) => {
-                !matches!(h.state, NodeHealthState::Down | NodeHealthState::Leaving)
-            }
+            Some((_, h)) => !matches!(h.state, NodeHealthState::Down | NodeHealthState::Leaving),
             // In membership but never heartbeated locally — treat as active
             // until fenced DOWN by sweep, so a live peer cannot be redirected.
             None => true,
