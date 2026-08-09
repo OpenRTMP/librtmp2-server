@@ -1333,7 +1333,10 @@ async fn handle_stream_delete(
             CoordError::Cluster(msg) if msg == "raft write timed out"
         );
         #[cfg(not(feature = "cluster"))]
-        let ambiguous_timeout = false;
+        let ambiguous_timeout = {
+            let _ = &e;
+            false
+        };
         if ambiguous_timeout {
             // BeginDeleteStream may still commit after the caller timed out —
             // keep the local marker and schedule finalize reconciliation.
