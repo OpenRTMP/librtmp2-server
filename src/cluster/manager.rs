@@ -841,7 +841,8 @@ impl ClusterManager {
     }
 
     fn verify_admin_proof(&self, proof: &str, payload: &str) -> bool {
-        let Some(hooks) = self.session_hooks.lock().as_ref() else {
+        let binding = self.session_hooks.lock();
+        let Some(hooks) = binding.as_ref() else {
             return false;
         };
         let token = hooks.api_token.read();

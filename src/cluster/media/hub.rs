@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::cluster::NodeId;
+use crate::cluster::media::MediaMembershipFn;
 use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::media::peer::{self, MediaPeer};

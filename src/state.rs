@@ -18,6 +18,21 @@ pub enum CoordError {
     Cluster(String),
 }
 
+impl std::fmt::Display for CoordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoordError::Duplicate => write!(f, "duplicate"),
+            CoordError::NotFound => write!(f, "not found"),
+            CoordError::Conflict => write!(f, "conflict"),
+            CoordError::Db => write!(f, "db error"),
+            #[cfg(feature = "cluster")]
+            CoordError::Cluster(msg) => write!(f, "cluster error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for CoordError {}
+
 impl From<StreamAddError> for CoordError {
     fn from(value: StreamAddError) -> Self {
         match value {

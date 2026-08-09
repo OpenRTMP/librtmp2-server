@@ -13,12 +13,6 @@ pub mod subscription;
 pub mod timeline;
 
 pub type MediaMembershipFn = Arc<dyn Fn(NodeId) -> bool + Send + Sync>;
-pub mod hub;
-pub mod ownership;
-pub mod peer;
-pub mod protocol;
-pub mod subscription;
-pub mod timeline;
 
 pub use hub::MediaHub;
 pub use ownership::OwnershipTracker;

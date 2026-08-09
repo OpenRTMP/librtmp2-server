@@ -1244,6 +1244,65 @@ impl RtmpEventHandler for DbRtmpBridge {
         true
     }
 
+    fn on_close(&self, conn: ConnId) {
+        // Deliberately do NOT clear auth_failures here: it is keyed by remote
+        // IP (not ConnId) precisely so a client can't reset the brute-force
+        // window by reconnecting. Entries expire naturally via the sliding
+        // window in is_auth_rate_limited/record_auth_failure.
+        let cs = self.conns.lock().remove(&conn);
+        let Some(cs) = cs else {
+            crate::log_warn!("RTMP: on_close for untracked connection {conn}");
+            return;
+        };
+        let peer = peer_label(&cs).to_string();
+        let had_role = cs.publisher.is_some() || cs.player.is_some();
+
+        if let Some(mut pub_row) = cs.publisher {
+            pub_row.active = false;
+            if self.db.publisher_update(&pub_row.id, &pub_row) {
+                crate::log_info!(
+                    "RTMP: publisher disconnected: stream={} session={} from {peer}",
+                    pub_row.stream_id,
+                    pub_row.id
+                );
+            } else {
+                crate::log_error!(
+                    "RTMP: failed to deactivate publisher on close: stream={} session={} from {peer}",
+                    pub_row.stream_id,
+                    pub_row.id
+                );
+            }
+        }
+
+        #[cfg(feature = "cluster")]
+        self.try_release_ownership_for_conn(conn);
+
+        if let Some(mut player_row) = cs.player {
+            #[cfg(feature = "cluster")]
+            self.maybe_unsubscribe_remote_play(&player_row.stream_id);
+            player_row.active = false;
+            if self.db.player_update(&player_row.id, &player_row) {
+                crate::log_info!(
+                    "RTMP: player disconnected: stream={} session={} from {peer}",
+                    player_row.stream_id,
+                    player_row.id
+                );
+            } else {
+                crate::log_error!(
+                    "RTMP: failed to deactivate player on close: stream={} session={} from {peer}",
+                    player_row.stream_id,
+                    player_row.id
+                );
+            }
+        } else if !had_role {
+            // No authorized role — still record the TCP close for auditability
+            // (matches srt-live-server logging accepted peers that never stream).
+            crate::log_info!("RTMP: connection closed {conn} from {peer}");
+        }
+    }
+}
+
+impl DbRtmpBridge {
     #[cfg(feature = "cluster")]
     fn try_release_ownership_for_conn(&self, conn: ConnId) {
         let release = {
@@ -1300,63 +1359,6 @@ impl RtmpEventHandler for DbRtmpBridge {
                         .push((stream_id, epoch));
                 }
             }
-        }
-    }
-
-    fn on_close(&self, conn: ConnId) {
-        // Deliberately do NOT clear auth_failures here: it is keyed by remote
-        // IP (not ConnId) precisely so a client can't reset the brute-force
-        // window by reconnecting. Entries expire naturally via the sliding
-        // window in is_auth_rate_limited/record_auth_failure.
-        let cs = self.conns.lock().remove(&conn);
-        let Some(cs) = cs else {
-            crate::log_warn!("RTMP: on_close for untracked connection {conn}");
-            return;
-        };
-        let peer = peer_label(&cs).to_string();
-        let had_role = cs.publisher.is_some() || cs.player.is_some();
-
-        if let Some(mut pub_row) = cs.publisher {
-            pub_row.active = false;
-            if self.db.publisher_update(&pub_row.id, &pub_row) {
-                crate::log_info!(
-                    "RTMP: publisher disconnected: stream={} session={} from {peer}",
-                    pub_row.stream_id,
-                    pub_row.id
-                );
-            } else {
-                crate::log_error!(
-                    "RTMP: failed to deactivate publisher on close: stream={} session={} from {peer}",
-                    pub_row.stream_id,
-                    pub_row.id
-                );
-            }
-        }
-
-        #[cfg(feature = "cluster")]
-        self.try_release_ownership_for_conn(conn);
-
-        if let Some(mut player_row) = cs.player {
-            #[cfg(feature = "cluster")]
-            self.maybe_unsubscribe_remote_play(&player_row.stream_id);
-            player_row.active = false;
-            if self.db.player_update(&player_row.id, &player_row) {
-                crate::log_info!(
-                    "RTMP: player disconnected: stream={} session={} from {peer}",
-                    player_row.stream_id,
-                    player_row.id
-                );
-            } else {
-                crate::log_error!(
-                    "RTMP: failed to deactivate player on close: stream={} session={} from {peer}",
-                    player_row.stream_id,
-                    player_row.id
-                );
-            }
-        } else if !had_role {
-            // No authorized role — still record the TCP close for auditability
-            // (matches srt-live-server logging accepted peers that never stream).
-            crate::log_info!("RTMP: connection closed {conn} from {peer}");
         }
     }
 }
