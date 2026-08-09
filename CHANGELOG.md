@@ -13,11 +13,6 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
-### Fixed
-- Docker runtime image is Alpine again (`alpine:latest`); builder stays
-  on `rust:1.97-bookworm`. Runtime includes `gcompat` so the glibc-linked
-  binary can run on musl.
-
 ## [0.2.0] — 2026-08-09
 
 ### Added
@@ -111,8 +106,7 @@ begin at `1.0.0`.
 
 ### Changed
 - Package version `0.1.9` → `0.2.0`.
-- Official Docker image builds with `--features cluster` on
-  `rust:1.97-bookworm` / `debian:bookworm-slim`; clustering stays disabled
+- Official Docker image builds with `--features cluster`; clustering stays disabled
   unless configured. Compose documents ports 1940/1941.
 
 ## [0.1.9] — 2026-08-06
