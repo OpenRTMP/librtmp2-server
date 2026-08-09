@@ -654,10 +654,17 @@ impl MediaHub {
                 epoch,
             });
             if ok.is_err() {
-                // Refcount was recorded before the wire send; roll it back so
-                // a later player can retry Subscribe instead of assuming the
-                // owner is already forwarding for us.
-                let _ = self.subs.remove(peer_id, app, stream);
+                // Sole first-subscriber: roll back so a later player retries.
+                // Concurrent holders already saw add==false and expect wire
+                // Subscribe — keep our refcount and retry the send instead of
+                // leaving them with refs and no owner fan-out.
+                if !self.subs.remove_if_sole(peer_id, app, stream) {
+                    let _ = peer.try_send(MediaMessage::Subscribe {
+                        app: app.to_string(),
+                        stream: stream.to_string(),
+                        epoch,
+                    });
+                }
             }
         }
     }

@@ -41,6 +41,21 @@ impl SubscriptionTable {
         }
     }
 
+    /// Drop the entry only when this peer holds a sole ref (`count == 1`).
+    /// Used to roll back a failed first `Subscribe` without stranding concurrent
+    /// holders that already observed `add == false` and expect wire state.
+    pub fn remove_if_sole(&self, peer: u64, app: &str, stream: &str) -> bool {
+        let mut g = self.inner.lock();
+        let key = (peer, app.to_string(), stream.to_string());
+        match g.get(&key).copied() {
+            Some(1) => {
+                g.remove(&key);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn peers_for_stream(&self, app: &str, stream: &str) -> Vec<u64> {
         self.inner
             .lock()

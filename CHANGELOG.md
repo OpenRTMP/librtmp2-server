@@ -26,6 +26,9 @@ begin at `1.0.0`.
   (membership Leaving, isolation reconcile, ownership sync).
 - Heartbeats carry per-viewer player counts; play admission enforces the
   per-play-key connection cap cluster-wide against that cache.
+- Failed first `Subscribe` rolls back only a sole refcount; concurrent holders
+  keep their refs and get a retry send so they are not stranded without wire
+  Subscribe.
 - A node pruned out of Raft membership enters `Leaving`, force-drains, and
   force-unpublishes local streams so it does not keep serving after removal.
 - `force_drain` sets the manual-drain flag without weakening stronger health
