@@ -13,6 +13,11 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- Docker image uses Alpine again (`rust:1.97-alpine` builder + `alpine`
+  runtime) instead of Debian bookworm/bookworm-slim, restoring the
+  multi-arch musl stack.
+
 ## [0.2.0] — 2026-08-09
 
 ### Added
