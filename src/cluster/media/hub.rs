@@ -68,9 +68,8 @@ impl InjectQueue {
         let mut st = self.state.lock();
         while st.1.saturating_add(size) > self.max_bytes && !st.0.is_empty() {
             if let Some(dropped) = st.0.pop_front() {
-                st.1 = st
-                    .1
-                    .saturating_sub(dropped.payload.len().saturating_add(64));
+                st.1 =
+                    st.1.saturating_sub(dropped.payload.len().saturating_add(64));
             }
         }
         if st.1.saturating_add(size) > self.max_bytes {

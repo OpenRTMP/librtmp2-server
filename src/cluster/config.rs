@@ -643,7 +643,8 @@ mod tests {
             ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
         ]);
         let mut cfg =
-            ClusterConfig::load_file_only_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+            ClusterConfig::load_file_only_from_kv(|k| map.get(k).map(|s| (*s).to_string()))
+                .unwrap();
         assert!((cfg.drain_threshold - 0.8).abs() < f64::EPSILON);
         let env = HashMap::from([("LRTMP2_CLUSTER_BANDWIDTH_MAX_MBPS", "2000")]);
         cfg.apply_env_overrides_from(|k| env.get(k).map(|s| (*s).to_string()))

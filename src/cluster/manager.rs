@@ -1524,8 +1524,8 @@ impl ClusterManager {
         // directly from the (node, epoch) sync_from captured before the
         // swap.
         for (stream_id, old_owner) in &changed {
-            let still_ours = self.ownership.get(stream_id).map(|(n, _)| n)
-                == Some(self.config.node_id);
+            let still_ours =
+                self.ownership.get(stream_id).map(|(n, _)| n) == Some(self.config.node_id);
             if !still_ours
                 && self
                     .db
@@ -1819,10 +1819,7 @@ impl ClusterManager {
         // unavailable even though heartbeats may still arrive during a partition.
         let peer_unavail =
             |s: NodeHealthState| matches!(s, NodeHealthState::Down | NodeHealthState::Isolated);
-        let healthy = peers
-            .iter()
-            .filter(|(_, p)| !peer_unavail(p.state))
-            .count()
+        let healthy = peers.iter().filter(|(_, p)| !peer_unavail(p.state)).count()
             + if !peer_unavail(self.health.local()) {
                 1
             } else {
@@ -2022,7 +2019,10 @@ impl ClusterManager {
         }
         let peers = self.health.peers_snapshot();
         let peer_state = |id: NodeId| -> Option<NodeHealthState> {
-            peers.iter().find(|(pid, _)| *pid == id).map(|(_, p)| p.state)
+            peers
+                .iter()
+                .find(|(pid, _)| *pid == id)
+                .map(|(_, p)| p.state)
         };
         let mut candidates: Vec<NodeId> = self
             .meta

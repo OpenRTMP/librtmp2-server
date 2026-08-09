@@ -56,9 +56,9 @@ pub fn check_join_reseed(db: &Db, joining: bool) -> Result<JoinReseedAction, Str
 /// Fail when a persisted node would resume against a different cluster identity.
 pub fn verify_cluster_identity(local: Option<&str>, remote: &str) -> Result<(), String> {
     match local {
-        Some(local) if remote.is_empty() => Err(
-            "target cluster returned an empty cluster_id; refuse to join or resume".into(),
-        ),
+        Some(local) if remote.is_empty() => {
+            Err("target cluster returned an empty cluster_id; refuse to join or resume".into())
+        }
         Some(local) if local != remote => Err(format!(
             "local cluster_id '{local}' does not match target cluster_id '{remote}'; \
              refuse to mix deployments. Reseed with an empty DB \
