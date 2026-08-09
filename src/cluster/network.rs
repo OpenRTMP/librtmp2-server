@@ -646,9 +646,13 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     let msg = read_control_frame(stream).await?;
     let resp = match msg {
         ControlMessage::RaftAppend(req) => {
-            if !is_member(peer_id) {
-                return Err(std::io::Error::other("peer not in membership"));
-            }
+            // No `is_member` gate here: the auth handshake above (shared
+            // secret, plus per-node mTLS identity when enabled) is already
+            // the trust boundary for raft transport RPCs. A learner freshly
+            // added via add_learner cannot be in its own local membership
+            // view yet — that view is only populated by processing the log
+            // entries carried in exactly these RPCs — so gating on
+            // `is_member` here would deadlock every new node's bootstrap.
             let parsed: AppendEntriesRequest<TypeConfig> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.append_entries(parsed).await;
@@ -657,9 +661,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             ControlMessage::RaftAppendResp(v)
         }
         ControlMessage::RaftVote(req) => {
-            if !is_member(peer_id) {
-                return Err(std::io::Error::other("peer not in membership"));
-            }
+            // See RaftAppend above: no is_member gate, same bootstrap reason.
             let parsed: VoteRequest<NodeId> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.vote(parsed).await;
@@ -668,9 +670,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             ControlMessage::RaftVoteResp(v)
         }
         ControlMessage::RaftSnapshot(req) => {
-            if !is_member(peer_id) {
-                return Err(std::io::Error::other("peer not in membership"));
-            }
+            // See RaftAppend above: no is_member gate, same bootstrap reason.
             let parsed: InstallSnapshotRequest<TypeConfig> =
                 serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
             let r = raft.install_snapshot(parsed).await;

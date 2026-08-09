@@ -264,6 +264,10 @@ impl SqliteStateMachine {
                     }
                     Err(OwnerError::Db) => ClusterResponse::Error("db".into()),
                     Err(OwnerError::Conflict) => ClusterResponse::Error("db".into()),
+                    // stream_owner_release never actually returns NotFound (it
+                    // only fails with Db), but OwnerError is shared with the
+                    // acquire path so the match must stay exhaustive.
+                    Err(OwnerError::NotFound) => ClusterResponse::Error("db".into()),
                 }
             }
             ClusterCommand::ReleaseOwnersForNode { node_id } => {
@@ -274,6 +278,8 @@ impl SqliteStateMachine {
                     }
                     Err(OwnerError::Db) => ClusterResponse::Error("db".into()),
                     Err(OwnerError::Conflict) => ClusterResponse::Error("db".into()),
+                    // Same rationale as ReleaseStreamOwner above.
+                    Err(OwnerError::NotFound) => ClusterResponse::Error("db".into()),
                 }
             }
             ClusterCommand::SeedFromStandalone {

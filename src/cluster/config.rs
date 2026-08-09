@@ -140,7 +140,7 @@ impl ClusterConfig {
 
         cfg.drain_at_mbps = drain_at_mbps;
         cfg.resume_at_mbps = resume_at_mbps;
-        normalize_absolute_bandwidth_thresholds(&mut cfg, cfg.drain_at_mbps, cfg.resume_at_mbps);
+        normalize_absolute_bandwidth_thresholds(&mut cfg, drain_at_mbps, resume_at_mbps);
         Ok(cfg)
     }
 
@@ -188,7 +188,7 @@ impl ClusterConfig {
 
         cfg.drain_at_mbps = drain_at_mbps;
         cfg.resume_at_mbps = resume_at_mbps;
-        normalize_absolute_bandwidth_thresholds(&mut cfg, cfg.drain_at_mbps, cfg.resume_at_mbps);
+        normalize_absolute_bandwidth_thresholds(&mut cfg, drain_at_mbps, resume_at_mbps);
 
         if cfg.enabled {
             cfg.validate()?;

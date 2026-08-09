@@ -6,7 +6,7 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use rand::RngCore;
+use rand::TryRng;
 use rand::rngs::SysRng;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -111,7 +111,9 @@ fn node_id_from_cert_bytes_scan(bytes: &[u8]) -> Option<u64> {
 /// CSPRNG nonce for cluster auth handshakes.
 pub fn auth_nonce() -> Vec<u8> {
     let mut nonce = vec![0u8; 16];
-    SysRng.fill_bytes(&mut nonce);
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .expect("OS RNG failure while generating cluster auth nonce");
     nonce
 }
 
