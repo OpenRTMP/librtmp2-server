@@ -175,6 +175,19 @@ impl TestServer {
                     rtmp_bridge.on_close(conn_id);
                 }
 
+                let live_stream_ids: HashSet<String> = tracked
+                    .values()
+                    .filter(|c| !c.stream_id.is_empty())
+                    .map(|c| c.stream_id.clone())
+                    .collect();
+                deleted_for_rtmp.lock().retain(|id| {
+                    crate::server::deleted_stream_marker_still_needed(
+                        id,
+                        &live_stream_ids,
+                        &rtmp_bridge,
+                    )
+                });
+
                 thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             }
 

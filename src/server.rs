@@ -182,6 +182,35 @@ fn should_evict_idle_conn(
         .is_some_and(|at| now.duration_since(at) >= idle_timeout)
 }
 
+/// Stream id used to kick a connection after HTTP DELETE. Falls back to the
+/// bridge's per-connection stream id so a publisher authorized in the poll
+/// callback is evicted while `TrackedConn.stream_id` waits for librtmp2 to
+/// report `is_publishing`.
+fn stream_id_for_delete_kick(
+    entry: &TrackedConn,
+    conn_id: u64,
+    rtmp_bridge: &DbRtmpBridge,
+) -> String {
+    if !entry.stream_id.is_empty() {
+        entry.stream_id.clone()
+    } else {
+        rtmp_bridge.stream_id_for_conn(conn_id)
+    }
+}
+
+/// Whether an HTTP DELETE eviction marker must stay in `deleted_streams`.
+/// The bridge is consulted separately from `TrackedConn` so markers are not
+/// dropped during the brief window before `process_server_connections` syncs
+/// bridge auth into tracked state.
+pub(crate) fn deleted_stream_marker_still_needed(
+    stream_id: &str,
+    live_tracked_stream_ids: &HashSet<String>,
+    rtmp_bridge: &DbRtmpBridge,
+) -> bool {
+    live_tracked_stream_ids.contains(stream_id)
+        || rtmp_bridge.live_conn_count_for_stream(stream_id) > 0
+}
+
 /// Drive one poll cycle's worth of connection bookkeeping: authorize new
 /// publish/play commands, reject connections the bridge doesn't own, kick
 /// connections whose stream/play-key was revoked, and flush stats. Returns
@@ -351,11 +380,11 @@ pub(crate) fn process_server_connections(
         }
 
         // Kick connections whose stream was deleted.
-        if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
+        let kick_stream_id = stream_id_for_delete_kick(entry, conn_id, rtmp_bridge);
+        if !kick_stream_id.is_empty() && deleted_now.contains(&kick_stream_id) {
             crate::log_info!(
-                "RTMP: kicking conn={conn_id} from {} — stream '{}' was deleted",
+                "RTMP: kicking conn={conn_id} from {} — stream '{kick_stream_id}' was deleted",
                 conn.remote_addr,
-                entry.stream_id
             );
             reject_indices.push(idx);
             continue;
@@ -733,9 +762,9 @@ impl ServerApp {
                     .filter(|c| !c.stream_id.is_empty())
                     .map(|c| c.stream_id.clone())
                     .collect();
-                deleted_streams
-                    .lock()
-                    .retain(|id| live_stream_ids.contains(id));
+                deleted_streams.lock().retain(|id| {
+                    deleted_stream_marker_still_needed(id, &live_stream_ids, &rtmp_bridge)
+                });
 
                 let live_viewer_ids: HashSet<String> = tracked
                     .keys()
@@ -814,8 +843,15 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerApp, TrackedConn, bind_with_default_port, should_evict_idle_conn};
+    use super::{
+        ServerApp, TrackedConn, bind_with_default_port, deleted_stream_marker_still_needed,
+        should_evict_idle_conn, stream_id_for_delete_kick,
+    };
     use crate::config::ServerConfig;
+    use crate::db::{Db, Stream};
+    use crate::rtmp_bridge::DbRtmpBridge;
+    use std::collections::HashSet;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn stale_first_seen(now: Instant) -> Option<Instant> {
@@ -918,5 +954,53 @@ mod tests {
         assert_eq!(app.config.api_token, env_token);
         let db = crate::db::Db::open(db_path_str).expect("reopen db");
         assert_eq!(db.token_get().unwrap().as_deref(), Some(env_token));
+    }
+
+    fn bridge_with_authorized_publisher() -> (Arc<DbRtmpBridge>, String) {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let deleted_streams = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let bridge = Arc::new(DbRtmpBridge::new(
+            Arc::clone(&db),
+            Arc::clone(&deleted_streams),
+        ));
+        let stream = Stream {
+            id: "sync_gap".to_string(),
+            name: "Sync".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_sync_gap_key_with_sufficient_length_here".to_string(),
+            play_key: "play_sync_gap_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_sync_gap_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&stream).unwrap();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge
+                .authorize_publish(1, "live", "pub_sync_gap_key_with_sufficient_length_here")
+                .is_ok()
+        );
+        (bridge, stream.id)
+    }
+
+    #[test]
+    fn delete_kick_uses_bridge_stream_id_before_tracked_sync() {
+        let (bridge, stream_id) = bridge_with_authorized_publisher();
+        let entry = TrackedConn::default();
+        assert_eq!(
+            stream_id_for_delete_kick(&entry, 1, bridge.as_ref()),
+            stream_id
+        );
+    }
+
+    #[test]
+    fn deleted_stream_marker_survives_tracked_sync_gap() {
+        let (bridge, stream_id) = bridge_with_authorized_publisher();
+        let live_tracked: HashSet<String> = HashSet::new();
+        assert!(deleted_stream_marker_still_needed(
+            &stream_id,
+            &live_tracked,
+            bridge.as_ref()
+        ));
     }
 }

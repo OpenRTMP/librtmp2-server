@@ -1,16 +1,27 @@
 # Bug scan progress
 
-Last scanned: http (2026-08-07)
+Last scanned: server (2026-08-09)
 
 ## Modules
 
 - [x] config — .env loader, env overrides
 - [x] db — SQLite persistence, stream/publisher/player CRUD
 - [x] http — REST API, auth, stats endpoints
-- [ ] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
+- [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [ ] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [ ] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-08-09 server pass)
+
+- **Critical (fixed):** After HTTP DELETE, the RTMP poll loop's `deleted_streams`
+  retain step only looked at `TrackedConn.stream_id`. Between
+  `authorize_publish` (bridge has a live session) and librtmp2 reporting
+  `is_publishing`, tracked state still had an empty `stream_id`, so the marker
+  was dropped while the publisher was still connected. The poll loop then
+  stopped kicking that connection, leaving it broadcasting on a
+  disabled/pending-delete stream until manual disconnect. Retain now also
+  consults `live_conn_count_for_stream`; kick falls back to the bridge stream id.
 
 ## Findings (2026-08-07 http pass)
 
