@@ -14,9 +14,9 @@ begin at `1.0.0`.
 ## [Unreleased]
 
 ### Fixed
-- Docker image uses Alpine again (`rust:1.97-alpine` builder + `alpine`
-  runtime) instead of Debian bookworm/bookworm-slim, restoring the
-  multi-arch musl stack.
+- Docker runtime image is Alpine again (`alpine:latest`); builder stays
+  on `rust:1.97-bookworm`. Runtime includes `gcompat` so the glibc-linked
+  binary can run on musl.
 
 ## [0.2.0] — 2026-08-09
 

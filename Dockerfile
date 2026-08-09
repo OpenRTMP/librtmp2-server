@@ -1,12 +1,14 @@
-# Build stage (official Rust on Alpine — musl, multi-arch friendly)
+# Build stage (official Rust toolchain — matches package rust-version / OpenRaft)
 # Standalone (default `docker compose` context `.`):
 #   docker build -t librtmp2-server .
 # Monorepo (parent OpenRTMP with sibling librtmp2/):
 #   docker build -f librtmp2-server/Dockerfile .
-FROM rust:1.97-alpine AS builder
+FROM rust:1.97-bookworm AS builder
 
-RUN apk add --no-cache \
-        musl-dev openssl-dev pkgconf git ca-certificates
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG LIBRTMP2_GIT=https://github.com/OpenRTMP/librtmp2.git
 # Empty = pin to the `rev` in Cargo.toml (standalone reproducible builds).
@@ -54,10 +56,10 @@ RUN version="$APP_VERSION" && \
     test -n "$version" && \
     printf '%s\n' "$version" > /build/VERSION
 
-# Runtime stage (Alpine — same libc as builder; multi-arch)
+# Runtime stage (Alpine — multi-arch; gcompat for glibc binary from bookworm builder)
 FROM alpine:latest
 
-RUN apk add --no-cache libgcc libstdc++ openssl ca-certificates wget \
+RUN apk add --no-cache gcompat libgcc libstdc++ openssl ca-certificates wget \
     && adduser -D -H -s /sbin/nologin openrtmp \
     && mkdir -p /data \
     && chown openrtmp:openrtmp /data
