@@ -13,6 +13,7 @@ use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
 use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
+use crate::state::StateCoordinator;
 
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
@@ -164,6 +165,29 @@ pub(crate) struct TrackedConn {
     video_codec: String,
     /// Last detected audio codec string from the protocol layer.
     audio_codec: String,
+}
+
+/// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
+/// bridge (authoritative for live publisher/player rows); fall back to the
+/// poll-loop tracker when the bridge has not been synced yet this tick.
+fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedConn) -> String {
+    let bridge_sid = rtmp_bridge.stream_id_for_conn(conn_id);
+    if !bridge_sid.is_empty() {
+        return bridge_sid;
+    }
+    entry.stream_id.clone()
+}
+
+pub(crate) fn live_stream_ids_for_deleted_markers(
+    tracked: &HashMap<u64, TrackedConn>,
+    rtmp_bridge: &DbRtmpBridge,
+) -> HashSet<String> {
+    tracked
+        .keys()
+        .copied()
+        .map(|conn_id| eviction_stream_id(rtmp_bridge, conn_id, &tracked[&conn_id]))
+        .filter(|sid| !sid.is_empty())
+        .collect()
 }
 
 /// Returns true when a connection has no authorized publish/play session and
@@ -351,11 +375,11 @@ pub(crate) fn process_server_connections(
         }
 
         // Kick connections whose stream was deleted.
-        if !entry.stream_id.is_empty() && deleted_now.contains(&entry.stream_id) {
+        let evict_stream_id = eviction_stream_id(rtmp_bridge, conn_id, entry);
+        if !evict_stream_id.is_empty() && deleted_now.contains(&evict_stream_id) {
             crate::log_info!(
-                "RTMP: kicking conn={conn_id} from {} — stream '{}' was deleted",
-                conn.remote_addr,
-                entry.stream_id
+                "RTMP: kicking conn={conn_id} from {} — stream '{evict_stream_id}' was deleted",
+                conn.remote_addr
             );
             reject_indices.push(idx);
             continue;
@@ -474,6 +498,27 @@ fn recover_pending_stream_deletes(db: &Db) {
     }
 }
 
+#[cfg(feature = "cluster")]
+fn recover_pending_stream_deletes_via_coordinator(coordinator: &StateCoordinator) {
+    for id in coordinator.db().stream_ids_pending_delete() {
+        match coordinator.finalize_delete_stream(&id) {
+            Ok(()) => {
+                crate::log_warn!(
+                    "Recovered abandoned delete for stream '{id}' via Raft from a prior run"
+                );
+            }
+            Err(crate::state::CoordError::NotFound) => {
+                // Already gone on leader / concurrent finalize.
+            }
+            Err(e) => {
+                crate::log_error!(
+                    "Failed to recover abandoned delete for stream '{id}' via Raft: {e:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Load the API bearer token from the database, seeding it from `LRTMP2_API_TOKEN`
 /// or generating a new value on first startup.
 fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
@@ -530,6 +575,7 @@ fn resolve_api_token(db: &Db, db_path: &str) -> Result<String, String> {
 pub struct ServerApp {
     config: ServerConfig,
     db: Arc<Db>,
+    coordinator: Arc<StateCoordinator>,
     rtmp_bridge: Arc<DbRtmpBridge>,
     /// Stream IDs deleted via HTTP while connections are live. The RTMP poll
     /// loop reads this set and kicks any connection whose stream_id appears.
@@ -558,19 +604,30 @@ impl ServerApp {
         );
 
         config.api_token = resolve_api_token(&db, db_path)?;
+        // Standalone: finalize abandoned deletes locally. Cluster mode must not
+        // mutate SQLite here — recovery runs via Raft after ClusterManager starts.
+        #[cfg(feature = "cluster")]
+        if !config.cluster.enabled {
+            recover_pending_stream_deletes(&db);
+        }
+        #[cfg(not(feature = "cluster"))]
         recover_pending_stream_deletes(&db);
 
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
 
+        let coordinator = Arc::new(StateCoordinator::standalone(Arc::clone(&db)));
+
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(
             Arc::clone(&db),
             Arc::clone(&deleted_streams),
         ));
+        rtmp_bridge.set_coordinator(Arc::clone(&coordinator));
 
         Ok(ServerApp {
             config,
             db,
+            coordinator,
             rtmp_bridge,
             deleted_streams,
             revoked_viewers,
@@ -580,6 +637,55 @@ impl ServerApp {
     /// Runs until SIGINT/SIGTERM. Blocks the calling task.
     pub async fn run(&self) -> Result<(), String> {
         crate::log_info!("OpenRTMP librtmp2-server alpha starting...");
+
+        #[cfg(feature = "cluster")]
+        let coordinator = {
+            if self.config.cluster.enabled {
+                let mgr = crate::cluster::ClusterManager::start(
+                    self.config.cluster.clone(),
+                    Arc::clone(&self.db),
+                    tokio::runtime::Handle::current(),
+                )
+                .await?;
+                let coord = Arc::new(StateCoordinator::cluster(mgr));
+                self.rtmp_bridge.set_coordinator(Arc::clone(&coord));
+                // Pending deletes must go through Raft so all replicas converge.
+                recover_pending_stream_deletes_via_coordinator(&coord);
+                coord
+            } else {
+                Arc::clone(&self.coordinator)
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let coordinator = Arc::clone(&self.coordinator);
+
+        // After cluster join/snapshot, prefer the replicated API token.
+        let mut live_token = self.config.api_token.clone();
+        if let Ok(Some(t)) = self.db.token_get() {
+            live_token = t;
+        }
+        let api_token = Arc::new(parking_lot::RwLock::new(live_token));
+
+        #[cfg(feature = "cluster")]
+        if let Some(mgr) = coordinator.cluster_manager() {
+            let deleted = Arc::clone(&self.deleted_streams);
+            let revoked = Arc::clone(&self.revoked_viewers);
+            let token = Arc::clone(&api_token);
+            let bridge = Arc::clone(&self.rtmp_bridge);
+            let bridge_fp = Arc::clone(&bridge);
+            let bridge_sessions = Arc::clone(&bridge);
+            mgr.register_session_hooks(crate::cluster::SessionHooks {
+                deleted_streams: deleted,
+                revoked_viewers: revoked,
+                api_token: token,
+                force_unpublish_stream: Arc::new(move |stream_id: &str| {
+                    bridge_fp.force_unpublish_stream(stream_id);
+                }),
+                local_stream_sessions: Arc::new(move |sid: &str| {
+                    bridge_sessions.live_conn_count_for_stream(sid) as u64
+                }),
+            });
+        }
 
         if self.config.tls_enabled {
             if self.config.tls_cert_file.is_empty() || self.config.tls_key_file.is_empty() {
@@ -596,7 +702,9 @@ impl ServerApp {
         let state = Arc::new(AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
+            api_token,
             rtmp_bridge: Arc::clone(&self.rtmp_bridge),
+            coordinator: Arc::clone(&coordinator),
             deleted_streams: Arc::clone(&self.deleted_streams),
             revoked_viewers: Arc::clone(&self.revoked_viewers),
         });
@@ -632,8 +740,13 @@ impl ServerApp {
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
         let rtmp_stop_clone = Arc::clone(&rtmp_stop);
+        #[cfg(feature = "cluster")]
+        let cluster_enabled = self.config.cluster.enabled;
+        #[cfg(feature = "cluster")]
+        let media_queue_mb = self.config.cluster.media_queue_mb;
 
         let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
+        let (rtmp_dead_tx, rtmp_dead_rx) = tokio::sync::oneshot::channel();
         let rtmp_thread = std::thread::spawn(move || {
             use librtmp2::server::Server as RtmpServer;
             use librtmp2::types::ServerConfig as RtmpConfig;
@@ -663,6 +776,11 @@ impl ServerApp {
             server.on_media_cb = Some(rtmp_media_cb);
             server.on_publish_cb = Some(rtmp_publish_cb);
             server.on_play_cb = Some(rtmp_play_cb);
+            #[cfg(feature = "cluster")]
+            if cluster_enabled {
+                let max_bytes = (media_queue_mb as usize).saturating_mul(1024 * 1024);
+                server.enable_relay_export(4096, max_bytes.max(1024 * 1024));
+            }
             if let Err(e) = server.listen(&rtmp_bind) {
                 let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
                 crate::log_warn!("{msg}");
@@ -714,6 +832,60 @@ impl ServerApp {
                     rtmp_idle_timeout,
                 );
 
+                #[cfg(feature = "cluster")]
+                if cluster_enabled {
+                    if let Some(mgr) = rtmp_bridge.cluster_manager() {
+                        mgr.poll_side_effects();
+                        rtmp_bridge.retry_pending_ownership_releases();
+                        for frame in server.drain_exported_relay_frames() {
+                            let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
+                            let stream_id = if sid.is_empty() {
+                                rtmp_bridge
+                                    .stream_id_for_publish_route(&frame.stream_name)
+                                    .unwrap_or_else(|| frame.stream_name.clone())
+                            } else {
+                                sid
+                            };
+                            // Stamp only with this publisher socket's claimed
+                            // epoch — durable/current stream epoch can belong
+                            // to another node after a local release/failover.
+                            let Some(epoch) =
+                                rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
+                            else {
+                                continue;
+                            };
+                            use crate::cluster::media::protocol::MediaMessage;
+                            mgr.enqueue_export(crate::cluster::ExportedFrame {
+                                app: frame.app.clone(),
+                                stream: stream_id,
+                                epoch,
+                                frame_type: MediaMessage::frame_type_from_librtmp2(
+                                    frame.frame_type,
+                                ),
+                                timestamp: frame.timestamp,
+                                payload: frame.payload,
+                            });
+                        }
+                        for inj in mgr.drain_injects() {
+                            if let Some(ft) =
+                                crate::cluster::media::protocol::MediaMessage::frame_type_to_librtmp2(
+                                    inj.frame_type,
+                                )
+                            {
+                                // Inject using stream name expected by local players:
+                                // resolve play route via stream id → stream.play_key / name.
+                                let _ = server.inject_relay_frame(
+                                    &inj.app,
+                                    &inj.stream,
+                                    ft,
+                                    inj.timestamp,
+                                    &inj.payload,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // A conn_id still in `tracked` but absent this cycle was
                 // closed by the peer (rather than rejected above) — notify
                 // the bridge.
@@ -728,11 +900,7 @@ impl ServerApp {
                 }
 
                 // Drain deletion/revocation markers no live connection still references.
-                let live_stream_ids: HashSet<String> = tracked
-                    .values()
-                    .filter(|c| !c.stream_id.is_empty())
-                    .map(|c| c.stream_id.clone())
-                    .collect();
+                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
                 deleted_streams
                     .lock()
                     .retain(|id| live_stream_ids.contains(id));
@@ -753,6 +921,10 @@ impl ServerApp {
             // Notify the bridge about connections that never got an explicit close event.
             for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
                 rtmp_bridge.on_close(conn_id);
+            }
+
+            if !rtmp_stop_clone.load(Ordering::Relaxed) {
+                let _ = rtmp_dead_tx.send(());
             }
         });
 
@@ -775,14 +947,33 @@ impl ServerApp {
             http_listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async {
+            tokio::select! {
+                () = shutdown_signal() => {},
+                _ = rtmp_dead_rx => {
+                    crate::log_error!(
+                        "RTMP thread exited unexpectedly; shutting down HTTP so the process does not keep serving a half-dead API"
+                    );
+                }
+            }
+        })
         .await
         .map_err(|e| format!("HTTP server error: {e}"));
 
         crate::log_info!("Shutting down...");
+        // Stop and join the RTMP thread before tearing down Raft: its
+        // on_close callbacks release publisher ownership through the
+        // coordinator, and running them after `shutdown_blocking()` would
+        // have those releases fail against an already-shut-down cluster
+        // manager, leaving durable ownership rows behind that block
+        // publishers routed to other nodes until the next failure sweep.
         rtmp_stop.store(true, Ordering::Relaxed);
         let _ = rtmp_thread.join();
         crate::log_info!("RTMP thread joined.");
+        #[cfg(feature = "cluster")]
+        if let Some(mgr) = coordinator.cluster_manager() {
+            mgr.shutdown_blocking();
+        }
         http_result?;
         Ok(())
     }
@@ -814,8 +1005,15 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerApp, TrackedConn, bind_with_default_port, should_evict_idle_conn};
+    use super::{
+        ServerApp, TrackedConn, bind_with_default_port, eviction_stream_id,
+        live_stream_ids_for_deleted_markers, should_evict_idle_conn,
+    };
     use crate::config::ServerConfig;
+    use crate::db::Db;
+    use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn stale_first_seen(now: Instant) -> Option<Instant> {
@@ -875,6 +1073,50 @@ mod tests {
         assert_eq!(bind_with_default_port("0.0.0.0", 1936), "0.0.0.0:1936");
         assert_eq!(bind_with_default_port("::1", 1936), "[::1]:1936");
         assert_eq!(bind_with_default_port("[::1]", 1936), "[::1]:1936");
+    }
+
+    #[test]
+    fn deleted_markers_retain_bridge_stream_id_before_tracker_sync() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let stream = crate::db::Stream {
+            id: "s1".to_string(),
+            name: "S1".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_key_with_sufficient_length_here01".to_string(),
+            play_key: "play_key_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&stream).unwrap();
+
+        let deleted = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::clone(&deleted));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &stream.publish_key)
+                .is_ok()
+        );
+
+        // Simulate a delete request arriving while the publisher is still live.
+        deleted.lock().insert("s1".to_string());
+
+        let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked.insert(
+            1,
+            TrackedConn {
+                connected: true,
+                ..Default::default()
+            },
+        );
+
+        let live = live_stream_ids_for_deleted_markers(&tracked, &bridge);
+        assert!(
+            live.contains("s1"),
+            "bridge stream_id must keep deleted marker until RTMP drain even when TrackedConn is not synced"
+        );
+        assert_eq!(eviction_stream_id(&bridge, 1, &tracked[&1]), "s1");
     }
 
     #[test]

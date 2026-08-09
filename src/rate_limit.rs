@@ -38,20 +38,23 @@ pub struct RateLimiter {
     inner: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     config: HttpRateLimitConfig,
     trusted_proxies: Arc<Vec<IpAddr>>,
-    /// API bearer token, used only to preview whether an `/api/*` request is
-    /// authenticated for rate-limit bucket selection (see `bucket_for`).
-    /// This does not perform request authorization — each handler still
-    /// enforces that independently.
-    api_token: Arc<str>,
+    /// Live API bearer token (shared with AppState; refreshed on cluster join).
+    /// Used only to preview whether an `/api/*` request is authenticated for
+    /// rate-limit bucket selection — handlers still enforce auth independently.
+    api_token: Arc<parking_lot::RwLock<String>>,
 }
 
 impl RateLimiter {
-    pub fn new(config: HttpRateLimitConfig, trusted_proxies: Vec<IpAddr>, api_token: &str) -> Self {
+    pub fn new(
+        config: HttpRateLimitConfig,
+        trusted_proxies: Vec<IpAddr>,
+        api_token: Arc<parking_lot::RwLock<String>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             config,
             trusted_proxies: Arc::new(trusted_proxies),
-            api_token: Arc::from(api_token),
+            api_token,
         }
     }
 
@@ -250,7 +253,8 @@ pub async fn middleware(
 ) -> Response {
     let path = request.uri().path();
     let peer = client_ip(&request, limiter.trusted_proxies.as_slice());
-    let authenticated = bearer_authenticated(request.headers(), &limiter.api_token);
+    let token = limiter.api_token.read().clone();
+    let authenticated = bearer_authenticated(request.headers(), &token);
     let (max, bucket) = limiter.bucket_for(path, authenticated);
     let key = format!("{peer}:{bucket}");
     if !limiter.check(&key, max) {
@@ -270,9 +274,18 @@ pub async fn middleware(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    fn token(s: &str) -> Arc<parking_lot::RwLock<String>> {
+        Arc::new(parking_lot::RwLock::new(s.to_string()))
+    }
 
     fn test_limiter() -> RateLimiter {
-        RateLimiter::new(HttpRateLimitConfig::default(), Vec::new(), "test-token")
+        RateLimiter::new(
+            HttpRateLimitConfig::default(),
+            Vec::new(),
+            token("test-token"),
+        )
     }
 
     #[test]
@@ -362,7 +375,7 @@ mod tests {
                 ..HttpRateLimitConfig::default()
             },
             Vec::new(),
-            "test-token",
+            token("test-token"),
         );
 
         let (health_max, health_bucket) = limiter.bucket_for("/api/v1/health", false);
@@ -400,7 +413,7 @@ mod tests {
                 ..HttpRateLimitConfig::default()
             },
             Vec::new(),
-            "test-token",
+            token("test-token"),
         );
 
         for i in 0..3 {
@@ -434,7 +447,7 @@ mod tests {
                 ..HttpRateLimitConfig::default()
             },
             Vec::new(),
-            "test-token",
+            token("test-token"),
         );
         for i in 0..5 {
             assert!(
@@ -456,7 +469,7 @@ mod tests {
                 ..HttpRateLimitConfig::default()
             },
             Vec::new(),
-            "test-token",
+            token("test-token"),
         );
 
         let (max, stats_bucket) = limiter.bucket_for("/stats", false);
@@ -497,7 +510,7 @@ mod tests {
                 ..HttpRateLimitConfig::default()
             },
             Vec::new(),
-            "test-token",
+            token("test-token"),
         );
 
         let (max_a, bucket_a) = limiter.bucket_for("/stats-abc123", false);

@@ -41,7 +41,7 @@ fn run() -> Result<(), String> {
         }
     };
 
-    config_apply_env(&mut config);
+    config_apply_env(&mut config)?;
 
     if let Some(port) = cli.rtmp_port {
         config.rtmp_bind = set_bind_port(&config.rtmp_bind, port);

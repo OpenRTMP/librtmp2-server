@@ -51,6 +51,8 @@ Everything below is implemented **in this repo**. Wire-protocol limits are defin
 - **JSON + Nginx-compatible XML stats**
 - **REST API** — stream CRUD, Bearer token auth
 - **Docker-ready** — lightweight Alpine container
+- **Optional HA clustering** — OpenRaft + media mesh (`--features cluster`;
+  runtime `CLUSTER_ENABLED=false` by default). See [docs/clustering.md](docs/clustering.md)
 
 ---
 
@@ -113,6 +115,8 @@ librtmp2 = { version = "0.4.1", features = ["tls"] }
 git clone https://github.com/OpenRTMP/librtmp2-server.git
 cd librtmp2-server
 cargo build --release
+# Optional HA (OpenRaft + media mesh); runtime still defaults off:
+# cargo build --release --features cluster
 ```
 
 ### Run

@@ -1,0 +1,66 @@
+//! Control-plane security unit tests (no live cluster required).
+
+#![cfg(feature = "cluster")]
+
+use librtmp2_server::cluster::command::ClusterCommand;
+use librtmp2_server::cluster::membership::verify_cluster_identity;
+use librtmp2_server::cluster::security::{
+    admin_proof, auth_response, node_id_from_peer_certs, secrets_equal, verify_tls_node_identity,
+};
+
+#[test]
+fn auth_response_binds_node_id() {
+    let secret = "cluster-secret-at-least-16";
+    let nonce = b"nonce-1234567890";
+    let a = auth_response(secret, 1, nonce);
+    let b = auth_response(secret, 2, nonce);
+    assert_ne!(a, b);
+    assert_eq!(a, auth_response(secret, 1, nonce));
+}
+
+#[test]
+fn control_plane_allows_member_forwarded_admin_commands() {
+    // Authenticated members may forward HTTP-authorized admin writes via
+    // ClientWrite so the any-node API works without leader discovery.
+    assert!(ClusterCommand::SetApiToken { token: "x".into() }.allowed_on_control_plane());
+    assert!(
+        ClusterCommand::AcquireStreamOwner {
+            stream_id: "s".into(),
+            node_id: 1,
+            epoch: 1,
+            acquired_at: 0,
+        }
+        .allowed_on_control_plane()
+    );
+}
+
+#[test]
+fn admin_proof_changes_with_payload() {
+    let token = "api-token-for-tests-only";
+    let a = admin_proof(token, r#"{"AddVoterIds":[2]}"#);
+    let b = admin_proof(token, r#"{"AddVoterIds":[3]}"#);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn verify_cluster_identity_empty_remote_fails() {
+    assert!(verify_cluster_identity(Some("cid"), "").is_err());
+}
+
+#[test]
+fn secrets_equal_rejects_length_pairs_that_overflow_u8() {
+    let a = "x".repeat(256);
+    assert!(!secrets_equal(&a, ""));
+    assert!(!secrets_equal("", &a));
+}
+
+#[test]
+fn tls_identity_requires_cert_marker_when_tls_on() {
+    let mut der = Vec::new();
+    der.extend_from_slice(b"noise-lrtmp2-node-99-trailer");
+    let cert_id = node_id_from_peer_certs(&[rustls::pki_types::CertificateDer::from(der)]);
+    assert_eq!(cert_id, Some(99));
+    assert!(verify_tls_node_identity(true, cert_id, 99).is_ok());
+    assert!(verify_tls_node_identity(true, cert_id, 1).is_err());
+    assert!(verify_tls_node_identity(true, None, 1).is_err());
+}

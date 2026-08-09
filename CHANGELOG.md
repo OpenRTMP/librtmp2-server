@@ -13,6 +13,103 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-09
+
+### Added
+- Optional high-availability clustering behind Cargo feature `cluster`
+  (OpenRaft 0.9.24 control plane, SQLite state machine, media mesh on
+  ports 1940/1941). Runtime default remains `CLUSTER_ENABLED=false`
+  (standalone unchanged). See `docs/clustering.md`.
+- `StateCoordinator` routes durable stream/viewer/token/ownership
+  mutations through local SQLite or Raft.
+- Authenticated cluster APIs: `GET /api/v1/cluster`, `/nodes`, `/streams`,
+  `POST .../nodes/{id}/drain|resume`, `DELETE .../nodes/{id}`; health
+  includes panel-shaped `cluster` block when enabled.
+- Raft `CreateStream` carries a pre-generated default viewer for identical
+  replica applies; StatsProxy for non-owner stream stats.
+- Multi-node loopback tests in `tests/cluster_ha.rs`.
+- Depends on `librtmp2` 0.7.0 (`rev` pinned to the main merge of OpenRTMP/librtmp2#202).
+- Follower durable writes forward to the Raft leader over the authenticated
+  control plane (`ClientWrite`); clients never need leader discovery.
+
+### Fixed
+- Outbound media-peer readers stamp the authenticated peer id so inbound
+  `MediaFrame`/`InitCache` require `accepts_owner` (same fence as direct accepts).
+- Failed outbound `Subscribe` try_send rolls back the subscription refcount so
+  later players can retry instead of assuming the owner is already forwarding.
+- Standalone Docker builds pin the cloned `librtmp2` checkout to `Cargo.toml`'s
+  `rev` (override with `LIBRTMP2_REF`) instead of tracking moving `main`.
+- Join rejects address replacement for an already-active member node id until
+  that member is `DOWN` or `LEAVING`.
+- Session-hook force-unpublish/drain clones hooks before nested lock re-entry
+  (membership Leaving, isolation reconcile, ownership sync).
+- Heartbeats carry per-viewer player counts; play admission enforces the
+  per-play-key connection cap cluster-wide against that cache.
+- Failed first `Subscribe` rolls back only a sole refcount; concurrent holders
+  keep their refs and get a retry send so they are not stranded without wire
+  Subscribe.
+- A node pruned out of Raft membership enters `Leaving`, force-drains, and
+  force-unpublishes local streams so it does not keep serving after removal.
+- `force_drain` sets the manual-drain flag without weakening stronger health
+  states (`Leaving`/`Isolated`/`Down`/`Learner`) to `Draining`.
+- Raft state-machine apply treats every `ClusterResponse::Error` as a storage
+  failure so `last_applied` cannot advance past a partial mutation.
+- Followers that are already members may proxy `JoinRequest` for a fresh
+  learner to the leader (join via non-leader `CLUSTER_JOIN` address).
+- Outbound media TLS handshakes are bounded by the same auth timeout as the
+  control plane.
+- Timed-out `BeginDeleteStream` keeps the local delete marker and schedules
+  finalize reconciliation instead of abandoning the workflow.
+- Inbound media accepts are capped (`MAX_MEDIA_CONN_INFLIGHT`) like control
+  connections.
+- Quorum recovery counts reachable `ISOLATED` peers so a restored majority can
+  leave isolation.
+- Snapshot restore emits `DrainStream` for pending-delete streams and
+  `RevokeViewer` for players whose viewer row did not survive.
+- Stream-switch publish rejects when prior ownership release fails (keeps the
+  prior epoch; rolls back the new claim) instead of leaking the old owner.
+- Ownership changes preserve media subscription refcounts per active player;
+  unreachable peers keep their last cached session counts individually.
+- Init-cache fields are cleared when the ownership epoch changes.
+- Exported relay frames are stamped only with the publisher connection's
+  claimed epoch (no durable/current-stream fallback).
+- File-based absolute drain/resume Mbps thresholds re-ratio when
+  `BANDWIDTH_MAX` is overridden via process env.
+- Ambiguous timed-out acquires stay queued until the ownership row appears
+  (or is superseded) instead of being dropped on the first empty lookup.
+- Ownership sync force-unpublishes local publishers when the applied owner
+  moves away from this node after Raft catch-up.
+- Failed ownership releases on publisher close are retried from the RTMP poll
+  loop; removed-node ownership cleanup is queued when the release write fails.
+- `FinalizeDeleteStream` deletes only while `pending_delete=1`, so stale
+  recovery cannot wipe a re-enabled stream.
+- Snapshot restore drains live sessions for streams fully absent from the
+  snapshot (not only pending-delete ids).
+- Media peer reconnect aborts a blocked reader; control-plane snapshot RPCs
+  accept up to the 64 MiB frame limit.
+- Cluster status `healthy_nodes` excludes `ISOLATED` peers (same predicate as
+  per-node `healthy`).
+- `scripts/docker_cargo_test.py` exits nonzero when any cargo suite fails.
+- `AcquireStreamOwner` on a missing stream returns `NotFound` (not storage
+  `Error`) so Raft apply cannot stall after a racing finalize-delete.
+- Inbound media frames require the authenticated peer to be the recorded owner
+  (node id + epoch), not epoch alone.
+- Topology resume fallbacks skip the local node; cluster Mbps totals include
+  peer heartbeat load; snapshot control RPCs use a 120s round-trip budget;
+  member-forwarded admin `ClientWrite` commands are accepted on the control
+  plane; Docker monorepo builds `[patch]` the sibling `librtmp2` path.
+- Ownership acquire rejects disabled/pending-delete streams; peer session
+  caches survive DOWN until ownership release; standby placement skips
+  unavailable peers; invalid cluster boolean env overrides error; concurrent
+  last-viewer delete races return 400; security test matches control-plane
+  policy.
+
+### Changed
+- Package version `0.1.9` → `0.2.0`.
+- Official Docker image builds with `--features cluster` on
+  `rust:1.97-bookworm` / `debian:bookworm-slim`; clustering stays disabled
+  unless configured. Compose documents ports 1940/1941.
+
 ## [0.1.9] — 2026-08-06
 
 ### Security
@@ -336,7 +433,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.6...v0.1.7

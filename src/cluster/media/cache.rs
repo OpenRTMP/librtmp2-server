@@ -1,0 +1,144 @@
+//! Init-cache staging for remote subscribe.
+
+use std::collections::HashMap;
+
+use parking_lot::Mutex;
+
+#[derive(Clone, Default)]
+pub struct InitCacheEntry {
+    pub metadata: Option<Vec<u8>>,
+    pub avc_header: Option<Vec<u8>>,
+    pub aac_header: Option<Vec<u8>>,
+    pub keyframe: Option<(u32, Vec<u8>)>,
+    pub epoch: u64,
+}
+
+#[derive(Default)]
+pub struct InitCacheStore {
+    inner: Mutex<HashMap<(String, String), InitCacheEntry>>,
+}
+
+impl InitCacheStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn put(&self, app: &str, stream: &str, entry: InitCacheEntry) {
+        self.inner
+            .lock()
+            .insert((app.to_string(), stream.to_string()), entry);
+    }
+
+    pub fn get(&self, app: &str, stream: &str) -> Option<InitCacheEntry> {
+        self.inner
+            .lock()
+            .get(&(app.to_string(), stream.to_string()))
+            .cloned()
+    }
+
+    pub fn remove(&self, app: &str, stream: &str) {
+        self.inner
+            .lock()
+            .remove(&(app.to_string(), stream.to_string()));
+    }
+
+    pub fn update_from_frame(
+        &self,
+        app: &str,
+        stream: &str,
+        epoch: u64,
+        frame_type: u8,
+        timestamp: u32,
+        payload: &[u8],
+    ) {
+        let Some(ft) =
+            crate::cluster::media::protocol::MediaMessage::frame_type_to_librtmp2(frame_type)
+        else {
+            return;
+        };
+        use librtmp2::media::{CacheFrameKind, classify_cache_frame};
+        let kind = classify_cache_frame(ft, payload);
+        let mut g = self.inner.lock();
+        let e = g.entry((app.to_string(), stream.to_string())).or_default();
+        // A new ownership epoch must not keep the previous publisher's
+        // metadata/headers/keyframe under the new epoch label — subscribers
+        // joining mid-handoff (or when the new publisher omits a media type)
+        // would otherwise accept incompatible init fields.
+        if e.epoch != epoch {
+            *e = InitCacheEntry {
+                epoch,
+                ..InitCacheEntry::default()
+            };
+        } else {
+            e.epoch = epoch;
+        }
+        match kind {
+            CacheFrameKind::VideoSequenceHeader => e.avc_header = Some(payload.to_vec()),
+            CacheFrameKind::VideoKeyframe => e.keyframe = Some((timestamp, payload.to_vec())),
+            CacheFrameKind::AudioSequenceHeader => e.aac_header = Some(payload.to_vec()),
+            CacheFrameKind::LiveOnly => {
+                // Metadata/script frames (types 2/3) still stage as metadata.
+                if matches!(frame_type, 2 | 3) {
+                    e.metadata = Some(payload.to_vec());
+                }
+            }
+        }
+    }
+
+    pub fn observe(
+        &self,
+        app: &str,
+        stream: &str,
+        epoch: u64,
+        frame_type: librtmp2::types::FrameType,
+        timestamp: u32,
+        payload: &[u8],
+    ) {
+        let ft =
+            crate::cluster::media::protocol::MediaMessage::frame_type_from_librtmp2(frame_type);
+        self.update_from_frame(app, stream, epoch, ft, timestamp, payload);
+    }
+
+    pub fn store_snapshot(
+        &self,
+        app: &str,
+        stream: &str,
+        epoch: u64,
+        snap: &librtmp2::server::StreamInitSnapshot,
+    ) {
+        self.put(
+            app,
+            stream,
+            InitCacheEntry {
+                metadata: snap.metadata.clone(),
+                avc_header: snap.avc_header.clone(),
+                aac_header: snap.aac_header.clone(),
+                keyframe: snap.last_keyframe.clone(),
+                epoch,
+            },
+        );
+    }
+
+    pub fn apply_wire(
+        &self,
+        app: &str,
+        stream: &str,
+        epoch: u64,
+        metadata: Option<Vec<u8>>,
+        avc_header: Option<Vec<u8>>,
+        aac_header: Option<Vec<u8>>,
+        keyframe: Option<(u32, Vec<u8>)>,
+    ) {
+        self.put(
+            app,
+            stream,
+            InitCacheEntry {
+                metadata,
+                avc_header,
+                aac_header,
+                keyframe,
+                epoch,
+            },
+        );
+    }
+}

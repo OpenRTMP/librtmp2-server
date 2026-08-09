@@ -77,6 +77,11 @@ pub struct ServerConfig {
     /// 0=error, 1=warn, 2=info, 3=debug
     pub log_level: i32,
     pub log_file: String,
+
+    /// Optional HA cluster settings (compiled only with `--features cluster`).
+    /// Runtime default remains disabled (`CLUSTER_ENABLED=false`).
+    #[cfg(feature = "cluster")]
+    pub cluster: crate::cluster::ClusterConfig,
 }
 
 impl Default for ServerConfig {
@@ -105,6 +110,8 @@ impl Default for ServerConfig {
             config_file: String::new(),
             log_level: 2,
             log_file: String::new(),
+            #[cfg(feature = "cluster")]
+            cluster: crate::cluster::ClusterConfig::default(),
         }
     }
 }
@@ -292,6 +299,12 @@ fn parse_max_body_bytes(val: &str) -> usize {
 }
 
 /// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
+#[cfg(feature = "cluster")]
+pub(crate) fn parse_env_line_public(line: &str) -> Option<(String, String)> {
+    parse_env_line(line)
+}
+
+/// Parse a single `.env` line into a (key, value) pair, skipping comments and blanks.
 fn parse_env_line(line: &str) -> Option<(String, String)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -399,17 +412,33 @@ pub fn config_load(path: &str) -> Result<ServerConfig, String> {
         config.http_bind
     );
 
+    #[cfg(feature = "cluster")]
+    {
+        // Parse file cluster keys without validating — env may disable cluster
+        // or supply missing fields after `config_apply_env`.
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot open config file: {path} ({e})"))?;
+        let mut map = std::collections::HashMap::new();
+        for line in text.lines() {
+            if let Some((k, v)) = parse_env_line(line) {
+                map.insert(k, v);
+            }
+        }
+        config.cluster =
+            crate::cluster::ClusterConfig::load_file_only_from_kv(|k| map.get(k).cloned())?;
+    }
+
     Ok(config)
 }
 
 /// Environment variables override config file values.
 /// `LRTMP2_API_TOKEN` is read during server bootstrap (see `ServerApp::bootstrap`),
 /// not here — it is persisted to the database on first startup when the DB is empty.
-pub fn config_apply_env(config: &mut ServerConfig) {
-    config_apply_env_from(config, |key| std::env::var(key).ok());
+pub fn config_apply_env(config: &mut ServerConfig) -> Result<(), String> {
+    config_apply_env_from(config, |key| std::env::var(key).ok())
 }
 
-fn config_apply_env_from<F>(config: &mut ServerConfig, mut get: F)
+fn config_apply_env_from<F>(config: &mut ServerConfig, mut get: F) -> Result<(), String>
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -544,6 +573,30 @@ where
             _ => crate::log_warn!("Ignoring invalid LRTMP2_LOG_LEVEL value '{v}' (expected 0-3)"),
         }
     }
+
+    #[cfg(feature = "cluster")]
+    {
+        // Merge `LRTMP2_CLUSTER_*` process overrides into the already-loaded
+        // file cluster block. Never rebuild from defaults — a lone
+        // `LRTMP2_CLUSTER_BIND` must not wipe enabled/node_id/secret/join.
+        let has_cluster_env = crate::cluster::config::CLUSTER_ENV_OVERRIDE_KEYS
+            .iter()
+            .any(|k| get(k).filter(|v| !v.is_empty()).is_some());
+        if has_cluster_env {
+            config
+                .cluster
+                .apply_env_overrides_from(|key| get(key))
+                .map_err(|e| {
+                    format!(
+                        "Invalid cluster env config (CLUSTER_ENABLED requires valid settings): {e}"
+                    )
+                })?;
+        }
+        if config.cluster.enabled {
+            config.cluster.validate()?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -686,7 +739,7 @@ mod tests {
         ]);
 
         let mut config = ServerConfig::default();
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
 
         assert!(config.tls_enabled);
         assert_eq!(config.tls_cert_file, "/env/cert.pem");
@@ -698,7 +751,7 @@ mod tests {
             tls_enabled: true,
             ..Default::default()
         };
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
         assert!(
             config.tls_enabled,
             "invalid value should leave TLS unchanged"
@@ -729,7 +782,7 @@ mod tests {
             ("LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR", "6"),
         ]);
         let mut config = ServerConfig::default();
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
         assert_eq!(config.rtmp_max_connections_per_addr, 8);
         assert_eq!(config.rtmp_max_pending_tls_per_addr, 6);
     }
@@ -798,7 +851,7 @@ mod tests {
         ]);
 
         let mut config = ServerConfig::default();
-        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string()));
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
 
         assert_eq!(config.http_rate_limit_window_secs, 120);
         assert_eq!(config.http_rate_limit_api, 50);

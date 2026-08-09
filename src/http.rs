@@ -14,7 +14,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query
 use axum::http::{HeaderMap, StatusCode, request::Parts};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -26,15 +26,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::ServerConfig;
-use crate::db::{Db, DbLookup, Stream, StreamAddError, StreamViewer};
+use crate::db::{Db, DbLookup, Stream, StreamViewer};
 use crate::keygen::keygen_stream_key;
 use crate::rate_limit::{self, RateLimiter};
 use crate::rtmp_bridge::DbRtmpBridge;
+use crate::state::{CoordError, StateCoordinator};
 
 pub struct AppState {
     pub db: Arc<Db>,
     pub config: ServerConfig,
+    /// Live bearer token (may be refreshed when a joiner installs the cluster token).
+    pub api_token: Arc<parking_lot::RwLock<String>>,
     pub rtmp_bridge: Arc<DbRtmpBridge>,
+    /// Durable mutations (standalone DB or Raft).
+    pub coordinator: Arc<StateCoordinator>,
     /// Stream IDs deleted via this API while RTMP connections are active.
     /// The RTMP poll loop reads this set and evicts matching connections.
     pub deleted_streams: Arc<Mutex<HashSet<String>>>,
@@ -47,7 +52,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let limiter = RateLimiter::new(
         state.config.http_rate_limit_config(),
         state.config.http_trusted_proxies.clone(),
-        &state.config.api_token,
+        Arc::clone(&state.api_token),
     );
     Router::new()
         .route("/api/v1/health", get(handle_health))
@@ -67,6 +72,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/streams/{id}/players/{player_id}",
             delete(handle_stream_player_delete),
+        )
+        .route("/api/v1/cluster", get(handle_cluster_get))
+        .route("/api/v1/cluster/nodes", get(handle_cluster_nodes))
+        .route("/api/v1/cluster/streams", get(handle_cluster_streams))
+        .route(
+            "/api/v1/cluster/nodes/{id}/drain",
+            post(handle_cluster_drain_node),
+        )
+        .route(
+            "/api/v1/cluster/nodes/{id}/resume",
+            post(handle_cluster_resume_node),
+        )
+        .route(
+            "/api/v1/cluster/nodes/{id}/promote",
+            post(handle_cluster_promote_node),
+        )
+        .route(
+            "/api/v1/cluster/nodes/{id}",
+            delete(handle_cluster_remove_node),
         )
         .layer(DefaultBodyLimit::max(state.config.http_max_body_bytes))
         .layer(middleware::from_fn_with_state(
@@ -208,7 +232,8 @@ fn xml_escape(s: &str) -> String {
 /// uses (to preview auth status for bucket selection) — sharing one
 /// implementation keeps the two checks from drifting apart.
 fn bearer_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    rate_limit::bearer_authenticated(headers, &state.config.api_token)
+    let token = state.api_token.read().clone();
+    rate_limit::bearer_authenticated(headers, &token)
 }
 
 fn stats_key_lookup(
@@ -304,8 +329,7 @@ fn viewer_to_json(v: &StreamViewer) -> Value {
     })
 }
 
-fn stream_to_json(db: &Db, s: &Stream) -> Value {
-    let players: Vec<Value> = db.viewer_list(&s.id).iter().map(viewer_to_json).collect();
+fn stream_to_json_with_players(s: &Stream, players: Vec<Value>) -> Value {
     json!({
         "id": s.id,
         "name": s.name,
@@ -317,6 +341,11 @@ fn stream_to_json(db: &Db, s: &Stream) -> Value {
         "enabled": s.enabled,
         "created_at": s.created_at,
     })
+}
+
+fn stream_to_json(db: &Db, s: &Stream) -> Value {
+    let players: Vec<Value> = db.viewer_list(&s.id).iter().map(viewer_to_json).collect();
+    stream_to_json_with_players(s, players)
 }
 
 fn create_viewer_row(
@@ -624,12 +653,27 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
 
 async fn handle_health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if bearer_ok(&state, &headers) {
+        #[cfg(feature = "cluster")]
+        {
+            if let Some(mgr) = state.coordinator.cluster_manager() {
+                return Json(json!({
+                    "status": "ok",
+                    "timestamp": now_ts(),
+                    "rtmp_port": state.config.rtmp_port(),
+                    "rtmps_enabled": state.config.tls_enabled,
+                    "rtmps_port": state.config.rtmps_port(),
+                    "cluster": mgr.health_cluster_block(),
+                }))
+                .into_response();
+            }
+        }
         return Json(json!({
             "status": "ok",
             "timestamp": now_ts(),
             "rtmp_port": state.config.rtmp_port(),
             "rtmps_enabled": state.config.tls_enabled,
             "rtmps_port": state.config.rtmps_port(),
+            "cluster": { "enabled": false },
         }))
         .into_response();
     }
@@ -1099,9 +1143,9 @@ async fn handle_stream_create(
         created_at: now_ts(),
     };
 
-    match state.db.stream_add(&s) {
-        Ok(()) => {}
-        Err(StreamAddError::Duplicate) => {
+    let default_viewer = match state.coordinator.create_stream(&s) {
+        Ok(viewer) => viewer,
+        Err(CoordError::Duplicate) => {
             log_http_access(
                 "POST",
                 PATH,
@@ -1115,7 +1159,7 @@ async fn handle_stream_create(
                 "Stream ID or access key already exists",
             );
         }
-        Err(StreamAddError::Db) => {
+        Err(_) => {
             log_http_access(
                 "POST",
                 PATH,
@@ -1129,7 +1173,7 @@ async fn handle_stream_create(
                 "Failed to create stream",
             );
         }
-    }
+    };
 
     crate::log_info!(
         "HTTP: POST /api/v1/streams from {peer} → 201 stream created id={} app={}",
@@ -1137,22 +1181,28 @@ async fn handle_stream_create(
         s.app
     );
 
-    (StatusCode::CREATED, Json(stream_to_json(&state.db, &s))).into_response()
+    let body = stream_to_json_with_players(&s, vec![viewer_to_json(&default_viewer)]);
+    (StatusCode::CREATED, Json(body)).into_response()
 }
 
 async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), ()> {
-    match state.db.stream_delete(id) {
-        Some(true) => {
+    match state.coordinator.finalize_delete_stream(id) {
+        Ok(()) => {
             state.deleted_streams.lock().remove(id);
             Ok(())
         }
-        Some(false) => {
-            let _ = state.db.stream_set_enabled(id, true);
+        Err(CoordError::NotFound) => {
+            // Already gone — success. Do not propose SetStreamEnabled(true),
+            // which would Error-stall Raft when the row no longer exists.
             state.deleted_streams.lock().remove(id);
-            Err(())
+            Ok(())
         }
-        None => {
-            let _ = state.db.stream_set_enabled(id, true);
+        Err(_) => {
+            // Only re-enable when the stream still exists (disable-not-delete
+            // failure). Skip when Missing so we don't write a stalling apply.
+            if matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
+                let _ = state.coordinator.set_stream_enabled(id, true);
+            }
             state.deleted_streams.lock().remove(id);
             Err(())
         }
@@ -1172,12 +1222,26 @@ const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
     let started = Instant::now();
     let mut last_warn = started;
-    while state.rtmp_bridge.live_conn_count_for_stream(&id) > 0 {
+    loop {
+        let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
+        #[cfg(feature = "cluster")]
+        let remote = {
+            if let Some(mgr) = state.coordinator.cluster_manager() {
+                mgr.remote_stream_session_count(&id).await
+            } else {
+                0
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let remote = 0u64;
+        if local == 0 && remote == 0 {
+            break;
+        }
         if last_warn.elapsed() >= DELETE_DRAIN_WARN_AFTER {
             crate::log_warn!(
                 "Still deleting stream '{id}' — stream stays disabled; \
-                 waiting for {} active RTMP session(s) to drain",
-                state.rtmp_bridge.live_conn_count_for_stream(&id)
+                 waiting for {} local + {remote} remote RTMP session(s) to drain",
+                local
             );
             last_warn = Instant::now();
         }
@@ -1262,7 +1326,31 @@ async fn handle_stream_delete(
     }
 
     state.deleted_streams.lock().insert(id.clone());
-    if state.db.stream_disable(&id).is_none() {
+    if let Err(e) = state.coordinator.begin_delete_stream(&id) {
+        #[cfg(feature = "cluster")]
+        let ambiguous_timeout = matches!(
+            &e,
+            CoordError::Cluster(msg) if msg == "raft write timed out"
+        );
+        #[cfg(not(feature = "cluster"))]
+        let ambiguous_timeout = {
+            let _ = &e;
+            false
+        };
+        if ambiguous_timeout {
+            // BeginDeleteStream may still commit after the caller timed out —
+            // keep the local marker and schedule finalize reconciliation.
+            crate::log_warn!(
+                "HTTP: DELETE /api/v1/streams/{id} begin_delete timed out; \
+                 reconciling via background finalize"
+            );
+            let state_bg = Arc::clone(&state);
+            let id_bg = id.clone();
+            tokio::spawn(async move {
+                wait_and_finalize_stream_delete(state_bg, id_bg).await;
+            });
+            return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
+        }
         state.deleted_streams.lock().remove(&id);
         log_http_access(
             "DELETE",
@@ -1277,8 +1365,23 @@ async fn handle_stream_delete(
             "Failed to disable stream",
         );
     }
+    #[cfg(feature = "cluster")]
+    if let Some(mgr) = state.coordinator.cluster_manager() {
+        mgr.broadcast_drain_stream(&id).await;
+    }
 
-    if state.rtmp_bridge.live_conn_count_for_stream(&id) == 0 {
+    let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
+    #[cfg(feature = "cluster")]
+    let remote = {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            mgr.remote_stream_session_count(&id).await
+        } else {
+            0
+        }
+    };
+    #[cfg(not(feature = "cluster"))]
+    let remote = 0u64;
+    if local == 0 && remote == 0 {
         return match finalize_stream_delete(&state, &id).await {
             Ok(()) => {
                 crate::log_info!(
@@ -1513,7 +1616,7 @@ async fn handle_stream_player_create(
             "Key generation failed",
         );
     };
-    if !state.db.viewer_add(&viewer) {
+    if state.coordinator.create_viewer(&viewer).is_err() {
         log_http_access(
             "POST",
             &path,
@@ -1651,16 +1754,20 @@ async fn handle_stream_player_delete(
             "Cannot delete the last play key for a stream",
         );
     }
-    match state.db.viewer_delete(&id, &player_id) {
-        Some(true) => {
+    match state.coordinator.delete_viewer(&id, &player_id) {
+        Ok(()) => {
             state.revoked_viewers.lock().insert(player_id.clone());
             state.db.players_deactivate_for_viewer(&player_id);
+            #[cfg(feature = "cluster")]
+            if let Some(mgr) = state.coordinator.cluster_manager() {
+                mgr.broadcast_revoke_viewer(&player_id).await;
+            }
             crate::log_info!(
                 "HTTP: DELETE /api/v1/streams/{id}/players/{player_id} from {peer} → 200 play key revoked"
             );
             Json(json!({"status": "deleted"})).into_response()
         }
-        Some(false) => {
+        Err(CoordError::NotFound) => {
             log_http_access(
                 "DELETE",
                 &path,
@@ -1670,7 +1777,23 @@ async fn handle_stream_player_delete(
             );
             err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found")
         }
-        None => {
+        Err(CoordError::Conflict) => {
+            // Concurrent last-viewer delete races serialize in Raft; the loser
+            // must see the same client error as the precheck, not a 500.
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::BAD_REQUEST,
+                "cannot delete last play key",
+            );
+            err_json(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "Cannot delete the last play key for a stream",
+            )
+        }
+        Err(_) => {
             log_http_access(
                 "DELETE",
                 &path,
@@ -1718,6 +1841,35 @@ async fn handle_stream_stats(
         match state.db.stream_get(&id) {
             DbLookup::Ok(_) => {
                 log_http_access("GET", &path, &peer, StatusCode::OK, "bearer");
+                #[cfg(feature = "cluster")]
+                {
+                    if let Some(mgr) = state.coordinator.cluster_manager() {
+                        let owner = state.db.stream_owner_get(&id);
+                        let local_owner = owner
+                            .as_ref()
+                            .map(|o| o.owner_node_id == mgr.node_id())
+                            .unwrap_or(true);
+                        if !local_owner && let Some(proxied) = mgr.proxy_stream_stats(&id).await {
+                            let mut body = build_json_stats(&state.db, Some(&id));
+                            if let Some(obj) = body.as_object_mut() {
+                                obj.insert("cluster_proxy".into(), proxied);
+                                obj.insert(
+                                    "owner_node_id".into(),
+                                    json!(owner.map(|o| o.owner_node_id)),
+                                );
+                            }
+                            return Json(body).into_response();
+                        }
+                        let mut body = build_json_stats(&state.db, Some(&id));
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.insert(
+                                "owner_node_id".into(),
+                                json!(owner.map(|o| o.owner_node_id)),
+                            );
+                        }
+                        return Json(body).into_response();
+                    }
+                }
                 return Json(build_json_stats(&state.db, Some(&id))).into_response();
             }
             DbLookup::Missing => {
@@ -1762,6 +1914,194 @@ async fn handle_stream_stats(
     pace_public_stats(start, response).await
 }
 
+// ---------- cluster management ----------
+
+async fn handle_cluster_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return Json(mgr.cluster_status_json()).into_response();
+        }
+    }
+    Json(json!({ "enabled": false })).into_response()
+}
+
+async fn handle_cluster_nodes(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return Json(mgr.nodes_info()).into_response();
+        }
+    }
+    Json(json!([])).into_response()
+}
+
+async fn handle_cluster_streams(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return Json(mgr.streams_info()).into_response();
+        }
+    }
+    // Standalone: surface local streams with null ownership.
+    let list: Vec<Value> = state
+        .db
+        .stream_list()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "stream_id": s.id,
+                "owner_node_id": null,
+                "epoch": null,
+                "subscribed_nodes": [],
+                "standby_nodes": [],
+                "cluster_players": state.db.player_list(Some(&s.id)).iter().filter(|p| p.active).count(),
+            })
+        })
+        .collect();
+    Json(list).into_response()
+}
+
+async fn handle_cluster_drain_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return match mgr.drain_node(id).await {
+                Ok(()) => Json(json!({"status": "draining", "node_id": id})).into_response(),
+                Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "CLUSTER_ERROR", &e),
+            };
+        }
+    }
+    let _ = id;
+    err_json(
+        StatusCode::BAD_REQUEST,
+        "CLUSTER_DISABLED",
+        "Clustering is not enabled",
+    )
+}
+
+async fn handle_cluster_resume_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return match mgr.resume_node(id).await {
+                Ok(()) => Json(json!({"status": "ready", "node_id": id})).into_response(),
+                Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "CLUSTER_ERROR", &e),
+            };
+        }
+    }
+    let _ = id;
+    err_json(
+        StatusCode::BAD_REQUEST,
+        "CLUSTER_DISABLED",
+        "Clustering is not enabled",
+    )
+}
+
+async fn handle_cluster_promote_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return match mgr.promote_learner(id).await {
+                Ok(()) => Json(json!({"status": "promoted", "node_id": id})).into_response(),
+                Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "CLUSTER_ERROR", &e),
+            };
+        }
+    }
+    let _ = id;
+    err_json(
+        StatusCode::BAD_REQUEST,
+        "CLUSTER_DISABLED",
+        "Clustering is not enabled",
+    )
+}
+
+async fn handle_cluster_remove_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return match mgr.remove_peer(id).await {
+                Ok(()) => Json(json!({"status": "removed", "node_id": id})).into_response(),
+                Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "CLUSTER_ERROR", &e),
+            };
+        }
+    }
+    let _ = id;
+    err_json(
+        StatusCode::BAD_REQUEST,
+        "CLUSTER_DISABLED",
+        "Clustering is not enabled",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1784,10 +2124,13 @@ mod tests {
             Arc::clone(&db),
             Arc::clone(&deleted_streams),
         ));
+        let api_token = Arc::new(parking_lot::RwLock::new(config.api_token.clone()));
         Arc::new(AppState {
-            db,
+            db: Arc::clone(&db),
             config,
+            api_token,
             rtmp_bridge,
+            coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
             revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
         })
@@ -1884,9 +2227,11 @@ mod tests {
             Arc::clone(&deleted_streams),
         ));
         let state = Arc::new(AppState {
-            db,
+            db: Arc::clone(&db),
+            api_token: Arc::new(parking_lot::RwLock::new(config.api_token.clone())),
             config,
             rtmp_bridge,
+            coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
             revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
         });
