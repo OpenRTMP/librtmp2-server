@@ -70,6 +70,9 @@ pub struct ClusterManager {
     /// Per-peer per-stream player counts from heartbeats.
     peer_stream_players:
         Mutex<std::collections::HashMap<NodeId, std::collections::HashMap<String, u64>>>,
+    /// Per-peer per-viewer (play-key) player counts from heartbeats.
+    peer_viewer_players:
+        Mutex<std::collections::HashMap<NodeId, std::collections::HashMap<String, u64>>>,
     /// Raft state-machine side-effect channel (drain/revoke/token).
     effects_rx:
         Mutex<Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>>,
@@ -254,6 +257,7 @@ impl ClusterManager {
             session_hooks: Mutex::new(None),
             peer_session_counts: Mutex::new(std::collections::HashMap::new()),
             peer_stream_players: Mutex::new(std::collections::HashMap::new()),
+            peer_viewer_players: Mutex::new(std::collections::HashMap::new()),
             effects_rx: Mutex::new(Some(effects_rx)),
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
@@ -318,6 +322,10 @@ impl ClusterManager {
                         .peer_stream_players
                         .lock()
                         .insert(info.node_id, info.stream_players.into_iter().collect());
+                    counts_hb
+                        .peer_viewer_players
+                        .lock()
+                        .insert(info.node_id, info.viewer_players.into_iter().collect());
                 });
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
@@ -926,9 +934,15 @@ impl ClusterManager {
                 // Treating "already exists" as a no-op success would leave
                 // Raft membership (and thus replication) still targeting the
                 // old address, so this blank learner would never catch up.
-                // SetNodes replaces the registered address for an existing
-                // member, which lets OpenRaft's normal log/snapshot
-                // catch-up target the right place.
+                // Refuse while the existing member is still active; only
+                // SetNodes once it has been fenced (DOWN/LEAVING) so a
+                // duplicate ID cannot redirect replication away from a live voter.
+                if self.active_member_blocks_rejoin(node_id) {
+                    return Err(format!(
+                        "node {node_id} is already an active cluster member; \
+                         refuse address replacement until the existing member is DOWN or LEAVING"
+                    ));
+                }
                 crate::log_warn!(
                     "Cluster: node {node_id} rejoined with an existing ID at {control_addr}; \
                      updating registered address for catch-up (likely a reseeded replacement)"
@@ -1045,6 +1059,35 @@ impl ClusterManager {
         }
     }
 
+    /// Clone hooks out of the mutex before invoking callbacks that may need
+    /// to re-enter `session_hooks` (e.g. `mark_stream_draining`).
+    fn force_unpublish_and_drain(&self, stream_id: &str) {
+        let hooks = self.session_hooks.lock().clone();
+        let Some(hooks) = hooks else {
+            return;
+        };
+        (hooks.force_unpublish_stream)(stream_id);
+        hooks.deleted_streams.lock().insert(stream_id.to_string());
+    }
+
+    /// True when `node_id` is still an active Raft member that should not be
+    /// silently address-replaced by a rejoining process with the same ID.
+    fn active_member_blocks_rejoin(&self, node_id: NodeId) -> bool {
+        let in_membership = self.peer_in_membership(node_id);
+        if !in_membership {
+            return false;
+        }
+        let peers = self.health.peers_snapshot();
+        match peers.into_iter().find(|(id, _)| *id == node_id) {
+            Some((_, h)) => {
+                !matches!(h.state, NodeHealthState::Down | NodeHealthState::Leaving)
+            }
+            // In membership but never heartbeated locally — treat as active
+            // until fenced DOWN by sweep, so a live peer cannot be redirected.
+            None => true,
+        }
+    }
+
     fn mark_stream_drain_clear(&self, stream_id: &str) {
         if self.local_live_sessions(stream_id) > 0 {
             // This node can apply DrainStream and ClearDrainStream back to
@@ -1145,10 +1188,7 @@ impl ClusterManager {
                          forcing local publisher off",
                         p.stream_id
                     );
-                    if let Some(hooks) = self.session_hooks.lock().as_ref() {
-                        (hooks.force_unpublish_stream)(&p.stream_id);
-                        self.mark_stream_draining(&p.stream_id);
-                    }
+                    self.force_unpublish_and_drain(&p.stream_id);
                 }
             }
         }
@@ -1254,11 +1294,8 @@ impl ClusterManager {
             );
             self.health.set_local(NodeHealthState::Leaving);
             self.admission.force_drain();
-            if let Some(hooks) = self.session_hooks.lock().as_ref() {
-                for p in self.db.publisher_list_all() {
-                    (hooks.force_unpublish_stream)(&p.stream_id);
-                    self.mark_stream_draining(&p.stream_id);
-                }
+            for p in self.db.publisher_list_all() {
+                self.force_unpublish_and_drain(&p.stream_id);
             }
         }
         for (id, _, _) in self.meta.all() {
@@ -1271,6 +1308,7 @@ impl ClusterManager {
             self.network.nodes.write().remove(&id);
             self.peer_session_counts.lock().remove(&id);
             self.peer_stream_players.lock().remove(&id);
+            self.peer_viewer_players.lock().remove(&id);
             crate::log_info!("Cluster: pruned removed node {id} from local topology caches");
         }
     }
@@ -1333,6 +1371,15 @@ impl ClusterManager {
             }
         }
         Err(primary_err)
+    }
+
+    /// Sum active play sessions for `viewer_id` across peers (excludes local).
+    pub fn remote_viewer_session_count_cached(&self, viewer_id: &str) -> u64 {
+        let counts = self.peer_viewer_players.lock();
+        counts
+            .values()
+            .map(|m| m.get(viewer_id).copied().unwrap_or(0))
+            .sum()
     }
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
@@ -1536,10 +1583,7 @@ impl ClusterManager {
                 // Applied owner moved away (or cleared) while we still have a
                 // local publisher — kick it so we don't serve under a stale
                 // epoch after isolation catch-up.
-                if let Some(hooks) = self.session_hooks.lock().as_ref() {
-                    (hooks.force_unpublish_stream)(stream_id);
-                    self.mark_stream_draining(stream_id);
-                }
+                self.force_unpublish_and_drain(stream_id);
             }
             let Some((old_node, _)) = old_owner else {
                 continue;
@@ -1660,6 +1704,7 @@ impl ClusterManager {
                             self.health.mark_ownership_released(id);
                             self.peer_session_counts.lock().remove(&id);
                             self.peer_stream_players.lock().remove(&id);
+                            self.peer_viewer_players.lock().remove(&id);
                         }
                         Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
                     }
@@ -1700,10 +1745,16 @@ impl ClusterManager {
                 .count() as u64;
             let mut stream_players: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
+            let mut viewer_players: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
             for p in self.db.player_list_all().iter().filter(|p| p.active) {
                 *stream_players.entry(p.stream_id.clone()).or_insert(0) += 1;
+                if !p.viewer_id.is_empty() {
+                    *viewer_players.entry(p.viewer_id.clone()).or_insert(0) += 1;
+                }
             }
             let stream_players: Vec<(String, u64)> = stream_players.into_iter().collect();
+            let viewer_players: Vec<(String, u64)> = viewer_players.into_iter().collect();
             let advertise = self.config.advertise_control();
             let media_advertise = self.config.advertise_media();
             self.prune_topology_to_membership();
@@ -1726,6 +1777,7 @@ impl ClusterManager {
                 let media_advertise = media_advertise.clone();
                 let health = health.clone();
                 let stream_players = stream_players.clone();
+                let viewer_players = viewer_players.clone();
                 let tls = tls.clone();
                 async move {
                     let _ = id;
@@ -1740,6 +1792,7 @@ impl ClusterManager {
                         local_pubs,
                         local_players,
                         stream_players,
+                        viewer_players,
                         tls,
                     )
                     .await;

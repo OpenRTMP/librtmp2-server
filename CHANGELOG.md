@@ -14,6 +14,18 @@ begin at `1.0.0`.
 ## [Unreleased]
 
 ### Fixed
+- Outbound media-peer readers stamp the authenticated peer id so inbound
+  `MediaFrame`/`InitCache` require `accepts_owner` (same fence as direct accepts).
+- Failed outbound `Subscribe` try_send rolls back the subscription refcount so
+  later players can retry instead of assuming the owner is already forwarding.
+- Standalone Docker builds pin the cloned `librtmp2` checkout to `Cargo.toml`'s
+  `rev` (override with `LIBRTMP2_REF`) instead of tracking moving `main`.
+- Join rejects address replacement for an already-active member node id until
+  that member is `DOWN` or `LEAVING`.
+- Session-hook force-unpublish/drain clones hooks before nested lock re-entry
+  (membership Leaving, isolation reconcile, ownership sync).
+- Heartbeats carry per-viewer player counts; play admission enforces the
+  per-play-key connection cap cluster-wide against that cache.
 - A node pruned out of Raft membership enters `Leaving`, force-drains, and
   force-unpublishes local streams so it does not keep serving after removal.
 - `force_drain` sets the manual-drain flag without weakening stronger health

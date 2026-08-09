@@ -180,7 +180,10 @@ pub struct MediaHub {
     cache: InitCacheStore,
     timelines: Mutex<HashMap<(String, String), TimelineRemapper>>,
     inject: Arc<InjectQueue>,
-    inbound_tx: mpsc::Sender<MediaMessage>,
+    /// Inbound frames from outbound `MediaPeer` readers, stamped with the
+    /// authenticated remote node id so ownership fencing matches the direct
+    /// accept path (`handle_inbound_conn`).
+    inbound_tx: mpsc::Sender<(NodeId, MediaMessage)>,
     shutdown: AtomicBool,
     tls_server: Option<Arc<ServerConfig>>,
     tls_client: Option<Arc<ClientConfig>>,
@@ -200,7 +203,8 @@ impl MediaHub {
         tls_client: Option<Arc<ClientConfig>>,
         is_peer_allowed: MediaMembershipFn,
     ) -> Arc<Self> {
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<MediaMessage>(MEDIA_INBOUND_QUEUE);
+        let (inbound_tx, mut inbound_rx) =
+            mpsc::channel::<(NodeId, MediaMessage)>(MEDIA_INBOUND_QUEUE);
         let (peer_reconnect_tx, mut peer_reconnect_rx) = mpsc::unbounded_channel::<NodeId>();
         let hub = Arc::new(Self {
             local_id,
@@ -222,8 +226,8 @@ impl MediaHub {
         });
         let hub_c = Arc::clone(&hub);
         tokio::spawn(async move {
-            while let Some(msg) = inbound_rx.recv().await {
-                hub_c.handle_inbound(msg);
+            while let Some((peer_id, msg)) = inbound_rx.recv().await {
+                hub_c.handle_inbound(peer_id, msg);
             }
         });
         let hub_r = Arc::clone(&hub);
@@ -448,7 +452,7 @@ impl MediaHub {
                     }
                     MediaMessage::StatsReq { stream_id: _ } => {}
                     other => {
-                        let _ = self.inbound_tx.try_send(other);
+                        let _ = self.inbound_tx.try_send((peer_id, other));
                     }
                 }
             }
@@ -464,7 +468,7 @@ impl MediaHub {
         result
     }
 
-    fn handle_inbound(&self, msg: MediaMessage) {
+    fn handle_inbound(&self, peer_id: NodeId, msg: MediaMessage) {
         match msg {
             MediaMessage::MediaFrame {
                 app,
@@ -475,7 +479,10 @@ impl MediaHub {
                 payload,
                 ..
             } => {
-                if !self.ownership.accepts_epoch(&stream, epoch) {
+                // Same owner+epoch fence as the direct inbound-connection path —
+                // epoch alone would let any connected member inject under a
+                // stolen fencing token via the outbound MediaPeer reader.
+                if !self.ownership.accepts_owner(&stream, peer_id, epoch) {
                     return;
                 }
                 let timestamp = {
@@ -507,7 +514,7 @@ impl MediaHub {
                 aac_header,
                 keyframe,
             } => {
-                if !self.ownership.accepts_epoch(&stream, epoch) {
+                if !self.ownership.accepts_owner(&stream, peer_id, epoch) {
                     return;
                 }
                 self.cache.put(
@@ -618,6 +625,9 @@ impl MediaHub {
         };
         for (app, stream) in self.subs.streams_for_peer(peer_id) {
             let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
+            // Soft control: if the queue rejects, leave the refcount in place
+            // for a later reconnect/resubscribe — this path is only entered
+            // after a fresh connection already exists.
             let _ = peer.try_send(MediaMessage::Subscribe { app, stream, epoch });
         }
     }
@@ -638,11 +648,17 @@ impl MediaHub {
         // this peer, including the one just added above — sending it again
         // here would just double the owner's per-connection subscribe tally.
         if !fresh {
-            let _ = peer.try_send(MediaMessage::Subscribe {
+            let ok = peer.try_send(MediaMessage::Subscribe {
                 app: app.to_string(),
                 stream: stream.to_string(),
                 epoch,
             });
+            if ok.is_err() {
+                // Refcount was recorded before the wire send; roll it back so
+                // a later player can retry Subscribe instead of assuming the
+                // owner is already forwarding for us.
+                let _ = self.subs.remove(peer_id, app, stream);
+            }
         }
     }
 

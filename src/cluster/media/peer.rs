@@ -87,7 +87,7 @@ impl MediaPeer {
         secret: String,
         local_id: NodeId,
         max_queue_mb: u32,
-        inbound: mpsc::Sender<MediaMessage>,
+        inbound: mpsc::Sender<(NodeId, MediaMessage)>,
         tls_client: Option<Arc<ClientConfig>>,
         on_reconnected: mpsc::UnboundedSender<NodeId>,
     ) -> Self {
@@ -205,9 +205,9 @@ async fn connect_and_run(
     addr: &str,
     secret: &str,
     local_id: NodeId,
-    _peer_id: NodeId,
+    peer_id: NodeId,
     outbound: &mut mpsc::Receiver<MediaMessage>,
-    inbound: &mpsc::Sender<MediaMessage>,
+    inbound: &mpsc::Sender<(NodeId, MediaMessage)>,
     queue_bytes: &AtomicUsize,
     _max_queue: usize,
     closed: &AtomicBool,
@@ -246,7 +246,9 @@ async fn connect_and_run(
         while !rc.load(Ordering::Relaxed) {
             match read_media_frame(&mut rh).await {
                 Ok(msg) => {
-                    if inbound_c.try_send(msg).is_err() {
+                    // Stamp the authenticated remote node so the hub can apply
+                    // the same accepts_owner fence as direct inbound accepts.
+                    if inbound_c.try_send((peer_id, msg)).is_err() {
                         tracing::warn!("media inbound queue full — dropping frame");
                     }
                 }

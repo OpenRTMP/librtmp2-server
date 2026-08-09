@@ -152,6 +152,9 @@ pub enum ControlMessage {
         /// Per-stream active player counts `(stream_id, count)`.
         #[serde(default)]
         stream_players: Vec<(String, u64)>,
+        /// Per-viewer (play-key) active player counts `(viewer_id, count)`.
+        #[serde(default)]
+        viewer_players: Vec<(String, u64)>,
     },
     /// Follower-forwarded durable mutation (`ClusterCommand` as JSON).
     ClientWrite(serde_json::Value),
@@ -429,6 +432,7 @@ pub struct HeartbeatInfo {
     pub publishers: u64,
     pub players: u64,
     pub stream_players: Vec<(String, u64)>,
+    pub viewer_players: Vec<(String, u64)>,
 }
 
 /// Accept control-plane connections and dispatch Raft / admin messages.
@@ -717,6 +721,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             publishers,
             players,
             stream_players,
+            viewer_players,
         } => {
             // Bind heartbeats to the authenticated peer — a secret-holder must
             // not rewrite another member's addrs by spoofing node_id.
@@ -732,6 +737,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 publishers,
                 players,
                 stream_players,
+                viewer_players,
             });
             ControlMessage::AdminOk
         }
@@ -1092,6 +1098,7 @@ pub async fn send_heartbeat(
     publishers: u64,
     players: u64,
     stream_players: Vec<(String, u64)>,
+    viewer_players: Vec<(String, u64)>,
     tls_client: Option<Arc<ClientConfig>>,
 ) {
     let _ = tokio::time::timeout(Duration::from_millis(500), async {
@@ -1109,6 +1116,7 @@ pub async fn send_heartbeat(
                 publishers,
                 players,
                 stream_players,
+                viewer_players,
             },
         )
         .await;

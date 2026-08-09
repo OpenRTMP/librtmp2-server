@@ -1737,6 +1737,19 @@ impl Db {
         self.player_list(None)
     }
 
+    /// Active player sessions for a configured viewer (play-key row).
+    pub fn player_active_count_for_viewer(&self, viewer_id: &str) -> u64 {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1",
+            params![viewer_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(0)
+    }
+
     // ==================== STATS SAMPLES ====================
 
     #[allow(dead_code)]

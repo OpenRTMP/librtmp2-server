@@ -1060,6 +1060,36 @@ impl DbRtmpBridge {
             // otherwise a failed switch would leave the prior stream unsubscribed.
         }
 
+        #[cfg(feature = "cluster")]
+        {
+            // Heartbeats carry per-viewer session counts so the documented
+            // per-play-key cap holds cluster-wide (local SQLite alone would
+            // admit MAX × node_count). Soft: races within one heartbeat
+            // interval can still briefly overshoot.
+            if let Some(coord) = self.coordinator.lock().clone()
+                && let Some(mgr) = coord.cluster_manager()
+            {
+                let local = self.db.player_active_count_for_viewer(&viewer.id);
+                let remote = mgr.remote_viewer_session_count_cached(&viewer.id);
+                if local.saturating_add(remote)
+                    >= crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64
+                {
+                    if let Some(ref prior) = old_player
+                        && !self.restore_player_row(prior)
+                    {
+                        crate::log_error!(
+                            "RTMP: play rollback failed — prior player row not restored from {peer}"
+                        );
+                    }
+                    crate::log_warn!(
+                        "RTMP: play rejected — cluster-wide connection limit ({}) reached for play key from {peer}",
+                        crate::db::MAX_CONNECTIONS_PER_PLAY_KEY
+                    );
+                    return Err(AuthFailureKind::RecognizedKey);
+                }
+            }
+        }
+
         if !self.db.player_try_acquire(&player_row) {
             if let Some(ref prior) = old_player
                 && !self.restore_player_row(prior)
