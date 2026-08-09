@@ -11,8 +11,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG LIBRTMP2_GIT=https://github.com/OpenRTMP/librtmp2.git
-# Empty = pin to the `rev` in Cargo.toml (standalone reproducible builds).
-# Override for monorepo/testing (branch name or commit SHA).
+# Empty (default) = resolve librtmp2 normally via the crates.io `version`
+# dependency in Cargo.toml. Set to a branch/tag/commit SHA to instead build
+# against an unpublished librtmp2 git ref (monorepo/testing).
 ARG LIBRTMP2_REF=
 
 WORKDIR /build
@@ -25,16 +26,10 @@ RUN set -eu; \
       mv /build/context/librtmp2-server /build/librtmp2-server; \
     elif [ -f /build/context/Cargo.toml ] && grep -q 'name = "librtmp2-server"' /build/context/Cargo.toml; then \
       mv /build/context /build/librtmp2-server; \
-      ref="${LIBRTMP2_REF}"; \
-      if [ -z "$ref" ]; then \
-        ref="$(sed -n 's/.*rev = "\([^"]*\)".*/\1/p' /build/librtmp2-server/Cargo.toml | head -n1)"; \
+      if [ -n "${LIBRTMP2_REF}" ]; then \
+        git clone "${LIBRTMP2_GIT}" /build/librtmp2; \
+        git -C /build/librtmp2 checkout --detach "${LIBRTMP2_REF}"; \
       fi; \
-      if [ -z "$ref" ]; then \
-        echo "LIBRTMP2_REF empty and no rev= in Cargo.toml" >&2; \
-        exit 1; \
-      fi; \
-      git clone "${LIBRTMP2_GIT}" /build/librtmp2; \
-      git -C /build/librtmp2 checkout --detach "$ref"; \
     else \
       echo "Unrecognized build context; expected OpenRTMP parent or librtmp2-server root" >&2; \
       exit 1; \
