@@ -28,7 +28,7 @@ begin at `1.0.0`.
 - Raft `CreateStream` carries a pre-generated default viewer for identical
   replica applies; StatsProxy for non-owner stream stats.
 - Multi-node loopback tests in `tests/cluster_ha.rs`.
-- Depends on `librtmp2` 0.7 path (relay export / inject / init snapshot).
+- Depends on `librtmp2` 0.7.0 (`rev` pinned to the main merge of OpenRTMP/librtmp2#202).
 - Follower durable writes forward to the Raft leader over the authenticated
   control plane (`ClientWrite`); clients never need leader discovery.
 
