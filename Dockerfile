@@ -3,7 +3,7 @@
 #   docker build -t librtmp2-server .
 # Monorepo (parent OpenRTMP with sibling librtmp2/):
 #   docker build -f librtmp2-server/Dockerfile .
-FROM rust:1.97-bookworm AS builder
+FROM rust:latest AS builder
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
