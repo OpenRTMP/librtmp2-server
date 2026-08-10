@@ -701,9 +701,7 @@ impl ClusterManager {
                 Ok(resp) => Ok(resp.data),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
                     let token = api_token.ok_or_else(|| {
-                        CoordError::Cluster(
-                            "API token unavailable for cluster admin write".into(),
-                        )
+                        CoordError::Cluster("API token unavailable for cluster admin write".into())
                     })?;
                     let req = serde_json::to_value(&cmd)
                         .map_err(|e| CoordError::Cluster(e.to_string()))?;
