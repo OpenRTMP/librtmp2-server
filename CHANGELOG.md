@@ -13,6 +13,33 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-10
+
+### Security
+- All durable control-plane `ClientWrite` commands require `admin_proof`,
+  including stream ownership (not only token/stream admin mutations).
+- Peer `AdminDrain` / `AdminResume` carry and verify `admin_proof`.
+- Network `DrainStream` / `RevokeViewer` hints are ignored unless local durable
+  state already shows pending delete or a missing viewer.
+
+### Fixed
+- Dual-role RTMP connections release only the deleted publish or play role;
+  `pending_relay` is cleared; the TCP connection is kicked only when no
+  authorized role remains.
+- Async stream delete drains are capped (300s). Stuck ConnState roles are
+  abandoned with ownership release, media unsubscribe, and force-close so
+  finalize cannot hang forever.
+- `relay_key` is not pointed at a stream that is still in `deleted_streams`
+  when a role release fails mid-drain.
+- `admin_proof` is computed only on `ForwardToLeader` so local-leader Raft
+  writes (e.g. health / ownership) work before session hooks are registered.
+- Docker image builds again on Alpine/musl (builder + runtime) instead of a
+  glibc binary under Alpine/`gcompat` (container exit 127). Musl release
+  links with `openssl-libs-static`.
+
+### Changed
+- Package version `0.2.0` → `0.2.1`.
+
 ## [0.2.0] — 2026-08-09
 
 ### Added
@@ -432,7 +459,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.7...v0.1.8
