@@ -1118,9 +1118,7 @@ impl ClusterManager {
         match self.db.stream_get(stream_id) {
             crate::db::DbLookup::Missing => true,
             crate::db::DbLookup::Failed => false,
-            crate::db::DbLookup::Ok(_) => {
-                self.db.stream_pending_delete(stream_id) == Some(true)
-            }
+            crate::db::DbLookup::Ok(_) => self.db.stream_pending_delete(stream_id) == Some(true),
         }
     }
 

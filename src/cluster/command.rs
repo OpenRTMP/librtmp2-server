@@ -130,9 +130,7 @@ mod tests {
             }
             .requires_admin_proof()
         );
-        assert!(
-            ClusterCommand::ReleaseOwnersForNode { node_id: 1 }.requires_admin_proof()
-        );
+        assert!(ClusterCommand::ReleaseOwnersForNode { node_id: 1 }.requires_admin_proof());
         assert!(ClusterCommand::SetApiToken { token: "t".into() }.requires_admin_proof());
         assert!(
             ClusterCommand::CreateStream {
