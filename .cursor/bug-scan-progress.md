@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: server (2026-08-08)
+Last scanned: rtmp_bridge (2026-08-10)
 
 ## Modules
 
@@ -8,9 +8,20 @@ Last scanned: server (2026-08-08)
 - [x] db — SQLite persistence, stream/publisher/player CRUD
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
-- [ ] rtmp_bridge — RTMP protocol ↔ DB integration seam
+- [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [ ] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-08-10 rtmp_bridge pass)
+
+- **Critical (fixed):** `live_conn_count_for_stream` and delete/eviction helpers
+  keyed only on `ConnState.stream_id`, which follows the publisher when both
+  roles are active. A connection publishing stream A while playing stream B
+  (supported by `authorize_play` stream-switch tests) was invisible to stream B
+  drain/kick: `wait_and_finalize_stream_delete` saw `local=0`, finalized early,
+  and `deleted_streams` markers for B could drop while the player was still live.
+  Counting and eviction now use publisher/player row `stream_id` via
+  `stream_ids_for_conn`.
 
 ## Findings (2026-08-08 server pass)
 
