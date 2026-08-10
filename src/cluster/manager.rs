@@ -679,7 +679,28 @@ impl ClusterManager {
         Ok(())
     }
 
+    fn client_write_admin_proof(&self, cmd: &ClusterCommand) -> Result<String, CoordError> {
+        let req = serde_json::to_value(cmd).map_err(|e| CoordError::Cluster(e.to_string()))?;
+        let req_str =
+            serde_json::to_string(&req).map_err(|e| CoordError::Cluster(e.to_string()))?;
+        let token = self
+            .session_hooks
+            .lock()
+            .as_ref()
+            .map(|h| h.api_token.read().clone())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                CoordError::Cluster("API token unavailable for cluster admin write".into())
+            })?;
+        Ok(crate::cluster::security::admin_proof(&token, &req_str))
+    }
+
     fn block_on_write(&self, cmd: ClusterCommand) -> Result<ClusterResponse, CoordError> {
+        let proof = if cmd.requires_admin_proof() {
+            self.client_write_admin_proof(&cmd)?
+        } else {
+            String::new()
+        };
         let raft = self.raft.clone();
         let secret = self.config.secret.clone();
         let local_id = self.config.node_id;
@@ -701,7 +722,7 @@ impl ClusterManager {
                         .ok_or_else(|| {
                             CoordError::Cluster("no leader available to forward write".into())
                         })?;
-                    network::send_client_write(&addr, &secret, local_id, cmd, tls_client)
+                    network::send_client_write(&addr, &secret, local_id, cmd, proof, tls_client)
                         .await
                         .map_err(CoordError::Cluster)
                 }
