@@ -1220,7 +1220,7 @@ const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 /// Cap how long delete waits for RTMP drain. Stuck ConnState roles (failed DB
 /// deactivate) must not block finalize forever — abandon local roles then proceed.
 #[cfg(test)]
-const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -1249,7 +1249,6 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
                 DELETE_DRAIN_TIMEOUT.as_secs().max(1)
             );
             state.rtmp_bridge.abandon_roles_for_stream(&id);
-            state.deleted_streams.lock().insert(id.clone());
             break;
         }
         if last_warn.elapsed() >= DELETE_DRAIN_WARN_AFTER {

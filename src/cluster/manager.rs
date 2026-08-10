@@ -679,38 +679,37 @@ impl ClusterManager {
         Ok(())
     }
 
-    fn client_write_admin_proof(&self, cmd: &ClusterCommand) -> Result<String, CoordError> {
-        let req = serde_json::to_value(cmd).map_err(|e| CoordError::Cluster(e.to_string()))?;
-        let req_str =
-            serde_json::to_string(&req).map_err(|e| CoordError::Cluster(e.to_string()))?;
-        let token = self
-            .session_hooks
-            .lock()
-            .as_ref()
-            .map(|h| h.api_token.read().clone())
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| {
-                CoordError::Cluster("API token unavailable for cluster admin write".into())
-            })?;
-        Ok(crate::cluster::security::admin_proof(&token, &req_str))
-    }
-
     fn block_on_write(&self, cmd: ClusterCommand) -> Result<ClusterResponse, CoordError> {
-        // Proof is required for every control-plane ClientWrite (including
-        // ownership). Local leaders still apply via raft.client_write below;
-        // the proof is only sent on ForwardToLeader.
-        let proof = self.client_write_admin_proof(&cmd)?;
+        // Admin proof is only needed when forwarding to a remote leader.
+        // Local-leader `raft.client_write` must not depend on session_hooks —
+        // health_loop / ownership can run before `register_session_hooks`.
         let raft = self.raft.clone();
         let secret = self.config.secret.clone();
         let local_id = self.config.node_id;
         let meta = Arc::clone(&self.meta);
         let tls_client = self.tls_client.clone();
+        let api_token = self
+            .session_hooks
+            .lock()
+            .as_ref()
+            .map(|h| h.api_token.read().clone())
+            .filter(|t| !t.is_empty());
         let fut = async move {
             use openraft::error::{ClientWriteError, RaftError};
 
             match raft.client_write(cmd.clone()).await {
                 Ok(resp) => Ok(resp.data),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                    let token = api_token.ok_or_else(|| {
+                        CoordError::Cluster(
+                            "API token unavailable for cluster admin write".into(),
+                        )
+                    })?;
+                    let req = serde_json::to_value(&cmd)
+                        .map_err(|e| CoordError::Cluster(e.to_string()))?;
+                    let req_str = serde_json::to_string(&req)
+                        .map_err(|e| CoordError::Cluster(e.to_string()))?;
+                    let proof = crate::cluster::security::admin_proof(&token, &req_str);
                     let addr = ftl
                         .leader_node
                         .map(|n| n.addr)

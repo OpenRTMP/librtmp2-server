@@ -201,32 +201,6 @@ pub(crate) fn live_stream_ids_for_deleted_markers(
     live
 }
 
-/// True when any publisher/player role on this connection targets a deleted stream.
-fn conn_references_deleted_stream(
-    rtmp_bridge: &DbRtmpBridge,
-    conn_id: u64,
-    entry: &TrackedConn,
-    deleted_now: &HashSet<String>,
-) -> bool {
-    let pub_hit = rtmp_bridge
-        .publisher_stream_id_for_conn(conn_id)
-        .is_some_and(|sid| deleted_now.contains(&sid));
-    let play_hit = rtmp_bridge
-        .player_stream_id_for_conn(conn_id)
-        .is_some_and(|sid| deleted_now.contains(&sid));
-    if pub_hit || play_hit {
-        return true;
-    }
-    let bridge_ids = rtmp_bridge.stream_ids_for_conn(conn_id);
-    if bridge_ids.is_empty()
-        && !entry.stream_id.is_empty()
-        && deleted_now.contains(&entry.stream_id)
-    {
-        return true;
-    }
-    false
-}
-
 /// Drop bridge/library roles whose stream was deleted. Returns `true` when the
 /// TCP connection must be kicked (no surviving authorized role).
 ///
@@ -304,9 +278,14 @@ fn drain_deleted_stream_roles(
         // Drop queued frames from the deleted role so they cannot drain onto
         // the surviving publisher/player route after relay_key is rewritten.
         conn.pending_relay.clear();
-        if !sid.is_empty() {
+        // If DB deactivation failed, stream_id_for_conn may still be the
+        // deleted stream — never enable relay on a stream being deleted.
+        if !sid.is_empty() && !deleted_now.contains(&sid) {
             conn.relay_key = sid;
             conn.relay_enabled = true;
+        } else {
+            conn.relay_key.clear();
+            conn.relay_enabled = false;
         }
         return false;
     }
@@ -387,6 +366,15 @@ pub(crate) fn process_server_connections(
                 "RTMP: closing idle conn={conn_id} from {} (no publish/play within {}s)",
                 conn.remote_addr,
                 idle_timeout.as_secs()
+            );
+            reject_indices.push(idx);
+            continue;
+        }
+
+        if rtmp_bridge.take_pending_force_close(conn_id) {
+            crate::log_info!(
+                "RTMP: force-closing conn={conn_id} from {} after delete-drain timeout",
+                conn.remote_addr
             );
             reject_indices.push(idx);
             continue;
@@ -508,9 +496,7 @@ pub(crate) fn process_server_connections(
 
         // Tear down roles whose stream was deleted. Dual-role conns keep the
         // surviving role; kick only when nothing authorized remains.
-        if conn_references_deleted_stream(rtmp_bridge, conn_id, entry, deleted_now)
-            && drain_deleted_stream_roles(conn, entry, rtmp_bridge, conn_id, deleted_now)
-        {
+        if drain_deleted_stream_roles(conn, entry, rtmp_bridge, conn_id, deleted_now) {
             reject_indices.push(idx);
             continue;
         }
