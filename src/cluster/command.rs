@@ -75,12 +75,21 @@ pub enum ClusterResponse {
 
 impl ClusterCommand {
     /// Commands that may be proposed over the inter-node control plane.
-    /// Authenticated members may forward any durable command — followers that
-    /// already validated an HTTP bearer token use `ClientWrite` so the
-    /// any-node admin API works without client-side leader discovery.
     pub fn allowed_on_control_plane(&self) -> bool {
         let _ = self;
         true
+    }
+
+    /// Whether a `ClientWrite` over the control plane must carry an HTTP-API
+    /// `admin_proof`. Ownership acquire/release is excluded so nodes can
+    /// coordinate RTMP sessions without holding the admin bearer token.
+    pub fn requires_admin_proof(&self) -> bool {
+        !matches!(
+            self,
+            ClusterCommand::AcquireStreamOwner { .. }
+                | ClusterCommand::ReleaseStreamOwner { .. }
+                | ClusterCommand::ReleaseOwnersForNode { .. }
+        )
     }
 }
 
@@ -122,5 +131,19 @@ mod tests {
             .allowed_on_control_plane()
         );
         assert!(ClusterCommand::SetApiToken { token: "t".into() }.allowed_on_control_plane());
+    }
+
+    #[test]
+    fn ownership_commands_skip_admin_proof() {
+        assert!(
+            !ClusterCommand::AcquireStreamOwner {
+                stream_id: "s".into(),
+                node_id: 1,
+                epoch: 1,
+                acquired_at: 0,
+            }
+            .requires_admin_proof()
+        );
+        assert!(ClusterCommand::SetApiToken { token: "t".into() }.requires_admin_proof());
     }
 }

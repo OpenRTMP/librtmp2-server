@@ -157,7 +157,11 @@ pub enum ControlMessage {
         viewer_players: Vec<(String, u64)>,
     },
     /// Follower-forwarded durable mutation (`ClusterCommand` as JSON).
-    ClientWrite(serde_json::Value),
+    ClientWrite {
+        req: serde_json::Value,
+        #[serde(default)]
+        proof: String,
+    },
     /// `{"ok":true,"data":...}` or `{"ok":false,"error":"..."}`.
     ClientWriteResp(serde_json::Value),
     /// Follower-forwarded OpenRaft membership change (JSON `ChangeMembers`).
@@ -749,17 +753,24 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 body: on_stats(stream_id),
             }
         }
-        ControlMessage::ClientWrite(req) => {
+        ControlMessage::ClientWrite { req, proof } => {
             if !is_member(peer_id) {
                 return Err(std::io::Error::other("peer not in membership"));
             }
             use crate::cluster::command::ClusterCommand;
             let cmd: ClusterCommand =
-                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
+                serde_json::from_value(req.clone()).map_err(|e| std::io::Error::other(e))?;
             if !cmd.allowed_on_control_plane() {
                 return Err(std::io::Error::other(
                     "cluster command not allowed on control plane",
                 ));
+            }
+            if cmd.requires_admin_proof() {
+                let req_str = serde_json::to_string(&req)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if !verify_admin_proof(&proof, &req_str) {
+                    return Err(std::io::Error::other("invalid client write admin proof"));
+                }
             }
             use openraft::error::{ClientWriteError, RaftError};
             let body = match raft.client_write(cmd.clone()).await {
@@ -787,6 +798,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                             &ctx.secret,
                             ctx.local_id,
                             cmd,
+                            proof,
                             ctx.tls_client.clone(),
                         )
                         .await
@@ -1188,6 +1200,7 @@ pub async fn send_client_write(
     secret: &str,
     local_id: NodeId,
     cmd: crate::cluster::command::ClusterCommand,
+    proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<crate::cluster::command::ClusterResponse, String> {
     let req = serde_json::to_value(&cmd).map_err(|e| e.to_string())?;
@@ -1196,7 +1209,7 @@ pub async fn send_client_write(
         secret,
         local_id,
         tls_client,
-        ControlMessage::ClientWrite(req),
+        ControlMessage::ClientWrite { req, proof },
     )
     .await?
     {

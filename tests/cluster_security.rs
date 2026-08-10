@@ -20,18 +20,17 @@ fn auth_response_binds_node_id() {
 
 #[test]
 fn control_plane_allows_member_forwarded_admin_commands() {
-    // Authenticated members may forward HTTP-authorized admin writes via
-    // ClientWrite so the any-node API works without leader discovery.
     assert!(ClusterCommand::SetApiToken { token: "x".into() }.allowed_on_control_plane());
     assert!(
-        ClusterCommand::AcquireStreamOwner {
+        !ClusterCommand::AcquireStreamOwner {
             stream_id: "s".into(),
             node_id: 1,
             epoch: 1,
             acquired_at: 0,
         }
-        .allowed_on_control_plane()
+        .requires_admin_proof()
     );
+    assert!(ClusterCommand::SetApiToken { token: "x".into() }.requires_admin_proof());
 }
 
 #[test]
