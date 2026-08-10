@@ -696,11 +696,10 @@ impl ClusterManager {
     }
 
     fn block_on_write(&self, cmd: ClusterCommand) -> Result<ClusterResponse, CoordError> {
-        let proof = if cmd.requires_admin_proof() {
-            self.client_write_admin_proof(&cmd)?
-        } else {
-            String::new()
-        };
+        // Proof is required for every control-plane ClientWrite (including
+        // ownership). Local leaders still apply via raft.client_write below;
+        // the proof is only sent on ForwardToLeader.
+        let proof = self.client_write_admin_proof(&cmd)?;
         let raft = self.raft.clone();
         let secret = self.config.secret.clone();
         let local_id = self.config.node_id;
@@ -762,8 +761,12 @@ impl ClusterManager {
             self.admission.force_drain();
             return Ok(());
         }
-        self.forward_admin(node_id, network::ControlMessage::AdminDrain { node_id })
-            .await
+        let proof = self.admin_action_proof(&format!("AdminDrain:{node_id}"))?;
+        self.forward_admin(
+            node_id,
+            network::ControlMessage::AdminDrain { node_id, proof },
+        )
+        .await
     }
 
     pub async fn resume_node(&self, node_id: NodeId) -> Result<(), String> {
@@ -771,8 +774,12 @@ impl ClusterManager {
             self.admission.force_resume();
             return Ok(());
         }
-        self.forward_admin(node_id, network::ControlMessage::AdminResume { node_id })
-            .await
+        let proof = self.admin_action_proof(&format!("AdminResume:{node_id}"))?;
+        self.forward_admin(
+            node_id,
+            network::ControlMessage::AdminResume { node_id, proof },
+        )
+        .await
     }
 
     pub async fn remove_peer(&self, node_id: NodeId) -> Result<(), String> {
@@ -851,14 +858,18 @@ impl ClusterManager {
         change: &ChangeMembers<NodeId, BasicNode>,
     ) -> Result<String, String> {
         let req = serde_json::to_string(change).map_err(|e| e.to_string())?;
+        self.admin_action_proof(&req)
+    }
+
+    fn admin_action_proof(&self, payload: &str) -> Result<String, String> {
         let token = self
             .session_hooks
             .lock()
             .as_ref()
             .map(|h| h.api_token.read().clone())
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| "API token unavailable for membership change".to_string())?;
-        Ok(crate::cluster::security::admin_proof(&token, &req))
+            .ok_or_else(|| "API token unavailable for cluster admin action".to_string())?;
+        Ok(crate::cluster::security::admin_proof(&token, payload))
     }
 
     fn verify_admin_proof(&self, proof: &str, payload: &str) -> bool {
@@ -1008,11 +1019,15 @@ impl ClusterManager {
 
     fn handle_admin_control(&self, msg: network::ControlMessage) -> network::ControlMessage {
         match msg {
-            network::ControlMessage::AdminDrain { node_id } if node_id == self.config.node_id => {
+            network::ControlMessage::AdminDrain { node_id, .. }
+                if node_id == self.config.node_id =>
+            {
                 self.admission.force_drain();
                 network::ControlMessage::AdminOk
             }
-            network::ControlMessage::AdminResume { node_id } if node_id == self.config.node_id => {
+            network::ControlMessage::AdminResume { node_id, .. }
+                if node_id == self.config.node_id =>
+            {
                 self.admission.force_resume();
                 network::ControlMessage::AdminOk
             }
@@ -1022,13 +1037,29 @@ impl ClusterManager {
                     message: "use DELETE /api/v1/cluster/nodes/{id} on a voter".into(),
                 }
             }
+            // Network DrainStream/RevokeViewer are best-effort hints after Raft
+            // already applied the durable mutation. Ignore spoofed messages for
+            // streams/viewers that are still fully live in the local DB — Raft
+            // StateEffect still marks draining/revoked on apply.
             network::ControlMessage::DrainStream { stream_id } => {
-                self.mark_stream_draining(&stream_id);
-                network::ControlMessage::AdminOk
+                if self.stream_allows_network_drain(&stream_id) {
+                    self.mark_stream_draining(&stream_id);
+                    network::ControlMessage::AdminOk
+                } else {
+                    network::ControlMessage::AdminErr {
+                        message: "drain rejected: stream not pending delete".into(),
+                    }
+                }
             }
             network::ControlMessage::RevokeViewer { viewer_id } => {
-                self.mark_viewer_revoked(&viewer_id);
-                network::ControlMessage::AdminOk
+                if self.viewer_allows_network_revoke(&viewer_id) {
+                    self.mark_viewer_revoked(&viewer_id);
+                    network::ControlMessage::AdminOk
+                } else {
+                    network::ControlMessage::AdminErr {
+                        message: "revoke rejected: viewer still present".into(),
+                    }
+                }
             }
             network::ControlMessage::SessionCountReq { stream_id } => {
                 let count = self.local_live_sessions(&stream_id);
@@ -1079,6 +1110,24 @@ impl ClusterManager {
         if let Some(hooks) = self.session_hooks.lock().as_ref() {
             hooks.deleted_streams.lock().insert(stream_id.to_string());
         }
+    }
+
+    /// True when a peer `DrainStream` hint is backed by local durable state
+    /// (Raft already applied begin-delete / the row is gone).
+    fn stream_allows_network_drain(&self, stream_id: &str) -> bool {
+        match self.db.stream_get(stream_id) {
+            crate::db::DbLookup::Missing => true,
+            crate::db::DbLookup::Failed => false,
+            crate::db::DbLookup::Ok(_) => {
+                self.db.stream_pending_delete(stream_id) == Some(true)
+            }
+        }
+    }
+
+    /// True when a peer `RevokeViewer` hint targets a viewer that is no longer
+    /// in the local DB (Raft DeleteViewer already applied).
+    fn viewer_allows_network_revoke(&self, viewer_id: &str) -> bool {
+        !self.db.viewer_exists(viewer_id)
     }
 
     /// Clone hooks out of the mutex before invoking callbacks that may need

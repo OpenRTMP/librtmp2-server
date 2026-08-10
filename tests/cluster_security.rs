@@ -19,10 +19,10 @@ fn auth_response_binds_node_id() {
 }
 
 #[test]
-fn control_plane_allows_member_forwarded_admin_commands() {
-    assert!(ClusterCommand::SetApiToken { token: "x".into() }.allowed_on_control_plane());
+fn client_write_admin_commands_require_proof() {
+    assert!(ClusterCommand::SetApiToken { token: "x".into() }.requires_admin_proof());
     assert!(
-        !ClusterCommand::AcquireStreamOwner {
+        ClusterCommand::AcquireStreamOwner {
             stream_id: "s".into(),
             node_id: 1,
             epoch: 1,
@@ -30,7 +30,9 @@ fn control_plane_allows_member_forwarded_admin_commands() {
         }
         .requires_admin_proof()
     );
-    assert!(ClusterCommand::SetApiToken { token: "x".into() }.requires_admin_proof());
+    assert!(
+        ClusterCommand::ReleaseOwnersForNode { node_id: 2 }.requires_admin_proof()
+    );
 }
 
 #[test]
@@ -39,6 +41,16 @@ fn admin_proof_changes_with_payload() {
     let a = admin_proof(token, r#"{"AddVoterIds":[2]}"#);
     let b = admin_proof(token, r#"{"AddVoterIds":[3]}"#);
     assert_ne!(a, b);
+}
+
+#[test]
+fn empty_client_write_proof_does_not_match_signed_payload() {
+    let token = "api-token-for-tests-only";
+    let payload = r#"{"SetApiToken":{"token":"stolen"}}"#;
+    let expected = admin_proof(token, payload);
+    assert!(!secrets_equal("", &expected));
+    assert!(!secrets_equal("deadbeef", &expected));
+    assert!(secrets_equal(&expected, &admin_proof(token, payload)));
 }
 
 #[test]

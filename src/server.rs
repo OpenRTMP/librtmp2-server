@@ -207,13 +207,16 @@ fn conn_references_deleted_stream(
     entry: &TrackedConn,
     deleted_now: &HashSet<String>,
 ) -> bool {
-    let bridge_ids = rtmp_bridge.stream_ids_for_conn(conn_id);
-    if bridge_ids
-        .iter()
-        .any(|sid| !sid.is_empty() && deleted_now.contains(sid))
-    {
+    let pub_hit = rtmp_bridge
+        .publisher_stream_id_for_conn(conn_id)
+        .is_some_and(|sid| deleted_now.contains(&sid));
+    let play_hit = rtmp_bridge
+        .player_stream_id_for_conn(conn_id)
+        .is_some_and(|sid| deleted_now.contains(&sid));
+    if pub_hit || play_hit {
         return true;
     }
+    let bridge_ids = rtmp_bridge.stream_ids_for_conn(conn_id);
     if bridge_ids.is_empty()
         && !entry.stream_id.is_empty()
         && deleted_now.contains(&entry.stream_id)
@@ -221,6 +224,101 @@ fn conn_references_deleted_stream(
         return true;
     }
     false
+}
+
+/// Drop bridge/library roles whose stream was deleted. Returns `true` when the
+/// TCP connection must be kicked (no surviving authorized role).
+///
+/// Dual-role connections (publish A + play B) only lose the role whose stream
+/// was deleted — the other role keeps the socket alive.
+fn drain_deleted_stream_roles(
+    conn: &mut librtmp2::session::conn::Conn,
+    entry: &mut TrackedConn,
+    rtmp_bridge: &DbRtmpBridge,
+    conn_id: u64,
+    deleted_now: &HashSet<String>,
+) -> bool {
+    let pub_sid = rtmp_bridge.publisher_stream_id_for_conn(conn_id);
+    let play_sid = rtmp_bridge.player_stream_id_for_conn(conn_id);
+    let pub_hit = pub_sid
+        .as_ref()
+        .is_some_and(|sid| deleted_now.contains(sid));
+    let play_hit = play_sid
+        .as_ref()
+        .is_some_and(|sid| deleted_now.contains(sid));
+
+    if !pub_hit && !play_hit {
+        // Pre-auth / unsynced tracker: fall back to TrackedConn stream id.
+        if rtmp_bridge.stream_ids_for_conn(conn_id).is_empty()
+            && !entry.stream_id.is_empty()
+            && deleted_now.contains(&entry.stream_id)
+        {
+            crate::log_info!(
+                "RTMP: kicking conn={conn_id} from {} — stream '{}' was deleted",
+                conn.remote_addr,
+                entry.stream_id
+            );
+            return true;
+        }
+        return false;
+    }
+
+    if pub_hit {
+        let deleted_id = pub_sid.as_deref().unwrap_or("");
+        crate::log_info!(
+            "RTMP: releasing publisher on conn={conn_id} from {} — stream '{deleted_id}' was deleted",
+            conn.remote_addr
+        );
+        rtmp_bridge.release_publisher(conn_id);
+        if !rtmp_bridge.has_publisher(conn_id) {
+            entry.publishing = false;
+            entry.video_codec.clear();
+            entry.audio_codec.clear();
+            if let Some(stream) = conn.current_stream.as_mut() {
+                stream.is_publishing = false;
+            }
+        }
+    }
+
+    if play_hit {
+        let deleted_id = play_sid.as_deref().unwrap_or("");
+        crate::log_info!(
+            "RTMP: releasing player on conn={conn_id} from {} — stream '{deleted_id}' was deleted",
+            conn.remote_addr
+        );
+        rtmp_bridge.release_player(conn_id);
+        if !rtmp_bridge.has_player(conn_id) {
+            entry.playing = false;
+            if let Some(stream) = conn.current_stream.as_mut() {
+                stream.is_playing = false;
+            }
+        }
+    }
+
+    let has_pub = rtmp_bridge.has_publisher(conn_id);
+    let has_play = rtmp_bridge.has_player(conn_id);
+    if has_pub || has_play {
+        let sid = rtmp_bridge.stream_id_for_conn(conn_id);
+        entry.stream_id = sid.clone();
+        // Drop queued frames from the deleted role so they cannot drain onto
+        // the surviving publisher/player route after relay_key is rewritten.
+        conn.pending_relay.clear();
+        if !sid.is_empty() {
+            conn.relay_key = sid;
+            conn.relay_enabled = true;
+        }
+        return false;
+    }
+
+    let kicked_id = pub_sid
+        .filter(|_| pub_hit)
+        .or_else(|| play_sid.filter(|_| play_hit))
+        .unwrap_or_else(|| entry.stream_id.clone());
+    crate::log_info!(
+        "RTMP: kicking conn={conn_id} from {} — stream '{kicked_id}' was deleted",
+        conn.remote_addr
+    );
+    true
 }
 
 /// Returns true when a connection has no authorized publish/play session and
@@ -407,13 +505,11 @@ pub(crate) fn process_server_connections(
             }
         }
 
-        // Kick connections whose publisher or player stream was deleted.
-        if conn_references_deleted_stream(rtmp_bridge, conn_id, entry, deleted_now) {
-            let evict_stream_id = eviction_stream_id(rtmp_bridge, conn_id, entry);
-            crate::log_info!(
-                "RTMP: kicking conn={conn_id} from {} — stream '{evict_stream_id}' was deleted",
-                conn.remote_addr
-            );
+        // Tear down roles whose stream was deleted. Dual-role conns keep the
+        // surviving role; kick only when nothing authorized remains.
+        if conn_references_deleted_stream(rtmp_bridge, conn_id, entry, deleted_now)
+            && drain_deleted_stream_roles(conn, entry, rtmp_bridge, conn_id, deleted_now)
+        {
             reject_indices.push(idx);
             continue;
         }
@@ -1039,8 +1135,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerApp, TrackedConn, bind_with_default_port, eviction_stream_id,
-        live_stream_ids_for_deleted_markers, should_evict_idle_conn,
+        ServerApp, TrackedConn, bind_with_default_port, drain_deleted_stream_roles,
+        eviction_stream_id, live_stream_ids_for_deleted_markers, should_evict_idle_conn,
     };
     use crate::config::ServerConfig;
     use crate::db::Db;
@@ -1199,6 +1295,75 @@ mod tests {
         assert!(
             live.contains("s2"),
             "dual-role play stream must retain deleted marker until player drains"
+        );
+    }
+
+    #[test]
+    fn drain_deleted_play_keeps_dual_role_publisher() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s1 = crate::db::Stream {
+            id: "s1".to_string(),
+            name: "S1".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_key_with_sufficient_length_here01".to_string(),
+            play_key: "play_key_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        let s2 = crate::db::Stream {
+            id: "s2".to_string(),
+            name: "S2".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_key2_with_sufficient_length_here01".to_string(),
+            play_key: "play_key2_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_key2_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&s1).unwrap();
+        db.stream_add(&s2).unwrap();
+
+        let deleted = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::clone(&deleted));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
+        assert!(bridge.authorize_play(1, "live", &s2.play_key).is_ok());
+
+        deleted.lock().insert("s2".to_string());
+        let deleted_now = deleted.lock().clone();
+
+        let mut conn = librtmp2::session::conn::Conn::new();
+        conn.conn_id = 1;
+        conn.remote_addr = "127.0.0.1:1000".into();
+        conn.current_stream = Some(Box::new(librtmp2::session::stream::Stream {
+            stream_id: 1,
+            is_publishing: true,
+            is_playing: true,
+            name: "live".into(),
+            paused: false,
+            receive_audio: true,
+            receive_video: true,
+        }));
+        let mut entry = TrackedConn {
+            connected: true,
+            publishing: true,
+            playing: true,
+            stream_id: "s1".into(),
+            ..Default::default()
+        };
+
+        let kick = drain_deleted_stream_roles(&mut conn, &mut entry, &bridge, 1, &deleted_now);
+        assert!(!kick, "publisher on s1 must keep the connection");
+        assert!(bridge.has_publisher(1));
+        assert!(!bridge.has_player(1));
+        assert!(entry.publishing);
+        assert!(!entry.playing);
+        assert_eq!(entry.stream_id, "s1");
+        assert!(!conn.current_stream.as_ref().unwrap().is_playing);
+        assert!(
+            conn.pending_relay.is_empty(),
+            "queued play frames must not survive onto the publisher route"
         );
     }
 

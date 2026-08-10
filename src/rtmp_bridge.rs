@@ -396,6 +396,22 @@ impl DbRtmpBridge {
         ids
     }
 
+    /// DB stream id for the active publisher role on this connection, if any.
+    pub fn publisher_stream_id_for_conn(&self, conn: ConnId) -> Option<String> {
+        self.conns
+            .lock()
+            .get(&conn)
+            .and_then(|cs| cs.publisher.as_ref().map(|p| p.stream_id.clone()))
+    }
+
+    /// DB stream id for the active player role on this connection, if any.
+    pub fn player_stream_id_for_conn(&self, conn: ConnId) -> Option<String> {
+        self.conns
+            .lock()
+            .get(&conn)
+            .and_then(|cs| cs.player.as_ref().map(|pl| pl.stream_id.clone()))
+    }
+
     /// Active RTMP connections with a publisher or player row on `stream_id`.
     pub fn live_conn_count_for_stream(&self, stream_id: &str) -> usize {
         self.conns
@@ -516,6 +532,47 @@ impl DbRtmpBridge {
             .collect();
         for conn in conns {
             self.release_publisher(conn);
+        }
+    }
+
+    /// Abandon publisher/player ConnState roles for `stream_id` even when DB
+    /// deactivation fails. Used when delete-drain times out so finalize is not
+    /// blocked forever by a stuck `active=1` / ConnState mismatch.
+    pub fn abandon_roles_for_stream(&self, stream_id: &str) {
+        let mut guard = self.conns.lock();
+        for cs in guard.values_mut() {
+            let drop_pub = cs
+                .publisher
+                .as_ref()
+                .is_some_and(|p| p.stream_id == stream_id);
+            let drop_play = cs
+                .player
+                .as_ref()
+                .is_some_and(|pl| pl.stream_id == stream_id);
+            if drop_pub {
+                cs.publisher = None;
+                cs.publisher_last_stats_at = None;
+                cs.publisher_bytes_base = 0;
+                cs.publisher_bytes_at_last_stats = 0;
+                cs.publisher_stats_reset_pending = true;
+            }
+            if drop_play {
+                cs.player = None;
+                cs.viewer_id.clear();
+                cs.player_last_stats_at = None;
+                cs.player_bytes_base = 0;
+                cs.player_bytes_at_last_stats = 0;
+                cs.player_stats_reset_pending = true;
+            }
+            if drop_pub || drop_play {
+                if let Some(ref pub_row) = cs.publisher {
+                    cs.stream_id = pub_row.stream_id.clone();
+                } else if let Some(ref pl) = cs.player {
+                    cs.stream_id = pl.stream_id.clone();
+                } else {
+                    cs.stream_id.clear();
+                }
+            }
         }
     }
 
