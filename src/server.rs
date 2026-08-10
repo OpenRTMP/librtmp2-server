@@ -1181,11 +1181,7 @@ mod tests {
         let deleted = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::clone(&deleted));
         bridge.on_connect(1, "127.0.0.1:1000");
-        assert!(
-            bridge
-                .authorize_publish(1, "live", &s1.publish_key)
-                .is_ok()
-        );
+        assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
         assert!(bridge.authorize_play(1, "live", &s2.play_key).is_ok());
 
         deleted.lock().insert("s2".to_string());
