@@ -170,6 +170,7 @@ pub(crate) struct TrackedConn {
 /// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
 /// bridge (authoritative for live publisher/player rows); fall back to the
 /// poll-loop tracker when the bridge has not been synced yet this tick.
+#[cfg(test)]
 fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedConn) -> String {
     let bridge_sid = rtmp_bridge.stream_id_for_conn(conn_id);
     if !bridge_sid.is_empty() {
