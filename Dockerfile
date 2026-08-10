@@ -5,8 +5,9 @@
 #   docker build -f librtmp2-server/Dockerfile .
 FROM rust:alpine AS builder
 
+# musl release builds static-link OpenSSL; need *-static pkgs for -lssl/-lcrypto.
 RUN apk add --no-cache \
-        musl-dev openssl-dev pkgconf git ca-certificates
+        musl-dev openssl-dev openssl-libs-static pkgconf git ca-certificates
 
 ARG LIBRTMP2_GIT=https://github.com/OpenRTMP/librtmp2.git
 # Empty (default) = resolve librtmp2 normally via the crates.io `version`
