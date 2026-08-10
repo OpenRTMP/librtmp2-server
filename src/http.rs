@@ -1210,14 +1210,19 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
 }
 
 /// How long to wait before logging that an async stream delete is taking
-/// longer than expected. The drain loop never gives up: `deleted_streams`
-/// must stay populated until every live RTMP session is gone so the poll loop
-/// keeps kicking them; removing the marker early left stuck publishers
-/// broadcasting on a disabled/pending-delete stream indefinitely.
+/// longer than expected. The drain loop keeps `deleted_streams` populated so
+/// the poll loop can kick live sessions; after [`DELETE_DRAIN_TIMEOUT`] it
+/// abandons stuck ConnState roles and finalizes anyway.
 #[cfg(test)]
 const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
+/// Cap how long delete waits for RTMP drain. Stuck ConnState roles (failed DB
+/// deactivate) must not block finalize forever — abandon local roles then proceed.
+#[cfg(test)]
+const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
     let started = Instant::now();
@@ -1235,6 +1240,15 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
         #[cfg(not(feature = "cluster"))]
         let remote = 0u64;
         if local == 0 && remote == 0 {
+            break;
+        }
+        if started.elapsed() >= DELETE_DRAIN_TIMEOUT {
+            crate::log_error!(
+                "Delete drain timed out for stream '{id}' after {}s \
+                 (local={local} remote={remote}); abandoning local roles and finalizing",
+                DELETE_DRAIN_TIMEOUT.as_secs().max(1)
+            );
+            state.rtmp_bridge.abandon_roles_for_stream(&id);
             break;
         }
         if last_warn.elapsed() >= DELETE_DRAIN_WARN_AFTER {

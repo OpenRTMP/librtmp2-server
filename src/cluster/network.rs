@@ -95,9 +95,15 @@ pub enum ControlMessage {
     },
     AdminDrain {
         node_id: NodeId,
+        /// HTTP-API `admin_proof` over `AdminDrain:{node_id}`.
+        #[serde(default)]
+        proof: String,
     },
     AdminResume {
         node_id: NodeId,
+        /// HTTP-API `admin_proof` over `AdminResume:{node_id}`.
+        #[serde(default)]
+        proof: String,
     },
     AdminRemove {
         node_id: NodeId,
@@ -760,11 +766,8 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             use crate::cluster::command::ClusterCommand;
             let cmd: ClusterCommand =
                 serde_json::from_value(req.clone()).map_err(|e| std::io::Error::other(e))?;
-            if !cmd.allowed_on_control_plane() {
-                return Err(std::io::Error::other(
-                    "cluster command not allowed on control plane",
-                ));
-            }
+            // Every ClientWrite must carry an HTTP-API admin_proof (see
+            // ClusterCommand::requires_admin_proof).
             if cmd.requires_admin_proof() {
                 let req_str = serde_json::to_string(&req)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -856,6 +859,18 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
         | ControlMessage::SessionCountReq { .. }) => {
             if !is_member(peer_id) {
                 return Err(std::io::Error::other("peer not in membership"));
+            }
+            if let ControlMessage::AdminDrain { node_id, proof } = &admin {
+                let payload = format!("AdminDrain:{node_id}");
+                if !verify_admin_proof(proof, &payload) {
+                    return Err(std::io::Error::other("invalid admin drain proof"));
+                }
+            }
+            if let ControlMessage::AdminResume { node_id, proof } = &admin {
+                let payload = format!("AdminResume:{node_id}");
+                if !verify_admin_proof(proof, &payload) {
+                    return Err(std::io::Error::other("invalid admin resume proof"));
+                }
             }
             on_admin(admin)
         }

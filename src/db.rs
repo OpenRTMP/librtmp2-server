@@ -798,9 +798,24 @@ impl Db {
         .is_ok()
     }
 
-    /// Cascade: remove dependent rows so deleted streams cannot leave ghost
-    /// active publishers/players that pollute stats after stream re-creation.
-    ///
+    /// Returns `Some(true)` when `pending_delete=1`, `Some(false)` when the row
+    /// exists and is not pending, `None` when the row is missing or on DB error.
+    pub fn stream_pending_delete(&self, id: &str) -> Option<bool> {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT pending_delete FROM streams WHERE id=?",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(v) => Some(v != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                crate::log_error!("stream_pending_delete: lookup failed for {id}: {e}");
+                None
+            }
+        }
+    }
+
     /// Like [`Self::stream_delete`], but only when `pending_delete=1`.
     /// Returns `Some(false)` when the row is missing or not pending (stale
     /// finalize must be a no-op).
@@ -1001,6 +1016,25 @@ impl Db {
             params![stream_id, viewer_id],
             Self::load_viewer_row,
         ))
+    }
+
+    /// True when any viewer row with this id still exists (any stream).
+    pub fn viewer_exists(&self, viewer_id: &str) -> bool {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT 1 FROM stream_viewers WHERE id=? LIMIT 1",
+            params![viewer_id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                crate::log_error!("viewer_exists failed: {e}");
+                // Fail closed: treat as present so spoofed revokes are ignored
+                // until the DB is readable again.
+                true
+            }
+        }
     }
 
     /// Returns `Some(true)` if deleted, `Some(false)` if not found, `None` on DB error.

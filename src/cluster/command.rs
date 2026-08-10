@@ -74,22 +74,15 @@ pub enum ClusterResponse {
 }
 
 impl ClusterCommand {
-    /// Commands that may be proposed over the inter-node control plane.
-    pub fn allowed_on_control_plane(&self) -> bool {
+    /// Whether a `ClientWrite` over the control plane must carry an HTTP-API
+    /// `admin_proof`. All durable mutations require proof so a member that
+    /// only knows `CLUSTER_SECRET` cannot mutate replicated state (including
+    /// stream ownership). Local leaders still apply via `raft.client_write`
+    /// after their own HTTP/session path; followers mint proof from the
+    /// session-hook API token when forwarding.
+    pub fn requires_admin_proof(&self) -> bool {
         let _ = self;
         true
-    }
-
-    /// Whether a `ClientWrite` over the control plane must carry an HTTP-API
-    /// `admin_proof`. Ownership acquire/release is excluded so nodes can
-    /// coordinate RTMP sessions without holding the admin bearer token.
-    pub fn requires_admin_proof(&self) -> bool {
-        !matches!(
-            self,
-            ClusterCommand::AcquireStreamOwner { .. }
-                | ClusterCommand::ReleaseStreamOwner { .. }
-                | ClusterCommand::ReleaseOwnersForNode { .. }
-        )
     }
 }
 
@@ -120,7 +113,7 @@ mod tests {
     use super::ClusterCommand;
 
     #[test]
-    fn control_plane_allows_member_forwarded_admin_writes() {
+    fn all_client_writes_require_admin_proof() {
         assert!(
             ClusterCommand::AcquireStreamOwner {
                 stream_id: "s".into(),
@@ -128,22 +121,39 @@ mod tests {
                 epoch: 1,
                 acquired_at: 0,
             }
-            .allowed_on_control_plane()
+            .requires_admin_proof()
         );
-        assert!(ClusterCommand::SetApiToken { token: "t".into() }.allowed_on_control_plane());
-    }
-
-    #[test]
-    fn ownership_commands_skip_admin_proof() {
         assert!(
-            !ClusterCommand::AcquireStreamOwner {
+            ClusterCommand::ReleaseStreamOwner {
                 stream_id: "s".into(),
-                node_id: 1,
                 epoch: 1,
-                acquired_at: 0,
             }
             .requires_admin_proof()
         );
+        assert!(ClusterCommand::ReleaseOwnersForNode { node_id: 1 }.requires_admin_proof());
         assert!(ClusterCommand::SetApiToken { token: "t".into() }.requires_admin_proof());
+        assert!(
+            ClusterCommand::CreateStream {
+                stream: crate::db::Stream {
+                    id: "s".into(),
+                    name: "n".into(),
+                    app: "live".into(),
+                    publish_key: "p".into(),
+                    play_key: "k".into(),
+                    stats_key: "st".into(),
+                    enabled: true,
+                    created_at: 0,
+                },
+                default_viewer: crate::db::StreamViewer {
+                    id: "v".into(),
+                    stream_id: "s".into(),
+                    name: "default".into(),
+                    play_key: "k".into(),
+                    enabled: true,
+                    created_at: 0,
+                },
+            }
+            .requires_admin_proof()
+        );
     }
 }

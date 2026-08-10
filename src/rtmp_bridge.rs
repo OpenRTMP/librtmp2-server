@@ -151,6 +151,10 @@ pub struct DbRtmpBridge {
     /// lifecycle event that would retry otherwise.
     #[cfg(feature = "cluster")]
     pending_ownership_releases: Mutex<Vec<(String, u64)>>,
+    /// Connections whose roles were force-abandoned (delete-drain timeout).
+    /// The RTMP poll loop closes these sockets after `deleted_streams` no
+    /// longer matches (finalize already cleared the marker).
+    pending_force_close: Mutex<HashSet<ConnId>>,
 }
 
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
@@ -216,6 +220,7 @@ impl DbRtmpBridge {
             ownership_epochs: Mutex::new(HashMap::new()),
             #[cfg(feature = "cluster")]
             pending_ownership_releases: Mutex::new(Vec::new()),
+            pending_force_close: Mutex::new(HashSet::new()),
         }
     }
 
@@ -396,6 +401,22 @@ impl DbRtmpBridge {
         ids
     }
 
+    /// DB stream id for the active publisher role on this connection, if any.
+    pub fn publisher_stream_id_for_conn(&self, conn: ConnId) -> Option<String> {
+        self.conns
+            .lock()
+            .get(&conn)
+            .and_then(|cs| cs.publisher.as_ref().map(|p| p.stream_id.clone()))
+    }
+
+    /// DB stream id for the active player role on this connection, if any.
+    pub fn player_stream_id_for_conn(&self, conn: ConnId) -> Option<String> {
+        self.conns
+            .lock()
+            .get(&conn)
+            .and_then(|cs| cs.player.as_ref().map(|pl| pl.stream_id.clone()))
+    }
+
     /// Active RTMP connections with a publisher or player row on `stream_id`.
     pub fn live_conn_count_for_stream(&self, stream_id: &str) -> usize {
         self.conns
@@ -517,6 +538,87 @@ impl DbRtmpBridge {
         for conn in conns {
             self.release_publisher(conn);
         }
+    }
+
+    /// Abandon publisher/player ConnState roles for `stream_id` even when DB
+    /// deactivation fails. Used when delete-drain times out so finalize is not
+    /// blocked forever by a stuck `active=1` / ConnState mismatch.
+    ///
+    /// Also releases cluster ownership / remote play subscriptions for the
+    /// abandoned roles and queues socket force-close for connections left with
+    /// no authorized role (poll loop closes them after finalize clears
+    /// `deleted_streams`).
+    pub fn abandon_roles_for_stream(&self, stream_id: &str) {
+        let mut abandoned_pubs: Vec<ConnId> = Vec::new();
+        let mut abandoned_any_play = false;
+        let mut force_close: Vec<ConnId> = Vec::new();
+        {
+            let mut guard = self.conns.lock();
+            for (conn_id, cs) in guard.iter_mut() {
+                let drop_pub = cs
+                    .publisher
+                    .as_ref()
+                    .is_some_and(|p| p.stream_id == stream_id);
+                let drop_play = cs
+                    .player
+                    .as_ref()
+                    .is_some_and(|pl| pl.stream_id == stream_id);
+                if drop_pub {
+                    cs.publisher = None;
+                    cs.publisher_last_stats_at = None;
+                    cs.publisher_bytes_base = 0;
+                    cs.publisher_bytes_at_last_stats = 0;
+                    cs.publisher_stats_reset_pending = true;
+                    abandoned_pubs.push(*conn_id);
+                }
+                if drop_play {
+                    cs.player = None;
+                    cs.viewer_id.clear();
+                    cs.player_last_stats_at = None;
+                    cs.player_bytes_base = 0;
+                    cs.player_bytes_at_last_stats = 0;
+                    cs.player_stats_reset_pending = true;
+                    abandoned_any_play = true;
+                }
+                if drop_pub || drop_play {
+                    if let Some(ref pub_row) = cs.publisher {
+                        cs.stream_id = pub_row.stream_id.clone();
+                    } else if let Some(ref pl) = cs.player {
+                        cs.stream_id = pl.stream_id.clone();
+                    } else {
+                        cs.stream_id.clear();
+                        force_close.push(*conn_id);
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "cluster")]
+        {
+            for conn_id in abandoned_pubs {
+                self.try_release_ownership_for_conn(conn_id);
+            }
+            if abandoned_any_play {
+                self.maybe_unsubscribe_remote_play(stream_id);
+            }
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            let _ = abandoned_pubs;
+            let _ = abandoned_any_play;
+        }
+
+        if !force_close.is_empty() {
+            let mut pending = self.pending_force_close.lock();
+            for conn_id in force_close {
+                pending.insert(conn_id);
+            }
+        }
+    }
+
+    /// True when delete-drain timeout queued a forced TCP close for `conn`.
+    pub fn take_pending_force_close(&self, conn: ConnId) -> bool {
+        self.pending_force_close.lock().remove(&conn)
     }
 
     /// Deactivate the publisher row for this connection without dropping the
@@ -1279,6 +1381,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         // IP (not ConnId) precisely so a client can't reset the brute-force
         // window by reconnecting. Entries expire naturally via the sliding
         // window in is_auth_rate_limited/record_auth_failure.
+        let _ = self.pending_force_close.lock().remove(&conn);
         let cs = self.conns.lock().remove(&conn);
         let Some(cs) = cs else {
             crate::log_warn!("RTMP: on_close for untracked connection {conn}");
