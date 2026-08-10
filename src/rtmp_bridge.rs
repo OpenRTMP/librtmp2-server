@@ -385,10 +385,10 @@ impl DbRtmpBridge {
         if let Some(p) = cs.publisher.as_ref() {
             ids.push(p.stream_id.clone());
         }
-        if let Some(pl) = cs.player.as_ref() {
-            if !ids.iter().any(|id| id == &pl.stream_id) {
-                ids.push(pl.stream_id.clone());
-            }
+        if let Some(pl) = cs.player.as_ref()
+            && !ids.iter().any(|id| id == &pl.stream_id)
+        {
+            ids.push(pl.stream_id.clone());
         }
         if ids.is_empty() && !cs.stream_id.is_empty() {
             ids.push(cs.stream_id.clone());
