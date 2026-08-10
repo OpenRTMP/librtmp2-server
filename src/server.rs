@@ -182,12 +182,45 @@ pub(crate) fn live_stream_ids_for_deleted_markers(
     tracked: &HashMap<u64, TrackedConn>,
     rtmp_bridge: &DbRtmpBridge,
 ) -> HashSet<String> {
-    tracked
-        .keys()
-        .copied()
-        .map(|conn_id| eviction_stream_id(rtmp_bridge, conn_id, &tracked[&conn_id]))
-        .filter(|sid| !sid.is_empty())
-        .collect()
+    let mut live = HashSet::new();
+    for (&conn_id, entry) in tracked {
+        let bridge_ids = rtmp_bridge.stream_ids_for_conn(conn_id);
+        if bridge_ids.is_empty() {
+            if !entry.stream_id.is_empty() {
+                live.insert(entry.stream_id.clone());
+            }
+        } else {
+            for sid in bridge_ids {
+                if !sid.is_empty() {
+                    live.insert(sid);
+                }
+            }
+        }
+    }
+    live
+}
+
+/// True when any publisher/player role on this connection targets a deleted stream.
+fn conn_references_deleted_stream(
+    rtmp_bridge: &DbRtmpBridge,
+    conn_id: u64,
+    entry: &TrackedConn,
+    deleted_now: &HashSet<String>,
+) -> bool {
+    let bridge_ids = rtmp_bridge.stream_ids_for_conn(conn_id);
+    if bridge_ids
+        .iter()
+        .any(|sid| !sid.is_empty() && deleted_now.contains(sid))
+    {
+        return true;
+    }
+    if bridge_ids.is_empty()
+        && !entry.stream_id.is_empty()
+        && deleted_now.contains(&entry.stream_id)
+    {
+        return true;
+    }
+    false
 }
 
 /// Returns true when a connection has no authorized publish/play session and
@@ -374,9 +407,9 @@ pub(crate) fn process_server_connections(
             }
         }
 
-        // Kick connections whose stream was deleted.
-        let evict_stream_id = eviction_stream_id(rtmp_bridge, conn_id, entry);
-        if !evict_stream_id.is_empty() && deleted_now.contains(&evict_stream_id) {
+        // Kick connections whose publisher or player stream was deleted.
+        if conn_references_deleted_stream(rtmp_bridge, conn_id, entry, deleted_now) {
+            let evict_stream_id = eviction_stream_id(rtmp_bridge, conn_id, entry);
             crate::log_info!(
                 "RTMP: kicking conn={conn_id} from {} — stream '{evict_stream_id}' was deleted",
                 conn.remote_addr
@@ -1117,6 +1150,60 @@ mod tests {
             "bridge stream_id must keep deleted marker until RTMP drain even when TrackedConn is not synced"
         );
         assert_eq!(eviction_stream_id(&bridge, 1, &tracked[&1]), "s1");
+    }
+
+    #[test]
+    fn deleted_markers_retain_dual_role_play_stream() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s1 = crate::db::Stream {
+            id: "s1".to_string(),
+            name: "S1".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_key_with_sufficient_length_here01".to_string(),
+            play_key: "play_key_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_key_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        let s2 = crate::db::Stream {
+            id: "s2".to_string(),
+            name: "S2".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_key2_with_sufficient_length_here01".to_string(),
+            play_key: "play_key2_with_sufficient_length_here01".to_string(),
+            stats_key: "stats_key2_with_sufficient_length_here01".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&s1).unwrap();
+        db.stream_add(&s2).unwrap();
+
+        let deleted = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let bridge = DbRtmpBridge::new(Arc::clone(&db), Arc::clone(&deleted));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &s1.publish_key)
+                .is_ok()
+        );
+        assert!(bridge.authorize_play(1, "live", &s2.play_key).is_ok());
+
+        deleted.lock().insert("s2".to_string());
+
+        let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked.insert(
+            1,
+            TrackedConn {
+                connected: true,
+                ..Default::default()
+            },
+        );
+
+        let live = live_stream_ids_for_deleted_markers(&tracked, &bridge);
+        assert!(
+            live.contains("s2"),
+            "dual-role play stream must retain deleted marker until player drains"
+        );
     }
 
     #[test]

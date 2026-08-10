@@ -372,13 +372,43 @@ impl DbRtmpBridge {
         self.auth_failures.lock().remove(remote_ip);
     }
 
-    /// Active RTMP connections still tied to a stream (publisher and/or player).
+    /// All DB stream ids this connection currently holds (publisher and/or player).
+    /// When both roles are active on different streams, `ConnState.stream_id`
+    /// follows the publisher — callers must not use it alone for per-stream
+    /// drain/eviction.
+    pub fn stream_ids_for_conn(&self, conn: ConnId) -> Vec<String> {
+        let guard = self.conns.lock();
+        let Some(cs) = guard.get(&conn) else {
+            return Vec::new();
+        };
+        let mut ids = Vec::with_capacity(2);
+        if let Some(p) = cs.publisher.as_ref() {
+            ids.push(p.stream_id.clone());
+        }
+        if let Some(pl) = cs.player.as_ref() {
+            if !ids.iter().any(|id| id == &pl.stream_id) {
+                ids.push(pl.stream_id.clone());
+            }
+        }
+        if ids.is_empty() && !cs.stream_id.is_empty() {
+            ids.push(cs.stream_id.clone());
+        }
+        ids
+    }
+
+    /// Active RTMP connections with a publisher or player row on `stream_id`.
     pub fn live_conn_count_for_stream(&self, stream_id: &str) -> usize {
         self.conns
             .lock()
             .values()
             .filter(|cs| {
-                cs.stream_id == stream_id && (cs.publisher.is_some() || cs.player.is_some())
+                cs.publisher
+                    .as_ref()
+                    .is_some_and(|p| p.stream_id == stream_id)
+                    || cs
+                        .player
+                        .as_ref()
+                        .is_some_and(|pl| pl.stream_id == stream_id)
             })
             .count()
     }
@@ -1890,6 +1920,26 @@ mod tests {
         let players = db.player_list(Some("s1"));
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].bytes_out, 4096);
+    }
+
+    #[test]
+    fn live_conn_count_includes_player_on_different_stream_than_publisher() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s1 = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s1.publish_key).is_ok());
+        assert!(bridge.authorize_play(1, "live", &s2.play_key).is_ok());
+
+        assert_eq!(bridge.live_conn_count_for_stream("s1"), 1);
+        assert_eq!(bridge.live_conn_count_for_stream("s2"), 1);
+        assert_eq!(bridge.stream_id_for_conn(1), "s1");
+        assert_eq!(
+            bridge.stream_ids_for_conn(1),
+            vec!["s1".to_string(), "s2".to_string()]
+        );
     }
 
     #[test]
