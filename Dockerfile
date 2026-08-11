@@ -1,13 +1,19 @@
-# Build stage (Alpine/musl — same libc as runtime; multi-arch friendly)
+# syntax=docker/dockerfile:1
+# Build stage (musl via rust-musl-cross — same libc as Alpine runtime; multi-arch)
 # Standalone (default `docker compose` context `.`):
 #   docker build -t librtmp2-server .
 # Monorepo (parent OpenRTMP with sibling librtmp2/):
 #   docker build -f librtmp2-server/Dockerfile .
-FROM rust:alpine AS builder
+ARG TARGETARCH=amd64
+FROM --platform=$BUILDPLATFORM ghcr.io/rust-cross/rust-musl-cross:${TARGETARCH}-musl AS builder
 
-# musl release builds static-link OpenSSL; need *-static pkgs for -lssl/-lcrypto.
-RUN apk add --no-cache \
-        musl-dev openssl-dev openssl-libs-static pkgconf git ca-certificates
+# Static OpenSSL keeps the musl binary self-contained on Alpine runtime.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV OPENSSL_STATIC=1
 
 ARG LIBRTMP2_GIT=https://github.com/OpenRTMP/librtmp2.git
 # Empty (default) = resolve librtmp2 normally via the crates.io `version`
@@ -40,7 +46,8 @@ RUN set -eu; \
     if [ -f /build/librtmp2/Cargo.toml ]; then \
       printf '\n[patch."https://github.com/OpenRTMP/librtmp2"]\nlibrtmp2 = { path = "../librtmp2" }\n' >> Cargo.toml; \
     fi; \
-    cargo build --release --features cluster
+    cargo build --release --features cluster; \
+    install -Dm755 target/*/release/librtmp2-server /build/out/librtmp2-server
 
 ARG APP_VERSION=""
 RUN version="$APP_VERSION" && \
@@ -58,7 +65,7 @@ RUN apk add --no-cache libgcc libstdc++ openssl ca-certificates wget \
     && mkdir -p /data \
     && chown openrtmp:openrtmp /data
 
-COPY --from=builder /build/librtmp2-server/target/release/librtmp2-server /usr/local/bin/librtmp2-server
+COPY --from=builder /build/out/librtmp2-server /usr/local/bin/librtmp2-server
 COPY --from=builder /build/librtmp2-server/.env.example /etc/librtmp2-server/.env
 COPY --from=builder /build/VERSION /usr/local/share/openrtmp/VERSION
 COPY --from=builder /build/librtmp2-server/entrypoint.sh /usr/local/bin/entrypoint.sh
