@@ -37,3 +37,17 @@ jobs:
 
     - name: Run E2E integration tests
       run: cargo test --verbose --features test-support --test rtmp_http_e2e -- --test-threads=1
+
+  docker-smoke:
+    name: docker build (amd64)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Build Docker image
+      run: docker build --platform linux/amd64 -t librtmp2-server:ci .
