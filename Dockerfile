@@ -7,13 +7,12 @@
 ARG TARGETARCH=amd64
 FROM --platform=$BUILDPLATFORM ghcr.io/rust-cross/rust-musl-cross:${TARGETARCH}-musl AS builder
 
-# Static OpenSSL keeps the musl binary self-contained on Alpine runtime.
+# Vendored OpenSSL is compiled for the musl target instead of linking the
+# builder host's glibc OpenSSL. Perl and make are required by openssl-src.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev ca-certificates git \
+        pkg-config perl make ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
-
-ENV OPENSSL_STATIC=1
 
 ARG LIBRTMP2_GIT=https://github.com/OpenRTMP/librtmp2.git
 # Empty (default) = resolve librtmp2 normally via the crates.io `version`
@@ -46,7 +45,7 @@ RUN set -eu; \
     if [ -f /build/librtmp2/Cargo.toml ]; then \
       printf '\n[patch."https://github.com/OpenRTMP/librtmp2"]\nlibrtmp2 = { path = "../librtmp2" }\n' >> Cargo.toml; \
     fi; \
-    cargo build --release --features cluster; \
+    cargo build --release --features cluster,vendored-openssl; \
     install -Dm755 target/*/release/librtmp2-server /build/out/librtmp2-server
 
 ARG APP_VERSION=""
