@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: rtmp_bridge (2026-08-10)
+Last scanned: keygen (2026-08-11)
 
 ## Modules
 
@@ -9,8 +9,20 @@ Last scanned: rtmp_bridge (2026-08-10)
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [ ] keygen — Stream key generation
+- [x] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-08-11 keygen pass)
+
+No critical bugs found. `keygen_with_entropy()` uses OS-backed `SysRng` (128-bit
+stream/play/stats/viewer keys, 256-bit API token); all call sites propagate RNG
+failure instead of falling back to predictable material. `is_valid_access_key()`
+enforces 32–63 safe ASCII chars on every RTMP/stats lookup and HTTP key path;
+globally unique access keys are enforced at insert via `key_globally_in_use_locked`
+plus `UNIQUE` columns. Auto-generated keys always satisfy validation (prefix +
+32 hex digits). Residual non-critical gap: no retry loop if an auto-generated key
+collides with an existing row (practically impossible; surfaces as insert
+CONFLICT/500 rather than a security hole).
 
 ## Findings (2026-08-10 rtmp_bridge pass)
 
