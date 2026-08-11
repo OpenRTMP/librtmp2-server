@@ -29,6 +29,9 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12"
+# Build-only helper for static musl Docker images. Cargo feature unification
+# enables vendored OpenSSL for the same `openssl` crate used by librtmp2 TLS.
+openssl = { version = "0.10.70", optional = true, features = ["vendored"] }
 
 # Optional HA clustering (OpenRaft). Off by default; enable with `--features cluster`.
 openraft = { version = "=0.9.25", optional = true, features = ["serde", "storage-v2"] }
@@ -46,6 +49,7 @@ x509-parser = { version = "0.18", optional = true }
 [features]
 default = []
 test-support = []
+vendored-openssl = ["dep:openssl"]
 cluster = [
     "dep:openraft",
     "dep:tokio-rustls",
