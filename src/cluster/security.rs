@@ -167,6 +167,11 @@ pub fn auth_response(secret: &str, node_id: u64, nonce: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Canonical payload for an HTTP-API-signed cluster join (`admin_proof`).
+pub fn join_admin_proof_payload(node_id: u64, control_addr: &str, media_addr: &str) -> String {
+    format!("Join:{node_id}:{control_addr}:{media_addr}")
+}
+
 /// Proof that a membership change was initiated via the HTTP API (bearer token).
 pub fn admin_proof(api_token: &str, payload: &str) -> String {
     use sha2::{Digest, Sha256};

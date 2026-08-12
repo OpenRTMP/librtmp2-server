@@ -24,7 +24,12 @@ fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-fn cluster_cfg(node_id: u64, bootstrap: bool, join: Option<String>) -> (ClusterConfig, u16, u16) {
+fn cluster_cfg(
+    node_id: u64,
+    bootstrap: bool,
+    join: Option<String>,
+    join_proof: String,
+) -> (ClusterConfig, u16, u16) {
     let control = free_port();
     let media = free_port();
     let mut cfg = ClusterConfig::default();
@@ -34,6 +39,7 @@ fn cluster_cfg(node_id: u64, bootstrap: bool, join: Option<String>) -> (ClusterC
     cfg.media_bind = format!("127.0.0.1:{media}");
     cfg.bootstrap = bootstrap;
     cfg.join = join;
+    cfg.join_proof = join_proof;
     cfg.secret = secret();
     cfg.heartbeat = Duration::from_millis(100);
     cfg.advertise_addr = Some(cfg.bind.clone());
@@ -45,11 +51,30 @@ async fn start_node(
     node_id: u64,
     bootstrap: bool,
     join: Option<String>,
+    join_proof: String,
 ) -> (Arc<ClusterManager>, TempDir) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join(format!("n{node_id}.db"));
     let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
-    let (cfg, _, _) = cluster_cfg(node_id, bootstrap, join);
+    let (cfg, _, _) = cluster_cfg(node_id, bootstrap, join, join_proof);
+    let mgr = ClusterManager::start(cfg, db, tokio::runtime::Handle::current())
+        .await
+        .expect("start cluster node");
+    (mgr, dir)
+}
+
+async fn start_joiner(
+    leader: &ClusterManager,
+    node_id: u64,
+    join_addr: String,
+) -> (Arc<ClusterManager>, TempDir) {
+    let (mut cfg, _, _) = cluster_cfg(node_id, false, Some(join_addr), String::new());
+    cfg.join_proof = leader
+        .mint_join_proof(node_id, &cfg.bind, &cfg.media_bind)
+        .expect("mint join proof");
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join(format!("n{node_id}.db"));
+    let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
     let mgr = ClusterManager::start(cfg, db, tokio::runtime::Handle::current())
         .await
         .expect("start cluster node");
@@ -58,12 +83,12 @@ async fn start_node(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_bootstrap_and_leader() {
-    let (n1, _d1) = start_node(1, true, None).await;
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let join = Some(n1.config.advertise_control());
-    let (n2, _d2) = start_node(2, false, join.clone()).await;
-    let (n3, _d3) = start_node(3, false, join).await;
+    let join = n1.config.advertise_control();
+    let (n2, _d2) = start_joiner(&n1, 2, join.clone()).await;
+    let (n3, _d3) = start_joiner(&n1, 3, join).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let m1 = n1.metrics().await;
@@ -73,10 +98,10 @@ async fn three_node_bootstrap_and_leader() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_stream_via_follower_forwards_to_leader() {
-    let (n1, _d1) = start_node(1, true, None).await;
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let join = Some(n1.config.advertise_control());
-    let (n2, _d2) = start_node(2, false, join).await;
+    let join = n1.config.advertise_control();
+    let (n2, _d2) = start_joiner(&n1, 2, join).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Promote learner so it can participate; writes still forward via OpenRaft.
@@ -109,10 +134,10 @@ async fn create_stream_via_follower_forwards_to_leader() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_stream_via_leader_replicates() {
-    let (n1, _d1) = start_node(1, true, None).await;
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let join = Some(n1.config.advertise_control());
-    let (n2, _d2) = start_node(2, false, join).await;
+    let join = n1.config.advertise_control();
+    let (n2, _d2) = start_joiner(&n1, 2, join).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     let stream = Stream {
@@ -135,10 +160,10 @@ async fn create_stream_via_leader_replicates() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn viewer_and_delete_replicate() {
-    let (n1, _d1) = start_node(1, true, None).await;
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let join = Some(n1.config.advertise_control());
-    let (n2, _d2) = start_node(2, false, join).await;
+    let join = n1.config.advertise_control();
+    let (n2, _d2) = start_joiner(&n1, 2, join).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let stream = Stream {
@@ -178,7 +203,7 @@ async fn viewer_and_delete_replicate() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ownership_conflict_and_release() {
-    let (n1, _d1) = start_node(1, true, None).await;
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let stream = Stream {
         id: "own".into(),
@@ -202,7 +227,7 @@ async fn ownership_conflict_and_release() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ownership_failover_via_release_owners_for_node() {
-    let (n1, _d1) = start_node(1, true, None).await;
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let stream = Stream {
         id: "fo".into(),
@@ -296,7 +321,7 @@ async fn standalone_coordinator_with_cluster_feature() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_write_command_roundtrip() {
-    let (n1, _d1) = start_node(1, true, None).await;
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     // Exercise SetStreamEnabled via coordinator path after create.
     let stream = Stream {

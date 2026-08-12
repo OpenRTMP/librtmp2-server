@@ -269,11 +269,12 @@ impl ClusterManager {
         // Control + media listeners
         {
             let mgr_join = Arc::clone(&mgr);
-            let on_join: network::JoinAcceptFn = Arc::new(move |nid, ctrl, media_addr| {
+            let on_join: network::JoinAcceptFn = Arc::new(move |nid, ctrl, media_addr, proof| {
                 let mgr = Arc::clone(&mgr_join);
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async move { mgr.accept_join(nid, ctrl, media_addr).await })
+                    tokio::runtime::Handle::current().block_on(async move {
+                        mgr.accept_join(nid, ctrl, media_addr, proof).await
+                    })
                 })
             });
             let health_hb = Arc::clone(&mgr.health);
@@ -453,6 +454,7 @@ impl ClusterManager {
                         config.node_id,
                         advertise.clone(),
                         media_advertise.clone(),
+                        config.join_proof.clone(),
                         tls_client.clone(),
                     )
                     .await?;
@@ -850,6 +852,17 @@ impl ClusterManager {
         }
     }
 
+    pub fn mint_join_proof(
+        &self,
+        node_id: NodeId,
+        control_addr: &str,
+        media_addr: &str,
+    ) -> Result<String, String> {
+        let payload =
+            crate::cluster::security::join_admin_proof_payload(node_id, control_addr, media_addr);
+        self.admin_action_proof(&payload)
+    }
+
     fn membership_admin_proof(
         &self,
         change: &ChangeMembers<NodeId, BasicNode>,
@@ -916,6 +929,7 @@ impl ClusterManager {
         node_id: NodeId,
         control_addr: String,
         media_addr: String,
+        proof: String,
     ) -> Result<(String, Vec<JoinPeerInfo>), String> {
         self.network.upsert_node(node_id, control_addr.clone());
         self.meta
@@ -950,6 +964,7 @@ impl ClusterManager {
                     node_id,
                     control_addr,
                     media_addr,
+                    proof,
                     self.tls_client.clone(),
                 )
                 .await;

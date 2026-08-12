@@ -92,6 +92,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/cluster/nodes/{id}",
             delete(handle_cluster_remove_node),
         )
+        .route(
+            "/api/v1/cluster/join-proof",
+            post(handle_cluster_join_proof),
+        )
         .layer(DefaultBodyLimit::max(state.config.http_max_body_bytes))
         .layer(middleware::from_fn_with_state(
             limiter,
@@ -2109,6 +2113,68 @@ async fn handle_cluster_remove_node(
         }
     }
     let _ = id;
+    err_json(
+        StatusCode::BAD_REQUEST,
+        "CLUSTER_DISABLED",
+        "Clustering is not enabled",
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinProofRequest {
+    node_id: u64,
+    control_addr: String,
+    media_addr: String,
+}
+
+async fn handle_cluster_join_proof(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Option<Json<JoinProofRequest>>,
+) -> Response {
+    if !bearer_ok(&state, &headers) {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    let Some(Json(req)) = body else {
+        return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Missing request body");
+    };
+    if req.node_id == 0 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "node_id must be a positive integer",
+        );
+    }
+    if req.control_addr.trim().is_empty() || req.media_addr.trim().is_empty() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "control_addr and media_addr are required",
+        );
+    }
+    #[cfg(feature = "cluster")]
+    {
+        if let Some(mgr) = state.coordinator.cluster_manager() {
+            return match mgr.mint_join_proof(
+                req.node_id,
+                req.control_addr.trim(),
+                req.media_addr.trim(),
+            ) {
+                Ok(proof) => Json(json!({
+                    "node_id": req.node_id,
+                    "control_addr": req.control_addr.trim(),
+                    "media_addr": req.media_addr.trim(),
+                    "proof": proof,
+                }))
+                .into_response(),
+                Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "CLUSTER_ERROR", &e),
+            };
+        }
+    }
     err_json(
         StatusCode::BAD_REQUEST,
         "CLUSTER_DISABLED",

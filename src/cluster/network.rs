@@ -1,10 +1,12 @@
 //! Length-prefixed JSON framing over TCP (optional mTLS) for Raft RPC + admin/join.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RemoteError, Unreachable};
@@ -35,7 +37,31 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap concurrent control-plane handshakes (pre-auth + one request).
 const MAX_CONTROL_CONN_INFLIGHT: usize = 512;
+/// Cap half-open auth handshakes per source IP so a remote peer cannot hold
+/// the global inflight budget before presenting valid cluster credentials.
+const MAX_PREAUTH_CONN_PER_IP: usize = 16;
 static CONTROL_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PREAUTH_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
+
+fn try_acquire_preauth_slot(peer: IpAddr) -> bool {
+    let mut guard = PREAUTH_CONN_PER_IP.lock();
+    let count = guard.entry(peer).or_insert(0);
+    if *count >= MAX_PREAUTH_CONN_PER_IP {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+fn release_preauth_slot(peer: IpAddr) {
+    let mut guard = PREAUTH_CONN_PER_IP.lock();
+    if let Some(count) = guard.get_mut(&peer) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            guard.remove(&peer);
+        }
+    }
+}
 /// Bounds an entire authenticated client round trip (connect + TLS + auth +
 /// write + response read). Callers like `ClusterManager::block_on_write`
 /// invoke this synchronously from the RTMP poll thread when forwarding a
@@ -84,6 +110,9 @@ pub enum ControlMessage {
         node_id: NodeId,
         control_addr: String,
         media_addr: String,
+        /// HTTP-API `admin_proof` over [`join_admin_proof_payload`].
+        #[serde(default)]
+        proof: String,
     },
     JoinResponse {
         ok: bool,
@@ -413,7 +442,9 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
 
 /// Result of accepting a join request (topology for the joiner).
 pub type JoinAcceptFn = Arc<
-    dyn Fn(NodeId, String, String) -> Result<(String, Vec<JoinPeerInfo>), String> + Send + Sync,
+    dyn Fn(NodeId, String, String, String) -> Result<(String, Vec<JoinPeerInfo>), String>
+        + Send
+        + Sync,
 >;
 
 /// Returns true when `node_id` is in the current Raft membership.
@@ -501,9 +532,8 @@ pub async fn serve_control_plane_listener(
     tracing::info!(%bind, tls = tls_required, "cluster control plane listening");
     loop {
         let (stream, peer) = listener.accept().await?;
-        if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_CONTROL_CONN_INFLIGHT {
-            CONTROL_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-            tracing::debug!(%peer, "control connection rejected: inflight limit");
+        if !try_acquire_preauth_slot(peer.ip()) {
+            tracing::debug!(%peer, "control connection rejected: preauth per-ip limit");
             continue;
         }
         let secret = secret.clone();
@@ -517,13 +547,19 @@ pub async fn serve_control_plane_listener(
         let write_forward = write_forward.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            struct PreauthGuard(IpAddr);
+            impl Drop for PreauthGuard {
+                fn drop(&mut self) {
+                    release_preauth_slot(self.0);
+                }
+            }
+            let _preauth = PreauthGuard(peer.ip());
             struct InflightGuard;
             impl Drop for InflightGuard {
                 fn drop(&mut self) {
                     CONTROL_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
                 }
             }
-            let _inflight = InflightGuard;
             let result = async {
                 if let Some(ref acc) = acceptor {
                     let mut tls = tokio::time::timeout(AUTH_TIMEOUT, acc.accept(stream))
@@ -536,9 +572,27 @@ pub async fn serve_control_plane_listener(
                         .1
                         .peer_certificates()
                         .and_then(node_id_from_peer_certs);
-                    handle_control_conn(
-                        &mut tls,
+                    let mut tls_stream = tls;
+                    let peer_id = server_auth_handshake(
+                        &mut tls_stream,
                         &secret,
+                        local_id,
+                        tls_required,
+                        cert_node_id,
+                    )
+                    .await?;
+                    if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
+                        >= MAX_CONTROL_CONN_INFLIGHT
+                    {
+                        CONTROL_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+                        return Err(std::io::Error::other(
+                            "control connection rejected: inflight limit",
+                        ));
+                    }
+                    let _inflight = InflightGuard;
+                    handle_authenticated_control_conn(
+                        &mut tls_stream,
+                        peer_id,
                         local_id,
                         raft,
                         on_join,
@@ -548,15 +602,30 @@ pub async fn serve_control_plane_listener(
                         is_member,
                         verify_admin_proof,
                         write_forward,
-                        tls_required,
-                        cert_node_id,
                     )
                     .await
                 } else {
                     let mut tcp = stream;
-                    handle_control_conn(
+                    let peer_id = server_auth_handshake(
                         &mut tcp,
                         &secret,
+                        local_id,
+                        tls_required,
+                        None,
+                    )
+                    .await?;
+                    if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
+                        >= MAX_CONTROL_CONN_INFLIGHT
+                    {
+                        CONTROL_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+                        return Err(std::io::Error::other(
+                            "control connection rejected: inflight limit",
+                        ));
+                    }
+                    let _inflight = InflightGuard;
+                    handle_authenticated_control_conn(
+                        &mut tcp,
+                        peer_id,
                         local_id,
                         raft,
                         on_join,
@@ -566,8 +635,6 @@ pub async fn serve_control_plane_listener(
                         is_member,
                         verify_admin_proof,
                         write_forward,
-                        tls_required,
-                        None,
                     )
                     .await
                 }
@@ -634,9 +701,9 @@ async fn client_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
+async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    secret: &str,
+    peer_id: NodeId,
     local_id: NodeId,
     raft: Raft,
     on_join: JoinAcceptFn,
@@ -646,12 +713,8 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     is_member: MembershipFn,
     verify_admin_proof: AdminProofFn,
     write_forward: Option<ClientWriteForwardCtx>,
-    tls_required: bool,
-    cert_node_id: Option<u64>,
 ) -> Result<(), std::io::Error> {
-    let peer_id =
-        server_auth_handshake(stream, secret, local_id, tls_required, cert_node_id).await?;
-
+    let _ = local_id;
     // One-shot request/response for this connection (matches client roundtrip).
     let msg = read_control_frame(stream).await?;
     let resp = match msg {
@@ -692,6 +755,7 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             node_id,
             control_addr,
             media_addr,
+            proof,
         } => {
             // Direct joins must authenticate as the joining node. Existing
             // members may proxy a JoinRequest for a fresh learner (follower
@@ -701,7 +765,15 @@ async fn handle_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                     "join node_id must match authenticated peer",
                 ));
             }
-            match on_join(node_id, control_addr, media_addr) {
+            let payload = crate::cluster::security::join_admin_proof_payload(
+                node_id,
+                &control_addr,
+                &media_addr,
+            );
+            if !verify_admin_proof(&proof, &payload) {
+                return Err(std::io::Error::other("invalid join admin proof"));
+            }
+            match on_join(node_id, control_addr, media_addr, proof) {
                 Ok((cluster_id, peers)) => ControlMessage::JoinResponse {
                     ok: true,
                     message: "joined as learner".into(),
@@ -971,6 +1043,7 @@ pub async fn send_join(
     local_id: NodeId,
     control_addr: String,
     media_addr: String,
+    proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
     send_join_with_hops(
@@ -979,6 +1052,7 @@ pub async fn send_join(
         local_id,
         control_addr,
         media_addr,
+        proof,
         tls_client,
         0,
     )
@@ -993,6 +1067,7 @@ async fn send_join_with_hops(
     local_id: NodeId,
     control_addr: String,
     media_addr: String,
+    proof: String,
     tls_client: Option<Arc<ClientConfig>>,
     hops: u8,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
@@ -1005,6 +1080,7 @@ async fn send_join_with_hops(
             node_id: local_id,
             control_addr: control_addr.clone(),
             media_addr: media_addr.clone(),
+            proof: proof.clone(),
         },
     )
     .await?
@@ -1038,6 +1114,7 @@ async fn send_join_with_hops(
                 local_id,
                 control_addr,
                 media_addr,
+                proof,
                 tls_client,
                 hops + 1,
             ))
@@ -1058,6 +1135,7 @@ pub async fn forward_join(
     joiner_id: NodeId,
     control_addr: String,
     media_addr: String,
+    proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
     match authed_roundtrip_inner(
@@ -1069,6 +1147,7 @@ pub async fn forward_join(
             node_id: joiner_id,
             control_addr,
             media_addr,
+            proof,
         },
     )
     .await?
