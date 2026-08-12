@@ -493,21 +493,23 @@ fn build_nginx_xml(db: &Db, stream_id: Option<&str>, redact_identifiers: bool) -
     }
 
     fn find_group<'g>(groups: &'g mut Vec<StreamGroup>, label: &str) -> &'g mut StreamGroup {
-        if !groups.iter().any(|g| g.label == label) {
-            groups.push(StreamGroup {
-                label: label.to_string(),
-                uptime_ms: 0,
-                bw_in: 0,
-                bytes_in: 0,
-                bw_out: 0,
-                bytes_out: 0,
-                publishing: false,
-                video: None,
-                audio: None,
-                clients: String::new(),
-            });
+        if let Some(idx) = groups.iter().position(|g| g.label == label) {
+            return &mut groups[idx];
         }
-        groups.iter_mut().find(|g| g.label == label).unwrap()
+        groups.push(StreamGroup {
+            label: label.to_string(),
+            uptime_ms: 0,
+            bw_in: 0,
+            bytes_in: 0,
+            bw_out: 0,
+            bytes_out: 0,
+            publishing: false,
+            video: None,
+            audio: None,
+            clients: String::new(),
+        });
+        let last = groups.len() - 1;
+        &mut groups[last]
     }
 
     let mut groups: Vec<StreamGroup> = Vec::new();
