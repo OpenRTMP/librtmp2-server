@@ -268,13 +268,11 @@ impl ClusterConfig {
                     .into(),
             );
         }
-        if self.join.is_some() && self.join_proof.is_empty() {
-            return Err(
-                "CLUSTER_JOIN_PROOF is required when CLUSTER_JOIN is set; mint one via \
-                 POST /api/v1/cluster/join-proof on an existing cluster member"
-                    .into(),
-            );
-        }
+        // CLUSTER_JOIN_PROOF is intentionally not required here. Existing members
+        // commonly retain CLUSTER_JOIN across restarts and skip the join handshake
+        // once durable Raft state is present. Fresh joins are rejected without a
+        // proof by network::send_join(), after reseed classification has selected
+        // the FreshJoin path.
         if self.tls_enabled {
             if self.tls_cert_file.as_os_str().is_empty()
                 || self.tls_key_file.as_os_str().is_empty()
