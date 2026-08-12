@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use librtmp2_server::cluster::ClusterManager;
+use librtmp2_server::cluster::{ClusterManager, SessionHooks};
 use librtmp2_server::cluster::command::ClusterCommand;
 use librtmp2_server::cluster::config::ClusterConfig;
 use librtmp2_server::cluster::media::subscription::SubscriptionTable;
@@ -15,6 +15,8 @@ use librtmp2_server::db::{Db, Stream, StreamViewer};
 use librtmp2_server::state::StateCoordinator;
 use tempfile::TempDir;
 
+const TEST_API_TOKEN: &str = "cluster-ha-test-api-token";
+
 fn secret() -> String {
     "test-cluster-secret!!".to_string()
 }
@@ -22,6 +24,16 @@ fn secret() -> String {
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+fn register_test_session_hooks(mgr: &ClusterManager) {
+    mgr.register_session_hooks(SessionHooks {
+        deleted_streams: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+        revoked_viewers: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+        api_token: Arc::new(parking_lot::RwLock::new(TEST_API_TOKEN.to_string())),
+        force_unpublish_stream: Arc::new(|_: &str| {}),
+        local_stream_sessions: Arc::new(|_: &str| 0u64),
+    });
 }
 
 fn cluster_cfg(
@@ -60,6 +72,7 @@ async fn start_node(
     let mgr = ClusterManager::start(cfg, db, tokio::runtime::Handle::current())
         .await
         .expect("start cluster node");
+    register_test_session_hooks(&mgr);
     (mgr, dir)
 }
 
@@ -78,6 +91,7 @@ async fn start_joiner(
     let mgr = ClusterManager::start(cfg, db, tokio::runtime::Handle::current())
         .await
         .expect("start cluster node");
+    register_test_session_hooks(&mgr);
     (mgr, dir)
 }
 
