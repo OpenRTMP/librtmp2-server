@@ -49,6 +49,8 @@ pub struct ClusterConfig {
     pub media_bind: String,
     pub bootstrap: bool,
     pub join: Option<String>,
+    /// HTTP-API `admin_proof` for [`JoinRequest`] (from `CLUSTER_JOIN_PROOF`).
+    pub join_proof: String,
     pub secret: String,
     pub tls_enabled: bool,
     pub tls_cert_file: PathBuf,
@@ -82,6 +84,7 @@ impl Default for ClusterConfig {
             media_bind: "0.0.0.0:1941".to_string(),
             bootstrap: false,
             join: None,
+            join_proof: String::new(),
             secret: String::new(),
             tls_enabled: false,
             tls_cert_file: PathBuf::new(),
@@ -265,6 +268,11 @@ impl ClusterConfig {
                     .into(),
             );
         }
+        // CLUSTER_JOIN_PROOF is intentionally not required here. Existing members
+        // commonly retain CLUSTER_JOIN across restarts and skip the join handshake
+        // once durable Raft state is present. Fresh joins are rejected without a
+        // proof by network::send_join(), after reseed classification has selected
+        // the FreshJoin path.
         if self.tls_enabled {
             if self.tls_cert_file.as_os_str().is_empty()
                 || self.tls_key_file.as_os_str().is_empty()
@@ -337,6 +345,7 @@ const CLUSTER_FILE_KEYS: &[&str] = &[
     "CLUSTER_MEDIA_BIND",
     "CLUSTER_BOOTSTRAP",
     "CLUSTER_JOIN",
+    "CLUSTER_JOIN_PROOF",
     "CLUSTER_SECRET",
     "CLUSTER_TLS_ENABLED",
     "CLUSTER_TLS_CERT_FILE",
@@ -368,6 +377,7 @@ const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
     ("LRTMP2_CLUSTER_MEDIA_BIND", "CLUSTER_MEDIA_BIND"),
     ("LRTMP2_CLUSTER_BOOTSTRAP", "CLUSTER_BOOTSTRAP"),
     ("LRTMP2_CLUSTER_JOIN", "CLUSTER_JOIN"),
+    ("LRTMP2_CLUSTER_JOIN_PROOF", "CLUSTER_JOIN_PROOF"),
     ("LRTMP2_CLUSTER_SECRET", "CLUSTER_SECRET"),
     ("LRTMP2_CLUSTER_TLS_ENABLED", "CLUSTER_TLS_ENABLED"),
     ("LRTMP2_CLUSTER_TLS_CERT_FILE", "CLUSTER_TLS_CERT_FILE"),
@@ -415,6 +425,7 @@ pub const CLUSTER_ENV_OVERRIDE_KEYS: &[&str] = &[
     "LRTMP2_CLUSTER_MEDIA_BIND",
     "LRTMP2_CLUSTER_BOOTSTRAP",
     "LRTMP2_CLUSTER_JOIN",
+    "LRTMP2_CLUSTER_JOIN_PROOF",
     "LRTMP2_CLUSTER_SECRET",
     "LRTMP2_CLUSTER_TLS_ENABLED",
     "LRTMP2_CLUSTER_TLS_CERT_FILE",
@@ -456,6 +467,7 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(),
                 Some(val.to_string())
             };
         }
+        "CLUSTER_JOIN_PROOF" => cfg.join_proof = val.to_string(),
         "CLUSTER_SECRET" => cfg.secret = val.to_string(),
         "CLUSTER_TLS_ENABLED" => cfg.tls_enabled = parse_bool_strict(val, key)?,
         "CLUSTER_TLS_CERT_FILE" => cfg.tls_cert_file = PathBuf::from(val),

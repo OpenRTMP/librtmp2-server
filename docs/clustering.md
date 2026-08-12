@@ -61,6 +61,7 @@ Set in `.env` or via `LRTMP2_CLUSTER_*` process overrides:
 | `CLUSTER_MEDIA_BIND` | `0.0.0.0:1941` | Media plane |
 | `CLUSTER_BOOTSTRAP` | `false` | First voter; mutually exclusive with JOIN |
 | `CLUSTER_JOIN` | — | Address of an existing control peer |
+| `CLUSTER_JOIN_PROOF` | — | Required for a fresh join; mint via authenticated `POST /api/v1/cluster/join-proof` |
 | `CLUSTER_SECRET` | — | Shared secret (≥16 chars); never logged |
 | `CLUSTER_TLS_ENABLED` | `false` | mTLS for control/media when true |
 | `CLUSTER_TLS_CERT_FILE` / `KEY` / `CA` | — | Required if TLS enabled |
@@ -97,15 +98,51 @@ joiner can heartbeat and open media mesh links.
 
 ### Join (additional node)
 
-Use an **empty** database (no prior `streams` / `raft_*` state):
+Use an **empty** database (no prior `streams` / `raft_*` state). Before starting
+the new node, mint a one-time join proof on an existing member using the normal
+HTTP API bearer token. The `control_addr` and `media_addr` in this request must
+match the addresses the joining node will advertise:
+
+```bash
+curl -sS -X POST http://10.0.0.1:8080/api/v1/cluster/join-proof \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "node_id": 2,
+    "control_addr": "10.0.0.2:1940",
+    "media_addr": "10.0.0.2:1941"
+  }'
+```
+
+Example response:
+
+```json
+{
+  "node_id": 2,
+  "control_addr": "10.0.0.2:1940",
+  "media_addr": "10.0.0.2:1941",
+  "proof": "<join-proof>"
+}
+```
+
+Configure the joining node with the returned `proof`:
 
 ```bash
 CLUSTER_ENABLED=true
 CLUSTER_NODE_ID=2
 CLUSTER_JOIN=10.0.0.1:1940
+CLUSTER_JOIN_PROOF=<join-proof>
 CLUSTER_SECRET=<same-secret>
+CLUSTER_BIND=0.0.0.0:1940
+CLUSTER_MEDIA_BIND=0.0.0.0:1941
+CLUSTER_ADVERTISE_ADDR=10.0.0.2:1940
+CLUSTER_MEDIA_ADVERTISE_ADDR=10.0.0.2:1941
 LRTMP2_DB=/data/node2.db   # fresh file
 ```
+
+A fresh join without `CLUSTER_JOIN_PROOF` is rejected before the join request is
+sent. The proof is bound to the node ID and advertised control/media addresses,
+so mint a new proof if any of those values change.
 
 Joined nodes start as **learners**. Promote to voter after catch-up:
 
@@ -121,14 +158,16 @@ a leftover `cluster_id` without raft membership.
 
 **Existing member restart:** if `CLUSTER_JOIN` is still set but local `raft_*`
 state already exists, the node **resumes** (skips the join handshake) instead of
-failing.
+failing. A restart on this `ResumeExisting` path does not require a new
+`CLUSTER_JOIN_PROOF`; the proof is only consumed by a fresh join.
 
 **To reseed a node:**
 
 1. Stop the process.
 2. Delete `server.db`, `server.db-wal`, `server.db-shm` (or use a new path).
-3. Start again with `CLUSTER_JOIN=...` (learner) or `CLUSTER_BOOTSTRAP=true`
-   only for a brand-new cluster.
+3. Mint a new join proof for the node ID and advertised addresses.
+4. Start again with `CLUSTER_JOIN=...` and `CLUSTER_JOIN_PROOF=...` (learner),
+   or `CLUSTER_BOOTSTRAP=true` only for a brand-new cluster.
 
 Do **not** copy a live DB from another cluster node and join — that creates
 conflicting Raft state.
@@ -141,6 +180,7 @@ conflicting Raft state.
 | GET | `/api/v1/cluster` | Cluster status (leader, term, load, quorum, …) |
 | GET | `/api/v1/cluster/nodes` | Peer list (panel node fields) |
 | GET | `/api/v1/cluster/streams` | Streams + ownership / mesh subscriptions |
+| POST | `/api/v1/cluster/join-proof` | Mint a proof authorizing one fresh node join |
 | POST | `/api/v1/cluster/nodes/{id}/drain` | Mark node DRAINING |
 | POST | `/api/v1/cluster/nodes/{id}/resume` | Mark node READY |
 | POST | `/api/v1/cluster/nodes/{id}/promote` | Promote learner → voter |
@@ -218,14 +258,3 @@ ports:
   - "1940:1940"   # cluster control
   - "1941:1941"   # cluster media
 ```
-
-## Tests
-
-```powershell
-$env:PATH = "C:\Users\alexg\.cargo\bin;" + $env:PATH
-cargo test --features test-support
-cargo test --features cluster,test-support
-```
-
-`tests/cluster_ha.rs` covers 3-node bootstrap, create via leader/follower,
-ownership conflict/failover, subscription/timeline units, and reseed refusal.

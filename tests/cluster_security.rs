@@ -5,7 +5,8 @@
 use librtmp2_server::cluster::command::ClusterCommand;
 use librtmp2_server::cluster::membership::verify_cluster_identity;
 use librtmp2_server::cluster::security::{
-    admin_proof, auth_response, node_id_from_peer_certs, secrets_equal, verify_tls_node_identity,
+    admin_proof, auth_response, join_admin_proof_payload, node_id_from_peer_certs, secrets_equal,
+    verify_tls_node_identity,
 };
 
 #[test]
@@ -38,6 +39,20 @@ fn admin_proof_changes_with_payload() {
     let token = "api-token-for-tests-only";
     let a = admin_proof(token, r#"{"AddVoterIds":[2]}"#);
     let b = admin_proof(token, r#"{"AddVoterIds":[3]}"#);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn join_admin_proof_binds_node_addresses() {
+    let token = "api-token-for-tests-only";
+    let a = admin_proof(
+        token,
+        &join_admin_proof_payload(2, "127.0.0.1:1940", "127.0.0.1:1941"),
+    );
+    let b = admin_proof(
+        token,
+        &join_admin_proof_payload(3, "127.0.0.1:1940", "127.0.0.1:1941"),
+    );
     assert_ne!(a, b);
 }
 
