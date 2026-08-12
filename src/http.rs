@@ -2140,7 +2140,11 @@ async fn handle_cluster_join_proof(
         );
     }
     let Some(Json(req)) = body else {
-        return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Missing request body");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Missing request body",
+        );
     };
     if req.node_id == 0 {
         return err_json(

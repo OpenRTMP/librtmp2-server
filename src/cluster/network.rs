@@ -606,14 +606,9 @@ pub async fn serve_control_plane_listener(
                     .await
                 } else {
                     let mut tcp = stream;
-                    let peer_id = server_auth_handshake(
-                        &mut tcp,
-                        &secret,
-                        local_id,
-                        tls_required,
-                        None,
-                    )
-                    .await?;
+                    let peer_id =
+                        server_auth_handshake(&mut tcp, &secret, local_id, tls_required, None)
+                            .await?;
                     if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
                         >= MAX_CONTROL_CONN_INFLIGHT
                     {
