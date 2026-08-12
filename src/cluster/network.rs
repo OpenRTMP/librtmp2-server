@@ -35,13 +35,28 @@ const MAX_CONTROL_FRAME: u32 = 8 * 1024 * 1024;
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Cap concurrent control-plane handshakes (pre-auth + one request).
+/// Cap concurrent authenticated control-plane requests.
 const MAX_CONTROL_CONN_INFLIGHT: usize = 512;
-/// Cap half-open auth handshakes per source IP so a remote peer cannot hold
-/// the global inflight budget before presenting valid cluster credentials.
+/// Preserve a global cap on half-open TLS/auth handshakes before spawning work.
+const MAX_PREAUTH_CONN_INFLIGHT: usize = 512;
+/// Cap half-open auth handshakes per source IP so one source cannot consume
+/// the entire global pre-authentication budget.
 const MAX_PREAUTH_CONN_PER_IP: usize = 16;
 static CONTROL_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PREAUTH_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
+
+fn try_acquire_global_preauth_slot() -> bool {
+    if PREAUTH_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_PREAUTH_CONN_INFLIGHT {
+        PREAUTH_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+fn release_global_preauth_slot() {
+    PREAUTH_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+}
 
 fn try_acquire_preauth_slot(peer: IpAddr) -> bool {
     let mut guard = PREAUTH_CONN_PER_IP.lock();
@@ -532,7 +547,12 @@ pub async fn serve_control_plane_listener(
     tracing::info!(%bind, tls = tls_required, "cluster control plane listening");
     loop {
         let (stream, peer) = listener.accept().await?;
+        if !try_acquire_global_preauth_slot() {
+            tracing::debug!(%peer, "control connection rejected: global preauth limit");
+            continue;
+        }
         if !try_acquire_preauth_slot(peer.ip()) {
+            release_global_preauth_slot();
             tracing::debug!(%peer, "control connection rejected: preauth per-ip limit");
             continue;
         }
@@ -551,9 +571,10 @@ pub async fn serve_control_plane_listener(
             impl Drop for PreauthGuard {
                 fn drop(&mut self) {
                     release_preauth_slot(self.0);
+                    release_global_preauth_slot();
                 }
             }
-            let _preauth = PreauthGuard(peer.ip());
+            let preauth = PreauthGuard(peer.ip());
             struct InflightGuard;
             impl Drop for InflightGuard {
                 fn drop(&mut self) {
@@ -581,6 +602,7 @@ pub async fn serve_control_plane_listener(
                         cert_node_id,
                     )
                     .await?;
+                    drop(preauth);
                     if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
                         >= MAX_CONTROL_CONN_INFLIGHT
                     {
@@ -609,6 +631,7 @@ pub async fn serve_control_plane_listener(
                     let peer_id =
                         server_auth_handshake(&mut tcp, &secret, local_id, tls_required, None)
                             .await?;
+                    drop(preauth);
                     if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
                         >= MAX_CONTROL_CONN_INFLIGHT
                     {
@@ -1041,6 +1064,12 @@ pub async fn send_join(
     proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
+    if proof.is_empty() {
+        return Err(
+            "CLUSTER_JOIN_PROOF is required for a fresh join; mint one via POST /api/v1/cluster/join-proof on an existing cluster member"
+                .into(),
+        );
+    }
     send_join_with_hops(
         leader_addr,
         secret,
