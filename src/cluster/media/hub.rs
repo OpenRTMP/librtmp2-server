@@ -32,7 +32,8 @@ static PREAUTH_MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
 
 fn try_acquire_global_preauth_media_slot() -> bool {
-    if PREAUTH_MEDIA_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_PREAUTH_MEDIA_CONN_INFLIGHT {
+    if PREAUTH_MEDIA_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_PREAUTH_MEDIA_CONN_INFLIGHT
+    {
         PREAUTH_MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
         return false;
     }
