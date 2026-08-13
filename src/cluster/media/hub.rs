@@ -1,7 +1,7 @@
 //! Media hub: peer mesh, subscribe fan-out, inject queue.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -20,10 +20,66 @@ use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
 
 const MEDIA_INBOUND_QUEUE: usize = 4096;
-/// Cap concurrent inbound media connections (auth + frame reader tasks),
-/// matching the control-plane inflight guard pattern.
+/// Cap concurrent authenticated inbound media connections (frame reader tasks).
 const MAX_MEDIA_CONN_INFLIGHT: usize = 512;
+/// Preserve a global cap on half-open TLS/auth handshakes before inflight.
+const MAX_PREAUTH_MEDIA_CONN_INFLIGHT: usize = 512;
+/// Cap half-open auth handshakes per source IP so one source cannot consume
+/// the entire global pre-authentication budget (mirrors control-plane limits).
+const MAX_PREAUTH_MEDIA_CONN_PER_IP: usize = 16;
 static MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PREAUTH_MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PREAUTH_MEDIA_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
+
+fn try_acquire_global_preauth_media_slot() -> bool {
+    if PREAUTH_MEDIA_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_PREAUTH_MEDIA_CONN_INFLIGHT
+    {
+        PREAUTH_MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+fn release_global_preauth_media_slot() {
+    PREAUTH_MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn try_acquire_preauth_media_slot(peer: IpAddr) -> bool {
+    let mut guard = PREAUTH_MEDIA_CONN_PER_IP.lock();
+    let count = guard.entry(peer).or_insert(0);
+    if *count >= MAX_PREAUTH_MEDIA_CONN_PER_IP {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+fn release_preauth_media_slot(peer: IpAddr) {
+    let mut guard = PREAUTH_MEDIA_CONN_PER_IP.lock();
+    if let Some(count) = guard.get_mut(&peer) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            guard.remove(&peer);
+        }
+    }
+}
+
+struct PreauthMediaGuard(IpAddr);
+
+impl Drop for PreauthMediaGuard {
+    fn drop(&mut self) {
+        release_preauth_media_slot(self.0);
+        release_global_preauth_media_slot();
+    }
+}
+
+struct MediaInflightGuard;
+
+impl Drop for MediaInflightGuard {
+    fn drop(&mut self) {
+        MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Frame exported from local librtmp2 for mesh fan-out.
 #[derive(Debug, Clone)]
@@ -268,37 +324,60 @@ impl MediaHub {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            let (stream, _) = listener.accept().await?;
-            if MEDIA_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_MEDIA_CONN_INFLIGHT {
-                MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-                tracing::warn!("media inbound connection cap reached; dropping accept");
-                drop(stream);
+            let (stream, peer_addr) = listener.accept().await?;
+            let peer_ip = peer_addr.ip();
+            if !try_acquire_global_preauth_media_slot() {
+                tracing::debug!(%peer_addr, "media connection rejected: global preauth limit");
+                continue;
+            }
+            if !try_acquire_preauth_media_slot(peer_ip) {
+                release_global_preauth_media_slot();
+                tracing::debug!(%peer_addr, "media connection rejected: preauth per-ip limit");
                 continue;
             }
             let hub = Arc::clone(&self);
             tokio::spawn(async move {
-                let result = hub.handle_inbound_conn(stream).await;
-                MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-                if let Err(e) = result {
-                    tracing::debug!(error=%e, "media inbound closed");
+                let preauth = PreauthMediaGuard(peer_ip);
+                let auth_result = peer::accept_tls_then_auth(
+                    stream,
+                    &hub.secret,
+                    hub.local_id,
+                    hub.tls_server.clone(),
+                    Arc::clone(&hub.is_peer_allowed),
+                )
+                .await;
+                drop(preauth);
+                match auth_result {
+                    Ok((peer_id, io)) => {
+                        if MEDIA_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
+                            >= MAX_MEDIA_CONN_INFLIGHT
+                        {
+                            MEDIA_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+                            tracing::warn!(
+                                peer = peer_id,
+                                "media inbound connection cap reached after auth; dropping"
+                            );
+                            return;
+                        }
+                        let _inflight = MediaInflightGuard;
+                        if let Err(e) = hub.run_inbound_media_session(peer_id, io).await {
+                            tracing::debug!(error=%e, "media inbound closed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error=%e, "media inbound auth failed");
+                    }
                 }
             });
         }
         Ok(())
     }
 
-    async fn handle_inbound_conn(
+    async fn run_inbound_media_session(
         self: Arc<Self>,
-        stream: tokio::net::TcpStream,
+        peer_id: NodeId,
+        io: Box<dyn peer::MediaIo>,
     ) -> Result<(), std::io::Error> {
-        let (peer_id, io) = peer::accept_tls_then_auth(
-            stream,
-            &self.secret,
-            self.local_id,
-            self.tls_server.clone(),
-            Arc::clone(&self.is_peer_allowed),
-        )
-        .await?;
         // Track Subscribe messages on this connection so a drop without Unsubscribe
         // cannot leave stale SubscriptionTable entries for the peer.
         let mut conn_subs: std::collections::HashMap<(String, String), usize> =
