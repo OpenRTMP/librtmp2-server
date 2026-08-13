@@ -887,22 +887,30 @@ impl DbRtmpBridge {
             return;
         }
 
+        let mut pub_update = None;
+        let mut player_update = None;
+
         if let Some(ref mut pub_row) = cs.publisher {
             pub_row.rtt_ms = rtt_ms;
-            cs.last_rtt_at = Some(now);
-            let pub_id = pub_row.id.clone();
-            let row = pub_row.clone();
-            drop(guard);
-            self.db.publisher_update(&pub_id, &row);
-            return;
+            pub_update = Some((pub_row.id.clone(), pub_row.clone()));
         }
 
         if let Some(ref mut player_row) = cs.player {
             player_row.rtt_ms = rtt_ms;
-            cs.last_rtt_at = Some(now);
-            let player_id = player_row.id.clone();
-            let row = player_row.clone();
-            drop(guard);
+            player_update = Some((player_row.id.clone(), player_row.clone()));
+        }
+
+        if pub_update.is_none() && player_update.is_none() {
+            return;
+        }
+
+        cs.last_rtt_at = Some(now);
+        drop(guard);
+
+        if let Some((pub_id, row)) = pub_update {
+            self.db.publisher_update(&pub_id, &row);
+        }
+        if let Some((player_id, row)) = player_update {
             self.db.player_update(&player_id, &row);
         }
     }
