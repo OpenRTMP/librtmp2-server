@@ -46,6 +46,33 @@ const CLUSTER_ID_SETTING: &str = "cluster_id";
 const BOOTSTRAP_SEEDED_SETTING: &str = "bootstrap_seeded";
 const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
 
+/// Resolve control/media addresses from a heartbeat payload.
+///
+/// With mTLS, the authenticated peer is bound to its certificate identity, so
+/// reported addresses may update routing. On plaintext clusters the shared
+/// `CLUSTER_SECRET` lets any holder authenticate as any `node_id`, so only
+/// previously registered addresses (join / topology refresh) are trusted.
+fn heartbeat_routing_addrs(
+    tls_enabled: bool,
+    reported_control: &str,
+    reported_media: &str,
+    known: Option<(&str, &str)>,
+) -> (Option<String>, Option<String>) {
+    if tls_enabled {
+        let ctrl = (!reported_control.is_empty()).then(|| reported_control.to_string());
+        let media = (!reported_media.is_empty()).then(|| reported_media.to_string());
+        return (ctrl, media);
+    }
+    known
+        .map(|(c, m)| {
+            (
+                (!c.is_empty()).then(|| c.to_string()),
+                (!m.is_empty()).then(|| m.to_string()),
+            )
+        })
+        .unwrap_or((None, None))
+}
+
 pub struct ClusterManager {
     pub config: ClusterConfig,
     db: Arc<Db>,
@@ -289,16 +316,13 @@ impl ClusterManager {
                     }
                     let state =
                         NodeHealthState::parse(&info.health).unwrap_or(NodeHealthState::Ready);
-                    let ctrl = if info.control_addr.is_empty() {
-                        None
-                    } else {
-                        Some(info.control_addr.clone())
-                    };
-                    let media_a = if info.media_addr.is_empty() {
-                        None
-                    } else {
-                        Some(info.media_addr.clone())
-                    };
+                    let known_addrs = meta_hb.get(info.node_id);
+                    let (ctrl, media_a) = heartbeat_routing_addrs(
+                        counts_hb.config.tls_enabled,
+                        &info.control_addr,
+                        &info.media_addr,
+                        known_addrs.as_ref().map(|(c, m)| (c.as_str(), m.as_str())),
+                    );
                     health_hb.note_peer(
                         info.node_id,
                         state,
@@ -306,14 +330,16 @@ impl ClusterManager {
                         ctrl.clone(),
                         media_a.clone(),
                     );
-                    if let (Some(c), Some(m)) = (ctrl, media_a) {
-                        meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
-                        network_hb.upsert_node(info.node_id, c);
-                        let hub = Arc::clone(&media_hb);
-                        let mid = info.node_id;
-                        tokio::spawn(async move {
-                            let _ = hub.connect_peer(mid, &m).await;
-                        });
+                    if counts_hb.config.tls_enabled {
+                        if let (Some(c), Some(m)) = (ctrl, media_a) {
+                            meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
+                            network_hb.upsert_node(info.node_id, c);
+                            let hub = Arc::clone(&media_hb);
+                            let mid = info.node_id;
+                            tokio::spawn(async move {
+                                let _ = hub.connect_peer(mid, &m).await;
+                            });
+                        }
                     }
                     counts_hb
                         .peer_session_counts
@@ -2324,3 +2350,32 @@ impl ClusterManager {
 
 #[allow(dead_code)]
 fn _cluster_manager_markers() {}
+
+#[cfg(test)]
+mod heartbeat_routing_tests {
+    use super::heartbeat_routing_addrs;
+
+    #[test]
+    fn plaintext_heartbeat_ignores_peer_supplied_routing_addrs() {
+        let (ctrl, media) = heartbeat_routing_addrs(
+            false,
+            "attacker:1940",
+            "attacker:1941",
+            Some(("victim:1940", "victim:1941")),
+        );
+        assert_eq!(ctrl.as_deref(), Some("victim:1940"));
+        assert_eq!(media.as_deref(), Some("victim:1941"));
+    }
+
+    #[test]
+    fn mtls_heartbeat_accepts_peer_supplied_routing_addrs() {
+        let (ctrl, media) = heartbeat_routing_addrs(
+            true,
+            "new-ctrl:1940",
+            "new-media:1941",
+            Some(("old-ctrl:1940", "old-media:1941")),
+        );
+        assert_eq!(ctrl.as_deref(), Some("new-ctrl:1940"));
+        assert_eq!(media.as_deref(), Some("new-media:1941"));
+    }
+}
