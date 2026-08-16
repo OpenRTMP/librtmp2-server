@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: rtmp_bridge (2026-08-10)
+Last scanned: keygen (2026-08-16)
 
 ## Modules
 
@@ -9,7 +9,7 @@ Last scanned: rtmp_bridge (2026-08-10)
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [ ] keygen — Stream key generation
+- [x] keygen — Stream key generation
 - [ ] logger — Logging
 
 ## Findings (2026-08-10 rtmp_bridge pass)
