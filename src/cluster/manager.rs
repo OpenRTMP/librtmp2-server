@@ -1,7 +1,8 @@
 //! ClusterManager: Raft lifecycle, durable mutations, media hub.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::BasicNode;
 use openraft::ChangeMembers;
@@ -45,6 +46,8 @@ const CLUSTER_ID_SETTING: &str = "cluster_id";
 /// seed actually landing.
 const BOOTSTRAP_SEEDED_SETTING: &str = "bootstrap_seeded";
 const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
+/// Reject re-sent `admin_proof` values captured from the control plane.
+const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -127,6 +130,9 @@ pub struct ClusterManager {
     /// reported as replicas with no data behind them.
     standby_subs: Mutex<std::collections::HashMap<(String, String), NodeId>>,
     state_machine: SqliteStateMachine,
+    /// Recently accepted `admin_proof` digests — blocks captured ClientWrite /
+    /// membership proofs from being replayed while the API token is unchanged.
+    used_admin_proofs: Mutex<HashMap<String, Instant>>,
 }
 
 /// Shared with AppState so Raft applies can mark deleted streams / revoked viewers
@@ -291,6 +297,7 @@ impl ClusterManager {
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
             standby_subs: Mutex::new(std::collections::HashMap::new()),
             state_machine: sm_handle.clone(),
+            used_admin_proofs: Mutex::new(HashMap::new()),
         });
 
         // Control + media listeners
@@ -341,18 +348,24 @@ impl ClusterManager {
                             });
                         }
                     }
-                    counts_hb
-                        .peer_session_counts
-                        .lock()
-                        .insert(info.node_id, (info.publishers, info.players));
-                    counts_hb
-                        .peer_stream_players
-                        .lock()
-                        .insert(info.node_id, info.stream_players.into_iter().collect());
-                    counts_hb
-                        .peer_viewer_players
-                        .lock()
-                        .insert(info.node_id, info.viewer_players.into_iter().collect());
+                    // Session counts are only trustworthy when mTLS binds the
+                    // authenticated peer to a certificate identity. On plaintext
+                    // clusters any `CLUSTER_SECRET` holder can authenticate as
+                    // another member and lie about remote play/publish load.
+                    if counts_hb.config.tls_enabled {
+                        counts_hb
+                            .peer_session_counts
+                            .lock()
+                            .insert(info.node_id, (info.publishers, info.players));
+                        counts_hb
+                            .peer_stream_players
+                            .lock()
+                            .insert(info.node_id, info.stream_players.into_iter().collect());
+                        counts_hb
+                            .peer_viewer_players
+                            .lock()
+                            .insert(info.node_id, info.viewer_players.into_iter().collect());
+                    }
                 });
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
@@ -908,7 +921,17 @@ impl ClusterManager {
         Ok(crate::cluster::security::admin_proof(&token, payload))
     }
 
+    fn purge_expired_admin_proofs(guard: &mut HashMap<String, Instant>, now: Instant) {
+        guard.retain(|_, seen_at| {
+            now.checked_duration_since(*seen_at)
+                .is_none_or(|age| age < ADMIN_PROOF_REPLAY_TTL)
+        });
+    }
+
     fn verify_admin_proof(&self, proof: &str, payload: &str) -> bool {
+        if proof.is_empty() {
+            return false;
+        }
         let binding = self.session_hooks.lock();
         let Some(hooks) = binding.as_ref() else {
             return false;
@@ -917,10 +940,20 @@ impl ClusterManager {
         if token.is_empty() {
             return false;
         }
-        crate::cluster::security::secrets_equal(
+        if !crate::cluster::security::secrets_equal(
             &crate::cluster::security::admin_proof(&token, payload),
             proof,
-        )
+        ) {
+            return false;
+        }
+        let mut used = self.used_admin_proofs.lock();
+        let now = Instant::now();
+        Self::purge_expired_admin_proofs(&mut used, now);
+        if used.contains_key(proof) {
+            return false;
+        }
+        used.insert(proof.to_string(), now);
+        true
     }
 
     async fn forward_admin(
@@ -2377,5 +2410,16 @@ mod heartbeat_routing_tests {
         );
         assert_eq!(ctrl.as_deref(), Some("new-ctrl:1940"));
         assert_eq!(media.as_deref(), Some("new-media:1941"));
+    }
+
+    #[test]
+    fn purge_expired_admin_proofs_drops_stale_entries() {
+        let mut map = HashMap::new();
+        map.insert(
+            "stale-proof".to_string(),
+            Instant::now() - ADMIN_PROOF_REPLAY_TTL - Duration::from_secs(1),
+        );
+        ClusterManager::purge_expired_admin_proofs(&mut map, Instant::now());
+        assert!(map.is_empty());
     }
 }
