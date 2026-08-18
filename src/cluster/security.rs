@@ -167,6 +167,40 @@ pub fn auth_response(secret: &str, node_id: u64, nonce: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Reject cluster peer dial targets that would turn join into SSRF against
+/// loopback, link-local (including cloud metadata), or other non-unicast IPs.
+/// RFC1918 addresses remain allowed — they are normal for inter-node traffic.
+pub fn validate_cluster_peer_addr(addr: &str, allow_loopback: bool) -> Result<(), String> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return Err("peer address is required".into());
+    }
+    let parsed = trimmed
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("invalid peer address '{trimmed}': {e}"))?;
+    let ip = parsed.ip();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("peer address '{trimmed}' must be a unicast IP"));
+    }
+    if !allow_loopback && ip.is_loopback() {
+        return Err(format!(
+            "peer address '{trimmed}' must not be loopback (set CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS=true for local dev)"
+        ));
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) if v4.is_link_local() => {
+            return Err(format!(
+                "peer address '{trimmed}' must not be link-local (includes cloud metadata endpoints)"
+            ));
+        }
+        std::net::IpAddr::V6(v6) if v6.is_unicast_link_local() => {
+            return Err(format!("peer address '{trimmed}' must not be link-local"));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Canonical payload for an HTTP-API-signed cluster join (`admin_proof`).
 pub fn join_admin_proof_payload(node_id: u64, control_addr: &str, media_addr: &str) -> String {
     format!("Join:{node_id}:{control_addr}:{media_addr}")
@@ -268,6 +302,16 @@ mod tests {
         assert!(verify_tls_node_identity(false, None, 2).is_ok());
         assert!(verify_tls_node_identity(true, Some(1), 2).is_err());
         assert!(verify_tls_node_identity(true, None, 2).is_err());
+    }
+
+    #[test]
+    fn validate_cluster_peer_addr_rejects_loopback_and_metadata() {
+        assert!(validate_cluster_peer_addr("127.0.0.1:1940", false).is_err());
+        assert!(validate_cluster_peer_addr("[::1]:1940", false).is_err());
+        assert!(validate_cluster_peer_addr("169.254.169.254:80", false).is_err());
+        assert!(validate_cluster_peer_addr("0.0.0.0:1940", false).is_err());
+        assert!(validate_cluster_peer_addr("10.0.0.2:1940", false).is_ok());
+        assert!(validate_cluster_peer_addr("127.0.0.1:1940", true).is_ok());
     }
 
     #[test]

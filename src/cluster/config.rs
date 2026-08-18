@@ -73,6 +73,9 @@ pub struct ClusterConfig {
     pub media_queue_mb: u32,
     pub advertise_addr: Option<String>,
     pub media_advertise_addr: Option<String>,
+    /// When false (default), join/control/media peer addresses must not target
+    /// loopback. Link-local targets (e.g. cloud metadata) are always rejected.
+    pub allow_loopback_peer_addrs: bool,
 }
 
 impl Default for ClusterConfig {
@@ -103,6 +106,7 @@ impl Default for ClusterConfig {
             media_queue_mb: 64,
             advertise_addr: None,
             media_advertise_addr: None,
+            allow_loopback_peer_addrs: false,
         }
     }
 }
@@ -367,6 +371,7 @@ const CLUSTER_FILE_KEYS: &[&str] = &[
     "CLUSTER_MEDIA_QUEUE_MB",
     "CLUSTER_ADVERTISE_ADDR",
     "CLUSTER_MEDIA_ADVERTISE_ADDR",
+    "CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS",
 ];
 
 const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
@@ -414,6 +419,10 @@ const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
         "LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR",
         "CLUSTER_MEDIA_ADVERTISE_ADDR",
     ),
+    (
+        "LRTMP2_CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS",
+        "CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS",
+    ),
 ];
 
 /// Process-env keys that may override a file-loaded [`ClusterConfig`].
@@ -447,6 +456,7 @@ pub const CLUSTER_ENV_OVERRIDE_KEYS: &[&str] = &[
     "LRTMP2_CLUSTER_MEDIA_QUEUE_MB",
     "LRTMP2_CLUSTER_ADVERTISE_ADDR",
     "LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR",
+    "LRTMP2_CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS",
 ];
 
 fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(), String> {
@@ -540,6 +550,9 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(),
         }
         "CLUSTER_ADVERTISE_ADDR" => cfg.advertise_addr = Some(val.to_string()),
         "CLUSTER_MEDIA_ADVERTISE_ADDR" => cfg.media_advertise_addr = Some(val.to_string()),
+        "CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS" => {
+            cfg.allow_loopback_peer_addrs = parse_bool_strict(val, key)?;
+        }
         _ => {}
     }
     Ok(())

@@ -6,7 +6,7 @@ use librtmp2_server::cluster::command::ClusterCommand;
 use librtmp2_server::cluster::membership::verify_cluster_identity;
 use librtmp2_server::cluster::security::{
     admin_proof, auth_response, join_admin_proof_payload, node_id_from_peer_certs, secrets_equal,
-    verify_tls_node_identity,
+    validate_cluster_peer_addr, verify_tls_node_identity,
 };
 
 #[test]
@@ -40,6 +40,13 @@ fn admin_proof_changes_with_payload() {
     let a = admin_proof(token, r#"{"AddVoterIds":[2]}"#);
     let b = admin_proof(token, r#"{"AddVoterIds":[3]}"#);
     assert_ne!(a, b);
+}
+
+#[test]
+fn join_peer_addr_validation_blocks_ssrf_targets() {
+    assert!(validate_cluster_peer_addr("127.0.0.1:1940", false).is_err());
+    assert!(validate_cluster_peer_addr("169.254.169.254:80", false).is_err());
+    assert!(validate_cluster_peer_addr("10.0.0.5:1941", false).is_ok());
 }
 
 #[test]
