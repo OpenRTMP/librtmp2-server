@@ -1297,7 +1297,7 @@ impl ClusterManager {
             if self.local_live_sessions(&stream_id) == 0 {
                 self.pending_drain_clears.lock().remove(&stream_id);
                 if let Some(hooks) = self.session_hooks.lock().as_ref() {
-                    hooks.deleted_streams.lock().remove(stream_id);
+                    hooks.deleted_streams.lock().remove(&stream_id);
                 }
             }
         }
