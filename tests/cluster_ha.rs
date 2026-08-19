@@ -56,6 +56,7 @@ fn cluster_cfg(
     cfg.heartbeat = Duration::from_millis(100);
     cfg.advertise_addr = Some(cfg.bind.clone());
     cfg.media_advertise_addr = Some(cfg.media_bind.clone());
+    cfg.allow_loopback_peer_addrs = true;
     (cfg, control, media)
 }
 
