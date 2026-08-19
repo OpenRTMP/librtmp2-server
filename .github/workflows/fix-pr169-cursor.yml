@@ -1,3 +1,4 @@
+# Re-trigger now that this workflow already exists on the branch.
 name: Apply PR 169 Cursor finding fix
 
 on:
