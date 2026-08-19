@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: rtmp_bridge (2026-08-10)
+Last scanned: keygen (2026-08-19)
 
 ## Modules
 
@@ -9,7 +9,7 @@ Last scanned: rtmp_bridge (2026-08-10)
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [ ] keygen — Stream key generation
+- [x] keygen — Stream key generation
 - [ ] logger — Logging
 
 ## Findings (2026-08-10 rtmp_bridge pass)
@@ -83,6 +83,14 @@ Last scanned: rtmp_bridge (2026-08-10)
   terminal. Fixed by escaping every `char::is_control()` codepoint (not just
   `\r`/`\n`) as `\xHH` in `sanitize_for_log()`; added unit tests for
   newline/CR forging and ANSI escape injection.
+
+## Findings (2026-08-19 keygen pass)
+
+No critical bugs found. Re-verified `keygen_with_entropy()` (SysRng / OS CSPRNG,
+128-bit stream keys, 256-bit API token), `is_valid_access_key()` enforcement at
+all RTMP/DB lookup boundaries, global uniqueness via `key_globally_in_use_locked`
++ UNIQUE constraints, RNG-failure propagation (no predictable fallback), and
+cluster leader-only viewer-id generation for Raft apply parity.
 
 ## Findings (2026-07-02 keygen pass)
 
