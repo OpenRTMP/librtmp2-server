@@ -86,6 +86,18 @@ fn secrets_equal_rejects_length_pairs_that_overflow_u8() {
 }
 
 #[test]
+fn admin_proof_is_deterministic_so_replay_cache_is_required() {
+    let token = "api-token-for-tests-only";
+    let payload = r#"{"SetApiToken":{"token":"stolen"}}"#;
+    let a = admin_proof(token, payload);
+    let b = admin_proof(token, payload);
+    assert_eq!(
+        a, b,
+        "identical payloads must yield identical proofs so nodes need replay tracking"
+    );
+}
+
+#[test]
 fn tls_identity_requires_cert_marker_when_tls_on() {
     let mut der = Vec::new();
     der.extend_from_slice(b"noise-lrtmp2-node-99-trailer");
