@@ -1,0 +1,251 @@
+name: Apply PR 169 Cursor finding fix
+
+on:
+  push:
+    branches:
+      - cursor/application-security-review-2fc5
+    paths:
+      - .github/workflows/fix-pr169-cursor.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cursor/application-security-review-2fc5
+          fetch-depth: 0
+
+      - name: Apply retry-safe admin proof fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/cluster/manager.rs')
+          text = path.read_text()
+
+          replacements = []
+
+          replacements.append((
+          '''                    let proof = crate::cluster::security::admin_proof(&token, &req_str);''',
+          '''                    let proof = ClusterManager::mint_fresh_admin_proof(&token, &req_str);'''
+          ))
+
+          replacements.append((
+          '''        Ok(crate::cluster::security::admin_proof(&token, payload))
+    }
+
+    fn purge_expired_admin_proofs(guard: &mut HashMap<String, Instant>, now: Instant) {''',
+          '''        Ok(Self::mint_fresh_admin_proof(&token, payload))
+    }
+
+    /// Mint a unique proof for each admin attempt. The random nonce is signed
+    /// together with the canonical payload, so repeated legitimate operations
+    /// do not reuse the same replay-cache key.
+    fn mint_fresh_admin_proof(api_token: &str, payload: &str) -> String {
+        let nonce = hex::encode(crate::cluster::security::auth_nonce());
+        let signed_payload = format!("{nonce}:{payload}");
+        let mac = crate::cluster::security::admin_proof(api_token, &signed_payload);
+        format!("{nonce}.{mac}")
+    }
+
+    fn admin_proof_signature_valid(api_token: &str, payload: &str, proof: &str) -> bool {
+        let Some((nonce, mac)) = proof.split_once('.') else {
+            return false;
+        };
+        // auth_nonce() is 16 bytes => exactly 32 lowercase/uppercase hex chars.
+        if nonce.len() != 32
+            || hex::decode(nonce)
+                .map(|decoded| decoded.len() != 16)
+                .unwrap_or(true)
+        {
+            return false;
+        }
+        let signed_payload = format!("{nonce}:{payload}");
+        crate::cluster::security::secrets_equal(
+            &crate::cluster::security::admin_proof(api_token, &signed_payload),
+            mac,
+        )
+    }
+
+    fn purge_expired_admin_proofs(guard: &mut HashMap<String, Instant>, now: Instant) {'''
+          ))
+
+          replacements.append((
+          '''        if !crate::cluster::security::secrets_equal(
+            &crate::cluster::security::admin_proof(&token, payload),
+            proof,
+        ) {
+            return false;
+        }
+        let mut used = self.used_admin_proofs.lock();
+        let now = Instant::now();
+        Self::purge_expired_admin_proofs(&mut used, now);
+        if used.contains_key(proof) {
+            return false;
+        }
+        used.insert(proof.to_string(), now);
+        true
+    }
+
+    async fn forward_admin(''',
+          '''        if !Self::admin_proof_signature_valid(&token, payload, proof) {
+            return false;
+        }
+        let mut used = self.used_admin_proofs.lock();
+        let now = Instant::now();
+        Self::purge_expired_admin_proofs(&mut used, now);
+        if used.contains_key(proof) {
+            return false;
+        }
+        // Join proofs must remain retryable if add_learner/forwarding fails.
+        // accept_join() consumes them only after the join actually succeeds.
+        if !payload.starts_with("Join:") {
+            used.insert(proof.to_string(), now);
+        }
+        true
+    }
+
+    fn consume_admin_proof(&self, proof: &str) {
+        let mut used = self.used_admin_proofs.lock();
+        let now = Instant::now();
+        Self::purge_expired_admin_proofs(&mut used, now);
+        used.insert(proof.to_string(), now);
+    }
+
+    async fn forward_admin('''
+          ))
+
+          replacements.append((
+          '''            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                let leader_addr = ftl
+                    .leader_node
+                    .map(|n| n.addr)
+                    .or_else(|| {
+                        ftl.leader_id
+                            .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
+                    })
+                    .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
+                return network::forward_join(
+                    &leader_addr,
+                    &self.config.secret,
+                    self.config.node_id,
+                    node_id,
+                    control_addr,
+                    media_addr,
+                    proof,
+                    self.tls_client.clone(),
+                )
+                .await;
+            }''',
+          '''            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                let leader_addr = ftl
+                    .leader_node
+                    .map(|n| n.addr)
+                    .or_else(|| {
+                        ftl.leader_id
+                            .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
+                    })
+                    .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
+                let proof_for_cache = proof.clone();
+                let result = network::forward_join(
+                    &leader_addr,
+                    &self.config.secret,
+                    self.config.node_id,
+                    node_id,
+                    control_addr,
+                    media_addr,
+                    proof,
+                    self.tls_client.clone(),
+                )
+                .await;
+                if result.is_ok() {
+                    self.consume_admin_proof(&proof_for_cache);
+                }
+                return result;
+            }'''
+          ))
+
+          replacements.append((
+          '''        crate::log_info!("Cluster: node {node_id} joined as learner");
+        Ok((self.cluster_id(), peers))
+    }''',
+          '''        crate::log_info!("Cluster: node {node_id} joined as learner");
+        self.consume_admin_proof(&proof);
+        Ok((self.cluster_id(), peers))
+    }'''
+          ))
+
+          replacements.append((
+          '''    fn purge_expired_admin_proofs_drops_stale_entries() {
+        let mut map = HashMap::new();
+        map.insert(
+            "stale-proof".to_string(),
+            Instant::now() - ADMIN_PROOF_REPLAY_TTL - Duration::from_secs(1),
+        );
+        ClusterManager::purge_expired_admin_proofs(&mut map, Instant::now());
+        assert!(map.is_empty());
+    }
+}''',
+          '''    fn purge_expired_admin_proofs_drops_stale_entries() {
+        let mut map = HashMap::new();
+        map.insert(
+            "stale-proof".to_string(),
+            Instant::now() - ADMIN_PROOF_REPLAY_TTL - Duration::from_secs(1),
+        );
+        ClusterManager::purge_expired_admin_proofs(&mut map, Instant::now());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn fresh_admin_proofs_are_unique_and_payload_bound() {
+        let token: String = (0u8..24).map(|i| char::from(b'a' + (i % 26))).collect();
+        let payload = "AdminDrain:2";
+        let first = ClusterManager::mint_fresh_admin_proof(&token, payload);
+        let second = ClusterManager::mint_fresh_admin_proof(&token, payload);
+        assert_ne!(first, second);
+        assert!(ClusterManager::admin_proof_signature_valid(
+            &token, payload, &first
+        ));
+        assert!(ClusterManager::admin_proof_signature_valid(
+            &token, payload, &second
+        ));
+        assert!(!ClusterManager::admin_proof_signature_valid(
+            &token,
+            "AdminResume:2",
+            &first
+        ));
+    }
+}'''
+          ))
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match, got {count}: {old[:100]!r}')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text)
+
+          # This workflow is a one-shot transport for the patch. Remove it from
+          # the final PR diff before committing the actual fix.
+          Path('.github/workflows/fix-pr169-cursor.yml').unlink()
+          PY
+
+          cargo fmt --all
+
+      - name: Validate cluster tests
+        run: cargo test --features cluster
+
+      - name: Commit fix back to PR branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/cluster/manager.rs .github/workflows/fix-pr169-cursor.yml
+          git commit -m "fix(security): make admin proof replay protection retry-safe"
+          git push origin HEAD:cursor/application-security-review-2fc5
