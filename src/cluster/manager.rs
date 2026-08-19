@@ -130,7 +130,7 @@ pub struct ClusterManager {
     /// reported as replicas with no data behind them.
     standby_subs: Mutex<std::collections::HashMap<(String, String), NodeId>>,
     state_machine: SqliteStateMachine,
-    /// Recently accepted `admin_proof` digests — blocks captured ClientWrite /
+    /// Recently accepted `admin_proof` values — blocks captured ClientWrite /
     /// membership proofs from being replayed while the API token is unchanged.
     used_admin_proofs: Mutex<HashMap<String, Instant>>,
 }
@@ -747,7 +747,7 @@ impl ClusterManager {
                         .map_err(|e| CoordError::Cluster(e.to_string()))?;
                     let req_str = serde_json::to_string(&req)
                         .map_err(|e| CoordError::Cluster(e.to_string()))?;
-                    let proof = crate::cluster::security::admin_proof(&token, &req_str);
+                    let proof = Self::mint_fresh_admin_proof(&token, &req_str);
                     let addr = ftl
                         .leader_node
                         .map(|n| n.addr)
@@ -917,7 +917,35 @@ impl ClusterManager {
             .map(|h| h.api_token.read().clone())
             .filter(|t| !t.is_empty())
             .ok_or_else(|| "API token unavailable for cluster admin action".to_string())?;
-        Ok(crate::cluster::security::admin_proof(&token, payload))
+        Ok(Self::mint_fresh_admin_proof(&token, payload))
+    }
+
+    /// Mint a unique proof for each admin attempt. The nonce is bound into the
+    /// API-token proof so an exact captured proof cannot be re-randomized by an
+    /// attacker, while a legitimate retry gets a different replay-cache key.
+    fn mint_fresh_admin_proof(api_token: &str, payload: &str) -> String {
+        let nonce = hex::encode(crate::cluster::security::auth_nonce());
+        let signed_payload = format!("{nonce}:{payload}");
+        let mac = crate::cluster::security::admin_proof(api_token, &signed_payload);
+        format!("{nonce}.{mac}")
+    }
+
+    fn admin_proof_signature_valid(api_token: &str, payload: &str, proof: &str) -> bool {
+        let Some((nonce, mac)) = proof.split_once('.') else {
+            return false;
+        };
+        if nonce.len() != 32
+            || hex::decode(nonce)
+                .map(|decoded| decoded.len() != 16)
+                .unwrap_or(true)
+        {
+            return false;
+        }
+        let signed_payload = format!("{nonce}:{payload}");
+        crate::cluster::security::secrets_equal(
+            &crate::cluster::security::admin_proof(api_token, &signed_payload),
+            mac,
+        )
     }
 
     fn purge_expired_admin_proofs(guard: &mut HashMap<String, Instant>, now: Instant) {
@@ -939,10 +967,7 @@ impl ClusterManager {
         if token.is_empty() {
             return false;
         }
-        if !crate::cluster::security::secrets_equal(
-            &crate::cluster::security::admin_proof(&token, payload),
-            proof,
-        ) {
+        if !Self::admin_proof_signature_valid(&token, payload, proof) {
             return false;
         }
         let mut used = self.used_admin_proofs.lock();
@@ -951,8 +976,21 @@ impl ClusterManager {
         if used.contains_key(proof) {
             return false;
         }
-        used.insert(proof.to_string(), now);
+        // A join proof is a configured one-time capability. Keep it retryable
+        // until add_learner/forwarding has actually succeeded; accept_join()
+        // records it after success. Other admin attempts mint a fresh nonce on
+        // each retry, so they can be consumed immediately here.
+        if !payload.starts_with("Join:") {
+            used.insert(proof.to_string(), now);
+        }
         true
+    }
+
+    fn consume_admin_proof(&self, proof: &str) {
+        let mut used = self.used_admin_proofs.lock();
+        let now = Instant::now();
+        Self::purge_expired_admin_proofs(&mut used, now);
+        used.insert(proof.to_string(), now);
     }
 
     async fn forward_admin(
@@ -1015,7 +1053,8 @@ impl ClusterManager {
                             .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
                     })
                     .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
-                return network::forward_join(
+                let proof_for_cache = proof.clone();
+                let result = network::forward_join(
                     &leader_addr,
                     &self.config.secret,
                     self.config.node_id,
@@ -1026,6 +1065,10 @@ impl ClusterManager {
                     self.tls_client.clone(),
                 )
                 .await;
+                if result.is_ok() {
+                    self.consume_admin_proof(&proof_for_cache);
+                }
+                return result;
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -1084,6 +1127,7 @@ impl ClusterManager {
             })
             .collect();
         crate::log_info!("Cluster: node {node_id} joined as learner");
+        self.consume_admin_proof(&proof);
         Ok((self.cluster_id(), peers))
     }
 
@@ -1253,7 +1297,7 @@ impl ClusterManager {
             if self.local_live_sessions(&stream_id) == 0 {
                 self.pending_drain_clears.lock().remove(&stream_id);
                 if let Some(hooks) = self.session_hooks.lock().as_ref() {
-                    hooks.deleted_streams.lock().remove(&stream_id);
+                    hooks.deleted_streams.lock().remove(stream_id);
                 }
             }
         }
@@ -2385,7 +2429,7 @@ fn _cluster_manager_markers() {}
 
 #[cfg(test)]
 mod heartbeat_routing_tests {
-    use super::heartbeat_routing_addrs;
+    use super::*;
 
     #[test]
     fn plaintext_heartbeat_ignores_peer_supplied_routing_addrs() {
@@ -2420,5 +2464,25 @@ mod heartbeat_routing_tests {
         );
         ClusterManager::purge_expired_admin_proofs(&mut map, Instant::now());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn fresh_admin_proofs_are_unique_and_payload_bound() {
+        let token: String = (0u8..24).map(|i| char::from(b'a' + (i % 26))).collect();
+        let payload = "AdminDrain:2";
+        let first = ClusterManager::mint_fresh_admin_proof(&token, payload);
+        let second = ClusterManager::mint_fresh_admin_proof(&token, payload);
+        assert_ne!(first, second);
+        assert!(ClusterManager::admin_proof_signature_valid(
+            &token, payload, &first
+        ));
+        assert!(ClusterManager::admin_proof_signature_valid(
+            &token, payload, &second
+        ));
+        assert!(!ClusterManager::admin_proof_signature_valid(
+            &token,
+            "AdminResume:2",
+            &first
+        ));
     }
 }
