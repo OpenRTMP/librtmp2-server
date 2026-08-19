@@ -348,24 +348,23 @@ impl ClusterManager {
                             });
                         }
                     }
-                    // Session counts are only trustworthy when mTLS binds the
-                    // authenticated peer to a certificate identity. On plaintext
-                    // clusters any `CLUSTER_SECRET` holder can authenticate as
-                    // another member and lie about remote play/publish load.
-                    if counts_hb.config.tls_enabled {
-                        counts_hb
-                            .peer_session_counts
-                            .lock()
-                            .insert(info.node_id, (info.publishers, info.players));
-                        counts_hb
-                            .peer_stream_players
-                            .lock()
-                            .insert(info.node_id, info.stream_players.into_iter().collect());
-                        counts_hb
-                            .peer_viewer_players
-                            .lock()
-                            .insert(info.node_id, info.viewer_players.into_iter().collect());
-                    }
+                    // Plaintext clustering explicitly uses possession of CLUSTER_SECRET
+                    // plus Raft membership as its trust boundary; mTLS strengthens that
+                    // boundary with per-node certificate identity. Keep session counts in
+                    // both modes because cluster-wide stats, viewer limits and drain/delete
+                    // accounting depend on these heartbeat caches.
+                    counts_hb
+                        .peer_session_counts
+                        .lock()
+                        .insert(info.node_id, (info.publishers, info.players));
+                    counts_hb
+                        .peer_stream_players
+                        .lock()
+                        .insert(info.node_id, info.stream_players.into_iter().collect());
+                    counts_hb
+                        .peer_viewer_players
+                        .lock()
+                        .insert(info.node_id, info.viewer_players.into_iter().collect());
                 });
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
