@@ -178,7 +178,9 @@ pub fn validate_cluster_peer_addr(addr: &str, allow_loopback: bool) -> Result<()
     let parsed = trimmed
         .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid peer address '{trimmed}': {e}"))?;
-    let ip = parsed.ip();
+    // Canonicalize IPv4-mapped IPv6 before classification so addresses such as
+    // ::ffff:127.0.0.1 and ::ffff:169.254.169.254 cannot bypass the IPv4 checks.
+    let ip = parsed.ip().to_canonical();
     if ip.is_unspecified() || ip.is_multicast() {
         return Err(format!("peer address '{trimmed}' must be a unicast IP"));
     }
@@ -309,9 +311,13 @@ mod tests {
         assert!(validate_cluster_peer_addr("127.0.0.1:1940", false).is_err());
         assert!(validate_cluster_peer_addr("[::1]:1940", false).is_err());
         assert!(validate_cluster_peer_addr("169.254.169.254:80", false).is_err());
+        assert!(validate_cluster_peer_addr("[::ffff:127.0.0.1]:1940", false).is_err());
+        assert!(validate_cluster_peer_addr("[::ffff:169.254.169.254]:80", false).is_err());
         assert!(validate_cluster_peer_addr("0.0.0.0:1940", false).is_err());
         assert!(validate_cluster_peer_addr("10.0.0.2:1940", false).is_ok());
+        assert!(validate_cluster_peer_addr("[::ffff:10.0.0.2]:1940", false).is_ok());
         assert!(validate_cluster_peer_addr("127.0.0.1:1940", true).is_ok());
+        assert!(validate_cluster_peer_addr("[::ffff:127.0.0.1]:1940", true).is_ok());
     }
 
     #[test]
