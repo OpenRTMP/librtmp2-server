@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: rtmp_bridge (2026-08-10)
+Last scanned: keygen (2026-08-20)
 
 ## Modules
 
@@ -9,8 +9,16 @@ Last scanned: rtmp_bridge (2026-08-10)
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [ ] keygen — Stream key generation
+- [x] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-08-20 keygen pass)
+
+No critical bugs found. Re-verified full caller chain: `keygen.rs` (SysRng 128/256-bit),
+HTTP `resolve_or_generate_access_key`, RTMP session id gen, cluster pre-propose viewer ids,
+API token seed. All RTMP/HTTP lookup paths gate on `is_valid_access_key`; `stream_find_by`
+blocks play_key column; global uniqueness via `key_globally_in_use` + UNIQUE cols; RNG failures
+fail closed. Legacy short DB keys rejected at lookup.
 
 ## Findings (2026-08-10 rtmp_bridge pass)
 
