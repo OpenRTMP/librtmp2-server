@@ -896,6 +896,9 @@ impl ClusterManager {
         control_addr: &str,
         media_addr: &str,
     ) -> Result<String, String> {
+        let allow_loopback = self.config.allow_loopback_peer_addrs;
+        crate::cluster::security::validate_cluster_peer_addr(control_addr, allow_loopback)?;
+        crate::cluster::security::validate_cluster_peer_addr(media_addr, allow_loopback)?;
         let payload =
             crate::cluster::security::join_admin_proof_payload(node_id, control_addr, media_addr);
         self.admin_action_proof(&payload)
@@ -1027,6 +1030,9 @@ impl ClusterManager {
         media_addr: String,
         proof: String,
     ) -> Result<(String, Vec<JoinPeerInfo>), String> {
+        let allow_loopback = self.config.allow_loopback_peer_addrs;
+        crate::cluster::security::validate_cluster_peer_addr(&control_addr, allow_loopback)?;
+        crate::cluster::security::validate_cluster_peer_addr(&media_addr, allow_loopback)?;
         self.network.upsert_node(node_id, control_addr.clone());
         self.meta
             .set_addrs(node_id, control_addr.clone(), media_addr.clone());
