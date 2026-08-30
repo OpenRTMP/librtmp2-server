@@ -300,6 +300,17 @@ impl ClusterManager {
             used_admin_proofs: Mutex::new(HashMap::new()),
         });
 
+        let mgr_gate = Arc::clone(&mgr);
+        mgr.media.set_inbound_subscribe_gate(Arc::new(
+            move |peer_id, app, stream| {
+                let mgr = Arc::clone(&mgr_gate);
+                Box::pin(async move {
+                    mgr.authorize_inbound_media_subscribe(peer_id, &app, &stream)
+                        .await
+                })
+            },
+        ));
+
         // Control + media listeners
         {
             let mgr_join = Arc::clone(&mgr);
@@ -1577,6 +1588,47 @@ impl ClusterManager {
             .values()
             .map(|m| m.get(stream_id).copied().unwrap_or(0))
             .sum()
+    }
+
+    /// Authorize an inbound media `Subscribe` on a stream this node owns.
+    /// Peers must either be configured standby replicas or report active local
+    /// players for the stream via `SessionCountReq`.
+    pub async fn authorize_inbound_media_subscribe(
+        &self,
+        peer_id: NodeId,
+        _app: &str,
+        stream_id: &str,
+    ) -> bool {
+        if peer_id == self.config.node_id {
+            return false;
+        }
+        let Some(owner) = self.db.stream_owner_get(stream_id) else {
+            return false;
+        };
+        if owner.owner_node_id != self.config.node_id {
+            return false;
+        }
+        if self
+            .standby_candidates(Some(self.config.node_id), &[])
+            .contains(&peer_id)
+        {
+            return true;
+        }
+        let Some((ctrl, _)) = self.meta.get(peer_id) else {
+            return false;
+        };
+        match network::send_session_count(
+            &ctrl,
+            &self.config.secret,
+            self.config.node_id,
+            stream_id.to_string(),
+            self.tls_client.clone(),
+        )
+        .await
+        {
+            Ok(count) => count > 0,
+            Err(_) => false,
+        }
     }
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
