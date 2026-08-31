@@ -6,7 +6,7 @@ use std::io;
 use std::io::BufReader;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -21,7 +21,8 @@ const CLUSTER_AUTH_MAX_FAILURES: usize = 10;
 const CLUSTER_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_CLUSTER_AUTH_IPS: usize = 10_000;
 
-static CLUSTER_AUTH_FAILURES: Mutex<HashMap<IpAddr, Vec<Instant>>> = Mutex::new(HashMap::new());
+static CLUSTER_AUTH_FAILURES: LazyLock<Mutex<HashMap<IpAddr, Vec<Instant>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn active_cluster_auth_failure_count(entries: &[Instant], now: Instant) -> usize {
     entries
