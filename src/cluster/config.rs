@@ -618,9 +618,7 @@ mod tests {
     fn cluster_secret_rejects_short_values() {
         assert!(!is_valid_cluster_secret("short"));
         assert!(!is_valid_cluster_secret("0123456789abcdef"));
-        assert!(is_valid_cluster_secret(
-            "0123456789abcdef0123456789abcdef"
-        ));
+        assert!(is_valid_cluster_secret("0123456789abcdef0123456789abcdef"));
     }
 
     #[test]
