@@ -596,6 +596,7 @@ pub async fn serve_control_plane_listener(
                     let mut tls_stream = tls;
                     let peer_id = server_auth_handshake(
                         &mut tls_stream,
+                        peer.ip(),
                         &secret,
                         local_id,
                         tls_required,
@@ -628,9 +629,15 @@ pub async fn serve_control_plane_listener(
                     .await
                 } else {
                     let mut tcp = stream;
-                    let peer_id =
-                        server_auth_handshake(&mut tcp, &secret, local_id, tls_required, None)
-                            .await?;
+                    let peer_id = server_auth_handshake(
+                        &mut tcp,
+                        peer.ip(),
+                        &secret,
+                        local_id,
+                        tls_required,
+                        None,
+                    )
+                    .await?;
                     drop(preauth);
                     if CONTROL_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
                         >= MAX_CONTROL_CONN_INFLIGHT
@@ -667,11 +674,16 @@ pub async fn serve_control_plane_listener(
 
 async fn server_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
+    peer: IpAddr,
     secret: &str,
     local_id: NodeId,
     tls_required: bool,
     cert_node_id: Option<u64>,
 ) -> Result<NodeId, std::io::Error> {
+    if crate::cluster::security::cluster_auth_rate_limited(peer) {
+        write_frame(stream, &ControlMessage::AuthFail).await?;
+        return Err(std::io::Error::other("auth rate limited"));
+    }
     let nonce = auth_nonce();
     write_frame(
         stream,
@@ -682,15 +694,18 @@ async fn server_auth_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     .await?;
     let auth = read_auth_frame(stream).await?;
     let ControlMessage::Auth { node_id, response } = auth else {
+        crate::cluster::security::record_cluster_auth_failure(peer);
         write_frame(stream, &ControlMessage::AuthFail).await?;
         return Err(std::io::Error::other("expected Auth"));
     };
     let expected = auth_response(secret, node_id, &nonce);
     if !secrets_equal(&expected, &response) {
+        crate::cluster::security::record_cluster_auth_failure(peer);
         write_frame(stream, &ControlMessage::AuthFail).await?;
         return Err(std::io::Error::other("auth fail"));
     }
     verify_tls_node_identity(tls_required, cert_node_id, node_id)?;
+    crate::cluster::security::clear_cluster_auth_failures(peer);
     write_frame(stream, &ControlMessage::AuthOk { node_id: local_id }).await?;
     Ok(node_id)
 }

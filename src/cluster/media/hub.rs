@@ -347,6 +347,7 @@ impl MediaHub {
                 let preauth = PreauthMediaGuard(peer_ip);
                 let auth_result = peer::accept_tls_then_auth(
                     stream,
+                    peer_ip,
                     &hub.secret,
                     hub.local_id,
                     hub.tls_server.clone(),

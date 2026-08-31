@@ -1,5 +1,6 @@
 //! Outbound/inbound media peer connection.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -15,7 +16,8 @@ use crate::cluster::NodeId;
 use crate::cluster::media::MediaMembershipFn;
 use crate::cluster::media::protocol::MediaMessage;
 use crate::cluster::security::{
-    auth_nonce, auth_response, node_id_from_peer_certs, secrets_equal, verify_tls_node_identity,
+    auth_nonce, auth_response, clear_cluster_auth_failures, cluster_auth_rate_limited,
+    node_id_from_peer_certs, record_cluster_auth_failure, secrets_equal, verify_tls_node_identity,
 };
 
 const MAX_FRAME: u32 = 32 * 1024 * 1024;
@@ -327,11 +329,16 @@ async fn client_media_auth<S: AsyncRead + AsyncWrite + Unpin>(
 /// Authenticate an inbound media connection (server: challenge → auth → hello).
 pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
+    peer: IpAddr,
     secret: &str,
     local_id: NodeId,
     tls_required: bool,
     cert_node_id: Option<u64>,
 ) -> Result<NodeId, std::io::Error> {
+    if cluster_auth_rate_limited(peer) {
+        write_media_frame(stream, &MediaMessage::AuthFail).await?;
+        return Err(std::io::Error::other("auth rate limited"));
+    }
     let nonce = auth_nonce();
     write_media_frame(
         stream,
@@ -342,15 +349,18 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     .await?;
     let auth = read_auth_media_frame(stream).await?;
     let MediaMessage::Auth { node_id, response } = auth else {
+        record_cluster_auth_failure(peer);
         write_media_frame(stream, &MediaMessage::AuthFail).await?;
         return Err(std::io::Error::other("expected AUTH"));
     };
     let expected = auth_response(secret, node_id, &nonce);
     if !secrets_equal(&expected, &response) {
+        record_cluster_auth_failure(peer);
         write_media_frame(stream, &MediaMessage::AuthFail).await?;
         return Err(std::io::Error::other("auth fail"));
     }
     verify_tls_node_identity(tls_required, cert_node_id, node_id)?;
+    clear_cluster_auth_failures(peer);
     let _ = local_id;
     write_media_frame(stream, &MediaMessage::AuthOk).await?;
 
@@ -382,6 +392,7 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
 /// Wrap an accepted TCP stream with optional mTLS, then run `accept_auth`.
 pub(crate) async fn accept_tls_then_auth(
     stream: TcpStream,
+    peer: IpAddr,
     secret: &str,
     local_id: NodeId,
     tls_server: Option<Arc<ServerConfig>>,
@@ -401,7 +412,15 @@ pub(crate) async fn accept_tls_then_auth(
             .peer_certificates()
             .and_then(node_id_from_peer_certs);
         let mut boxed: Box<dyn MediaIo> = Box::new(tls);
-        let peer_id = accept_auth(&mut boxed, secret, local_id, tls_required, cert_node_id).await?;
+        let peer_id = accept_auth(
+            &mut boxed,
+            peer,
+            secret,
+            local_id,
+            tls_required,
+            cert_node_id,
+        )
+        .await?;
         if !(is_peer_allowed)(peer_id) {
             return Err(std::io::Error::other(
                 "media peer not in cluster membership",
@@ -411,7 +430,7 @@ pub(crate) async fn accept_tls_then_auth(
     } else {
         Box::new(stream)
     };
-    let peer_id = accept_auth(&mut io, secret, local_id, tls_required, None).await?;
+    let peer_id = accept_auth(&mut io, peer, secret, local_id, tls_required, None).await?;
     if !(is_peer_allowed)(peer_id) {
         return Err(std::io::Error::other(
             "media peer not in cluster membership",

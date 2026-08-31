@@ -1,10 +1,15 @@
 //! Constant-time secret comparison and TLS helpers for the cluster plane.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
+use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use rand::TryRng;
 use rand::rngs::SysRng;
@@ -12,6 +17,63 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 const NODE_ID_CERT_PREFIX: &[u8] = b"lrtmp2-node-";
+const CLUSTER_AUTH_MAX_FAILURES: usize = 10;
+const CLUSTER_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_TRACKED_CLUSTER_AUTH_IPS: usize = 10_000;
+
+static CLUSTER_AUTH_FAILURES: LazyLock<Mutex<HashMap<IpAddr, Vec<Instant>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn active_cluster_auth_failure_count(entries: &[Instant], now: Instant) -> usize {
+    entries
+        .iter()
+        .copied()
+        .filter(|t| {
+            now.checked_duration_since(*t)
+                .is_none_or(|age| age < CLUSTER_AUTH_FAILURE_WINDOW)
+        })
+        .count()
+}
+
+fn purge_expired_cluster_auth_failures(guard: &mut HashMap<IpAddr, Vec<Instant>>, now: Instant) {
+    guard.retain(|_, entries| {
+        entries.retain(|t| {
+            now.checked_duration_since(*t)
+                .is_none_or(|age| age < CLUSTER_AUTH_FAILURE_WINDOW)
+        });
+        !entries.is_empty()
+    });
+}
+
+/// True when `peer` has exceeded the cluster auth failure budget.
+///
+/// New, untracked peers are also rejected while the bounded tracker is full,
+/// preventing an attacker from bypassing the per-IP limit by cycling source IPs.
+pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
+    let mut guard = CLUSTER_AUTH_FAILURES.lock();
+    let now = Instant::now();
+    purge_expired_cluster_auth_failures(&mut guard, now);
+    let Some(entries) = guard.get_mut(&peer) else {
+        return guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS;
+    };
+    active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES
+}
+
+/// Record a failed cluster auth handshake attempt from `peer`.
+pub fn record_cluster_auth_failure(peer: IpAddr) {
+    let mut guard = CLUSTER_AUTH_FAILURES.lock();
+    let now = Instant::now();
+    purge_expired_cluster_auth_failures(&mut guard, now);
+    if !guard.contains_key(&peer) && guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS {
+        return;
+    }
+    guard.entry(peer).or_default().push(now);
+}
+
+/// Clear auth failures after a successful cluster auth handshake.
+pub fn clear_cluster_auth_failures(peer: IpAddr) {
+    CLUSTER_AUTH_FAILURES.lock().remove(&peer);
+}
 
 /// Compare two secrets in constant time (length included via padded XOR).
 pub fn secrets_equal(a: &str, b: &str) -> bool {
@@ -324,15 +386,29 @@ mod tests {
     fn auth_response_deterministic() {
         // Build secret/nonce at runtime so static analysis does not treat
         // them as hard-coded production cryptographic material.
-        let secret: String = (0u8..24).map(|i| char::from(b'a' + (i % 26))).collect();
+        let secret: String = (0u8..32).map(|i| char::from(b'a' + (i % 26))).collect();
         let nonce: Vec<u8> = (0u8..16)
             .map(|i| i.wrapping_mul(17).wrapping_add(3))
             .collect();
         let a = auth_response(&secret, 42, &nonce);
         let b = auth_response(&secret, 42, &nonce);
         assert_eq!(a, b);
-        let other: String = (0u8..24).map(|i| char::from(b'z' - (i % 26))).collect();
+        let other: String = (0u8..32).map(|i| char::from(b'z' - (i % 26))).collect();
         assert_ne!(a, auth_response(&other, 42, &nonce));
         assert_ne!(a, auth_response(&secret, 43, &nonce));
+    }
+
+    #[test]
+    fn cluster_auth_rate_limit_tracks_failures_per_ip() {
+        use std::net::IpAddr;
+
+        let peer: IpAddr = "198.51.100.77".parse().unwrap();
+        assert!(!super::cluster_auth_rate_limited(peer));
+        for _ in 0..10 {
+            super::record_cluster_auth_failure(peer);
+        }
+        assert!(super::cluster_auth_rate_limited(peer));
+        super::clear_cluster_auth_failures(peer);
+        assert!(!super::cluster_auth_rate_limited(peer));
     }
 }
