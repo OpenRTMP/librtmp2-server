@@ -18,7 +18,7 @@ use tempfile::TempDir;
 const TEST_API_TOKEN: &str = "cluster-ha-test-api-token";
 
 fn secret() -> String {
-    "test-cluster-secret!!".to_string()
+    "test-cluster-secret-32-chars-min!!".to_string()
 }
 
 fn free_port() -> u16 {

@@ -111,6 +111,14 @@ impl Default for ClusterConfig {
     }
 }
 
+fn is_valid_cluster_secret(secret: &str) -> bool {
+    secret.len() >= 32
+        && secret.len() <= 256
+        && secret
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
 impl ClusterConfig {
     /// Load cluster keys from a file map only (no process env, no validation).
     pub fn load_file_only_from_kv<F>(mut get_file: F) -> Result<Self, String>
@@ -256,9 +264,10 @@ impl ClusterConfig {
                 "CLUSTER_NODE_ID must be a positive integer when CLUSTER_ENABLED=true".into(),
             );
         }
-        if self.secret.len() < 16 {
+        if !is_valid_cluster_secret(&self.secret) {
             return Err(
-                "CLUSTER_SECRET must be at least 16 characters when CLUSTER_ENABLED=true".into(),
+                "CLUSTER_SECRET must be 32-256 ASCII alphanumeric characters, '-' or '_' when CLUSTER_ENABLED=true"
+                    .into(),
             );
         }
         parse_bind(&self.bind).map_err(|e| format!("CLUSTER_BIND: {e}"))?;
@@ -606,6 +615,15 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn cluster_secret_rejects_short_values() {
+        assert!(!is_valid_cluster_secret("short"));
+        assert!(!is_valid_cluster_secret("0123456789abcdef"));
+        assert!(is_valid_cluster_secret(
+            "0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
     fn disabled_by_default() {
         let cfg = ClusterConfig::load_from_kv(|_| None).unwrap();
         assert!(!cfg.enabled);
@@ -630,7 +648,7 @@ mod tests {
             ("CLUSTER_ENABLED", "true"),
             ("CLUSTER_NODE_ID", "1"),
             ("CLUSTER_BOOTSTRAP", "true"),
-            ("CLUSTER_SECRET", "0123456789abcdef"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
             ("CLUSTER_BIND", "127.0.0.1:1940"),
             ("CLUSTER_MEDIA_BIND", "127.0.0.1:1941"),
         ]);
@@ -646,7 +664,7 @@ mod tests {
             ("CLUSTER_ENABLED", "true"),
             ("CLUSTER_NODE_ID", "1"),
             ("CLUSTER_BOOTSTRAP", "true"),
-            ("CLUSTER_SECRET", "0123456789abcdef"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
             ("CLUSTER_DRAIN_AT_MBPS", "800"),
             ("CLUSTER_RESUME_AT_MBPS", "500"),
             ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
@@ -662,7 +680,7 @@ mod tests {
             ("CLUSTER_ENABLED", "true"),
             ("CLUSTER_NODE_ID", "1"),
             ("CLUSTER_BOOTSTRAP", "true"),
-            ("CLUSTER_SECRET", "0123456789abcdef"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
             ("CLUSTER_DRAIN_AT_MBPS", "800"),
             ("CLUSTER_RESUME_AT_MBPS", "500"),
             ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),

@@ -11,7 +11,7 @@ use librtmp2_server::cluster::security::{
 
 #[test]
 fn auth_response_binds_node_id() {
-    let secret = "cluster-secret-at-least-16";
+    let secret = "cluster-secret-at-least-32-chars!!";
     let nonce = b"nonce-1234567890";
     let a = auth_response(secret, 1, nonce);
     let b = auth_response(secret, 2, nonce);
