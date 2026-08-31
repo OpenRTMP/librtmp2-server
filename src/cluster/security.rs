@@ -46,23 +46,16 @@ fn purge_expired_cluster_auth_failures(guard: &mut HashMap<IpAddr, Vec<Instant>>
 }
 
 /// True when `peer` has exceeded the cluster auth failure budget.
+///
+/// New, untracked peers are also rejected while the bounded tracker is full,
+/// preventing an attacker from bypassing the per-IP limit by cycling source IPs.
 pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
     let mut guard = CLUSTER_AUTH_FAILURES.lock();
     let now = Instant::now();
+    purge_expired_cluster_auth_failures(&mut guard, now);
     let Some(entries) = guard.get_mut(&peer) else {
-        return guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS
-            && guard.values().all(|e| {
-                active_cluster_auth_failure_count(e, now) >= CLUSTER_AUTH_MAX_FAILURES
-            });
+        return guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS;
     };
-    entries.retain(|t| {
-        now.checked_duration_since(*t)
-            .is_none_or(|age| age < CLUSTER_AUTH_FAILURE_WINDOW)
-    });
-    if entries.is_empty() {
-        guard.remove(&peer);
-        return false;
-    }
     active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES
 }
 
@@ -72,12 +65,7 @@ pub fn record_cluster_auth_failure(peer: IpAddr) {
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
     if !guard.contains_key(&peer) && guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS {
-        let saturated = guard.values().all(|entries| {
-            active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES
-        });
-        if saturated {
-            return;
-        }
+        return;
     }
     guard.entry(peer).or_default().push(now);
 }
