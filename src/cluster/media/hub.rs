@@ -11,13 +11,13 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::cluster::NodeId;
-use crate::cluster::media::MediaMembershipFn;
 use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::media::peer::{self, MediaPeer};
 use crate::cluster::media::protocol::MediaMessage;
 use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
+use crate::cluster::media::{InboundSubscribeGateFn, MediaMembershipFn};
 
 const MEDIA_INBOUND_QUEUE: usize = 4096;
 /// Cap concurrent authenticated inbound media connections (frame reader tasks).
@@ -245,6 +245,8 @@ pub struct MediaHub {
     tls_client: Option<Arc<ClientConfig>>,
     peer_reconnect_tx: mpsc::UnboundedSender<NodeId>,
     is_peer_allowed: MediaMembershipFn,
+    /// Optional authorization for inbound `Subscribe` (cluster owner nodes).
+    inbound_subscribe_gate: parking_lot::Mutex<Option<InboundSubscribeGateFn>>,
 }
 
 impl MediaHub {
@@ -279,6 +281,7 @@ impl MediaHub {
             tls_client,
             peer_reconnect_tx,
             is_peer_allowed,
+            inbound_subscribe_gate: parking_lot::Mutex::new(None),
         });
         let hub_c = Arc::clone(&hub);
         tokio::spawn(async move {
@@ -311,6 +314,10 @@ impl MediaHub {
             p.close();
         }
         self.subs.clear_peer(peer_id);
+    }
+
+    pub fn set_inbound_subscribe_gate(&self, gate: InboundSubscribeGateFn) {
+        *self.inbound_subscribe_gate.lock() = Some(gate);
     }
 
     pub async fn serve(self: Arc<Self>, bind: SocketAddr) -> Result<(), std::io::Error> {
@@ -392,6 +399,18 @@ impl MediaHub {
                         stream,
                         epoch: _,
                     } => {
+                        let subscribe_gate = self.inbound_subscribe_gate.lock().clone();
+                        if let Some(gate) = subscribe_gate {
+                            if !gate(peer_id, app.clone(), stream.clone()).await {
+                                tracing::warn!(
+                                    peer = peer_id,
+                                    %app,
+                                    %stream,
+                                    "media subscribe rejected: peer not authorized"
+                                );
+                                continue;
+                            }
+                        }
                         self.subs.add(peer_id, &app, &stream);
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
                         if let Some(cache) = self.cache.get(&app, &stream) {
