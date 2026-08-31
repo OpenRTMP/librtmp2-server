@@ -301,15 +301,14 @@ impl ClusterManager {
         });
 
         let mgr_gate = Arc::clone(&mgr);
-        mgr.media.set_inbound_subscribe_gate(Arc::new(
-            move |peer_id, app, stream| {
+        mgr.media
+            .set_inbound_subscribe_gate(Arc::new(move |peer_id, app, stream| {
                 let mgr = Arc::clone(&mgr_gate);
                 Box::pin(async move {
                     mgr.authorize_inbound_media_subscribe(peer_id, &app, &stream)
                         .await
                 })
-            },
-        ));
+            }));
 
         // Control + media listeners
         {

@@ -11,13 +11,13 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::cluster::NodeId;
-use crate::cluster::media::{InboundSubscribeGateFn, MediaMembershipFn};
 use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::media::peer::{self, MediaPeer};
 use crate::cluster::media::protocol::MediaMessage;
 use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
+use crate::cluster::media::{InboundSubscribeGateFn, MediaMembershipFn};
 
 const MEDIA_INBOUND_QUEUE: usize = 4096;
 /// Cap concurrent authenticated inbound media connections (frame reader tasks).
@@ -399,7 +399,8 @@ impl MediaHub {
                         stream,
                         epoch: _,
                     } => {
-                        if let Some(gate) = self.inbound_subscribe_gate.lock().clone() {
+                        let subscribe_gate = self.inbound_subscribe_gate.lock().clone();
+                        if let Some(gate) = subscribe_gate {
                             if !gate(peer_id, app.clone(), stream.clone()).await {
                                 tracing::warn!(
                                     peer = peer_id,

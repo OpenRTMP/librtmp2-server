@@ -583,7 +583,7 @@ pub async fn serve_control_plane_listener(
             }
             let result = async {
                 if let Some(ref acc) = acceptor {
-                    let mut tls = tokio::time::timeout(AUTH_TIMEOUT, acc.accept(stream))
+                    let tls = tokio::time::timeout(AUTH_TIMEOUT, acc.accept(stream))
                         .await
                         .map_err(|_| {
                             std::io::Error::new(std::io::ErrorKind::TimedOut, "tls accept timeout")
