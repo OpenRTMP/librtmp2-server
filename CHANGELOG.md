@@ -42,7 +42,7 @@ begin at `1.0.0`.
   host toolchain.
 
 ### Changed
-- Crate version `0.2.1` → `0.2.2`.
+- Package version `0.2.1` → `0.2.2`.
 
 ## [0.2.1] — 2026-08-10
 
