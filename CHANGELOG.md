@@ -13,6 +13,42 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-09-03
+
+### Security
+- `CLUSTER_SECRET` is validated at startup with the same 32-256 character
+  rules as `LRTMP2_API_TOKEN`, and repeated failed cluster control-plane
+  auth attempts are locked out.
+- Cluster media-plane `Subscribe` is rejected unless the peer is a
+  configured standby replica or reports active local players for the
+  stream, closing a secret-only stream-siphoning path.
+- Cluster `admin_proof` digests are tracked per node so a captured
+  `ClientWrite`/membership proof cannot be replayed, without breaking
+  plaintext heartbeat accounting.
+- Cluster join peer-address validation rejects loopback, link-local
+  (including cloud metadata addresses), unspecified, and multicast
+  targets when minting or accepting join proofs, closing an SSRF path.
+- Plaintext (non-mTLS) clusters ignore heartbeat routing updates that
+  would let any `CLUSTER_SECRET` holder hijack an existing member's
+  `node_id`.
+
+### Fixed
+- Dual-role connections update RTT for both the publisher and player side
+  instead of only one; `find_group` stats lookup no longer panics via
+  `unwrap`, using an index-based lookup instead.
+- Docker multi-arch release builds use the `rust-musl-cross` builder so
+  `linux/riscv64` compiles (the plain `rust:alpine` image has no riscv64
+  manifest); musl cross builds vendor OpenSSL instead of relying on the
+  host toolchain.
+
+### Changed
+- Bump the `librtmp2` dependency to the crates.io release **0.8.0**
+  (FCPublish/releaseStream, AMF3 shared objects, HDR colorInfo,
+  ExVideo/ExAudio write helpers, E-RTMP v2 reconnect, and the publish/
+  play/shared-object auth and budget-hardening fixes described in that
+  release's own changelog).
+- Package version `0.2.1` → `0.2.2`.
+
 ## [0.2.1] — 2026-08-10
 
 ### Security
@@ -459,7 +495,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.8...v0.1.9
