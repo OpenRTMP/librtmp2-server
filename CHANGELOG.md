@@ -13,7 +13,7 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
-## [0.2.2] — 2026-09-02
+## [0.2.2] — 2026-09-03
 
 ### Security
 - `CLUSTER_SECRET` is validated at startup with the same 32-256 character
