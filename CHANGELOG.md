@@ -42,6 +42,11 @@ begin at `1.0.0`.
   host toolchain.
 
 ### Changed
+- Bump the `librtmp2` dependency to the crates.io release **0.8.0**
+  (FCPublish/releaseStream, AMF3 shared objects, HDR colorInfo,
+  ExVideo/ExAudio write helpers, E-RTMP v2 reconnect, and the publish/
+  play/shared-object auth and budget-hardening fixes described in that
+  release's own changelog).
 - Package version `0.2.1` → `0.2.2`.
 
 ## [0.2.1] — 2026-08-10

@@ -15,11 +15,10 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-# Pin to librtmp2 0.7.0 commit (relay export/inject). Switch to crates.io
-# `version = "0.7.0"` once published. Local sibling override:
+# Pinned to the crates.io release. Local sibling override:
 #   [patch."https://github.com/OpenRTMP/librtmp2"]
 #   librtmp2 = { path = "../librtmp2" }
-librtmp2 = { version = "0.7.0", features = ["tls"] }
+librtmp2 = { version = "0.8.0", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
