@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Pinned to the crates.io release. Local sibling override:
-#   [patch."https://github.com/OpenRTMP/librtmp2"]
+#   [patch.crates-io]
 #   librtmp2 = { path = "../librtmp2" }
 librtmp2 = { version = "0.8.0", features = ["tls"] }
 axum = "0.8"
