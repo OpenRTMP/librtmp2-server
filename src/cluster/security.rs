@@ -45,16 +45,55 @@ fn purge_expired_cluster_auth_failures(guard: &mut HashMap<IpAddr, Vec<Instant>>
     });
 }
 
+/// Remove the least-recently-active IP bucket that is not currently
+/// rate-limited. Actively throttled buckets are never evicted — dropping
+/// one would reset its failure window and let a client immediately resume
+/// brute-forcing CLUSTER_SECRET.
+fn evict_oldest_eligible_cluster_auth_ip(
+    guard: &mut HashMap<IpAddr, Vec<Instant>>,
+    now: Instant,
+) -> bool {
+    let Some(oldest_key) = guard
+        .iter()
+        .filter(|(_, entries)| {
+            active_cluster_auth_failure_count(entries, now) < CLUSTER_AUTH_MAX_FAILURES
+        })
+        .min_by_key(|(_, entries)| entries.last().copied().unwrap_or_else(Instant::now))
+        .map(|(key, _)| *key)
+    else {
+        return false;
+    };
+    guard.remove(&oldest_key);
+    true
+}
+
+fn all_cluster_auth_buckets_throttled(
+    guard: &HashMap<IpAddr, Vec<Instant>>,
+    now: Instant,
+) -> bool {
+    !guard.is_empty()
+        && guard
+            .values()
+            .all(|entries| active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES)
+}
+
 /// True when `peer` has exceeded the cluster auth failure budget.
 ///
-/// New, untracked peers are also rejected while the bounded tracker is full,
-/// preventing an attacker from bypassing the per-IP limit by cycling source IPs.
+/// When the tracker is at capacity, only peers whose buckets are actively
+/// throttled cause fail-closed behaviour for new source IPs — mirroring the
+/// HTTP rate limiter so a scan with many one-off failures cannot deny
+/// legitimate cluster joins that present a valid CLUSTER_SECRET.
 pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
     let mut guard = CLUSTER_AUTH_FAILURES.lock();
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
     let Some(entries) = guard.get_mut(&peer) else {
-        return guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS;
+        if guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS {
+            if !evict_oldest_eligible_cluster_auth_ip(&mut guard, now) {
+                return all_cluster_auth_buckets_throttled(&guard, now);
+            }
+        }
+        return false;
     };
     active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES
 }
@@ -65,7 +104,9 @@ pub fn record_cluster_auth_failure(peer: IpAddr) {
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
     if !guard.contains_key(&peer) && guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS {
-        return;
+        if !evict_oldest_eligible_cluster_auth_ip(&mut guard, now) {
+            return;
+        }
     }
     guard.entry(peer).or_default().push(now);
 }
@@ -410,5 +451,62 @@ mod tests {
         assert!(super::cluster_auth_rate_limited(peer));
         super::clear_cluster_auth_failures(peer);
         assert!(!super::cluster_auth_rate_limited(peer));
+    }
+
+    #[test]
+    fn cluster_auth_tracker_evicts_eligible_ips_when_at_capacity() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let now = Instant::now();
+        let limited: IpAddr = "198.51.100.0".parse().unwrap();
+        let fresh: IpAddr = "203.0.113.9".parse().unwrap();
+
+        {
+            let mut guard = super::CLUSTER_AUTH_FAILURES.lock();
+            guard.clear();
+            for i in 1..super::MAX_TRACKED_CLUSTER_AUTH_IPS {
+                let ip = IpAddr::V4(Ipv4Addr::from(i as u32));
+                guard.insert(ip, vec![now - Duration::from_secs(30)]);
+            }
+            guard.insert(
+                limited,
+                vec![now - Duration::from_secs(1); super::CLUSTER_AUTH_MAX_FAILURES],
+            );
+        }
+
+        assert!(
+            !super::cluster_auth_rate_limited(fresh),
+            "a new peer must be admitted after evicting an eligible bucket"
+        );
+        assert!(
+            super::cluster_auth_rate_limited(limited),
+            "actively throttled bucket must not be reset by eviction"
+        );
+
+        super::CLUSTER_AUTH_FAILURES.lock().clear();
+    }
+
+    #[test]
+    fn cluster_auth_tracker_fails_closed_when_every_bucket_is_throttled() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let now = Instant::now();
+        let fresh: IpAddr = "203.0.113.9".parse().unwrap();
+
+        {
+            let mut guard = super::CLUSTER_AUTH_FAILURES.lock();
+            guard.clear();
+            for i in 0..super::MAX_TRACKED_CLUSTER_AUTH_IPS {
+                let ip = IpAddr::V4(Ipv4Addr::from(i as u32));
+                guard.insert(ip, vec![now; super::CLUSTER_AUTH_MAX_FAILURES]);
+            }
+        }
+
+        assert!(
+            super::cluster_auth_rate_limited(fresh),
+            "new peer must be denied when every tracked bucket is throttled"
+        );
+
+        super::CLUSTER_AUTH_FAILURES.lock().clear();
     }
 }
