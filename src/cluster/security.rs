@@ -67,14 +67,11 @@ fn evict_oldest_eligible_cluster_auth_ip(
     true
 }
 
-fn all_cluster_auth_buckets_throttled(
-    guard: &HashMap<IpAddr, Vec<Instant>>,
-    now: Instant,
-) -> bool {
+fn all_cluster_auth_buckets_throttled(guard: &HashMap<IpAddr, Vec<Instant>>, now: Instant) -> bool {
     !guard.is_empty()
-        && guard
-            .values()
-            .all(|entries| active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES)
+        && guard.values().all(|entries| {
+            active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES
+        })
 }
 
 /// True when `peer` has exceeded the cluster auth failure budget.
