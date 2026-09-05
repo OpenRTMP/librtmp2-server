@@ -35,6 +35,9 @@ jobs:
     - name: Run tests
       run: cargo test --verbose --features test-support -- --test-threads=1
 
+    - name: Run cluster tests
+      run: cargo test --verbose --features cluster,test-support -- --test-threads=1
+
     - name: Run E2E integration tests
       run: cargo test --verbose --features test-support --test rtmp_http_e2e -- --test-threads=1
 
