@@ -67,13 +67,6 @@ fn evict_oldest_eligible_cluster_auth_ip(
     true
 }
 
-fn all_cluster_auth_buckets_throttled(guard: &HashMap<IpAddr, Vec<Instant>>, now: Instant) -> bool {
-    !guard.is_empty()
-        && guard.values().all(|entries| {
-            active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES
-        })
-}
-
 /// True when `peer` has exceeded the cluster auth failure budget.
 ///
 /// When the tracker is at capacity, only peers whose buckets are actively
@@ -87,7 +80,7 @@ pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
     let Some(entries) = guard.get_mut(&peer) else {
         if guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS {
             if !evict_oldest_eligible_cluster_auth_ip(&mut guard, now) {
-                return all_cluster_auth_buckets_throttled(&guard, now);
+                return true;
             }
         }
         return false;
@@ -329,7 +322,7 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     let file = File::open(path).map_err(|e| format!("open key {}: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("parse key {}: {e}", path.display()))?
+        .map_err(|e| format!("parse key {}: {e}"))?
         .ok_or_else(|| format!("no private key in {}", path.display()))
 }
 
@@ -378,6 +371,7 @@ pub fn build_client_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn constant_time_compare() {
@@ -437,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cluster_auth_rate_limit_tracks_failures_per_ip() {
         use std::net::IpAddr;
 
@@ -451,6 +446,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cluster_auth_tracker_evicts_eligible_ips_when_at_capacity() {
         use std::net::{IpAddr, Ipv4Addr};
 
@@ -484,6 +480,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cluster_auth_tracker_fails_closed_when_every_bucket_is_throttled() {
         use std::net::{IpAddr, Ipv4Addr};
 
