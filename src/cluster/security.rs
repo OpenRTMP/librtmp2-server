@@ -322,7 +322,7 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     let file = File::open(path).map_err(|e| format!("open key {}: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("parse key {}: {e}"))?
+        .map_err(|e| format!("parse key {}: {e}", path.display()))?
         .ok_or_else(|| format!("no private key in {}", path.display()))
 }
 
