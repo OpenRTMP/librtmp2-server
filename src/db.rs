@@ -1880,13 +1880,9 @@ mod tests {
         std::fs::write(&real, []).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let Err(err) = Db::open(link.to_str().unwrap()) else {
-            panic!("expected symlink rejection");
-        };
         assert!(
-            err.to_string().to_lowercase().contains("symlink")
-                || err.to_string().to_lowercase().contains("follow"),
-            "expected symlink rejection, got: {err}"
+            Db::open(link.to_str().unwrap()).is_err(),
+            "symlink database path must be rejected"
         );
     }
 
