@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn on_disk_db_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
 }
@@ -319,7 +320,7 @@ fn restrict_db_file_permissions(path: &str) {
 
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Db> {
-        let conn = if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+        let conn = if path.is_empty() || path == ":memory:" {
             Connection::open(path)?
         } else {
             Connection::open_with_flags(path, on_disk_db_open_flags())?
@@ -747,7 +748,6 @@ impl Db {
     pub fn stream_find_by_stats_key(&self, key: &str) -> DbLookup<Stream> {
         self.stream_find_by("stats_key", key)
     }
-
     /// Disable a stream and mark it as pending deletion, so new publish/play
     /// attempts are rejected while RTMP sessions drain and a crash before the
     /// delete finishes can be recovered on the next startup (see
@@ -1884,6 +1884,27 @@ mod tests {
             Db::open(link.to_str().unwrap()).is_err(),
             "symlink database path must be rejected"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_database_file_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-uri.db");
+        let link = dir.path().join("link-uri.db");
+        std::fs::write(&real, []).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let uri = format!("file:{}", link.to_str().unwrap());
+
+        assert!(
+            Db::open(&uri).is_err(),
+            "symlink database file URI must be rejected"
+        );
+    }
+
+    #[test]
+    fn open_allows_in_memory_file_uri() {
+        let _db = Db::open("file:librtmp2-test?mode=memory&cache=shared").unwrap();
     }
 
     fn sample_stream(id: &str, pub_key: &str, play_key: &str, stats_key: &str) -> Stream {
