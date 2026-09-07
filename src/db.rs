@@ -6,9 +6,20 @@
 //! needing a connection pool.
 
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Open flags for on-disk databases. `SQLITE_OPEN_NOFOLLOW` blocks a local
+/// attacker from planting a symlink at `LRTMP2_DB` to hijack or replace the
+/// credential store before startup.
+fn on_disk_db_open_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+}
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -309,7 +320,11 @@ fn restrict_db_file_permissions(path: &str) {
 
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Db> {
-        let conn = Connection::open(path)?;
+        let conn = if path.is_empty() || path == ":memory:" {
+            Connection::open(path)?
+        } else {
+            Connection::open_with_flags(path, on_disk_db_open_flags())?
+        };
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
@@ -733,7 +748,6 @@ impl Db {
     pub fn stream_find_by_stats_key(&self, key: &str) -> DbLookup<Stream> {
         self.stream_find_by("stats_key", key)
     }
-
     /// Disable a stream and mark it as pending deletion, so new publish/play
     /// attempts are rejected while RTMP sessions drain and a crash before the
     /// delete finishes can be recovered on the next startup (see
@@ -1855,6 +1869,42 @@ mod tests {
 
         let mode = std::fs::metadata(path_str).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "database must not be world-readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let link = dir.path().join("link.db");
+        std::fs::write(&real, []).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            Db::open(link.to_str().unwrap()).is_err(),
+            "symlink database path must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_database_file_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-uri.db");
+        let link = dir.path().join("link-uri.db");
+        std::fs::write(&real, []).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let uri = format!("file:{}", link.to_str().unwrap());
+
+        assert!(
+            Db::open(&uri).is_err(),
+            "symlink database file URI must be rejected"
+        );
+    }
+
+    #[test]
+    fn open_allows_in_memory_file_uri() {
+        let _db = Db::open("file:librtmp2-test?mode=memory&cache=shared").unwrap();
     }
 
     fn sample_stream(id: &str, pub_key: &str, play_key: &str, stats_key: &str) -> Stream {
