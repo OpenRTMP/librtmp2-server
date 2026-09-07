@@ -6,9 +6,19 @@
 //! needing a connection pool.
 
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Open flags for on-disk databases. `SQLITE_OPEN_NOFOLLOW` blocks a local
+/// attacker from planting a symlink at `LRTMP2_DB` to hijack or replace the
+/// credential store before startup.
+fn on_disk_db_open_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+}
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -309,7 +319,11 @@ fn restrict_db_file_permissions(path: &str) {
 
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Db> {
-        let conn = Connection::open(path)?;
+        let conn = if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+            Connection::open(path)?
+        } else {
+            Connection::open_with_flags(path, on_disk_db_open_flags())?
+        };
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
@@ -1855,6 +1869,23 @@ mod tests {
 
         let mode = std::fs::metadata(path_str).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "database must not be world-readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        let link = dir.path().join("link.db");
+        std::fs::write(&real, []).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = Db::open(link.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("symlink")
+                || err.to_string().to_lowercase().contains("follow"),
+            "expected symlink rejection, got: {err}"
+        );
     }
 
     fn sample_stream(id: &str, pub_key: &str, play_key: &str, stats_key: &str) -> Stream {
