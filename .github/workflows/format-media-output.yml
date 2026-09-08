@@ -1,0 +1,50 @@
+name: Format media output branch
+
+on:
+  push:
+    branches:
+      - feature/media-outputs
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feature/media-outputs
+          persist-credentials: true
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Fix borrow and format
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/media_output.rs')
+          text = path.read_text()
+          text = text.replace(
+              '&& let Ok(text) = String::from_utf8(body)',
+              '&& let Ok(text) = std::str::from_utf8(&body)',
+          )
+          path.write_text(text)
+          PY
+          cargo fmt --all
+      - name: Commit formatting
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/media_output.rs src/server.rs
+          git commit -m 'Format media output implementation'
+          git push origin HEAD:feature/media-outputs
