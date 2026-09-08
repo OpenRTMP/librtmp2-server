@@ -1,0 +1,56 @@
+name: Retry PR 198 Findings Fix
+
+on:
+  push:
+    branches:
+      - feature/media-outputs
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feature/media-outputs
+          persist-credentials: true
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Apply findings fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import re
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/fix-pr198-codex-findings.yml').read_text()
+          match = re.search(r"echo '([^']+)' \| base64 -d > /tmp/fix_pr198\.py", workflow, re.S)
+          if not match:
+              raise SystemExit('embedded PR 198 patch payload not found')
+          payload = ''.join(match.group(1).split())
+          Path('/tmp/fix_pr198.py').write_bytes(base64.b64decode(payload))
+          PY
+          python3 /tmp/fix_pr198.py
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --features test-support -- -D warnings
+          cargo test --features test-support
+      - name: Commit fixes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/media_output.rs src/rate_limit.rs src/server.rs docs/media-outputs.md
+          git commit -m 'Fix media output lifecycle and HLS findings'
+          git push origin HEAD:feature/media-outputs
