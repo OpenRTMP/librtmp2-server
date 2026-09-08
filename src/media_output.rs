@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::db::{Db, DbLookup};
 use librtmp2::session::conn::RelayFrame;
@@ -255,6 +255,7 @@ pub struct MediaOutputManager {
     config: MediaOutputConfig,
     db: Arc<Db>,
     sessions: HashMap<u64, MediaSession>,
+    failed_sessions: HashSet<u64>,
 }
 
 impl MediaOutputManager {
@@ -263,6 +264,7 @@ impl MediaOutputManager {
             config,
             db,
             sessions: HashMap::new(),
+            failed_sessions: HashSet::new(),
         }
     }
 
@@ -272,6 +274,9 @@ impl MediaOutputManager {
 
     pub fn ensure_publisher(&mut self, conn_id: u64, stream_id: &str) {
         if !self.config.enabled() || stream_id.is_empty() {
+            return;
+        }
+        if self.failed_sessions.contains(&conn_id) {
             return;
         }
         if self
@@ -292,7 +297,11 @@ impl MediaOutputManager {
                 self.sessions.insert(conn_id, session);
             }
             Err(e) => {
-                crate::log_error!("Media outputs: failed to start stream '{}': {e}", stream.id)
+                self.failed_sessions.insert(conn_id);
+                crate::log_error!(
+                    "Media outputs: failed to start stream '{}': {e}; retries disabled for conn={conn_id}",
+                    stream.id
+                );
             }
         }
     }
@@ -322,9 +331,11 @@ impl MediaOutputManager {
                 session.stop(&self.config);
             }
         }
+        self.failed_sessions.retain(|id| live.contains(id));
     }
 
     pub fn stop_all(&mut self) {
+        self.failed_sessions.clear();
         let sessions = std::mem::take(&mut self.sessions);
         for (_, session) in sessions {
             session.stop(&self.config);
@@ -439,7 +450,10 @@ impl MediaSession {
     }
 
     fn stop(mut self, config: &MediaOutputConfig) {
-        self.sinks.clear();
+        let sinks = std::mem::take(&mut self.sinks);
+        for sink in sinks {
+            sink.stop();
+        }
         if let Some(mut child) = self.publish_exec.take() {
             terminate_child(&mut child);
         }
@@ -472,6 +486,7 @@ struct SinkSender {
     queued_bytes: Arc<AtomicUsize>,
     max_bytes: usize,
     failed: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl SinkSender {
@@ -503,6 +518,30 @@ impl SinkSender {
         }
         self.tx = None;
     }
+
+    fn stop(mut self) {
+        self.tx = None;
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if worker.is_finished() {
+            if worker.join().is_err() {
+                crate::log_warn!(
+                    "Media output '{}' worker panicked during shutdown",
+                    self.label
+                );
+            }
+        } else {
+            crate::log_warn!(
+                "Media output '{}' worker did not stop within 5s; continuing shutdown",
+                self.label
+            );
+        }
+    }
 }
 
 fn make_sink<F>(label: String, max_bytes: usize, worker: F) -> SinkSender
@@ -515,19 +554,24 @@ where
     let worker_bytes = Arc::clone(&queued_bytes);
     let worker_failed = Arc::clone(&failed);
     let thread_name = format!("media-{}", safe_component(&label));
-    if thread::Builder::new()
+    let worker = match thread::Builder::new()
         .name(thread_name)
         .spawn(move || worker(rx, worker_bytes, worker_failed))
-        .is_err()
     {
-        failed.store(true, Ordering::Relaxed);
-    }
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            failed.store(true, Ordering::Relaxed);
+            crate::log_error!("Failed to start media output worker '{label}': {e}");
+            None
+        }
+    };
     SinkSender {
         label,
         tx: Some(tx),
         queued_bytes,
         max_bytes,
         failed,
+        worker,
     }
 }
 
@@ -952,10 +996,7 @@ fn rewrite_playlist_key(text: &str, key: &str) -> String {
 fn rewrite_uri_attributes(line: &str, key: &str) -> String {
     let mut out = line.to_string();
     let mut search_from = 0usize;
-    loop {
-        let Some(rel) = out[search_from..].find("URI=\"") else {
-            break;
-        };
+    while let Some(rel) = out[search_from..].find("URI=\"") {
         let start = search_from + rel + 5;
         let Some(end_rel) = out[start..].find('"') else {
             break;

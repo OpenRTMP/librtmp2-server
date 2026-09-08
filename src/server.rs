@@ -837,13 +837,23 @@ impl ServerApp {
             deleted_streams: Arc::clone(&self.deleted_streams),
             revoked_viewers: Arc::clone(&self.revoked_viewers),
         });
-        let mut app = http::router(state);
+        let mut app = http::router(Arc::clone(&state));
         if media_output_config.hls_enabled {
-            app = app.merge(crate::media_output::hls_router(
+            let hls_limiter = crate::rate_limit::RateLimiter::new(
+                self.config.http_rate_limit_config(),
+                self.config.http_trusted_proxies.clone(),
+                Arc::clone(&state.api_token),
+            );
+            let hls_app = crate::media_output::hls_router(
                 media_output_config.hls_path.clone(),
                 Arc::clone(&self.db),
                 media_output_config.hls_require_key,
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                hls_limiter,
+                crate::rate_limit::middleware,
             ));
+            app = app.merge(hls_app);
             crate::log_info!(
                 "HLS HTTP enabled at /hls/<stream_id>/index.m3u8 (play-key auth={})",
                 media_output_config.hls_require_key
