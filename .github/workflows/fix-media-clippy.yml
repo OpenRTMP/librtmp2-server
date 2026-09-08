@@ -1,0 +1,41 @@
+name: Fix media output Clippy
+
+on:
+  push:
+    branches:
+      - feature/media-outputs
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feature/media-outputs
+          persist-credentials: true
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Apply Clippy fixes
+        shell: bash
+        run: |
+          cargo clippy --fix --allow-dirty --all-targets --features test-support -- -D warnings
+          cargo fmt --all
+      - name: Commit fixes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/media_output.rs src/server.rs
+          git commit -m 'Fix media output Clippy findings'
+          git push origin HEAD:feature/media-outputs
