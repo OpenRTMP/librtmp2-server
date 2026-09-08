@@ -26,47 +26,8 @@ jobs:
       - name: Fix path containment
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('src/media_output.rs')
-          text = path.read_text()
-          old = '''    let full = state.root.join(&stream_id).join(relative);
-    let result = tokio::task::spawn_blocking(move || fs::read(full)).await;
-    let Ok(Ok(mut body)) = result else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-'''
-          new = '''    let hls_root = state.root.clone();
-    let stream_root = hls_root.join(&stream_id);
-    let full = stream_root.join(relative);
-    let result = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-        let hls_root = hls_root.canonicalize()?;
-        let stream_root = stream_root.canonicalize()?;
-        if !stream_root.starts_with(&hls_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "HLS stream path escaped configured root",
-            ));
-        }
-        let full = full.canonicalize()?;
-        if !full.starts_with(&stream_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "HLS file path escaped stream root",
-            ));
-        }
-        fs::read(full)
-    })
-    .await;
-    let Ok(Ok(mut body)) = result else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-'''
-          if old not in text:
-              raise SystemExit('target HLS read block not found')
-          text = text.replace(old, new, 1)
-          path.write_text(text)
-          PY
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCnBhdGggPSBQYXRoKCJzcmMvbWVkaWFfb3V0cHV0LnJzIikKdGV4dCA9IHBhdGgucmVhZF90ZXh0KCkKb2xkID0gIiIiICAgIGxldCBmdWxsID0gc3RhdGUucm9vdC5qb2luKCZzdHJlYW1faWQpLmpvaW4ocmVsYXRpdmUpOwogICAgbGV0IHJlc3VsdCA9IHRva2lvOjp0YXNrOjpzcGF3bl9ibG9ja2luZyhtb3ZlIHx8IGZzOjpyZWFkKGZ1bGwpKS5hd2FpdDsKICAgIGxldCBPayhPayhtdXQgYm9keSkpID0gcmVzdWx0IGVsc2UgewogICAgICAgIHJldHVybiBTdGF0dXNDb2RlOjpOT1RfRk9VTkQuaW50b19yZXNwb25zZSgpOwogICAgfTsKIiIiCm5ldyA9ICIiIiAgICBsZXQgaGxzX3Jvb3QgPSBzdGF0ZS5yb290LmNsb25lKCk7CiAgICBsZXQgc3RyZWFtX3Jvb3QgPSBobHNfcm9vdC5qb2luKCZzdHJlYW1faWQpOwogICAgbGV0IGZ1bGwgPSBzdHJlYW1fcm9vdC5qb2luKHJlbGF0aXZlKTsKICAgIGxldCByZXN1bHQgPSB0b2tpbzo6dGFzazo6c3Bhd25fYmxvY2tpbmcobW92ZSB8fCAtPiBpbzo6UmVzdWx0PFZlYzx1OD4+IHsKICAgICAgICBsZXQgaGxzX3Jvb3QgPSBobHNfcm9vdC5jYW5vbmljYWxpemUoKT87CiAgICAgICAgbGV0IHN0cmVhbV9yb290ID0gc3RyZWFtX3Jvb3QuY2Fub25pY2FsaXplKCk/OwogICAgICAgIGlmICFzdHJlYW1fcm9vdC5zdGFydHNfd2l0aCgm aGxzX3Jvb3QpIHsKICAgICAgICAgICAgcmV0dXJuIEVycihpbzo6RXJyb3I6Om5ldy gKICAgICAgICAgICAgICAgIGlvOjpFcnJvcktpbmQ6OlBlcm1pc3Npb25EZW5pZWQsCiAgICAgICAgICAgICAgICAiSExTIHN0cmVhbSBwYXRoIGVzY2FwZWQgY29uZmlndXJlZCByb290IiwKICAgICAgICAgICAgKSk7CiAgICAgICAgfQogICAgICAgIGxldCBmdWxsID0gZnVsbC5jYW5vbmljYWxpemUoKT87CiAgICAgICAgaWYgIWZ1bGwuc3RhcnRzX3dpdGgoJnN0cmVhbV9yb290KSB7CiAgICAgICAgICAgIHJldHVybiBFcnIoaW86OkVycm9yOjpuZXcoCiAgICAgICAgICAgICAgICBp bzo6RXJyb3JLaW5kOjpQZXJtaXNzaW9uRGVuaWVkLAogICAgICAgICAgICAgICAgIkhMUyBmaWxlIHBhdGggZXNjYXBlZCBzdHJlYW0gcm9vdCIsCiAgICAgICAgICAgICkpOwogICAgICAgIH0KICAgICAgICBm czo6cmVhZChmdWxsKQogICAgfSkKICAgIC5hd2FpdDsKICAgIGxldCBPayhPayhtdXQgYm9keSkpID0gcmVzdWx0IGVsc2UgewogICAgICAgIHJldHVybiBTdGF0dXNDb2RlOjpOT1RfRk9VTkQuaW50b19yZXNwb25zZSgpOwogICAgfTsKIiIiCmlmIG9sZCBub3QgaW4gdGV4dDoKICAgIHJhaXNlIFN5c3RlbUV4aXQoInRhcmdldCBITFMgcmVhZCBibG9jayBub3QgZm91bmQiKQpwYXRoLndyaXRlX3RleHQodGV4dC5yZXBsYWNlKG9sZCwgbmV3LCAxKSkK' | tr -d ' ' | base64 -d > /tmp/fix_codeql.py
+          python3 /tmp/fix_codeql.py
           cargo fmt --all
           cargo fmt --all -- --check
           cargo clippy --all-targets --features test-support -- -D warnings
