@@ -59,7 +59,10 @@ RUN version="$APP_VERSION" && \
 # Runtime stage (Alpine — same musl libc as builder; no gcompat needed)
 FROM alpine:latest
 
-RUN apk add --no-cache libgcc libstdc++ openssl ca-certificates wget \
+# FFmpeg is used only by optional HLS, push-relay and transcoding outputs.
+# Keeping it in the standard image makes those features work when enabled
+# without a second image variant; recording and exec hooks do not depend on it.
+RUN apk add --no-cache ca-certificates ffmpeg libgcc libstdc++ openssl wget \
     && adduser -D -H -s /sbin/nologin openrtmp \
     && mkdir -p /data \
     && chown openrtmp:openrtmp /data
