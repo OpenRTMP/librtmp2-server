@@ -429,10 +429,7 @@ impl MediaHub {
                         stream,
                         epoch: _,
                     } => {
-                        if !self
-                            .inbound_subscribe_allowed(peer_id, &app, &stream)
-                            .await
-                        {
+                        if !self.inbound_subscribe_allowed(peer_id, &app, &stream).await {
                             tracing::warn!(
                                 peer = peer_id,
                                 %app,
