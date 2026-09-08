@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rustls::{ClientConfig, ServerConfig};
@@ -27,6 +28,11 @@ const MAX_PREAUTH_MEDIA_CONN_INFLIGHT: usize = 512;
 /// Cap half-open auth handshakes per source IP so one source cannot consume
 /// the entire global pre-authentication budget (mirrors control-plane limits).
 const MAX_PREAUTH_MEDIA_CONN_PER_IP: usize = 16;
+/// A just-admitted learner may authenticate before Raft membership has propagated
+/// to the node handling its first Subscribe. Keep that one wire request alive
+/// briefly instead of dropping it permanently while the connection stays open.
+const SUBSCRIBE_GATE_RETRY_WINDOW: Duration = Duration::from_secs(2);
+const SUBSCRIBE_GATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 static MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
@@ -320,6 +326,29 @@ impl MediaHub {
         *self.inbound_subscribe_gate.lock() = Some(gate);
     }
 
+    /// Retry a transient Subscribe denial for a bounded interval. This is
+    /// needed because the media protocol has no Subscribe ACK: dropping the
+    /// first request while Raft membership converges would otherwise leave the
+    /// caller's retained subscription refcount with no wire-level subscription.
+    async fn inbound_subscribe_allowed(&self, peer_id: NodeId, app: &str, stream: &str) -> bool {
+        let Some(gate) = self.inbound_subscribe_gate.lock().clone() else {
+            return true;
+        };
+        let app = app.to_string();
+        let stream = stream.to_string();
+        let retry = async move {
+            loop {
+                if gate(peer_id, app.clone(), stream.clone()).await {
+                    return true;
+                }
+                tokio::time::sleep(SUBSCRIBE_GATE_RETRY_DELAY).await;
+            }
+        };
+        tokio::time::timeout(SUBSCRIBE_GATE_RETRY_WINDOW, retry)
+            .await
+            .unwrap_or(false)
+    }
+
     pub async fn serve(self: Arc<Self>, bind: SocketAddr) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(bind).await?;
         tracing::info!(%bind, tls = self.tls_server.is_some(), "cluster media plane listening");
@@ -400,17 +429,17 @@ impl MediaHub {
                         stream,
                         epoch: _,
                     } => {
-                        let subscribe_gate = self.inbound_subscribe_gate.lock().clone();
-                        if let Some(gate) = subscribe_gate {
-                            if !gate(peer_id, app.clone(), stream.clone()).await {
-                                tracing::warn!(
-                                    peer = peer_id,
-                                    %app,
-                                    %stream,
-                                    "media subscribe rejected: peer not authorized"
-                                );
-                                continue;
-                            }
+                        if !self
+                            .inbound_subscribe_allowed(peer_id, &app, &stream)
+                            .await
+                        {
+                            tracing::warn!(
+                                peer = peer_id,
+                                %app,
+                                %stream,
+                                "media subscribe rejected: peer not authorized"
+                            );
+                            continue;
                         }
                         self.subs.add(peer_id, &app, &stream);
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
