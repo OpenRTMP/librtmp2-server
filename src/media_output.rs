@@ -921,8 +921,28 @@ async fn handle_hls(
     let Some(relative) = safe_hls_path(&raw_path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let full = state.root.join(&stream_id).join(relative);
-    let result = tokio::task::spawn_blocking(move || fs::read(full)).await;
+    let hls_root = state.root.clone();
+    let stream_root = hls_root.join(&stream_id);
+    let full = stream_root.join(relative);
+    let result = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+        let hls_root = hls_root.canonicalize()?;
+        let stream_root = stream_root.canonicalize()?;
+        if !stream_root.starts_with(&hls_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS stream path escaped configured root",
+            ));
+        }
+        let full = full.canonicalize()?;
+        if !full.starts_with(&stream_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS file path escaped stream root",
+            ));
+        }
+        fs::read(full)
+    })
+    .await;
     let Ok(Ok(mut body)) = result else {
         return StatusCode::NOT_FOUND.into_response();
     };
