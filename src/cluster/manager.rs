@@ -1033,6 +1033,17 @@ impl ClusterManager {
         .await
     }
 
+    fn record_joined_peer_addresses(
+        &self,
+        node_id: NodeId,
+        control_addr: &str,
+        media_addr: &str,
+    ) {
+        self.network.upsert_node(node_id, control_addr.clone());
+        self.meta
+            .set_addrs(node_id, control_addr.clone(), media_addr.clone());
+    }
+
     pub async fn accept_join(
         &self,
         node_id: NodeId,
@@ -1043,9 +1054,6 @@ impl ClusterManager {
         let allow_loopback = self.config.allow_loopback_peer_addrs;
         crate::cluster::security::validate_cluster_peer_addr(&control_addr, allow_loopback)?;
         crate::cluster::security::validate_cluster_peer_addr(&media_addr, allow_loopback)?;
-        self.network.upsert_node(node_id, control_addr.clone());
-        self.meta
-            .set_addrs(node_id, control_addr.clone(), media_addr.clone());
 
         use openraft::error::{ClientWriteError, RaftError};
         match self
@@ -1070,6 +1078,8 @@ impl ClusterManager {
                     })
                     .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
                 let proof_for_cache = proof.clone();
+                let control_for_meta = control_addr.clone();
+                let media_for_meta = media_addr.clone();
                 let result = network::forward_join(
                     &leader_addr,
                     &self.config.secret,
@@ -1082,6 +1092,11 @@ impl ClusterManager {
                 )
                 .await;
                 if result.is_ok() {
+                    self.record_joined_peer_addresses(
+                        node_id,
+                        &control_for_meta,
+                        &media_for_meta,
+                    );
                     self.consume_admin_proof(&proof_for_cache);
                 }
                 return result;
@@ -1124,6 +1139,7 @@ impl ClusterManager {
             }
         }
 
+        self.record_joined_peer_addresses(node_id, &control_addr, &media_addr);
         let _ = self.media.connect_peer(node_id, &media_addr).await;
         self.health.note_peer(
             node_id,
@@ -1599,6 +1615,9 @@ impl ClusterManager {
         stream_id: &str,
     ) -> bool {
         if peer_id == self.config.node_id {
+            return false;
+        }
+        if !self.peer_in_membership(peer_id) {
             return false;
         }
         let Some(owner) = self.db.stream_owner_get(stream_id) else {
