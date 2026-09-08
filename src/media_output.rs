@@ -4,11 +4,11 @@
 //! I/O and FFmpeg live on worker threads so a slow disk/upstream cannot stall
 //! RTMP ingest or local player relay.
 
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -136,9 +136,15 @@ impl MediaOutputConfig {
                 self.recording_path = PathBuf::from(value.trim())
             }
             "MEDIA_HLS_ENABLED" => set_bool(&mut self.hls_enabled, key, value),
-            "MEDIA_HLS_PATH" if !value.trim().is_empty() => self.hls_path = PathBuf::from(value.trim()),
-            "MEDIA_HLS_TIME_SECS" => self.hls_time_secs = parse_u32(value, 1, 60, self.hls_time_secs, key),
-            "MEDIA_HLS_LIST_SIZE" => self.hls_list_size = parse_u32(value, 1, 100, self.hls_list_size, key),
+            "MEDIA_HLS_PATH" if !value.trim().is_empty() => {
+                self.hls_path = PathBuf::from(value.trim())
+            }
+            "MEDIA_HLS_TIME_SECS" => {
+                self.hls_time_secs = parse_u32(value, 1, 60, self.hls_time_secs, key)
+            }
+            "MEDIA_HLS_LIST_SIZE" => {
+                self.hls_list_size = parse_u32(value, 1, 100, self.hls_list_size, key)
+            }
             "MEDIA_HLS_SEGMENT_TYPE" => match value.trim().to_ascii_lowercase().as_str() {
                 "fmp4" | "mpegts" => self.hls_segment_type = value.trim().to_ascii_lowercase(),
                 _ => crate::log_warn!("Ignoring invalid {key}='{value}' (expected fmp4 or mpegts)"),
@@ -149,7 +155,9 @@ impl MediaOutputConfig {
             "MEDIA_PUSH_TRANSCODE" => set_bool(&mut self.push_transcode, key, value),
             "MEDIA_EXEC_PUBLISH" => self.exec_publish = value.to_string(),
             "MEDIA_EXEC_PUBLISH_DONE" => self.exec_publish_done = value.to_string(),
-            "MEDIA_FFMPEG_BIN" if !value.trim().is_empty() => self.ffmpeg_bin = value.trim().to_string(),
+            "MEDIA_FFMPEG_BIN" if !value.trim().is_empty() => {
+                self.ffmpeg_bin = value.trim().to_string()
+            }
             "MEDIA_QUEUE_MB" => self.queue_mb = parse_usize(value, 1, 512, self.queue_mb, key),
             _ => {}
         }
@@ -227,7 +235,9 @@ fn parse_push_targets(value: &str) -> Vec<PushTarget> {
                 .map(|(s, u)| (s.trim(), u.trim()))
                 .unwrap_or(("*", entry));
             if selector.is_empty() || !(url.starts_with("rtmp://") || url.starts_with("rtmps://")) {
-                crate::log_warn!("Ignoring invalid MEDIA_PUSH_TARGETS entry (RTMP(S) URL required)");
+                crate::log_warn!(
+                    "Ignoring invalid MEDIA_PUSH_TARGETS entry (RTMP(S) URL required)"
+                );
                 return None;
             }
             Some(PushTarget {
@@ -249,7 +259,11 @@ pub struct MediaOutputManager {
 
 impl MediaOutputManager {
     pub fn new(config: MediaOutputConfig, db: Arc<Db>) -> Self {
-        Self { config, db, sessions: HashMap::new() }
+        Self {
+            config,
+            db,
+            sessions: HashMap::new(),
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -260,7 +274,11 @@ impl MediaOutputManager {
         if !self.config.enabled() || stream_id.is_empty() {
             return;
         }
-        if self.sessions.get(&conn_id).is_some_and(|s| s.stream_id == stream_id) {
+        if self
+            .sessions
+            .get(&conn_id)
+            .is_some_and(|s| s.stream_id == stream_id)
+        {
             return;
         }
         if let Some(old) = self.sessions.remove(&conn_id) {
@@ -273,7 +291,9 @@ impl MediaOutputManager {
             Ok(session) => {
                 self.sessions.insert(conn_id, session);
             }
-            Err(e) => crate::log_error!("Media outputs: failed to start stream '{}': {e}", stream.id),
+            Err(e) => {
+                crate::log_error!("Media outputs: failed to start stream '{}': {e}", stream.id)
+            }
         }
     }
 
@@ -291,7 +311,12 @@ impl MediaOutputManager {
     }
 
     pub fn retain_publishers(&mut self, live: &HashSet<u64>) {
-        let stale: Vec<u64> = self.sessions.keys().copied().filter(|id| !live.contains(id)).collect();
+        let stale: Vec<u64> = self
+            .sessions
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
         for id in stale {
             if let Some(session) = self.sessions.remove(&id) {
                 session.stop(&self.config);
@@ -319,7 +344,13 @@ struct MediaSession {
 }
 
 impl MediaSession {
-    fn start(conn_id: u64, stream_id: &str, stream_name: &str, app: &str, config: &MediaOutputConfig) -> io::Result<Self> {
+    fn start(
+        conn_id: u64,
+        stream_id: &str,
+        stream_name: &str,
+        app: &str,
+        config: &MediaOutputConfig,
+    ) -> io::Result<Self> {
         let safe_id = safe_component(stream_id);
         let max_queue_bytes = config.export_buffer_bytes();
         let mut sinks = Vec::new();
@@ -353,7 +384,9 @@ impl MediaSession {
             }
             let url = target.render_url(stream_id, stream_name, app);
             if !(url.starts_with("rtmp://") || url.starts_with("rtmps://")) {
-                crate::log_warn!("Media outputs: rendered push target #{index} is not an RTMP(S) URL");
+                crate::log_warn!(
+                    "Media outputs: rendered push target #{index} is not an RTMP(S) URL"
+                );
                 continue;
             }
             sinks.push(spawn_push_sink(
@@ -388,7 +421,9 @@ impl MediaSession {
             "Media outputs: publisher session started stream='{stream_id}' recording={} hls={} push_targets={}",
             recording_file.is_some(),
             hls_playlist.is_some(),
-            sinks.len().saturating_sub(recording_file.is_some() as usize + hls_playlist.is_some() as usize)
+            sinks.len().saturating_sub(
+                recording_file.is_some() as usize + hls_playlist.is_some() as usize
+            )
         );
 
         Ok(Self {
@@ -418,10 +453,16 @@ impl MediaSession {
                 hls_playlist: self.hls_playlist.as_deref(),
             };
             if let Err(e) = spawn_hook(&config.exec_publish_done, "publish_done", &env) {
-                crate::log_error!("Media outputs: publish_done exec failed for '{}': {e}", self.stream_id);
+                crate::log_error!(
+                    "Media outputs: publish_done exec failed for '{}': {e}",
+                    self.stream_id
+                );
             }
         }
-        crate::log_info!("Media outputs: publisher session stopped stream='{}'", self.stream_id);
+        crate::log_info!(
+            "Media outputs: publisher session stopped stream='{}'",
+            self.stream_id
+        );
     }
 }
 
@@ -474,10 +515,20 @@ where
     let worker_bytes = Arc::clone(&queued_bytes);
     let worker_failed = Arc::clone(&failed);
     let thread_name = format!("media-{}", safe_component(&label));
-    if thread::Builder::new().name(thread_name).spawn(move || worker(rx, worker_bytes, worker_failed)).is_err() {
+    if thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || worker(rx, worker_bytes, worker_failed))
+        .is_err()
+    {
         failed.store(true, Ordering::Relaxed);
     }
-    SinkSender { label, tx: Some(tx), queued_bytes, max_bytes, failed }
+    SinkSender {
+        label,
+        tx: Some(tx),
+        queued_bytes,
+        max_bytes,
+        failed,
+    }
 }
 
 fn spawn_recording_sink(path: PathBuf, max_bytes: usize) -> SinkSender {
@@ -496,7 +547,13 @@ fn spawn_recording_sink(path: PathBuf, max_bytes: usize) -> SinkSender {
     })
 }
 
-fn spawn_hls_sink(config: &MediaOutputConfig, dir: PathBuf, playlist: PathBuf, max_bytes: usize, label: String) -> SinkSender {
+fn spawn_hls_sink(
+    config: &MediaOutputConfig,
+    dir: PathBuf,
+    playlist: PathBuf,
+    max_bytes: usize,
+    label: String,
+) -> SinkSender {
     let ffmpeg = config.ffmpeg_bin.clone();
     let segment_type = config.hls_segment_type.clone();
     let hls_time = config.hls_time_secs;
@@ -511,11 +568,26 @@ fn spawn_hls_sink(config: &MediaOutputConfig, dir: PathBuf, playlist: PathBuf, m
             let mut cmd = Command::new(&ffmpeg);
             add_ffmpeg_input(&mut cmd);
             add_codec_args(&mut cmd, transcode);
-            cmd.args(["-f", "hls", "-hls_time", &hls_time.to_string(), "-hls_list_size", &list_size.to_string(), "-hls_flags", "delete_segments+independent_segments+omit_endlist"]);
+            cmd.args([
+                "-f",
+                "hls",
+                "-hls_time",
+                &hls_time.to_string(),
+                "-hls_list_size",
+                &list_size.to_string(),
+                "-hls_flags",
+                "delete_segments+independent_segments+omit_endlist",
+            ]);
             if segment_type == "fmp4" {
                 let segments = dir.join("segment_%06d.m4s");
-                cmd.args(["-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4", "-hls_segment_filename"])
-                    .arg(segments);
+                cmd.args([
+                    "-hls_segment_type",
+                    "fmp4",
+                    "-hls_fmp4_init_filename",
+                    "init.mp4",
+                    "-hls_segment_filename",
+                ])
+                .arg(segments);
             } else {
                 let segments = dir.join("segment_%06d.ts");
                 cmd.arg("-hls_segment_filename").arg(segments);
@@ -530,7 +602,12 @@ fn spawn_hls_sink(config: &MediaOutputConfig, dir: PathBuf, playlist: PathBuf, m
     })
 }
 
-fn spawn_push_sink(config: &MediaOutputConfig, url: String, max_bytes: usize, label: String) -> SinkSender {
+fn spawn_push_sink(
+    config: &MediaOutputConfig,
+    url: String,
+    max_bytes: usize,
+    label: String,
+) -> SinkSender {
     let ffmpeg = config.ffmpeg_bin.clone();
     let transcode = config.push_transcode;
     make_sink(label.clone(), max_bytes, move |rx, queued, failed| {
@@ -549,23 +626,53 @@ fn spawn_push_sink(config: &MediaOutputConfig, url: String, max_bytes: usize, la
 }
 
 fn add_ffmpeg_input(cmd: &mut Command) {
-    cmd.args(["-hide_banner", "-loglevel", "warning", "-f", "flv", "-i", "pipe:0", "-map", "0:v?", "-map", "0:a?"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-f",
+        "flv",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v?",
+        "-map",
+        "0:a?",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::inherit());
 }
 
 fn add_codec_args(cmd: &mut Command, transcode: bool) {
     if transcode {
-        cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-c:a", "aac", "-b:a", "128k"]);
+        cmd.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+        ]);
     } else {
         cmd.args(["-c", "copy"]);
     }
 }
 
-fn run_ffmpeg_worker(mut cmd: Command, rx: mpsc::Receiver<Arc<Vec<u8>>>, queued: Arc<AtomicUsize>) -> io::Result<()> {
+fn run_ffmpeg_worker(
+    mut cmd: Command,
+    rx: mpsc::Receiver<Arc<Vec<u8>>>,
+    queued: Arc<AtomicUsize>,
+) -> io::Result<()> {
     let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().ok_or_else(|| io::Error::other("FFmpeg stdin unavailable"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("FFmpeg stdin unavailable"))?;
     stdin.write_all(flv_header())?;
     let write_result = consume_queue(rx, queued, |tag| stdin.write_all(tag));
     drop(stdin);
@@ -577,7 +684,11 @@ fn run_ffmpeg_worker(mut cmd: Command, rx: mpsc::Receiver<Arc<Vec<u8>>>, queued:
     Ok(())
 }
 
-fn consume_queue<F>(rx: mpsc::Receiver<Arc<Vec<u8>>>, queued: Arc<AtomicUsize>, mut write: F) -> io::Result<()>
+fn consume_queue<F>(
+    rx: mpsc::Receiver<Arc<Vec<u8>>>,
+    queued: Arc<AtomicUsize>,
+    mut write: F,
+) -> io::Result<()>
 where
     F: FnMut(&[u8]) -> io::Result<()>,
 {
@@ -602,7 +713,9 @@ fn wait_child_bounded(child: &mut Child, timeout: Duration) {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return,
-            Ok(None) if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25))
+            }
             _ => {
                 terminate_child(child);
                 return;
@@ -634,15 +747,28 @@ fn spawn_hook(command: &str, event: &str, env: &ExecEnv<'_>) -> io::Result<Child
         c
     };
     #[cfg(not(any(unix, windows)))]
-    return Err(io::Error::new(io::ErrorKind::Unsupported, "exec hooks unsupported on this platform"));
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "exec hooks unsupported on this platform",
+    ));
 
     cmd.env("OPENRTMP_EVENT", event)
         .env("OPENRTMP_STREAM_ID", env.stream_id)
         .env("OPENRTMP_STREAM_NAME", env.stream_name)
         .env("OPENRTMP_APP", env.app)
         .env("OPENRTMP_PUBLISHER_CONN_ID", env.conn_id.to_string())
-        .env("OPENRTMP_RECORDING_FILE", env.recording_file.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default())
-        .env("OPENRTMP_HLS_PLAYLIST", env.hls_playlist.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default())
+        .env(
+            "OPENRTMP_RECORDING_FILE",
+            env.recording_file
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+        .env(
+            "OPENRTMP_HLS_PLAYLIST",
+            env.hls_playlist
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -650,13 +776,22 @@ fn spawn_hook(command: &str, event: &str, env: &ExecEnv<'_>) -> io::Result<Child
 }
 
 fn unix_millis() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn safe_component(input: &str) -> String {
     let mut out: String = input
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if out.is_empty() || out == "." || out == ".." {
         out = "stream".to_string();
@@ -681,7 +816,12 @@ fn flv_tag(frame_type: FrameType, timestamp: u32, payload: &[u8]) -> Option<Vec<
     let mut out = Vec::with_capacity(15 + payload.len());
     out.push(tag_type);
     out.extend_from_slice(&[(size >> 16) as u8, (size >> 8) as u8, size as u8]);
-    out.extend_from_slice(&[(timestamp >> 16) as u8, (timestamp >> 8) as u8, timestamp as u8, (timestamp >> 24) as u8]);
+    out.extend_from_slice(&[
+        (timestamp >> 16) as u8,
+        (timestamp >> 8) as u8,
+        timestamp as u8,
+        (timestamp >> 24) as u8,
+    ]);
     out.extend_from_slice(&[0, 0, 0]);
     out.extend_from_slice(payload);
     out.extend_from_slice(&(11u32.saturating_add(size)).to_be_bytes());
@@ -703,7 +843,11 @@ struct HlsQuery {
 /// Serve generated HLS from the existing HTTP listener. When key protection
 /// is enabled, the same enabled play/viewer keys accepted by RTMP are used.
 pub fn hls_router(root: PathBuf, db: Arc<Db>, require_key: bool) -> Router {
-    let state = HlsState { root, db, require_key };
+    let state = HlsState {
+        root,
+        db,
+        require_key,
+    };
     Router::new()
         .route("/hls/{stream_id}/{*path}", get(handle_hls))
         .with_state(state)
@@ -739,11 +883,14 @@ async fn handle_hls(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let extension = Path::new(&raw_path).extension().and_then(|v| v.to_str()).unwrap_or("");
+    let extension = Path::new(&raw_path)
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("");
     if extension == "m3u8"
         && state.require_key
         && let Some(key) = query.key.as_deref()
-        && let Ok(text) = String::from_utf8(body)
+        && let Ok(text) = std::str::from_utf8(&body)
     {
         body = rewrite_playlist_key(&text, key).into_bytes();
     }
@@ -757,9 +904,15 @@ async fn handle_hls(
     };
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
     if extension == "m3u8" {
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
     }
     (headers, body).into_response()
 }
@@ -800,9 +953,13 @@ fn rewrite_uri_attributes(line: &str, key: &str) -> String {
     let mut out = line.to_string();
     let mut search_from = 0usize;
     loop {
-        let Some(rel) = out[search_from..].find("URI=\"") else { break; };
+        let Some(rel) = out[search_from..].find("URI=\"") else {
+            break;
+        };
         let start = search_from + rel + 5;
-        let Some(end_rel) = out[start..].find('"') else { break; };
+        let Some(end_rel) = out[start..].find('"') else {
+            break;
+        };
         let end = start + end_rel;
         let uri = append_key(&out[start..end], key);
         out.replace_range(start..end, &uri);
@@ -839,7 +996,10 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert!(targets[0].matches("one", "name"));
         assert!(targets[1].matches("id", "cam"));
-        assert_eq!(targets[0].render_url("one", "Name", "live"), "rtmp://a/live/one");
+        assert_eq!(
+            targets[0].render_url("one", "Name", "live"),
+            "rtmp://a/live/one"
+        );
     }
 
     #[test]

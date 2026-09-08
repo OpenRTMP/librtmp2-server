@@ -823,7 +823,8 @@ impl ServerApp {
                 media_output_config.recording_enabled,
                 media_output_config.hls_enabled,
                 media_output_config.push_targets.len(),
-                !media_output_config.exec_publish.is_empty() || !media_output_config.exec_publish_done.is_empty()
+                !media_output_config.exec_publish.is_empty()
+                    || !media_output_config.exec_publish_done.is_empty()
             );
         }
 
@@ -960,7 +961,8 @@ impl ServerApp {
             }
 
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
-            let mut media_outputs = MediaOutputManager::new(media_output_thread_config, media_output_db);
+            let mut media_outputs =
+                MediaOutputManager::new(media_output_thread_config, media_output_db);
 
             loop {
                 if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -995,9 +997,7 @@ impl ServerApp {
                 }
 
                 #[cfg(feature = "cluster")]
-                if cluster_enabled
-                    && let Some(mgr) = rtmp_bridge.cluster_manager()
-                {
+                if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
                     mgr.poll_side_effects();
                     rtmp_bridge.retry_pending_ownership_releases();
                 }
@@ -1020,9 +1020,7 @@ impl ServerApp {
                 }
 
                 #[cfg(feature = "cluster")]
-                if cluster_enabled
-                    && let Some(mgr) = rtmp_bridge.cluster_manager()
-                {
+                if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
                     for frame in exported_frames {
                         let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
                         let stream_id = if sid.is_empty() {
@@ -1035,7 +1033,8 @@ impl ServerApp {
                         // Stamp only with this publisher socket's claimed
                         // epoch — durable/current stream epoch can belong
                         // to another node after a local release/failover.
-                        let Some(epoch) = rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
+                        let Some(epoch) =
+                            rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
                         else {
                             continue;
                         };
