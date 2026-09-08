@@ -611,13 +611,13 @@ fn spawn_push_sink(
     let ffmpeg = config.ffmpeg_bin.clone();
     let transcode = config.push_transcode;
     make_sink(label.clone(), max_bytes, move |rx, queued, failed| {
-        let result = (|| -> io::Result<()> {
+        let result = {
             let mut cmd = Command::new(&ffmpeg);
             add_ffmpeg_input(&mut cmd);
             add_codec_args(&mut cmd, transcode);
             cmd.args(["-f", "flv"]).arg(&url);
             run_ffmpeg_worker(cmd, rx, queued)
-        })();
+        };
         if let Err(e) = result {
             failed.store(true, Ordering::Relaxed);
             crate::log_error!("Push worker '{label}' failed: {e}");
@@ -892,7 +892,7 @@ async fn handle_hls(
         && let Some(key) = query.key.as_deref()
         && let Ok(text) = std::str::from_utf8(&body)
     {
-        body = rewrite_playlist_key(&text, key).into_bytes();
+        body = rewrite_playlist_key(text, key).into_bytes();
     }
 
     let content_type = match extension {
