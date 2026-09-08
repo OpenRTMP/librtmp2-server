@@ -1033,15 +1033,10 @@ impl ClusterManager {
         .await
     }
 
-    fn record_joined_peer_addresses(
-        &self,
-        node_id: NodeId,
-        control_addr: &str,
-        media_addr: &str,
-    ) {
-        self.network.upsert_node(node_id, control_addr.clone());
+    fn record_joined_peer_addresses(&self, node_id: NodeId, control_addr: &str, media_addr: &str) {
+        self.network.upsert_node(node_id, control_addr.to_string());
         self.meta
-            .set_addrs(node_id, control_addr.clone(), media_addr.clone());
+            .set_addrs(node_id, control_addr.to_string(), media_addr.to_string());
     }
 
     pub async fn accept_join(
@@ -1092,11 +1087,7 @@ impl ClusterManager {
                 )
                 .await;
                 if result.is_ok() {
-                    self.record_joined_peer_addresses(
-                        node_id,
-                        &control_for_meta,
-                        &media_for_meta,
-                    );
+                    self.record_joined_peer_addresses(node_id, &control_for_meta, &media_for_meta);
                     self.consume_admin_proof(&proof_for_cache);
                 }
                 return result;
