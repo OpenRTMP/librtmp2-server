@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
+use crate::media_output::{MediaOutputConfig, MediaOutputManager};
 use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
 use crate::state::StateCoordinator;
 
@@ -815,6 +816,17 @@ impl ServerApp {
             crate::log_info!("RTMPS disabled (plaintext RTMP only)");
         }
 
+        let media_output_config = MediaOutputConfig::load(&self.config.config_file);
+        if media_output_config.enabled() {
+            crate::log_info!(
+                "Media outputs enabled — recording={} hls={} push_targets={} exec={}",
+                media_output_config.recording_enabled,
+                media_output_config.hls_enabled,
+                media_output_config.push_targets.len(),
+                !media_output_config.exec_publish.is_empty() || !media_output_config.exec_publish_done.is_empty()
+            );
+        }
+
         let state = Arc::new(AppState {
             db: Arc::clone(&self.db),
             config: self.config.clone(),
@@ -824,7 +836,18 @@ impl ServerApp {
             deleted_streams: Arc::clone(&self.deleted_streams),
             revoked_viewers: Arc::clone(&self.revoked_viewers),
         });
-        let app = http::router(state);
+        let mut app = http::router(state);
+        if media_output_config.hls_enabled {
+            app = app.merge(crate::media_output::hls_router(
+                media_output_config.hls_path.clone(),
+                Arc::clone(&self.db),
+                media_output_config.hls_require_key,
+            ));
+            crate::log_info!(
+                "HLS HTTP enabled at /hls/<stream_id>/index.m3u8 (play-key auth={})",
+                media_output_config.hls_require_key
+            );
+        }
 
         let http_listener = TcpListener::bind(&self.config.http_bind)
             .await
@@ -856,10 +879,28 @@ impl ServerApp {
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
         let rtmp_stop_clone = Arc::clone(&rtmp_stop);
+        let media_export_bytes = if media_output_config.needs_relay_export() {
+            media_output_config.export_buffer_bytes()
+        } else {
+            0
+        };
+        let media_output_thread_config = media_output_config.clone();
+        let media_output_db = Arc::clone(&self.db);
         #[cfg(feature = "cluster")]
         let cluster_enabled = self.config.cluster.enabled;
         #[cfg(feature = "cluster")]
-        let media_queue_mb = self.config.cluster.media_queue_mb;
+        let cluster_media_queue_mb = self.config.cluster.media_queue_mb;
+        #[cfg(feature = "cluster")]
+        let relay_export_bytes = {
+            let cluster_bytes = if cluster_enabled {
+                (cluster_media_queue_mb as usize).saturating_mul(1024 * 1024)
+            } else {
+                0
+            };
+            media_export_bytes.max(cluster_bytes)
+        };
+        #[cfg(not(feature = "cluster"))]
+        let relay_export_bytes = media_export_bytes;
 
         let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
         let (rtmp_dead_tx, rtmp_dead_rx) = tokio::sync::oneshot::channel();
@@ -892,10 +933,8 @@ impl ServerApp {
             server.on_media_cb = Some(rtmp_media_cb);
             server.on_publish_cb = Some(rtmp_publish_cb);
             server.on_play_cb = Some(rtmp_play_cb);
-            #[cfg(feature = "cluster")]
-            if cluster_enabled {
-                let max_bytes = (media_queue_mb as usize).saturating_mul(1024 * 1024);
-                server.enable_relay_export(4096, max_bytes.max(1024 * 1024));
+            if relay_export_bytes > 0 {
+                server.enable_relay_export(4096, relay_export_bytes.max(1024 * 1024));
             }
             if let Err(e) = server.listen(&rtmp_bind) {
                 let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
@@ -921,6 +960,7 @@ impl ServerApp {
             }
 
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+            let mut media_outputs = MediaOutputManager::new(media_output_thread_config, media_output_db);
 
             loop {
                 if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -948,56 +988,82 @@ impl ServerApp {
                     rtmp_idle_timeout,
                 );
 
+                for (&conn_id, entry) in &tracked {
+                    if entry.publishing && !entry.stream_id.is_empty() {
+                        media_outputs.ensure_publisher(conn_id, &entry.stream_id);
+                    }
+                }
+
                 #[cfg(feature = "cluster")]
-                if cluster_enabled {
-                    if let Some(mgr) = rtmp_bridge.cluster_manager() {
-                        mgr.poll_side_effects();
-                        rtmp_bridge.retry_pending_ownership_releases();
-                        for frame in server.drain_exported_relay_frames() {
-                            let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
-                            let stream_id = if sid.is_empty() {
-                                rtmp_bridge
-                                    .stream_id_for_publish_route(&frame.stream_name)
-                                    .unwrap_or_else(|| frame.stream_name.clone())
-                            } else {
-                                sid
-                            };
-                            // Stamp only with this publisher socket's claimed
-                            // epoch — durable/current stream epoch can belong
-                            // to another node after a local release/failover.
-                            let Some(epoch) =
-                                rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
-                            else {
-                                continue;
-                            };
-                            use crate::cluster::media::protocol::MediaMessage;
-                            mgr.enqueue_export(crate::cluster::ExportedFrame {
-                                app: frame.app.clone(),
-                                stream: stream_id,
-                                epoch,
-                                frame_type: MediaMessage::frame_type_from_librtmp2(
-                                    frame.frame_type,
-                                ),
-                                timestamp: frame.timestamp,
-                                payload: frame.payload,
-                            });
+                if cluster_enabled
+                    && let Some(mgr) = rtmp_bridge.cluster_manager()
+                {
+                    mgr.poll_side_effects();
+                    rtmp_bridge.retry_pending_ownership_releases();
+                }
+
+                let exported_frames = if relay_export_bytes > 0 {
+                    server.drain_exported_relay_frames()
+                } else {
+                    Vec::new()
+                };
+
+                if media_outputs.enabled() {
+                    for frame in &exported_frames {
+                        if tracked
+                            .get(&frame.publisher_conn_id)
+                            .is_some_and(|entry| entry.publishing)
+                        {
+                            media_outputs.handle_frame(frame);
                         }
-                        for inj in mgr.drain_injects() {
-                            if let Some(ft) =
-                                crate::cluster::media::protocol::MediaMessage::frame_type_to_librtmp2(
-                                    inj.frame_type,
-                                )
-                            {
-                                // Inject using stream name expected by local players:
-                                // resolve play route via stream id → stream.play_key / name.
-                                let _ = server.inject_relay_frame(
-                                    &inj.app,
-                                    &inj.stream,
-                                    ft,
-                                    inj.timestamp,
-                                    &inj.payload,
-                                );
-                            }
+                    }
+                }
+
+                #[cfg(feature = "cluster")]
+                if cluster_enabled
+                    && let Some(mgr) = rtmp_bridge.cluster_manager()
+                {
+                    for frame in exported_frames {
+                        let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
+                        let stream_id = if sid.is_empty() {
+                            rtmp_bridge
+                                .stream_id_for_publish_route(&frame.stream_name)
+                                .unwrap_or_else(|| frame.stream_name.clone())
+                        } else {
+                            sid
+                        };
+                        // Stamp only with this publisher socket's claimed
+                        // epoch — durable/current stream epoch can belong
+                        // to another node after a local release/failover.
+                        let Some(epoch) = rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
+                        else {
+                            continue;
+                        };
+                        use crate::cluster::media::protocol::MediaMessage;
+                        mgr.enqueue_export(crate::cluster::ExportedFrame {
+                            app: frame.app.clone(),
+                            stream: stream_id,
+                            epoch,
+                            frame_type: MediaMessage::frame_type_from_librtmp2(frame.frame_type),
+                            timestamp: frame.timestamp,
+                            payload: frame.payload,
+                        });
+                    }
+                    for inj in mgr.drain_injects() {
+                        if let Some(ft) =
+                            crate::cluster::media::protocol::MediaMessage::frame_type_to_librtmp2(
+                                inj.frame_type,
+                            )
+                        {
+                            // Inject using stream name expected by local players:
+                            // resolve play route via stream id → stream.play_key / name.
+                            let _ = server.inject_relay_frame(
+                                &inj.app,
+                                &inj.stream,
+                                ft,
+                                inj.timestamp,
+                                &inj.payload,
+                            );
                         }
                     }
                 }
@@ -1014,6 +1080,12 @@ impl ServerApp {
                     tracked.remove(&conn_id);
                     rtmp_bridge.on_close(conn_id);
                 }
+
+                let live_publishers: HashSet<u64> = tracked
+                    .iter()
+                    .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
+                    .collect();
+                media_outputs.retain_publishers(&live_publishers);
 
                 // Drain deletion/revocation markers no live connection still references.
                 let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
@@ -1033,6 +1105,8 @@ impl ServerApp {
 
                 std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             }
+
+            media_outputs.stop_all();
 
             // Notify the bridge about connections that never got an explicit close event.
             for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
