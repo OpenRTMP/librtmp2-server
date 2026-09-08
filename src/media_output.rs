@@ -929,7 +929,7 @@ async fn handle_hls(
 
     let extension = Path::new(&raw_path)
         .extension()
-        .and_then(|v| v.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("");
     if extension == "m3u8"
         && state.require_key
@@ -972,7 +972,7 @@ fn safe_hls_path(raw: &str) -> Option<PathBuf> {
             _ => return None,
         }
     }
-    match path.extension().and_then(|v| v.to_str()) {
+    match path.extension().and_then(std::ffi::OsStr::to_str) {
         Some("m3u8" | "m4s" | "mp4" | "ts") => Some(path.to_path_buf()),
         _ => None,
     }
