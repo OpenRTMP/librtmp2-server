@@ -1,0 +1,52 @@
+name: Fix Sonar PR 198
+
+on:
+  push:
+    branches:
+      - feature/media-outputs
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feature/media-outputs
+          persist-credentials: true
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Fix Sonar S1612 findings
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/media_output.rs')
+          text = path.read_text()
+          old = '.and_then(|v| v.to_str())'
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'expected exactly 2 S1612 closures, found {count}')
+          text = text.replace(old, '.and_then(std::ffi::OsStr::to_str)')
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          cargo clippy --all-targets --features test-support -- -D warnings
+      - name: Commit fixes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/media_output.rs
+          git commit -m 'Fix Sonar S1612 findings'
+          git push origin HEAD:feature/media-outputs
