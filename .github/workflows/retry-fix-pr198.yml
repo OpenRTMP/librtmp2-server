@@ -26,19 +26,7 @@ jobs:
       - name: Apply findings fixes
         shell: bash
         run: |
-          python3 - <<'PY'
-          import base64
-          import re
-          from pathlib import Path
-
-          workflow = Path('.github/workflows/fix-pr198-codex-findings.yml').read_text()
-          match = re.search(r"echo '([^']+)' \| base64 -d > /tmp/fix_pr198\.py", workflow, re.S)
-          if not match:
-              raise SystemExit('embedded PR 198 patch payload not found')
-          payload = ''.join(match.group(1).split())
-          Path('/tmp/fix_pr198.py').write_bytes(base64.b64decode(payload))
-          PY
-          python3 /tmp/fix_pr198.py
+          python3 .github/fix_pr198_findings.py
           cargo fmt --all
           cargo fmt --all -- --check
           cargo clippy --all-targets --features test-support -- -D warnings
