@@ -1,0 +1,84 @@
+name: Fix CodeQL PR 198
+
+on:
+  push:
+    branches:
+      - feature/media-outputs
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feature/media-outputs
+          persist-credentials: true
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Fix path containment
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/media_output.rs')
+          text = path.read_text()
+          old = '''    let full = state.root.join(&stream_id).join(relative);
+    let result = tokio::task::spawn_blocking(move || fs::read(full)).await;
+    let Ok(Ok(mut body)) = result else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+'''
+          new = '''    let hls_root = state.root.clone();
+    let stream_root = hls_root.join(&stream_id);
+    let full = stream_root.join(relative);
+    let result = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+        let hls_root = hls_root.canonicalize()?;
+        let stream_root = stream_root.canonicalize()?;
+        if !stream_root.starts_with(&hls_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS stream path escaped configured root",
+            ));
+        }
+        let full = full.canonicalize()?;
+        if !full.starts_with(&stream_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "HLS file path escaped stream root",
+            ));
+        }
+        fs::read(full)
+    })
+    .await;
+    let Ok(Ok(mut body)) = result else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+'''
+          if old not in text:
+              raise SystemExit('target HLS read block not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --features test-support -- -D warnings
+          cargo test --features test-support
+      - name: Commit fix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/media_output.rs
+          git commit -m 'Fix HLS path containment validation'
+          git push origin HEAD:feature/media-outputs
