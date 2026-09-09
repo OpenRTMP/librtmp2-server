@@ -130,10 +130,7 @@ pub fn try_reserve_inflight_bytes(
     len: usize,
 ) -> Result<InflightByteBudgetGuard, ()> {
     if len == 0 {
-        return Ok(InflightByteBudgetGuard {
-            counter,
-            bytes: 0,
-        });
+        return Ok(InflightByteBudgetGuard { counter, bytes: 0 });
     }
     loop {
         let cur = counter.load(Ordering::Acquire);
