@@ -6,6 +6,7 @@ use std::io;
 use std::io::BufReader;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,48 @@ pub fn record_cluster_auth_failure(peer: IpAddr) {
 /// Clear auth failures after a successful cluster auth handshake.
 pub fn clear_cluster_auth_failures(peer: IpAddr) {
     CLUSTER_AUTH_FAILURES.lock().remove(&peer);
+}
+
+/// RAII guard for a reserved slice of a global in-flight byte budget.
+pub struct InflightByteBudgetGuard {
+    counter: &'static AtomicUsize,
+    bytes: usize,
+}
+
+impl Drop for InflightByteBudgetGuard {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Reserve `len` bytes from a process-wide budget before allocating a large
+/// cluster frame buffer. Prevents parallel authenticated reads from scaling
+/// to `max_connections × max_frame` resident memory.
+pub fn try_reserve_inflight_bytes(
+    counter: &'static AtomicUsize,
+    max: usize,
+    len: usize,
+) -> Result<InflightByteBudgetGuard, ()> {
+    if len == 0 {
+        return Ok(InflightByteBudgetGuard { counter, bytes: 0 });
+    }
+    loop {
+        let cur = counter.load(Ordering::Acquire);
+        if cur.saturating_add(len) > max {
+            return Err(());
+        }
+        if counter
+            .compare_exchange(cur, cur + len, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(InflightByteBudgetGuard {
+                counter,
+                bytes: len,
+            });
+        }
+    }
 }
 
 /// Compare two secrets in constant time (length included via padded XOR).
@@ -502,5 +545,21 @@ mod tests {
         );
 
         super::CLUSTER_AUTH_FAILURES.lock().clear();
+    }
+
+    #[test]
+    fn inflight_byte_budget_rejects_when_cap_exceeded() {
+        use std::sync::atomic::AtomicUsize;
+
+        static TEST_BUDGET: AtomicUsize = AtomicUsize::new(0);
+        let first = super::try_reserve_inflight_bytes(&TEST_BUDGET, 100, 60);
+        assert!(first.is_ok());
+        let second = super::try_reserve_inflight_bytes(&TEST_BUDGET, 100, 50);
+        assert!(second.is_err());
+        drop(first);
+        let third = super::try_reserve_inflight_bytes(&TEST_BUDGET, 100, 50);
+        assert!(third.is_ok());
+        drop(third);
+        assert_eq!(TEST_BUDGET.load(Ordering::Acquire), 0);
     }
 }
