@@ -28,6 +28,9 @@ const MAX_MEDIA_READ_BYTES_INFLIGHT: usize = 128 * 1024 * 1024;
 static MEDIA_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound post-authentication frame reads so a peer cannot reserve the media
+/// read budget indefinitely by advertising a frame and then withholding it.
+const MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on a single frame write to a peer. Without this, a peer that stops
 /// reading (backpressure with no consumer) leaves the write stuck forever —
 /// the task and socket never clean up, and heartbeat-driven peer replacement
@@ -53,7 +56,11 @@ pub async fn write_media_frame<W: AsyncWriteExt + Unpin>(
 pub async fn read_media_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<MediaMessage, std::io::Error> {
-    read_media_frame_max(r, MAX_FRAME).await
+    tokio::time::timeout(MEDIA_READ_TIMEOUT, read_media_frame_max(r, MAX_FRAME))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "media frame read timeout")
+        })?
 }
 
 async fn read_media_frame_max<R: AsyncReadExt + Unpin>(
