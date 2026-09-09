@@ -291,12 +291,8 @@ async fn read_control_frame<R: AsyncReadExt + Unpin>(
                 )
             };
             Some(
-                crate::cluster::security::try_reserve_inflight_bytes(
-                    counter,
-                    max,
-                    len as usize,
-                )
-                .map_err(|_| std::io::Error::other(error))?,
+                crate::cluster::security::try_reserve_inflight_bytes(counter, max, len as usize)
+                    .map_err(|_| std::io::Error::other(error))?,
             )
         };
         let mut buf = vec![0u8; len as usize];
