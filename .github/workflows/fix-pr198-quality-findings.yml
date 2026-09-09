@@ -27,6 +27,37 @@ jobs:
       - name: Apply fixes
         run: python3 /tmp/fix_pr198_quality_findings.py
 
+      - name: Fix Clippy cleanup guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/media_output.rs")
+          text = path.read_text()
+          old = '''        if name.starts_with("session-") && name.as_ref() < current_name {
+              if let Err(e) = fs::remove_dir_all(entry.path()) {
+                  crate::log_warn!(
+                      "Unable to remove stale HLS session directory '{}': {e}",
+                      entry.path().display()
+                  );
+              }
+          }
+          '''
+          new = '''        if name.starts_with("session-")
+              && name.as_ref() < current_name
+              && let Err(e) = fs::remove_dir_all(entry.path())
+          {
+              crate::log_warn!(
+                  "Unable to remove stale HLS session directory '{}': {e}",
+                  entry.path().display()
+              );
+          }
+          '''
+          if old not in text:
+              raise SystemExit("expected HLS cleanup guard not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Format
         run: cargo fmt --all
 
