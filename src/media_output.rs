@@ -16,7 +16,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,7 +28,9 @@ use tokio_util::io::ReaderStream;
 
 const DEFAULT_QUEUE_MB: usize = 32;
 const SINK_QUEUE_MESSAGES: usize = 512;
+const RETIRED_SESSION_QUEUE: usize = 16;
 const MAX_FLV_PAYLOAD: usize = 0x00ff_ffff;
+static HLS_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_HLS_PLAYLIST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,13 +277,13 @@ pub struct MediaOutputManager {
     config: MediaOutputConfig,
     db: Arc<Db>,
     sessions: HashMap<u64, MediaSession>,
-    retire_tx: Option<mpsc::Sender<MediaSession>>,
+    retire_tx: Option<mpsc::SyncSender<MediaSession>>,
     reaper: Option<thread::JoinHandle<()>>,
 }
 
 impl MediaOutputManager {
     pub fn new(config: MediaOutputConfig, db: Arc<Db>) -> Self {
-        let (retire_tx, retire_rx) = mpsc::channel::<MediaSession>();
+        let (retire_tx, retire_rx) = mpsc::sync_channel::<MediaSession>(RETIRED_SESSION_QUEUE);
         let reaper_config = config.clone();
         let reaper = thread::Builder::new()
             .name("media-session-reaper".to_string())
@@ -311,12 +313,22 @@ impl MediaOutputManager {
     }
 
     fn retire(&mut self, session: MediaSession) {
-        if let Some(tx) = self.retire_tx.as_ref() {
-            if let Err(e) = tx.send(session) {
-                e.0.stop(&self.config);
+        let Some(tx) = self.retire_tx.as_ref() else {
+            session.abort("session reaper unavailable");
+            return;
+        };
+        match tx.try_send(session) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(session)) => {
+                crate::log_warn!(
+                    "Media session retirement queue full; cancelling excess session immediately"
+                );
+                session.abort("session retirement queue full");
             }
-        } else {
-            session.stop(&self.config);
+            Err(mpsc::TrySendError::Disconnected(session)) => {
+                crate::log_warn!("Media session reaper disconnected; cancelling session");
+                session.abort("session reaper disconnected");
+            }
         }
     }
 
@@ -462,10 +474,12 @@ impl MediaSession {
         }
 
         if config.hls_enabled {
-            let dir = config.hls_path.join(&safe_id);
+            let stream_dir = config.hls_path.join(&safe_id);
+            let dir = stream_dir.join(hls_session_dir_name(conn_id, generation));
             let playlist = dir.join("index.m3u8");
             sinks.push(spawn_hls_sink(
                 config,
+                stream_dir,
                 dir,
                 playlist.clone(),
                 max_queue_bytes,
@@ -534,6 +548,19 @@ impl MediaSession {
             hls_playlist,
             last_timestamp: None,
         }
+    }
+
+    fn abort(mut self, reason: &str) {
+        for mut sink in std::mem::take(&mut self.sinks) {
+            sink.disable(reason);
+        }
+        if let Some(mut child) = self.publish_exec.take() {
+            terminate_hook_child(&mut child);
+        }
+        crate::log_warn!(
+            "Media outputs: publisher session cancelled stream='{}' reason='{reason}'",
+            self.stream_id
+        );
     }
 
     fn stop(mut self, config: &MediaOutputConfig) {
@@ -682,6 +709,38 @@ fn spawn_recording_sink(path: PathBuf, max_bytes: usize) -> SinkSender {
     })
 }
 
+fn hls_session_dir_name(conn_id: u64, generation: u64) -> String {
+    let sequence = HLS_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "session-{:020}-{sequence:020}-{conn_id:020}-{generation:020}",
+        unix_millis()
+    )
+}
+
+fn clean_older_hls_sessions(stream_dir: &Path, current_dir: &Path) -> io::Result<()> {
+    let Some(current_name) = current_dir.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(stream_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("session-")
+            && name.as_ref() < current_name
+            && let Err(e) = fs::remove_dir_all(entry.path())
+        {
+            crate::log_warn!(
+                "Unable to remove stale HLS session directory '{}': {e}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn clean_hls_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     for entry in fs::read_dir(dir)? {
@@ -702,6 +761,7 @@ fn clean_hls_dir(dir: &Path) -> io::Result<()> {
 
 fn spawn_hls_sink(
     config: &MediaOutputConfig,
+    stream_dir: PathBuf,
     dir: PathBuf,
     playlist: PathBuf,
     max_bytes: usize,
@@ -715,6 +775,7 @@ fn spawn_hls_sink(
     make_sink(label, max_bytes, move |rx, queued, failed| {
         let result = (|| -> io::Result<()> {
             clean_hls_dir(&dir)?;
+            clean_older_hls_sessions(&stream_dir, &dir)?;
             let mut cmd = Command::new(&ffmpeg);
             add_ffmpeg_input(&mut cmd);
             add_codec_args(&mut cmd, transcode);
@@ -1104,60 +1165,88 @@ pub fn hls_router(root: PathBuf, db: Arc<Db>, require_key: bool) -> Router {
         .with_state(state)
 }
 
-async fn handle_hls(
-    State(state): State<HlsState>,
-    AxumPath((stream_id, raw_path)): AxumPath<(String, String)>,
-    Query(query): Query<HlsQuery>,
-) -> Response {
-    if safe_component(&stream_id) != stream_id {
-        return StatusCode::BAD_REQUEST.into_response();
+fn authorize_hls_request(
+    state: &HlsState,
+    stream_id: &str,
+    key: Option<&str>,
+) -> Result<(), StatusCode> {
+    if !state.require_key {
+        return Ok(());
     }
-    if state.require_key {
-        let Some(key) = query.key.as_deref() else {
-            return StatusCode::UNAUTHORIZED.into_response();
-        };
-        let authorized = matches!(
-            state.db.viewer_find_by_play_key(key),
-            DbLookup::Ok(ref viewer) if viewer.stream_id == stream_id
-        ) && matches!(state.db.stream_get(&stream_id), DbLookup::Ok(ref stream) if stream.enabled);
-        if !authorized {
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    let key = key.ok_or(StatusCode::UNAUTHORIZED)?;
+    let viewer_allowed = matches!(
+        state.db.viewer_find_by_play_key(key),
+        DbLookup::Ok(ref viewer) if viewer.stream_id == stream_id
+    );
+    let stream_enabled =
+        matches!(state.db.stream_get(stream_id), DbLookup::Ok(ref stream) if stream.enabled);
+    if viewer_allowed && stream_enabled {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
     }
+}
 
-    let Some(relative) = safe_hls_path(&raw_path) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let extension = Path::new(&raw_path)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("");
-    let hls_root = state.root.clone();
-    let stream_root = hls_root.join(&stream_id);
-    let full = stream_root.join(relative);
-    let result = tokio::task::spawn_blocking(move || -> io::Result<PathBuf> {
-        let hls_root = hls_root.canonicalize()?;
-        let stream_root = stream_root.canonicalize()?;
-        if !stream_root.starts_with(&hls_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "HLS stream path escaped configured root",
-            ));
+fn latest_hls_session(stream_root: &Path) -> io::Result<String> {
+    let mut latest: Option<String> = None;
+    for entry in fs::read_dir(stream_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
         }
-        let full = full.canonicalize()?;
-        if !full.starts_with(&stream_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "HLS file path escaped stream root",
-            ));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("session-") || safe_component(&name) != name {
+            continue;
         }
-        Ok(full)
-    })
-    .await;
-    let Ok(Ok(full)) = result else {
+        if latest
+            .as_ref()
+            .is_none_or(|current| name.as_str() > current.as_str())
+        {
+            latest = Some(name);
+        }
+    }
+    latest.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no active HLS session"))
+}
+
+async fn active_hls_redirect(state: &HlsState, stream_id: &str, key: Option<&str>) -> Response {
+    let stream_root = state.root.join(stream_id);
+    let result = tokio::task::spawn_blocking(move || latest_hls_session(&stream_root)).await;
+    let Ok(Ok(session)) = result else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let mut location = format!("/hls/{}/{session}/index.m3u8", url_component(stream_id));
+    if let Some(key) = key {
+        location.push_str("?key=");
+        location.push_str(&url_component(key));
+    }
+    let Ok(location) = HeaderValue::from_str(&location) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::LOCATION, location);
+    (StatusCode::TEMPORARY_REDIRECT, headers).into_response()
+}
 
+fn canonical_hls_file(root: &Path, stream_id: &str, relative: &Path) -> io::Result<PathBuf> {
+    let hls_root = root.canonicalize()?;
+    let stream_root = hls_root.join(stream_id).canonicalize()?;
+    if !stream_root.starts_with(&hls_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HLS stream path escaped configured root",
+        ));
+    }
+    let full = stream_root.join(relative).canonicalize()?;
+    if !full.starts_with(&stream_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HLS file path escaped stream root",
+        ));
+    }
+    Ok(full)
+}
+
+fn hls_headers(extension: &str) -> HeaderMap {
     let content_type = match extension {
         "m3u8" => "application/vnd.apple.mpegurl",
         "m4s" => "video/iso.segment",
@@ -1171,30 +1260,73 @@ async fn handle_hls(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
     );
+    headers
+}
 
-    if extension == "m3u8" {
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-        );
-        let Ok(metadata) = tokio::fs::metadata(&full).await else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        if metadata.len() > MAX_HLS_PLAYLIST_BYTES {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-        }
-        let Ok(mut body) = tokio::fs::read(&full).await else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        if state.require_key
-            && let Some(key) = query.key.as_deref()
-            && let Ok(text) = std::str::from_utf8(&body)
-        {
-            body = rewrite_playlist_key(text, key).into_bytes();
-        }
-        return (headers, body).into_response();
+async fn serve_hls_playlist(
+    full: PathBuf,
+    mut headers: HeaderMap,
+    require_key: bool,
+    key: Option<String>,
+) -> Response {
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    let Ok(metadata) = tokio::fs::metadata(&full).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if metadata.len() > MAX_HLS_PLAYLIST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let Ok(mut body) = tokio::fs::read(&full).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if require_key
+        && let Some(key) = key.as_deref()
+        && let Ok(text) = std::str::from_utf8(&body)
+    {
+        body = rewrite_playlist_key(text, key).into_bytes();
+    }
+    (headers, body).into_response()
+}
+
+async fn handle_hls(
+    State(state): State<HlsState>,
+    AxumPath((stream_id, raw_path)): AxumPath<(String, String)>,
+    Query(query): Query<HlsQuery>,
+) -> Response {
+    if safe_component(&stream_id) != stream_id {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(status) = authorize_hls_request(&state, &stream_id, query.key.as_deref()) {
+        return status.into_response();
+    }
+    if raw_path == "index.m3u8" {
+        return active_hls_redirect(&state, &stream_id, query.key.as_deref()).await;
     }
 
+    let Some(relative) = safe_hls_path(&raw_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let extension = Path::new(&raw_path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("")
+        .to_string();
+    let root = state.root.clone();
+    let path_stream_id = stream_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || canonical_hls_file(&root, &path_stream_id, &relative))
+            .await;
+    let Ok(Ok(full)) = result else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let headers = hls_headers(&extension);
+    if extension == "m3u8" {
+        return serve_hls_playlist(full, headers, state.require_key, query.key).await;
+    }
     match tokio::fs::File::open(full).await {
         Ok(file) => (headers, Body::from_stream(ReaderStream::new(file))).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -1294,6 +1426,7 @@ mod tests {
     #[test]
     fn hls_paths_reject_traversal_and_unknown_files() {
         assert!(safe_hls_path("segment_000001.m4s").is_some());
+        assert!(safe_hls_path("session-0001/segment_000001.m4s").is_some());
         assert!(safe_hls_path("../server.db").is_none());
         assert!(safe_hls_path("index.html").is_none());
     }

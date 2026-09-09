@@ -25,7 +25,7 @@ static PUBLISH_GENERATIONS: LazyLock<StdMutex<HashMap<u64, u64>>> =
 fn bump_publish_generation(conn_id: u64) -> u64 {
     let mut generations = PUBLISH_GENERATIONS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let generation = generations.entry(conn_id).or_insert(0);
     *generation = generation.saturating_add(1);
     *generation
@@ -34,7 +34,7 @@ fn bump_publish_generation(conn_id: u64) -> u64 {
 fn publisher_generation(conn_id: u64) -> u64 {
     PUBLISH_GENERATIONS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&conn_id)
         .copied()
         .unwrap_or(0)
@@ -43,7 +43,7 @@ fn publisher_generation(conn_id: u64) -> u64 {
 fn clear_publish_generation(conn_id: u64) {
     PUBLISH_GENERATIONS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&conn_id);
 }
 
@@ -1013,6 +1013,18 @@ impl ServerApp {
                     break;
                 }
 
+                // Capture the publish generation before entering librtmp2. If the
+                // callback accepts a republish during this poll, relay frames already
+                // buffered in the same poll cannot be attributed safely to either
+                // generation because RelayFrame does not carry that boundary. Such a
+                // mixed batch is dropped for media outputs below rather than merging two
+                // logical publisher sessions.
+                let publish_generations_before_poll: HashMap<u64, u64> = tracked
+                    .iter()
+                    .filter(|(_, entry)| entry.publishing)
+                    .map(|(&conn_id, _)| (conn_id, publisher_generation(conn_id)))
+                    .collect();
+
                 set_rtmp_poll_server(&mut server);
                 let poll_result = server.poll(0);
                 clear_rtmp_poll_server();
@@ -1047,23 +1059,33 @@ impl ServerApp {
 
                 if media_outputs.enabled() {
                     for frame in &exported_frames {
-                        if tracked
+                        if !tracked
                             .get(&frame.publisher_conn_id)
                             .is_some_and(|entry| entry.publishing)
                         {
-                            // RelayFrame carries the route active when the frame
-                            // was exported. Resolve publish keys before consulting
-                            // the connection's current stream so queued frames from
-                            // stream A cannot be written into a newly switched B.
-                            let frame_stream_id = rtmp_bridge
-                                .stream_id_for_publish_route(&frame.stream_name)
-                                .unwrap_or_else(|| frame.stream_name.clone());
-                            media_outputs.handle_frame(
-                                frame,
-                                &frame_stream_id,
-                                publisher_generation(frame.publisher_conn_id),
-                            );
+                            continue;
                         }
+                        let generation = publisher_generation(frame.publisher_conn_id);
+                        if publish_generations_before_poll
+                            .get(&frame.publisher_conn_id)
+                            .is_some_and(|before| *before != generation)
+                        {
+                            // A same-connection republish happened while this poll was
+                            // producing the export batch. RelayFrame has no per-frame
+                            // generation marker, so conservatively drop this ambiguous
+                            // boundary batch. The reconciliation below starts the new
+                            // generation before the next poll, preventing cross-session
+                            // recording/HLS/push corruption without guessing by timestamp.
+                            continue;
+                        }
+                        // RelayFrame carries the route active when the frame was
+                        // exported. Resolve publish keys before consulting the
+                        // connection's current stream so queued frames from stream A
+                        // cannot be written into a newly switched B.
+                        let frame_stream_id = rtmp_bridge
+                            .stream_id_for_publish_route(&frame.stream_name)
+                            .unwrap_or_else(|| frame.stream_name.clone());
+                        media_outputs.handle_frame(frame, &frame_stream_id, generation);
                     }
                 }
 
