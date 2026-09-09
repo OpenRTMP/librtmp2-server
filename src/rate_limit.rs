@@ -160,6 +160,17 @@ impl RateLimiter {
             }
         } else if matches!(path, "/stats" | "/stats-nginx") {
             (self.config.stats_max, path.to_string())
+        } else if path.starts_with("/hls/") {
+            // HLS performs recurring playlist + segment requests. Keep it in
+            // its own bucket and size it for normal playback instead of the
+            // generic 60-request/minute default. Preserve an explicit zero as
+            // "deny all" rather than silently re-enabling the route.
+            let hls_max = if self.config.default_max == 0 {
+                0
+            } else {
+                self.config.default_max.saturating_mul(10).max(600)
+            };
+            (hls_max, "hls".to_string())
         } else {
             (self.config.default_max, "default".to_string())
         }

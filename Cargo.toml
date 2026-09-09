@@ -20,7 +20,8 @@ path = "src/main.rs"
 #   librtmp2 = { path = "../librtmp2" }
 librtmp2 = { version = "0.8.0", features = ["tls"] }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12"
+libc = "0.2"
 # Build-only helper for static musl Docker images. Cargo feature unification
 # enables vendored OpenSSL for the same `openssl` crate used by librtmp2 TLS.
 openssl = { version = "0.10.70", optional = true, features = ["vendored"] }
