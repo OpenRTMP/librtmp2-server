@@ -1106,6 +1106,16 @@ impl ServerApp {
                 #[cfg(feature = "cluster")]
                 if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
                     for frame in exported_frames {
+                        let generation = publisher_generation(frame.publisher_conn_id);
+                        if publish_generations_before_poll
+                            .get(&frame.publisher_conn_id)
+                            .is_some_and(|before| *before != generation)
+                        {
+                            // A republish during this poll makes the buffered frame batch
+                            // ambiguous for cluster export as well. Do not stamp old frames
+                            // with the new stream/ownership epoch.
+                            continue;
+                        }
                         let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
                         let stream_id = if sid.is_empty() {
                             rtmp_bridge
