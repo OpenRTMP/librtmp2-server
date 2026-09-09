@@ -37,6 +37,10 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap concurrent authenticated control-plane requests.
 const MAX_CONTROL_CONN_INFLIGHT: usize = 512;
+/// Cap aggregate resident memory for concurrent authenticated control reads
+/// (512 connections × 64 MiB snapshot frames would otherwise reach ~32 GiB).
+const MAX_CONTROL_READ_BYTES_INFLIGHT: usize = 256 * 1024 * 1024;
+static CONTROL_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Preserve a global cap on half-open TLS/auth handshakes before spawning work.
 const MAX_PREAUTH_CONN_INFLIGHT: usize = 512;
 /// Cap half-open auth handshakes per source IP so one source cannot consume
@@ -256,6 +260,12 @@ async fn read_control_frame<R: AsyncReadExt + Unpin>(
         if len > MAX_FRAME {
             return Err(std::io::Error::other("frame too large"));
         }
+        let _read_budget = crate::cluster::security::try_reserve_inflight_bytes(
+            &CONTROL_READ_BYTES_INFLIGHT,
+            MAX_CONTROL_READ_BYTES_INFLIGHT,
+            len as usize,
+        )
+        .map_err(|_| std::io::Error::other("control read memory budget exceeded"))?;
         let mut buf = vec![0u8; len as usize];
         r.read_exact(&mut buf).await?;
         let msg: ControlMessage =
