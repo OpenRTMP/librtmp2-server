@@ -31,16 +31,24 @@ use crate::cluster::state::ClusterMeta;
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
 /// Post-auth control-plane frames (Raft RPC, admin) — smaller than snapshot path.
 const MAX_CONTROL_FRAME: u32 = 8 * 1024 * 1024;
+/// Small control frames are bounded by the authenticated connection cap, so
+/// keep them outside the shared byte budgets to preserve capacity for
+/// heartbeats and other liveness traffic even while large reads are stalled.
+const MAX_UNBUDGETED_CONTROL_FRAME: u32 = 256 * 1024;
 /// Bound unauthenticated frames (challenge/auth) to limit DoS before AuthOk.
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap concurrent authenticated control-plane requests.
 const MAX_CONTROL_CONN_INFLIGHT: usize = 512;
-/// Cap aggregate resident memory for concurrent authenticated control reads
-/// (512 connections × 64 MiB snapshot frames would otherwise reach ~32 GiB).
-const MAX_CONTROL_READ_BYTES_INFLIGHT: usize = 256 * 1024 * 1024;
+/// Cap aggregate resident memory for non-snapshot control reads above the
+/// small-frame allowance.
+const MAX_CONTROL_READ_BYTES_INFLIGHT: usize = 64 * 1024 * 1024;
 static CONTROL_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Keep large snapshot reads on a separate budget so stalled snapshots cannot
+/// consume the capacity required by ordinary Raft/control traffic.
+const MAX_SNAPSHOT_READ_BYTES_INFLIGHT: usize = 192 * 1024 * 1024;
+static SNAPSHOT_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Preserve a global cap on half-open TLS/auth handshakes before spawning work.
 const MAX_PREAUTH_CONN_INFLIGHT: usize = 512;
 /// Cap half-open auth handshakes per source IP so one source cannot consume
@@ -251,7 +259,13 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
 
 async fn read_control_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
-) -> Result<ControlMessage, std::io::Error> {
+) -> Result<
+    (
+        ControlMessage,
+        Option<crate::cluster::security::InflightByteBudgetGuard>,
+    ),
+    std::io::Error,
+> {
     // Authenticated traffic may carry RaftSnapshot payloads up to MAX_FRAME;
     // non-snapshot control messages stay capped at MAX_CONTROL_FRAME after
     // decode so a peer cannot inflate ordinary RPCs to snapshot size.
@@ -260,12 +274,31 @@ async fn read_control_frame<R: AsyncReadExt + Unpin>(
         if len > MAX_FRAME {
             return Err(std::io::Error::other("frame too large"));
         }
-        let _read_budget = crate::cluster::security::try_reserve_inflight_bytes(
-            &CONTROL_READ_BYTES_INFLIGHT,
-            MAX_CONTROL_READ_BYTES_INFLIGHT,
-            len as usize,
-        )
-        .map_err(|_| std::io::Error::other("control read memory budget exceeded"))?;
+        let read_budget = if len <= MAX_UNBUDGETED_CONTROL_FRAME {
+            None
+        } else {
+            let (counter, max, error) = if len > MAX_CONTROL_FRAME {
+                (
+                    &SNAPSHOT_READ_BYTES_INFLIGHT,
+                    MAX_SNAPSHOT_READ_BYTES_INFLIGHT,
+                    "snapshot read memory budget exceeded",
+                )
+            } else {
+                (
+                    &CONTROL_READ_BYTES_INFLIGHT,
+                    MAX_CONTROL_READ_BYTES_INFLIGHT,
+                    "control read memory budget exceeded",
+                )
+            };
+            Some(
+                crate::cluster::security::try_reserve_inflight_bytes(
+                    counter,
+                    max,
+                    len as usize,
+                )
+                .map_err(|_| std::io::Error::other(error))?,
+            )
+        };
         let mut buf = vec![0u8; len as usize];
         r.read_exact(&mut buf).await?;
         let msg: ControlMessage =
@@ -277,7 +310,7 @@ async fn read_control_frame<R: AsyncReadExt + Unpin>(
         if !allow_large && len > MAX_CONTROL_FRAME {
             return Err(std::io::Error::other("frame too large"));
         }
-        Ok(msg)
+        Ok((msg, read_budget))
     })
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))?
@@ -758,8 +791,10 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
     write_forward: Option<ClientWriteForwardCtx>,
 ) -> Result<(), std::io::Error> {
     let _ = local_id;
-    // One-shot request/response for this connection (matches client roundtrip).
-    let msg = read_control_frame(stream).await?;
+    // Keep the byte-budget guard alive for the entire request handling path,
+    // including Raft snapshot installation, so decoded payloads cannot escape
+    // aggregate accounting merely because the socket read has completed.
+    let (msg, _read_budget) = read_control_frame(stream).await?;
     let resp = match msg {
         ControlMessage::RaftAppend(req) => {
             // No `is_member` gate here: the auth handshake above (shared
