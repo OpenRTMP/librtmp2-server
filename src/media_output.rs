@@ -4,11 +4,12 @@
 //! I/O and FFmpeg live on worker threads so a slow disk/upstream cannot stall
 //! RTMP ingest or local player relay.
 
-use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Router, body::Body};
+use parking_lot::Mutex as ParkingMutex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -23,10 +24,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::db::{Db, DbLookup};
 use librtmp2::session::conn::RelayFrame;
 use librtmp2::types::FrameType;
+use tokio_util::io::ReaderStream;
 
 const DEFAULT_QUEUE_MB: usize = 32;
 const SINK_QUEUE_MESSAGES: usize = 512;
 const MAX_FLV_PAYLOAD: usize = 0x00ff_ffff;
+const MAX_HLS_PLAYLIST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushTarget {
@@ -41,10 +44,23 @@ impl PushTarget {
 
     fn render_url(&self, stream_id: &str, stream_name: &str, app: &str) -> String {
         self.url_template
-            .replace("{stream_id}", stream_id)
-            .replace("{stream_name}", stream_name)
-            .replace("{app}", app)
+            .replace("{stream_id}", &url_component(stream_id))
+            .replace("{stream_name}", &url_component(stream_name))
+            .replace("{app}", &url_component(app))
     }
+}
+
+fn url_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(*byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -120,10 +136,14 @@ impl MediaOutputConfig {
             ("LRTMP2_MEDIA_FFMPEG_BIN", "MEDIA_FFMPEG_BIN"),
             ("LRTMP2_MEDIA_QUEUE_MB", "MEDIA_QUEUE_MB"),
         ] {
-            if let Ok(value) = std::env::var(env_key)
-                && !value.is_empty()
-            {
-                config.apply(config_key, &value);
+            if let Ok(value) = std::env::var(env_key) {
+                let clearable = matches!(
+                    config_key,
+                    "MEDIA_PUSH_TARGETS" | "MEDIA_EXEC_PUBLISH" | "MEDIA_EXEC_PUBLISH_DONE"
+                );
+                if clearable || !value.is_empty() {
+                    config.apply(config_key, &value);
+                }
             }
         }
         config
@@ -255,16 +275,34 @@ pub struct MediaOutputManager {
     config: MediaOutputConfig,
     db: Arc<Db>,
     sessions: HashMap<u64, MediaSession>,
-    failed_sessions: HashSet<u64>,
+    retire_tx: Option<mpsc::Sender<MediaSession>>,
+    reaper: Option<thread::JoinHandle<()>>,
 }
 
 impl MediaOutputManager {
     pub fn new(config: MediaOutputConfig, db: Arc<Db>) -> Self {
+        let (retire_tx, retire_rx) = mpsc::channel::<MediaSession>();
+        let reaper_config = config.clone();
+        let reaper = thread::Builder::new()
+            .name("media-session-reaper".to_string())
+            .spawn(move || {
+                while let Ok(session) = retire_rx.recv() {
+                    session.stop(&reaper_config);
+                }
+            });
+        let (retire_tx, reaper) = match reaper {
+            Ok(handle) => (Some(retire_tx), Some(handle)),
+            Err(e) => {
+                crate::log_error!("Failed to start media session reaper: {e}");
+                (None, None)
+            }
+        };
         Self {
             config,
             db,
             sessions: HashMap::new(),
-            failed_sessions: HashSet::new(),
+            retire_tx,
+            reaper,
         }
     }
 
@@ -272,44 +310,85 @@ impl MediaOutputManager {
         self.config.enabled()
     }
 
-    pub fn ensure_publisher(&mut self, conn_id: u64, stream_id: &str) {
-        if !self.config.enabled() || stream_id.is_empty() {
-            return;
-        }
-        if self.failed_sessions.contains(&conn_id) {
-            return;
-        }
-        if self
-            .sessions
-            .get(&conn_id)
-            .is_some_and(|s| s.stream_id == stream_id)
-        {
-            return;
-        }
-        if let Some(old) = self.sessions.remove(&conn_id) {
-            old.stop(&self.config);
-        }
-        let DbLookup::Ok(stream) = self.db.stream_get(stream_id) else {
-            return;
-        };
-        match MediaSession::start(conn_id, &stream.id, &stream.name, &stream.app, &self.config) {
-            Ok(session) => {
-                self.sessions.insert(conn_id, session);
+    fn retire(&mut self, session: MediaSession) {
+        if let Some(tx) = self.retire_tx.as_ref() {
+            if let Err(e) = tx.send(session) {
+                e.0.stop(&self.config);
             }
-            Err(e) => {
-                self.failed_sessions.insert(conn_id);
-                crate::log_error!(
-                    "Media outputs: failed to start stream '{}': {e}; retries disabled for conn={conn_id}",
-                    stream.id
-                );
-            }
+        } else {
+            session.stop(&self.config);
         }
     }
 
-    pub fn handle_frame(&mut self, frame: &RelayFrame) {
+    fn start_session(&mut self, conn_id: u64, stream_id: &str, generation: u64) {
+        let DbLookup::Ok(stream) = self.db.stream_get(stream_id) else {
+            return;
+        };
+        let session = MediaSession::start(
+            conn_id,
+            generation,
+            &stream.id,
+            &stream.name,
+            &stream.app,
+            &self.config,
+        );
+        self.sessions.insert(conn_id, session);
+    }
+
+    pub fn ensure_publisher(&mut self, conn_id: u64, stream_id: &str, generation: u64) {
+        if !self.config.enabled() || stream_id.is_empty() {
+            return;
+        }
+        if self.sessions.get(&conn_id).is_some_and(|session| {
+            session.stream_id == stream_id && session.generation == generation
+        }) {
+            return;
+        }
+        if let Some(old) = self.sessions.remove(&conn_id) {
+            self.retire(old);
+        }
+        self.start_session(conn_id, stream_id, generation);
+    }
+
+    pub fn handle_frame(&mut self, frame: &RelayFrame, stream_id: &str, generation: u64) {
+        if !self.config.enabled() || stream_id.is_empty() {
+            return;
+        }
+
+        let needs_switch = self
+            .sessions
+            .get(&frame.publisher_conn_id)
+            .is_none_or(|session| session.stream_id != stream_id);
+        if needs_switch {
+            if let Some(old) = self.sessions.remove(&frame.publisher_conn_id) {
+                self.retire(old);
+            }
+            self.start_session(frame.publisher_conn_id, stream_id, generation);
+        }
+
+        // RTMP timestamps normally move forward. A significant backwards jump
+        // on the same route marks a same-connection republish boundary; restart
+        // outputs before writing the new session so recordings/HLS/hooks do not
+        // merge two logical publish sessions.
+        let timestamp_reset = self
+            .sessions
+            .get(&frame.publisher_conn_id)
+            .and_then(|session| session.last_timestamp)
+            .is_some_and(|last| frame.timestamp.saturating_add(1000) < last);
+        if timestamp_reset {
+            if let Some(old) = self.sessions.remove(&frame.publisher_conn_id) {
+                self.retire(old);
+            }
+            self.start_session(frame.publisher_conn_id, stream_id, generation);
+        }
+
         let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) else {
             return;
         };
+        if session.stream_id != stream_id {
+            return;
+        }
+        session.last_timestamp = Some(frame.timestamp);
         let Some(tag) = flv_tag(frame.frame_type, frame.timestamp, &frame.payload) else {
             return;
         };
@@ -328,23 +407,28 @@ impl MediaOutputManager {
             .collect();
         for id in stale {
             if let Some(session) = self.sessions.remove(&id) {
-                session.stop(&self.config);
+                self.retire(session);
             }
         }
-        self.failed_sessions.retain(|id| live.contains(id));
     }
 
     pub fn stop_all(&mut self) {
-        self.failed_sessions.clear();
         let sessions = std::mem::take(&mut self.sessions);
         for (_, session) in sessions {
             session.stop(&self.config);
+        }
+        self.retire_tx.take();
+        if let Some(reaper) = self.reaper.take()
+            && reaper.join().is_err()
+        {
+            crate::log_warn!("Media session reaper panicked during shutdown");
         }
     }
 }
 
 struct MediaSession {
     conn_id: u64,
+    generation: u64,
     stream_id: String,
     stream_name: String,
     app: String,
@@ -352,16 +436,18 @@ struct MediaSession {
     publish_exec: Option<Child>,
     recording_file: Option<PathBuf>,
     hls_playlist: Option<PathBuf>,
+    last_timestamp: Option<u32>,
 }
 
 impl MediaSession {
     fn start(
         conn_id: u64,
+        generation: u64,
         stream_id: &str,
         stream_name: &str,
         app: &str,
         config: &MediaOutputConfig,
-    ) -> io::Result<Self> {
+    ) -> Self {
         let safe_id = safe_component(stream_id);
         let max_queue_bytes = config.export_buffer_bytes();
         let mut sinks = Vec::new();
@@ -370,7 +456,6 @@ impl MediaSession {
 
         if config.recording_enabled {
             let dir = config.recording_path.join(&safe_id);
-            fs::create_dir_all(&dir)?;
             let path = dir.join(format!("{}.flv", unix_millis()));
             sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
             recording_file = Some(path);
@@ -437,8 +522,9 @@ impl MediaSession {
             )
         );
 
-        Ok(Self {
+        Self {
             conn_id,
+            generation,
             stream_id: stream_id.to_string(),
             stream_name: stream_name.to_string(),
             app: app.to_string(),
@@ -446,7 +532,8 @@ impl MediaSession {
             publish_exec,
             recording_file,
             hls_playlist,
-        })
+            last_timestamp: None,
+        }
     }
 
     fn stop(mut self, config: &MediaOutputConfig) {
@@ -455,7 +542,7 @@ impl MediaSession {
             sink.stop();
         }
         if let Some(mut child) = self.publish_exec.take() {
-            terminate_child(&mut child);
+            terminate_hook_child(&mut child);
         }
         if !config.exec_publish_done.trim().is_empty() {
             let env = ExecEnv {
@@ -466,11 +553,12 @@ impl MediaSession {
                 recording_file: self.recording_file.as_deref(),
                 hls_playlist: self.hls_playlist.as_deref(),
             };
-            if let Err(e) = spawn_hook(&config.exec_publish_done, "publish_done", &env) {
-                crate::log_error!(
+            match spawn_hook(&config.exec_publish_done, "publish_done", &env) {
+                Ok(child) => reap_child_async(child, format!("publish_done:{}", self.stream_id)),
+                Err(e) => crate::log_error!(
                     "Media outputs: publish_done exec failed for '{}': {e}",
                     self.stream_id
-                );
+                ),
             }
         }
         crate::log_info!(
@@ -579,9 +667,12 @@ fn spawn_recording_sink(path: PathBuf, max_bytes: usize) -> SinkSender {
     let label = format!("record:{}", path.display());
     make_sink(label, max_bytes, move |rx, queued, failed| {
         let result = (|| -> io::Result<()> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             let mut file = File::create(&path)?;
             file.write_all(flv_header())?;
-            consume_queue(rx, queued, |tag| file.write_all(tag))?;
+            consume_queue(rx, queued, Arc::clone(&failed), |tag| file.write_all(tag))?;
             file.flush()
         })();
         if let Err(e) = result {
@@ -589,6 +680,24 @@ fn spawn_recording_sink(path: PathBuf, max_bytes: usize) -> SinkSender {
             crate::log_error!("Recording worker failed for {}: {e}", path.display());
         }
     })
+}
+
+fn clean_hls_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let owned = matches!(name.as_ref(), "index.m3u8" | "index.m3u8.tmp" | "init.mp4")
+            || (name.starts_with("segment_") && (name.ends_with(".m4s") || name.ends_with(".ts")));
+        if owned {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn spawn_hls_sink(
@@ -605,10 +714,7 @@ fn spawn_hls_sink(
     let transcode = config.hls_transcode;
     make_sink(label, max_bytes, move |rx, queued, failed| {
         let result = (|| -> io::Result<()> {
-            if dir.exists() {
-                fs::remove_dir_all(&dir)?;
-            }
-            fs::create_dir_all(&dir)?;
+            clean_hls_dir(&dir)?;
             let mut cmd = Command::new(&ffmpeg);
             add_ffmpeg_input(&mut cmd);
             add_codec_args(&mut cmd, transcode);
@@ -637,7 +743,7 @@ fn spawn_hls_sink(
                 cmd.arg("-hls_segment_filename").arg(segments);
             }
             cmd.arg(&playlist);
-            run_ffmpeg_worker(cmd, rx, queued)
+            run_ffmpeg_worker(cmd, rx, queued, Arc::clone(&failed))
         })();
         if let Err(e) = result {
             failed.store(true, Ordering::Relaxed);
@@ -658,9 +764,12 @@ fn spawn_push_sink(
         let result = {
             let mut cmd = Command::new(&ffmpeg);
             add_ffmpeg_input(&mut cmd);
+            // FFmpeg diagnostics can echo the full destination URL, including
+            // upstream stream keys. Keep push stderr out of server logs.
+            cmd.stderr(Stdio::null());
             add_codec_args(&mut cmd, transcode);
             cmd.args(["-f", "flv"]).arg(&url);
-            run_ffmpeg_worker(cmd, rx, queued)
+            run_ffmpeg_worker(cmd, rx, queued, Arc::clone(&failed))
         };
         if let Err(e) = result {
             failed.store(true, Ordering::Relaxed);
@@ -711,15 +820,44 @@ fn run_ffmpeg_worker(
     mut cmd: Command,
     rx: mpsc::Receiver<Arc<Vec<u8>>>,
     queued: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let mut child = cmd.spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("FFmpeg stdin unavailable"))?;
+    let child = Arc::new(ParkingMutex::new(cmd.spawn()?));
+    let mut stdin = {
+        let mut child = child.lock();
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("FFmpeg stdin unavailable"))?
+    };
+
+    let monitor_child = Arc::clone(&child);
+    let monitor_failed = Arc::clone(&failed);
+    let monitor_done = Arc::new(AtomicBool::new(false));
+    let monitor_done_worker = Arc::clone(&monitor_done);
+    let monitor = thread::spawn(move || {
+        while !monitor_done_worker.load(Ordering::Acquire) {
+            if monitor_failed.load(Ordering::Acquire) {
+                let mut child = monitor_child.lock();
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    });
+
     stdin.write_all(flv_header())?;
-    let write_result = consume_queue(rx, queued, |tag| stdin.write_all(tag));
+    let write_result = consume_queue(rx, queued, Arc::clone(&failed), |tag| stdin.write_all(tag));
     drop(stdin);
+    if write_result.is_err() {
+        failed.store(true, Ordering::Release);
+    }
+    monitor_done.store(true, Ordering::Release);
+    let _ = monitor.join();
+
+    let mut child = child.lock();
     if write_result.is_err() {
         terminate_child(&mut child);
         return write_result;
@@ -731,16 +869,29 @@ fn run_ffmpeg_worker(
 fn consume_queue<F>(
     rx: mpsc::Receiver<Arc<Vec<u8>>>,
     queued: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
     mut write: F,
 ) -> io::Result<()>
 where
     F: FnMut(&[u8]) -> io::Result<()>,
 {
-    while let Ok(tag) = rx.recv() {
+    while !failed.load(Ordering::Acquire) {
+        let tag = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(tag) => tag,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let size = tag.len();
+        if failed.load(Ordering::Acquire) {
+            queued.store(0, Ordering::Release);
+            break;
+        }
         let result = write(tag.as_slice());
         queued.fetch_sub(size, Ordering::AcqRel);
         result?;
+    }
+    if failed.load(Ordering::Acquire) {
+        queued.store(0, Ordering::Release);
     }
     Ok(())
 }
@@ -753,13 +904,11 @@ fn terminate_child(child: &mut Child) {
 }
 
 fn wait_child_bounded(child: &mut Child, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(25))
-            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
             _ => {
                 terminate_child(child);
                 return;
@@ -780,8 +929,12 @@ struct ExecEnv<'a> {
 fn spawn_hook(command: &str, event: &str, env: &ExecEnv<'_>) -> io::Result<Child> {
     #[cfg(unix)]
     let mut cmd = {
+        use std::os::unix::process::CommandExt;
         let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(command);
+        // Give the hook its own process group so teardown can terminate shell
+        // pipelines and descendants, not just the top-level /bin/sh process.
+        c.process_group(0);
         c
     };
     #[cfg(windows)]
@@ -817,6 +970,42 @@ fn spawn_hook(command: &str, event: &str, env: &ExecEnv<'_>) -> io::Result<Child
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
+}
+
+fn reap_child_async(mut child: Child, label: String) {
+    thread::spawn(move || {
+        if let Err(e) = child.wait() {
+            crate::log_warn!("Media hook '{label}' reap failed: {e}");
+        }
+    });
+}
+
+#[cfg(unix)]
+fn terminate_hook_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let pgid = child.id() as i32;
+        // SAFETY: the hook is spawned in its own process group with PGID equal
+        // to the child PID; a negative PID targets that group only.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if child.try_wait().ok().flatten().is_none() {
+            // SAFETY: same dedicated process group as above.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_hook_child(child: &mut Child) {
+    terminate_child(child);
 }
 
 fn unix_millis() -> u128 {
@@ -921,10 +1110,14 @@ async fn handle_hls(
     let Some(relative) = safe_hls_path(&raw_path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let extension = Path::new(&raw_path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("");
     let hls_root = state.root.clone();
     let stream_root = hls_root.join(&stream_id);
     let full = stream_root.join(relative);
-    let result = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+    let result = tokio::task::spawn_blocking(move || -> io::Result<PathBuf> {
         let hls_root = hls_root.canonicalize()?;
         let stream_root = stream_root.canonicalize()?;
         if !stream_root.starts_with(&hls_root) {
@@ -940,24 +1133,12 @@ async fn handle_hls(
                 "HLS file path escaped stream root",
             ));
         }
-        fs::read(full)
+        Ok(full)
     })
     .await;
-    let Ok(Ok(mut body)) = result else {
+    let Ok(Ok(full)) = result else {
         return StatusCode::NOT_FOUND.into_response();
     };
-
-    let extension = Path::new(&raw_path)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("");
-    if extension == "m3u8"
-        && state.require_key
-        && let Some(key) = query.key.as_deref()
-        && let Ok(text) = std::str::from_utf8(&body)
-    {
-        body = rewrite_playlist_key(text, key).into_bytes();
-    }
 
     let content_type = match extension {
         "m3u8" => "application/vnd.apple.mpegurl",
@@ -972,13 +1153,34 @@ async fn handle_hls(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
     );
+
     if extension == "m3u8" {
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache, no-store, must-revalidate"),
         );
+        let Ok(metadata) = tokio::fs::metadata(&full).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if metadata.len() > MAX_HLS_PLAYLIST_BYTES {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        let Ok(mut body) = tokio::fs::read(&full).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if state.require_key
+            && let Some(key) = query.key.as_deref()
+            && let Ok(text) = std::str::from_utf8(&body)
+        {
+            body = rewrite_playlist_key(text, key).into_bytes();
+        }
+        return (headers, body).into_response();
     }
-    (headers, body).into_response()
+
+    match tokio::fs::File::open(full).await {
+        Ok(file) => (headers, Body::from_stream(ReaderStream::new(file))).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 fn safe_hls_path(raw: &str) -> Option<PathBuf> {
@@ -1060,6 +1262,14 @@ mod tests {
         assert_eq!(
             targets[0].render_url("one", "Name", "live"),
             "rtmp://a/live/one"
+        );
+        let named = PushTarget {
+            selector: "*".to_string(),
+            url_template: "rtmp://a/live/{stream_name}".to_string(),
+        };
+        assert_eq!(
+            named.render_url("one", "Cam One/West", "live"),
+            "rtmp://a/live/Cam%20One%2FWest"
         );
     }
 

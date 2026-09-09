@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
@@ -19,6 +19,33 @@ use crate::state::StateCoordinator;
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
 pub(crate) static RTMP_BRIDGE: StdMutex<Option<Arc<DbRtmpBridge>>> = StdMutex::new(None);
+static PUBLISH_GENERATIONS: LazyLock<StdMutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn bump_publish_generation(conn_id: u64) -> u64 {
+    let mut generations = PUBLISH_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = generations.entry(conn_id).or_insert(0);
+    *generation = generation.saturating_add(1);
+    *generation
+}
+
+fn publisher_generation(conn_id: u64) -> u64 {
+    PUBLISH_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&conn_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn clear_publish_generation(conn_id: u64) {
+    PUBLISH_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&conn_id);
+}
 
 thread_local! {
     static RTMP_POLL_SERVER: Cell<Option<*mut librtmp2::server::Server>> = const {
@@ -120,7 +147,12 @@ fn ensure_conn_registered_for_auth(conn_id: u64) {
 
 pub(crate) fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
     ensure_conn_registered_for_auth(conn_id);
-    with_rtmp_bridge(|b| b.authorize_publish(conn_id, app, stream_key).is_ok()).unwrap_or(false)
+    let allowed = with_rtmp_bridge(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
+        .unwrap_or(false);
+    if allowed {
+        bump_publish_generation(conn_id);
+    }
+    allowed
 }
 
 pub(crate) fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
@@ -571,6 +603,7 @@ pub(crate) fn process_server_connections(
             conn.pending_relay.clear();
             tracked.remove(&conn_id);
             rtmp_bridge.on_close(conn_id);
+            clear_publish_generation(conn_id);
         }
         server.connections.remove(idx);
     }
@@ -1000,12 +1033,6 @@ impl ServerApp {
                     rtmp_idle_timeout,
                 );
 
-                for (&conn_id, entry) in &tracked {
-                    if entry.publishing && !entry.stream_id.is_empty() {
-                        media_outputs.ensure_publisher(conn_id, &entry.stream_id);
-                    }
-                }
-
                 #[cfg(feature = "cluster")]
                 if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
                     mgr.poll_side_effects();
@@ -1024,8 +1051,33 @@ impl ServerApp {
                             .get(&frame.publisher_conn_id)
                             .is_some_and(|entry| entry.publishing)
                         {
-                            media_outputs.handle_frame(frame);
+                            // RelayFrame carries the route active when the frame
+                            // was exported. Resolve publish keys before consulting
+                            // the connection's current stream so queued frames from
+                            // stream A cannot be written into a newly switched B.
+                            let frame_stream_id = rtmp_bridge
+                                .stream_id_for_publish_route(&frame.stream_name)
+                                .unwrap_or_else(|| frame.stream_name.clone());
+                            media_outputs.handle_frame(
+                                frame,
+                                &frame_stream_id,
+                                publisher_generation(frame.publisher_conn_id),
+                            );
                         }
+                    }
+                }
+
+                // Reconcile the output session only after draining exported
+                // frames. This preserves the tail of an old publish session and
+                // still restarts hooks/outputs when the same TCP connection
+                // republishes the same stream with a new generation.
+                for (&conn_id, entry) in &tracked {
+                    if entry.publishing && !entry.stream_id.is_empty() {
+                        media_outputs.ensure_publisher(
+                            conn_id,
+                            &entry.stream_id,
+                            publisher_generation(conn_id),
+                        );
                     }
                 }
 
@@ -1088,6 +1140,7 @@ impl ServerApp {
                 for conn_id in closed_ids {
                     tracked.remove(&conn_id);
                     rtmp_bridge.on_close(conn_id);
+                    clear_publish_generation(conn_id);
                 }
 
                 let live_publishers: HashSet<u64> = tracked
@@ -1120,6 +1173,7 @@ impl ServerApp {
             // Notify the bridge about connections that never got an explicit close event.
             for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
                 rtmp_bridge.on_close(conn_id);
+                clear_publish_generation(conn_id);
             }
 
             if !rtmp_stop_clone.load(Ordering::Relaxed) {
