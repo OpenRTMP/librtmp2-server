@@ -1003,7 +1003,25 @@ fn terminate_hook_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_hook_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let pid = child.id().to_string();
+        let killed_tree = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !killed_tree {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate_hook_child(child: &mut Child) {
     terminate_child(child);
 }
