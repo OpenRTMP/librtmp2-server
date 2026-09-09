@@ -1,6 +1,7 @@
 name: Apply PR 198 final fixes
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - feature/media-outputs
