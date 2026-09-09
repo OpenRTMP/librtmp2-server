@@ -1,0 +1,47 @@
+name: Apply PR 198 quality findings
+
+on:
+  push:
+    branches:
+      - feature/media-outputs
+    paths:
+      - .github/pr198_patch/**
+      - .github/workflows/fix-pr198-quality-findings.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: feature/media-outputs
+          fetch-depth: 0
+
+      - name: Rebuild patch helper
+        run: cat .github/pr198_patch/* | base64 -d > /tmp/fix_pr198_quality_findings.py
+
+      - name: Apply fixes
+        run: python3 /tmp/fix_pr198_quality_findings.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features test-support -- -D warnings
+
+      - name: Validate
+        run: cargo test --features test-support
+
+      - name: Commit fixes and remove temporary automation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -rf .github/pr198_patch
+          git rm -f .github/workflows/fix-pr198-quality-findings.yml
+          git add -A
+          git commit -m "fix(media): address quality and review findings"
+          git push origin HEAD:feature/media-outputs
