@@ -1209,7 +1209,18 @@ fn latest_hls_session(stream_root: &Path) -> io::Result<String> {
 }
 
 async fn active_hls_redirect(state: &HlsState, stream_id: &str, key: Option<&str>) -> Response {
+    let root = match fs::canonicalize(&state.root) {
+        Ok(root) => root,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     let stream_root = state.root.join(stream_id);
+    let stream_root = match fs::canonicalize(&stream_root) {
+        Ok(path) => path,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if !stream_root.starts_with(&root) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let result = tokio::task::spawn_blocking(move || latest_hls_session(&stream_root)).await;
     let Ok(Ok(session)) = result else {
         return StatusCode::NOT_FOUND.into_response();
