@@ -1514,10 +1514,7 @@ mod tests {
     fn media_output_files_are_not_world_readable() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!(
-            "lrtmp2-media-perms-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("lrtmp2-media-perms-{}", std::process::id()));
         let file = dir.join("sample.flv");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1527,7 +1524,10 @@ mod tests {
 
         let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         let file_mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700, "media directories must not be world-accessible");
+        assert_eq!(
+            dir_mode, 0o700,
+            "media directories must not be world-accessible"
+        );
         assert_eq!(file_mode, 0o600, "media files must not be world-readable");
 
         let _ = fs::remove_dir_all(&dir);
