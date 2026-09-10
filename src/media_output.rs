@@ -451,6 +451,110 @@ struct MediaSession {
     last_timestamp: Option<u32>,
 }
 
+fn setup_recording_sink(
+    config: &MediaOutputConfig,
+    safe_id: &str,
+    max_queue_bytes: usize,
+    sinks: &mut Vec<SinkSender>,
+) -> Option<PathBuf> {
+    if !config.recording_enabled {
+        return None;
+    }
+
+    let dir = config.recording_path.join(safe_id);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        crate::log_warn!(
+            "Media outputs: unable to create recording directory '{}': {e}",
+            dir.display()
+        );
+    } else {
+        restrict_media_path_permissions(&dir, true);
+    }
+    let path = dir.join(format!("{}.flv", unix_millis()));
+    sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
+    Some(path)
+}
+
+fn setup_hls_sink(
+    config: &MediaOutputConfig,
+    safe_id: &str,
+    conn_id: u64,
+    generation: u64,
+    stream_id: &str,
+    max_queue_bytes: usize,
+    sinks: &mut Vec<SinkSender>,
+) -> Option<PathBuf> {
+    if !config.hls_enabled {
+        return None;
+    }
+
+    let stream_dir = config.hls_path.join(safe_id);
+    if let Err(e) = fs::create_dir_all(&stream_dir) {
+        crate::log_warn!(
+            "Media outputs: unable to create HLS stream directory '{}': {e}",
+            stream_dir.display()
+        );
+    } else {
+        restrict_media_path_permissions(&stream_dir, true);
+    }
+    let dir = stream_dir.join(hls_session_dir_name(conn_id, generation));
+    let playlist = dir.join("index.m3u8");
+    sinks.push(spawn_hls_sink(
+        config,
+        stream_dir,
+        dir,
+        playlist.clone(),
+        max_queue_bytes,
+        format!("hls:{stream_id}"),
+    ));
+    Some(playlist)
+}
+
+fn add_push_sinks(
+    config: &MediaOutputConfig,
+    stream_id: &str,
+    stream_name: &str,
+    app: &str,
+    max_queue_bytes: usize,
+    sinks: &mut Vec<SinkSender>,
+) {
+    for (index, target) in config.push_targets.iter().enumerate() {
+        if !target.matches(stream_id, stream_name) {
+            continue;
+        }
+        let url = target.render_url(stream_id, stream_name, app);
+        if !(url.starts_with("rtmp://") || url.starts_with("rtmps://")) {
+            crate::log_warn!(
+                "Media outputs: rendered push target #{index} is not an RTMP(S) URL"
+            );
+            continue;
+        }
+        sinks.push(spawn_push_sink(
+            config,
+            url,
+            max_queue_bytes,
+            format!("push#{index}:{stream_id}"),
+        ));
+    }
+}
+
+fn spawn_publish_exec(config: &MediaOutputConfig, env: &ExecEnv<'_>) -> Option<Child> {
+    if config.exec_publish.trim().is_empty() {
+        return None;
+    }
+
+    match spawn_hook(&config.exec_publish, "publish", env) {
+        Ok(child) => Some(child),
+        Err(e) => {
+            crate::log_error!(
+                "Media outputs: publish exec failed for '{}': {e}",
+                env.stream_id
+            );
+            None
+        }
+    }
+}
+
 impl MediaSession {
     fn start(
         conn_id: u64,
@@ -463,65 +567,26 @@ impl MediaSession {
         let safe_id = safe_component(stream_id);
         let max_queue_bytes = config.export_buffer_bytes();
         let mut sinks = Vec::new();
-        let mut recording_file = None;
-        let mut hls_playlist = None;
 
-        if config.recording_enabled {
-            let dir = config.recording_path.join(&safe_id);
-            if let Err(e) = fs::create_dir_all(&dir) {
-                crate::log_warn!(
-                    "Media outputs: unable to create recording directory '{}': {e}",
-                    dir.display()
-                );
-            } else {
-                restrict_media_path_permissions(&dir, true);
-            }
-            let path = dir.join(format!("{}.flv", unix_millis()));
-            sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
-            recording_file = Some(path);
-        }
-
-        if config.hls_enabled {
-            let stream_dir = config.hls_path.join(&safe_id);
-            if let Err(e) = fs::create_dir_all(&stream_dir) {
-                crate::log_warn!(
-                    "Media outputs: unable to create HLS stream directory '{}': {e}",
-                    stream_dir.display()
-                );
-            } else {
-                restrict_media_path_permissions(&stream_dir, true);
-            }
-            let dir = stream_dir.join(hls_session_dir_name(conn_id, generation));
-            let playlist = dir.join("index.m3u8");
-            sinks.push(spawn_hls_sink(
-                config,
-                stream_dir,
-                dir,
-                playlist.clone(),
-                max_queue_bytes,
-                format!("hls:{stream_id}"),
-            ));
-            hls_playlist = Some(playlist);
-        }
-
-        for (index, target) in config.push_targets.iter().enumerate() {
-            if !target.matches(stream_id, stream_name) {
-                continue;
-            }
-            let url = target.render_url(stream_id, stream_name, app);
-            if !(url.starts_with("rtmp://") || url.starts_with("rtmps://")) {
-                crate::log_warn!(
-                    "Media outputs: rendered push target #{index} is not an RTMP(S) URL"
-                );
-                continue;
-            }
-            sinks.push(spawn_push_sink(
-                config,
-                url,
-                max_queue_bytes,
-                format!("push#{index}:{stream_id}"),
-            ));
-        }
+        let recording_file =
+            setup_recording_sink(config, &safe_id, max_queue_bytes, &mut sinks);
+        let hls_playlist = setup_hls_sink(
+            config,
+            &safe_id,
+            conn_id,
+            generation,
+            stream_id,
+            max_queue_bytes,
+            &mut sinks,
+        );
+        add_push_sinks(
+            config,
+            stream_id,
+            stream_name,
+            app,
+            max_queue_bytes,
+            &mut sinks,
+        );
 
         let env = ExecEnv {
             conn_id,
@@ -531,17 +596,7 @@ impl MediaSession {
             recording_file: recording_file.as_deref(),
             hls_playlist: hls_playlist.as_deref(),
         };
-        let publish_exec = if config.exec_publish.trim().is_empty() {
-            None
-        } else {
-            match spawn_hook(&config.exec_publish, "publish", &env) {
-                Ok(child) => Some(child),
-                Err(e) => {
-                    crate::log_error!("Media outputs: publish exec failed for '{stream_id}': {e}");
-                    None
-                }
-            }
-        };
+        let publish_exec = spawn_publish_exec(config, &env);
 
         crate::log_info!(
             "Media outputs: publisher session started stream='{stream_id}' recording={} hls={} push_targets={}",
