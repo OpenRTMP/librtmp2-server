@@ -773,7 +773,8 @@ impl DbRtmpBridge {
             let pub_id = pub_row.id.clone();
             let pub_row_clone = pub_row.clone();
             drop(guard);
-            self.db.publisher_update(&pub_id, &pub_row_clone);
+            // Stats-only write: must not touch `active` (TOCTOU vs release_publisher).
+            self.db.publisher_update_stats(&pub_id, &pub_row_clone);
             return;
         }
 
@@ -808,7 +809,8 @@ impl DbRtmpBridge {
         let pub_row_clone = pub_row.clone();
         drop(guard);
 
-        self.db.publisher_update(&pub_id, &pub_row_clone);
+        // Stats-only write: must not touch `active` (TOCTOU vs release_publisher).
+        self.db.publisher_update_stats(&pub_id, &pub_row_clone);
     }
 
     /// Update player stats (media bytes_out, bitrate) in the DB.
@@ -834,7 +836,8 @@ impl DbRtmpBridge {
             let player_id = player_row.id.clone();
             let row = player_row.clone();
             drop(guard);
-            self.db.player_update(&player_id, &row);
+            // Stats-only write: must not touch `active` (TOCTOU vs release_player).
+            self.db.player_update_stats(&player_id, &row);
             return;
         }
 
@@ -864,7 +867,8 @@ impl DbRtmpBridge {
         let row = player_row.clone();
         drop(guard);
 
-        self.db.player_update(&player_id, &row);
+        // Stats-only write: must not touch `active` (TOCTOU vs release_player).
+        self.db.player_update_stats(&player_id, &row);
     }
 
     /// Persist the latest measured client↔server RTT for this connection.
@@ -907,11 +911,12 @@ impl DbRtmpBridge {
         cs.last_rtt_at = Some(now);
         drop(guard);
 
+        // Stats-only write: must not touch `active` (TOCTOU vs release_*).
         if let Some((pub_id, row)) = pub_update {
-            self.db.publisher_update(&pub_id, &row);
+            self.db.publisher_update_stats(&pub_id, &row);
         }
         if let Some((player_id, row)) = player_update {
-            self.db.player_update(&player_id, &row);
+            self.db.player_update_stats(&player_id, &row);
         }
     }
 
