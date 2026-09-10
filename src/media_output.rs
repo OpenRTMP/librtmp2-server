@@ -283,6 +283,13 @@ pub struct MediaOutputManager {
 
 impl MediaOutputManager {
     pub fn new(config: MediaOutputConfig, db: Arc<Db>) -> Self {
+        if config.recording_enabled {
+            harden_existing_media_root(&config.recording_path, "recording");
+        }
+        if config.hls_enabled {
+            harden_existing_media_root(&config.hls_path, "HLS");
+        }
+
         let (retire_tx, retire_rx) = mpsc::sync_channel::<MediaSession>(RETIRED_SESSION_QUEUE);
         let reaper_config = config.clone();
         let reaper = thread::Builder::new()
@@ -451,6 +458,92 @@ struct MediaSession {
     last_timestamp: Option<u32>,
 }
 
+fn setup_recording_sink(
+    config: &MediaOutputConfig,
+    safe_id: &str,
+    max_queue_bytes: usize,
+    sinks: &mut Vec<SinkSender>,
+) -> Option<PathBuf> {
+    if !config.recording_enabled {
+        return None;
+    }
+
+    let dir = config.recording_path.join(safe_id);
+    let path = dir.join(format!("{}.flv", unix_millis()));
+    sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
+    Some(path)
+}
+
+fn setup_hls_sink(
+    config: &MediaOutputConfig,
+    safe_id: &str,
+    conn_id: u64,
+    generation: u64,
+    stream_id: &str,
+    max_queue_bytes: usize,
+    sinks: &mut Vec<SinkSender>,
+) -> Option<PathBuf> {
+    if !config.hls_enabled {
+        return None;
+    }
+
+    let stream_dir = config.hls_path.join(safe_id);
+    let dir = stream_dir.join(hls_session_dir_name(conn_id, generation));
+    let playlist = dir.join("index.m3u8");
+    sinks.push(spawn_hls_sink(
+        config,
+        stream_dir,
+        dir,
+        playlist.clone(),
+        max_queue_bytes,
+        format!("hls:{stream_id}"),
+    ));
+    Some(playlist)
+}
+
+fn add_push_sinks(
+    config: &MediaOutputConfig,
+    stream_id: &str,
+    stream_name: &str,
+    app: &str,
+    max_queue_bytes: usize,
+    sinks: &mut Vec<SinkSender>,
+) {
+    for (index, target) in config.push_targets.iter().enumerate() {
+        if !target.matches(stream_id, stream_name) {
+            continue;
+        }
+        let url = target.render_url(stream_id, stream_name, app);
+        if !(url.starts_with("rtmp://") || url.starts_with("rtmps://")) {
+            crate::log_warn!("Media outputs: rendered push target #{index} is not an RTMP(S) URL");
+            continue;
+        }
+        sinks.push(spawn_push_sink(
+            config,
+            url,
+            max_queue_bytes,
+            format!("push#{index}:{stream_id}"),
+        ));
+    }
+}
+
+fn spawn_publish_exec(config: &MediaOutputConfig, env: &ExecEnv<'_>) -> Option<Child> {
+    if config.exec_publish.trim().is_empty() {
+        return None;
+    }
+
+    match spawn_hook(&config.exec_publish, "publish", env) {
+        Ok(child) => Some(child),
+        Err(e) => {
+            crate::log_error!(
+                "Media outputs: publish exec failed for '{}': {e}",
+                env.stream_id
+            );
+            None
+        }
+    }
+}
+
 impl MediaSession {
     fn start(
         conn_id: u64,
@@ -463,49 +556,25 @@ impl MediaSession {
         let safe_id = safe_component(stream_id);
         let max_queue_bytes = config.export_buffer_bytes();
         let mut sinks = Vec::new();
-        let mut recording_file = None;
-        let mut hls_playlist = None;
 
-        if config.recording_enabled {
-            let dir = config.recording_path.join(&safe_id);
-            let path = dir.join(format!("{}.flv", unix_millis()));
-            sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
-            recording_file = Some(path);
-        }
-
-        if config.hls_enabled {
-            let stream_dir = config.hls_path.join(&safe_id);
-            let dir = stream_dir.join(hls_session_dir_name(conn_id, generation));
-            let playlist = dir.join("index.m3u8");
-            sinks.push(spawn_hls_sink(
-                config,
-                stream_dir,
-                dir,
-                playlist.clone(),
-                max_queue_bytes,
-                format!("hls:{stream_id}"),
-            ));
-            hls_playlist = Some(playlist);
-        }
-
-        for (index, target) in config.push_targets.iter().enumerate() {
-            if !target.matches(stream_id, stream_name) {
-                continue;
-            }
-            let url = target.render_url(stream_id, stream_name, app);
-            if !(url.starts_with("rtmp://") || url.starts_with("rtmps://")) {
-                crate::log_warn!(
-                    "Media outputs: rendered push target #{index} is not an RTMP(S) URL"
-                );
-                continue;
-            }
-            sinks.push(spawn_push_sink(
-                config,
-                url,
-                max_queue_bytes,
-                format!("push#{index}:{stream_id}"),
-            ));
-        }
+        let recording_file = setup_recording_sink(config, &safe_id, max_queue_bytes, &mut sinks);
+        let hls_playlist = setup_hls_sink(
+            config,
+            &safe_id,
+            conn_id,
+            generation,
+            stream_id,
+            max_queue_bytes,
+            &mut sinks,
+        );
+        add_push_sinks(
+            config,
+            stream_id,
+            stream_name,
+            app,
+            max_queue_bytes,
+            &mut sinks,
+        );
 
         let env = ExecEnv {
             conn_id,
@@ -515,17 +584,7 @@ impl MediaSession {
             recording_file: recording_file.as_deref(),
             hls_playlist: hls_playlist.as_deref(),
         };
-        let publish_exec = if config.exec_publish.trim().is_empty() {
-            None
-        } else {
-            match spawn_hook(&config.exec_publish, "publish", &env) {
-                Ok(child) => Some(child),
-                Err(e) => {
-                    crate::log_error!("Media outputs: publish exec failed for '{stream_id}': {e}");
-                    None
-                }
-            }
-        };
+        let publish_exec = spawn_publish_exec(config, &env);
 
         crate::log_info!(
             "Media outputs: publisher session started stream='{stream_id}' recording={} hls={} push_targets={}",
@@ -695,9 +754,9 @@ fn spawn_recording_sink(path: PathBuf, max_bytes: usize) -> SinkSender {
     make_sink(label, max_bytes, move |rx, queued, failed| {
         let result = (|| -> io::Result<()> {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+                ensure_private_directory(parent)?;
             }
-            let mut file = File::create(&path)?;
+            let mut file = create_private_media_file(&path)?;
             file.write_all(flv_header())?;
             consume_queue(rx, queued, Arc::clone(&failed), |tag| file.write_all(tag))?;
             file.flush()
@@ -742,7 +801,7 @@ fn clean_older_hls_sessions(stream_dir: &Path, current_dir: &Path) -> io::Result
 }
 
 fn clean_hls_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    ensure_private_directory(dir)?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -774,6 +833,7 @@ fn spawn_hls_sink(
     let transcode = config.hls_transcode;
     make_sink(label, max_bytes, move |rx, queued, failed| {
         let result = (|| -> io::Result<()> {
+            ensure_private_directory(&stream_dir)?;
             clean_hls_dir(&dir)?;
             clean_older_hls_sessions(&stream_dir, &dir)?;
             let mut cmd = Command::new(&ffmpeg);
@@ -804,6 +864,7 @@ fn spawn_hls_sink(
                 cmd.arg("-hls_segment_filename").arg(segments);
             }
             cmd.arg(&playlist);
+            configure_private_child_umask(&mut cmd);
             run_ffmpeg_worker(cmd, rx, queued, Arc::clone(&failed))
         })();
         if let Err(e) = result {
@@ -1093,6 +1154,179 @@ fn unix_millis() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
+
+fn symlink_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("refusing symlinked media path '{}'", path.display()),
+    )
+}
+
+fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error(path));
+            }
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("media path '{}' is not a directory", path.display()),
+                ));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+        Err(e) => return Err(e),
+    }
+    restrict_media_path_permissions(path, true)
+}
+
+fn harden_existing_media_root(root: &Path, label: &str) {
+    if let Err(e) = harden_media_tree(root) {
+        crate::log_warn!(
+            "Media outputs: unable to harden existing {label} path '{}': {e}",
+            root.display()
+        );
+    }
+}
+
+fn harden_media_tree(root: &Path) -> io::Result<()> {
+    ensure_private_directory(root)?;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            harden_media_entry(entry?, &mut pending)?;
+        }
+    }
+    Ok(())
+}
+
+fn harden_media_entry(entry: fs::DirEntry, pending: &mut Vec<PathBuf>) -> io::Result<()> {
+    let path = entry.path();
+    let file_type = entry.file_type()?;
+    if file_type.is_symlink() {
+        crate::log_warn!(
+            "Media outputs: skipping symlink while hardening existing media '{}': target is not followed",
+            path.display()
+        );
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        restrict_media_path_permissions(&path, true)?;
+        pending.push(path);
+    } else if file_type.is_file() {
+        restrict_media_path_permissions(&path, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_media_path_permissions(path: &Path, is_dir: bool) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(symlink_error(path));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.is_dir() != is_dir {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("media path '{}' has unexpected type", path.display()),
+        ));
+    }
+    let mode = if is_dir { 0o700 } else { 0o600 };
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+fn restrict_media_path_permissions(path: &Path, is_dir: bool) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(symlink_error(path));
+    }
+    if metadata.is_dir() != is_dir {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("media path '{}' has unexpected type", path.display()),
+        ));
+    }
+
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    if username.is_empty() {
+        return Err(io::Error::other(
+            "USERNAME is unavailable; cannot restrict Windows media ACL",
+        ));
+    }
+    let grant = if is_dir {
+        format!("{username}:(OI)(CI)F")
+    } else {
+        format!("{username}:(F)")
+    };
+    let status = Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &grant])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "icacls exited with {status} for '{}'",
+            path.display()
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict_media_path_permissions(_path: &Path, _is_dir: bool) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_media_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn create_private_media_file(path: &Path) -> io::Result<File> {
+    let file = File::create(path)?;
+    restrict_media_path_permissions(path, false)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn configure_private_child_umask(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: pre_exec runs after fork in the FFmpeg child. umask is changed
+    // only there, so the server process and unrelated hooks keep their umask.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(0o177);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_private_child_umask(_cmd: &mut Command) {}
 
 fn safe_component(input: &str) -> String {
     let mut out: String = input
@@ -1454,5 +1688,48 @@ mod tests {
     fn safe_component_never_allows_parent_components() {
         assert_eq!(safe_component("../../x"), ".._.._x");
         assert_eq!(safe_component(".."), "stream");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn media_output_files_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("lrtmp2-media-perms-{}", std::process::id()));
+        let file = dir.join("sample.flv");
+        let _ = fs::remove_dir_all(&dir);
+        ensure_private_directory(&dir).unwrap();
+        let _created = create_private_media_file(&file).unwrap();
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "media directories must not be world-accessible"
+        );
+        assert_eq!(file_mode, 0o600, "media files must not be world-readable");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn media_directory_setup_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "lrtmp2-media-symlink-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        let target = base.join("target");
+        let link = base.join("stream");
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = ensure_private_directory(&link);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
