@@ -1181,11 +1181,11 @@ impl ServerApp {
                     .collect();
                 media_outputs.retain_publishers(&live_publishers);
 
-                // Drain deletion/revocation markers no live connection still references.
-                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
-                deleted_streams
-                    .lock()
-                    .retain(|id| live_stream_ids.contains(id));
+                // `deleted_streams` markers are owned by HTTP/cluster delete
+                // paths (insert on begin_delete, remove on finalize/rollback).
+                // Do not prune by live session presence — that drops sticky
+                // markers during Raft begin_delete ambiguity when the node has
+                // no local RTMP sessions for the stream.
 
                 let live_viewer_ids: HashSet<String> = tracked
                     .keys()

@@ -33,6 +33,11 @@ impl TimelineRemapper {
         let out = ts_in.wrapping_add(self.offset);
         // Guard against non-monotonic within epoch (encoder reset).
         if self.current_epoch.is_some() && out < self.last_out {
+            // At u32::MAX, wrapping_add(1) collapses to 0 and snaps the
+            // timeline backward — saturate instead of wrapping.
+            if self.last_out == u32::MAX {
+                return u32::MAX;
+            }
             self.offset = self.last_out.wrapping_add(1).wrapping_sub(ts_in);
             let out2 = ts_in.wrapping_add(self.offset);
             self.last_out = out2;

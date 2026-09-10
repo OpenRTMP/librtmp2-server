@@ -18,8 +18,7 @@ use crate::logger;
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 use crate::server::{
     POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn, clear_rtmp_poll_server,
-    live_stream_ids_for_deleted_markers, process_server_connections, rtmp_media_cb, rtmp_play_cb,
-    rtmp_publish_cb, set_rtmp_poll_server,
+    process_server_connections, rtmp_media_cb, rtmp_play_cb, rtmp_publish_cb, set_rtmp_poll_server,
 };
 
 static TEST_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -182,10 +181,9 @@ impl TestServer {
                     rtmp_bridge.on_close(conn_id);
                 }
 
-                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
-                deleted_for_rtmp
-                    .lock()
-                    .retain(|id| live_stream_ids.contains(id));
+                // `deleted_streams` markers are owned by HTTP/cluster delete
+                // paths — do not prune by live session presence (sticky Raft
+                // begin_delete ambiguity with no local sessions).
 
                 let live_viewer_ids: HashSet<String> = tracked
                     .keys()

@@ -524,56 +524,9 @@ impl MediaHub {
                                 epoch,
                             },
                         );
-                        if let Some(md) = metadata {
-                            let _ = self.inject.try_send(InjectedFrame {
-                                app: app.clone(),
-                                stream: stream.clone(),
-                                epoch,
-                                frame_type: 2,
-                                timestamp: 0,
-                                payload: md,
-                            });
-                        }
-                        if let Some(h) = avc_header {
-                            let _ = self.inject.try_send(InjectedFrame {
-                                app: app.clone(),
-                                stream: stream.clone(),
-                                epoch,
-                                frame_type: 1,
-                                timestamp: 0,
-                                payload: h,
-                            });
-                        }
-                        if let Some(h) = aac_header {
-                            let _ = self.inject.try_send(InjectedFrame {
-                                app: app.clone(),
-                                stream: stream.clone(),
-                                epoch,
-                                frame_type: 0,
-                                timestamp: 0,
-                                payload: h,
-                            });
-                        }
-                        if let Some((ts, kf)) = keyframe {
-                            // Route the cached keyframe through the same
-                            // per-stream timeline as subsequent MediaFrames —
-                            // its raw timestamp was captured under the prior
-                            // publisher's epoch and can otherwise jump
-                            // backward relative to what a player already saw.
-                            let timestamp = {
-                                let mut maps = self.timelines.lock();
-                                let key = (app.clone(), stream.clone());
-                                maps.entry(key).or_default().map(epoch, ts)
-                            };
-                            let _ = self.inject.try_send(InjectedFrame {
-                                app,
-                                stream,
-                                epoch,
-                                frame_type: 1,
-                                timestamp,
-                                payload: kf,
-                            });
-                        }
+                        self.inject_init_cache_live(
+                            app, stream, epoch, metadata, avc_header, aac_header, keyframe,
+                        );
                     }
                     MediaMessage::StatsReq { stream_id: _ } => {}
                     other => {
@@ -653,57 +606,81 @@ impl MediaHub {
                         epoch,
                     },
                 );
-                if let Some(md) = metadata {
-                    let _ = self.inject.try_send(InjectedFrame {
-                        app: app.clone(),
-                        stream: stream.clone(),
-                        epoch,
-                        frame_type: 2,
-                        timestamp: 0,
-                        payload: md,
-                    });
-                }
-                if let Some(h) = avc_header {
-                    let _ = self.inject.try_send(InjectedFrame {
-                        app: app.clone(),
-                        stream: stream.clone(),
-                        epoch,
-                        frame_type: 1,
-                        timestamp: 0,
-                        payload: h,
-                    });
-                }
-                if let Some(h) = aac_header {
-                    let _ = self.inject.try_send(InjectedFrame {
-                        app: app.clone(),
-                        stream: stream.clone(),
-                        epoch,
-                        frame_type: 0,
-                        timestamp: 0,
-                        payload: h,
-                    });
-                }
-                if let Some((ts, kf)) = keyframe {
-                    // Same reasoning as the inbound-connection InitCache
-                    // branch: remap through the per-stream timeline so a
-                    // player that already saw the previous epoch doesn't get
-                    // a keyframe timestamp that jumps backward.
-                    let timestamp = {
-                        let mut maps = self.timelines.lock();
-                        let key = (app.clone(), stream.clone());
-                        maps.entry(key).or_default().map(epoch, ts)
-                    };
-                    let _ = self.inject.try_send(InjectedFrame {
-                        app,
-                        stream,
-                        epoch,
-                        frame_type: 1,
-                        timestamp,
-                        payload: kf,
-                    });
-                }
+                self.inject_init_cache_live(
+                    app, stream, epoch, metadata, avc_header, aac_header, keyframe,
+                );
             }
             _ => {}
+        }
+    }
+
+    /// Inject InitCache payloads onto the live path using one remapped
+    /// timestamp for headers and keyframe. Mid-stream InitCache must not emit
+    /// timestamp 0 ahead of a high remapped keyframe (non-monotonic for players
+    /// that already saw the previous epoch). Cache keyframe timestamps are in
+    /// the MediaFrame.timeline_ts domain after `fanout_local_frame` stages
+    /// remapped values.
+    fn inject_init_cache_live(
+        &self,
+        app: String,
+        stream: String,
+        epoch: u64,
+        metadata: Option<Vec<u8>>,
+        avc_header: Option<Vec<u8>>,
+        aac_header: Option<Vec<u8>>,
+        keyframe: Option<(u32, Vec<u8>)>,
+    ) {
+        let (inject_ts, kf_payload) = {
+            let mut maps = self.timelines.lock();
+            let key = (app.clone(), stream.clone());
+            let remap = maps.entry(key).or_default();
+            match keyframe {
+                Some((ts, kf)) => {
+                    let t = remap.map(epoch, ts);
+                    (t, Some(kf))
+                }
+                None => (remap.last_out(), None),
+            }
+        };
+        if let Some(md) = metadata {
+            let _ = self.inject.try_send(InjectedFrame {
+                app: app.clone(),
+                stream: stream.clone(),
+                epoch,
+                frame_type: 2,
+                timestamp: inject_ts,
+                payload: md,
+            });
+        }
+        if let Some(h) = avc_header {
+            let _ = self.inject.try_send(InjectedFrame {
+                app: app.clone(),
+                stream: stream.clone(),
+                epoch,
+                frame_type: 1,
+                timestamp: inject_ts,
+                payload: h,
+            });
+        }
+        if let Some(h) = aac_header {
+            let _ = self.inject.try_send(InjectedFrame {
+                app: app.clone(),
+                stream: stream.clone(),
+                epoch,
+                frame_type: 0,
+                timestamp: inject_ts,
+                payload: h,
+            });
+        }
+        if let Some(kf) = kf_payload {
+            let _ = self.inject.try_send(InjectedFrame {
+                app,
+                stream,
+                epoch,
+                frame_type: 1,
+                timestamp: inject_ts,
+                payload: kf,
+            });
         }
     }
 
@@ -808,21 +785,23 @@ impl MediaHub {
 
     /// Fan out a local publisher frame to subscribed peers (+ optional standby replicas).
     pub async fn fanout_local_frame(&self, frame: ExportedFrame) {
-        self.cache.update_from_frame(
-            &frame.app,
-            &frame.stream,
-            frame.epoch,
-            frame.frame_type,
-            frame.timestamp,
-            &frame.payload,
-        );
-
+        // Remap before staging InitCache so keyframe timestamps share the same
+        // domain as MediaFrame.timeline_ts (receivers map that domain again).
         let timeline_ts = {
             let mut maps = self.timelines.lock();
             let key = (frame.app.clone(), frame.stream.clone());
             let remap = maps.entry(key).or_default();
             remap.map(frame.epoch, frame.timestamp)
         };
+
+        self.cache.update_from_frame(
+            &frame.app,
+            &frame.stream,
+            frame.epoch,
+            frame.frame_type,
+            timeline_ts,
+            &frame.payload,
+        );
 
         let msg = MediaMessage::MediaFrame {
             app: frame.app.clone(),
