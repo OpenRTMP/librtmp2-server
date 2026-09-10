@@ -468,6 +468,14 @@ impl MediaSession {
 
         if config.recording_enabled {
             let dir = config.recording_path.join(&safe_id);
+            if let Err(e) = fs::create_dir_all(&dir) {
+                crate::log_warn!(
+                    "Media outputs: unable to create recording directory '{}': {e}",
+                    dir.display()
+                );
+            } else {
+                restrict_media_path_permissions(&dir, true);
+            }
             let path = dir.join(format!("{}.flv", unix_millis()));
             sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
             recording_file = Some(path);
@@ -475,6 +483,14 @@ impl MediaSession {
 
         if config.hls_enabled {
             let stream_dir = config.hls_path.join(&safe_id);
+            if let Err(e) = fs::create_dir_all(&stream_dir) {
+                crate::log_warn!(
+                    "Media outputs: unable to create HLS stream directory '{}': {e}",
+                    stream_dir.display()
+                );
+            } else {
+                restrict_media_path_permissions(&stream_dir, true);
+            }
             let dir = stream_dir.join(hls_session_dir_name(conn_id, generation));
             let playlist = dir.join("index.m3u8");
             sinks.push(spawn_hls_sink(
@@ -693,11 +709,14 @@ where
 fn spawn_recording_sink(path: PathBuf, max_bytes: usize) -> SinkSender {
     let label = format!("record:{}", path.display());
     make_sink(label, max_bytes, move |rx, queued, failed| {
+        private_media_umask();
         let result = (|| -> io::Result<()> {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
+                restrict_media_path_permissions(parent, true);
             }
             let mut file = File::create(&path)?;
+            restrict_media_path_permissions(&path, false);
             file.write_all(flv_header())?;
             consume_queue(rx, queued, Arc::clone(&failed), |tag| file.write_all(tag))?;
             file.flush()
@@ -743,6 +762,7 @@ fn clean_older_hls_sessions(stream_dir: &Path, current_dir: &Path) -> io::Result
 
 fn clean_hls_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
+    restrict_media_path_permissions(dir, true);
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -773,8 +793,10 @@ fn spawn_hls_sink(
     let list_size = config.hls_list_size;
     let transcode = config.hls_transcode;
     make_sink(label, max_bytes, move |rx, queued, failed| {
+        private_media_umask();
         let result = (|| -> io::Result<()> {
             clean_hls_dir(&dir)?;
+            restrict_media_path_permissions(&dir, true);
             clean_older_hls_sessions(&stream_dir, &dir)?;
             let mut cmd = Command::new(&ffmpeg);
             add_ffmpeg_input(&mut cmd);
@@ -1093,6 +1115,37 @@ fn unix_millis() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
+
+/// Recording/HLS workers and FFmpeg children inherit the process umask, which
+/// often leaves new files world-readable on multi-user hosts. Tighten created
+/// media paths the same way `db::restrict_db_file_permissions` does for SQLite.
+#[cfg(unix)]
+fn restrict_media_path_permissions(path: &Path, is_dir: bool) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if is_dir { 0o700 } else { 0o600 };
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+        crate::log_warn!("Could not restrict permissions on {}: {e}", path.display());
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_media_path_permissions(_path: &Path, _is_dir: bool) {}
+
+/// Apply a private umask for worker threads that spawn FFmpeg so segment files
+/// are not created world-readable before we can chmod parent directories.
+#[cfg(unix)]
+fn private_media_umask() {
+    // SAFETY: umask is process-global but these workers run in dedicated
+    // threads that do not share filesystem creation with unrelated tasks.
+    unsafe {
+        libc::umask(0o177);
+    }
+}
+
+#[cfg(not(unix))]
+fn private_media_umask() {}
 
 fn safe_component(input: &str) -> String {
     let mut out: String = input
@@ -1454,5 +1507,29 @@ mod tests {
     fn safe_component_never_allows_parent_components() {
         assert_eq!(safe_component("../../x"), ".._.._x");
         assert_eq!(safe_component(".."), "stream");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn media_output_files_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "lrtmp2-media-perms-{}",
+            std::process::id()
+        ));
+        let file = dir.join("sample.flv");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        restrict_media_path_permissions(&dir, true);
+        File::create(&file).unwrap();
+        restrict_media_path_permissions(&file, false);
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "media directories must not be world-accessible");
+        assert_eq!(file_mode, 0o600, "media files must not be world-readable");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
