@@ -17,8 +17,9 @@ use crate::http::{self, AppState};
 use crate::logger;
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 use crate::server::{
-    POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn, clear_rtmp_poll_server, process_server_connections,
-    rtmp_media_cb, rtmp_play_cb, rtmp_publish_cb, set_rtmp_poll_server,
+    POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn, clear_rtmp_poll_server,
+    live_stream_ids_for_deleted_markers, process_server_connections, rtmp_media_cb, rtmp_play_cb,
+    rtmp_publish_cb, set_rtmp_poll_server,
 };
 
 static TEST_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -47,6 +48,7 @@ impl TestServer {
 
         let db = Arc::new(Db::open(":memory:").unwrap());
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
+        let sticky_deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(
             Arc::clone(&db),
@@ -70,6 +72,7 @@ impl TestServer {
             rtmp_bridge: Arc::clone(&rtmp_bridge),
             coordinator,
             deleted_streams: Arc::clone(&deleted_streams),
+            sticky_deleted_streams: Arc::clone(&sticky_deleted_streams),
             revoked_viewers: Arc::clone(&revoked_viewers),
         });
 
@@ -100,6 +103,7 @@ impl TestServer {
         let rtmp_stop_clone = Arc::clone(&rtmp_stop);
         let (rtmp_ready_tx, rtmp_ready_rx) = std::sync::mpsc::channel();
         let deleted_for_rtmp = Arc::clone(&deleted_streams);
+        let sticky_for_rtmp = Arc::clone(&sticky_deleted_streams);
         let revoked_for_rtmp = Arc::clone(&revoked_viewers);
 
         let rtmp_thread = thread::spawn(move || {
@@ -181,9 +185,13 @@ impl TestServer {
                     rtmp_bridge.on_close(conn_id);
                 }
 
-                // `deleted_streams` markers are owned by HTTP/cluster delete
-                // paths — do not prune by live session presence (sticky Raft
-                // begin_delete ambiguity with no local sessions).
+                // Prune transient drain markers once no local session references
+                // them; keep HTTP sticky markers until finalize/rollback.
+                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
+                let sticky = sticky_for_rtmp.lock().clone();
+                deleted_for_rtmp
+                    .lock()
+                    .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
 
                 let live_viewer_ids: HashSet<String> = tracked
                     .keys()

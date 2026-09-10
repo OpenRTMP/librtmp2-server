@@ -212,7 +212,6 @@ fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedC
     entry.stream_id.clone()
 }
 
-#[cfg(test)]
 pub(crate) fn live_stream_ids_for_deleted_markers(
     tracked: &HashMap<u64, TrackedConn>,
     rtmp_bridge: &DbRtmpBridge,
@@ -731,6 +730,9 @@ pub struct ServerApp {
     /// Stream IDs deleted via HTTP while connections are live. The RTMP poll
     /// loop reads this set and kicks any connection whose stream_id appears.
     deleted_streams: Arc<Mutex<HashSet<String>>>,
+    /// HTTP delete markers that must survive live-session pruning (see
+    /// [`crate::http::AppState::sticky_deleted_streams`]).
+    sticky_deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Viewer slot IDs revoked via HTTP while player connections are live.
     revoked_viewers: Arc<Mutex<HashSet<String>>>,
 }
@@ -765,6 +767,7 @@ impl ServerApp {
         recover_pending_stream_deletes(&db);
 
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
+        let sticky_deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
 
         let coordinator = Arc::new(StateCoordinator::standalone(Arc::clone(&db)));
@@ -781,6 +784,7 @@ impl ServerApp {
             coordinator,
             rtmp_bridge,
             deleted_streams,
+            sticky_deleted_streams,
             revoked_viewers,
         })
     }
@@ -869,6 +873,7 @@ impl ServerApp {
             rtmp_bridge: Arc::clone(&self.rtmp_bridge),
             coordinator: Arc::clone(&coordinator),
             deleted_streams: Arc::clone(&self.deleted_streams),
+            sticky_deleted_streams: Arc::clone(&self.sticky_deleted_streams),
             revoked_viewers: Arc::clone(&self.revoked_viewers),
         });
         let mut app = http::router(Arc::clone(&state));
@@ -921,6 +926,7 @@ impl ServerApp {
         let rtmp_tls_key = self.config.tls_key_file.clone();
         let rtmp_bridge = Arc::clone(&self.rtmp_bridge);
         let deleted_streams = Arc::clone(&self.deleted_streams);
+        let sticky_deleted_streams = Arc::clone(&self.sticky_deleted_streams);
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
         let rtmp_stop_clone = Arc::clone(&rtmp_stop);
@@ -1182,11 +1188,16 @@ impl ServerApp {
                     .collect();
                 media_outputs.retain_publishers(&live_publishers);
 
-                // `deleted_streams` markers are owned by HTTP/cluster delete
-                // paths (insert on begin_delete, remove on finalize/rollback).
-                // Do not prune by live session presence — that drops sticky
-                // markers during Raft begin_delete ambiguity when the node has
-                // no local RTMP sessions for the stream.
+                // Prune transient drain markers (e.g. ownership force_unpublish)
+                // once no local session references them. Keep HTTP sticky
+                // markers until finalize/rollback clears them explicitly —
+                // otherwise Raft begin_delete timeouts lose rejection cover
+                // when the node has no live RTMP sessions for the stream.
+                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
+                let sticky = sticky_deleted_streams.lock().clone();
+                deleted_streams
+                    .lock()
+                    .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
 
                 let live_viewer_ids: HashSet<String> = tracked
                     .keys()

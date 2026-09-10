@@ -43,6 +43,11 @@ pub struct AppState {
     /// Stream IDs deleted via this API while RTMP connections are active.
     /// The RTMP poll loop reads this set and evicts matching connections.
     pub deleted_streams: Arc<Mutex<HashSet<String>>>,
+    /// HTTP-owned subset of [`Self::deleted_streams`] that must not be
+    /// auto-pruned when no local sessions remain (Raft begin_delete ambiguity,
+    /// remote-only drain). Transient cluster force-unpublish markers stay only
+    /// in `deleted_streams` and are pruned after local sessions drain.
+    pub sticky_deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Viewer slot IDs revoked via HTTP while RTMP player sessions are active.
     pub revoked_viewers: Arc<Mutex<HashSet<String>>>,
 }
@@ -1191,16 +1196,26 @@ async fn handle_stream_create(
     (StatusCode::CREATED, Json(body)).into_response()
 }
 
+fn clear_http_delete_marker(state: &AppState, id: &str) {
+    state.deleted_streams.lock().remove(id);
+    state.sticky_deleted_streams.lock().remove(id);
+}
+
+fn mark_http_delete_sticky(state: &AppState, id: &str) {
+    state.deleted_streams.lock().insert(id.to_string());
+    state.sticky_deleted_streams.lock().insert(id.to_string());
+}
+
 async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), ()> {
     match state.coordinator.finalize_delete_stream(id) {
         Ok(()) => {
-            state.deleted_streams.lock().remove(id);
+            clear_http_delete_marker(state, id);
             Ok(())
         }
         Err(CoordError::NotFound) => {
             // Already gone — success. Do not propose SetStreamEnabled(true),
             // which would Error-stall Raft when the row no longer exists.
-            state.deleted_streams.lock().remove(id);
+            clear_http_delete_marker(state, id);
             Ok(())
         }
         Err(_) => {
@@ -1209,7 +1224,7 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
             if matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
                 let _ = state.coordinator.set_stream_enabled(id, true);
             }
-            state.deleted_streams.lock().remove(id);
+            clear_http_delete_marker(state, id);
             Err(())
         }
     }
@@ -1345,7 +1360,7 @@ async fn handle_stream_delete(
         DbLookup::Ok(_) => {}
     }
 
-    state.deleted_streams.lock().insert(id.clone());
+    mark_http_delete_sticky(&state, &id);
     if let Err(e) = state.coordinator.begin_delete_stream(&id) {
         #[cfg(feature = "cluster")]
         let ambiguous_timeout = matches!(
@@ -1371,7 +1386,7 @@ async fn handle_stream_delete(
             });
             return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
         }
-        state.deleted_streams.lock().remove(&id);
+        clear_http_delete_marker(&state, &id);
         log_http_access(
             "DELETE",
             &path,
@@ -2218,6 +2233,7 @@ mod tests {
             rtmp_bridge,
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
+            sticky_deleted_streams: Arc::new(Mutex::new(HashSet::new())),
             revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -2319,6 +2335,7 @@ mod tests {
             rtmp_bridge,
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
+            sticky_deleted_streams: Arc::new(Mutex::new(HashSet::new())),
             revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
         });
         let app = router(state);
