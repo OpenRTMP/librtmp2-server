@@ -1505,6 +1505,51 @@ impl Db {
         }
     }
 
+    /// Periodic stats/RTT flush for an already-active publisher.
+    ///
+    /// Unlike [`Self::publisher_update`], this never writes `active`. The RTMP
+    /// poll thread clones ConnState under the conns lock, drops it, then
+    /// persists — a concurrent `release_publisher` (cluster force-unpublish /
+    /// delete-drain) can deactivate the row in that window. Writing `active`
+    /// from the stale clone would resurrect a ghost active slot; restricting
+    /// the UPDATE to `WHERE id=? AND active=1` makes the late flush a no-op.
+    pub fn publisher_update_stats(&self, id: &str, p: &Publisher) -> bool {
+        let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
+            crate::log_error!(
+                "publisher_update_stats: bytes_in {} overflows i64",
+                p.bytes_in
+            );
+            return false;
+        };
+        let conn = self.conn.lock();
+        match conn.execute(
+            "UPDATE publishers SET \
+             video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
+             audio_sample_rate=?,audio_channels=?,\
+             bytes_in=?,bitrate_kbps=?,rtt_ms=? WHERE id=? AND active=1",
+            params![
+                p.video_codec,
+                p.audio_codec,
+                p.video_width,
+                p.video_height,
+                p.fps,
+                p.audio_sample_rate,
+                p.audio_channels,
+                bytes_in,
+                p.bitrate_kbps,
+                p.rtt_ms,
+                id
+            ],
+        ) {
+            Ok(rows) if rows > 0 => true,
+            Ok(_) => false,
+            Err(e) => {
+                crate::log_error!("publisher_update_stats error for {id}: {e}");
+                false
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn publisher_remove(&self, id: &str) -> bool {
         let conn = self.conn.lock();
@@ -1709,6 +1754,34 @@ impl Db {
             }
             Err(e) => {
                 crate::log_error!("player_update error for {id}: {e}");
+                false
+            }
+        }
+    }
+
+    /// Periodic stats/RTT flush for an already-active player.
+    ///
+    /// See [`Self::publisher_update_stats`]: never writes `active`, and only
+    /// touches rows that are still `active=1`, so a stale ConnState clone
+    /// cannot resurrect a deactivated player after `release_player`.
+    pub fn player_update_stats(&self, id: &str, p: &Player) -> bool {
+        let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
+            crate::log_error!(
+                "player_update_stats: bytes_out {} overflows i64",
+                p.bytes_out
+            );
+            return false;
+        };
+        let conn = self.conn.lock();
+        match conn.execute(
+            "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
+             WHERE id=? AND active=1",
+            params![bytes_out, p.bitrate_kbps, p.rtt_ms, id],
+        ) {
+            Ok(rows) if rows > 0 => true,
+            Ok(_) => false,
+            Err(e) => {
+                crate::log_error!("player_update_stats error for {id}: {e}");
                 false
             }
         }
@@ -2384,6 +2457,93 @@ mod tests {
     }
 
     #[test]
+    fn publisher_update_stats_does_not_resurrect_inactive_row() {
+        // Models the cluster TOCTOU: stats clone still has active=true after
+        // release_publisher wrote active=false. The stats path must not flip
+        // the row back to active.
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+
+        let first = Publisher {
+            id: "pub1".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            bytes_in: 100,
+            bitrate_kbps: 1000.0,
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&first));
+
+        let mut inactive = first.clone();
+        inactive.active = false;
+        assert!(db.publisher_update("pub1", &inactive));
+        assert!(db.publisher_list(Some("stream1")).is_empty());
+
+        let mut stale_stats = first;
+        stale_stats.active = true;
+        stale_stats.bytes_in = 9999;
+        stale_stats.bitrate_kbps = 4200.0;
+        assert!(
+            !db.publisher_update_stats("pub1", &stale_stats),
+            "stats flush against an inactive row must be a no-op"
+        );
+        assert!(
+            db.publisher_list(Some("stream1")).is_empty(),
+            "stale stats flush must not resurrect active=1"
+        );
+        // A genuine replacement acquire must still succeed.
+        assert!(db.publisher_try_acquire(&Publisher {
+            id: "pub2".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn publisher_update_stats_updates_active_row() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+
+        let first = Publisher {
+            id: "pub1".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&first));
+
+        let mut flushed = first;
+        flushed.bytes_in = 42_000;
+        flushed.bitrate_kbps = 4200.0;
+        flushed.rtt_ms = 12.5;
+        flushed.video_codec = "avc1".into();
+        assert!(db.publisher_update_stats("pub1", &flushed));
+        let listed = db.publisher_list(Some("stream1"));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].bytes_in, 42_000);
+        assert_eq!(listed[0].bitrate_kbps, 4200.0);
+        assert_eq!(listed[0].rtt_ms, 12.5);
+        assert_eq!(listed[0].video_codec, "avc1");
+        assert!(listed[0].active);
+    }
+
+    #[test]
     fn player_update_respects_per_viewer_connection_cap() {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
@@ -2479,6 +2639,75 @@ mod tests {
             "a stats flush that keeps active=true for the same viewer must not be rejected \
              by the connection-cap check, which only guards real transitions"
         );
+    }
+
+    #[test]
+    fn player_update_stats_does_not_resurrect_inactive_row() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+
+        let first = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            bytes_out: 100,
+            bitrate_kbps: 800.0,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&first));
+
+        let mut inactive = first.clone();
+        inactive.active = false;
+        assert!(db.player_update("pl0", &inactive));
+        assert!(db.player_list(Some("stream1")).is_empty());
+
+        let mut stale_stats = first;
+        stale_stats.active = true;
+        stale_stats.bytes_out = 9999;
+        stale_stats.bitrate_kbps = 1500.0;
+        assert!(!db.player_update_stats("pl0", &stale_stats));
+        assert!(
+            db.player_list(Some("stream1")).is_empty(),
+            "stale stats flush must not resurrect active=1"
+        );
+    }
+
+    #[test]
+    fn player_update_stats_updates_active_row() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+
+        let first = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&first));
+
+        let mut flushed = first;
+        flushed.bytes_out = 8192;
+        flushed.bitrate_kbps = 1500.0;
+        flushed.rtt_ms = 8.0;
+        assert!(db.player_update_stats("pl0", &flushed));
+        let listed = db.player_list(Some("stream1"));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].bytes_out, 8192);
+        assert_eq!(listed[0].bitrate_kbps, 1500.0);
+        assert_eq!(listed[0].rtt_ms, 8.0);
+        assert!(listed[0].active);
     }
 
     #[test]
