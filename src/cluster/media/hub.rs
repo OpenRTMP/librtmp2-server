@@ -513,20 +513,15 @@ impl MediaHub {
                         if !self.ownership.accepts_owner(&stream, peer_id, epoch) {
                             continue;
                         }
-                        self.cache.put(
-                            &app,
-                            &stream,
-                            InitCacheEntry {
-                                metadata: metadata.clone(),
-                                avc_header: avc_header.clone(),
-                                aac_header: aac_header.clone(),
-                                keyframe: keyframe.clone(),
-                                epoch,
-                            },
-                        );
-                        self.inject_init_cache_live(
-                            app, stream, epoch, metadata, avc_header, aac_header, keyframe,
-                        );
+                        let entry = InitCacheEntry {
+                            metadata: metadata.clone(),
+                            avc_header: avc_header.clone(),
+                            aac_header: aac_header.clone(),
+                            keyframe: keyframe.clone(),
+                            epoch,
+                        };
+                        self.cache.put(&app, &stream, entry.clone());
+                        self.inject_init_cache_live(app, stream, entry);
                     }
                     MediaMessage::StatsReq { stream_id: _ } => {}
                     other => {
@@ -595,20 +590,15 @@ impl MediaHub {
                 if !self.ownership.accepts_owner(&stream, peer_id, epoch) {
                     return;
                 }
-                self.cache.put(
-                    &app,
-                    &stream,
-                    InitCacheEntry {
-                        metadata: metadata.clone(),
-                        avc_header: avc_header.clone(),
-                        aac_header: aac_header.clone(),
-                        keyframe: keyframe.clone(),
-                        epoch,
-                    },
-                );
-                self.inject_init_cache_live(
-                    app, stream, epoch, metadata, avc_header, aac_header, keyframe,
-                );
+                let entry = InitCacheEntry {
+                    metadata: metadata.clone(),
+                    avc_header: avc_header.clone(),
+                    aac_header: aac_header.clone(),
+                    keyframe: keyframe.clone(),
+                    epoch,
+                };
+                self.cache.put(&app, &stream, entry.clone());
+                self.inject_init_cache_live(app, stream, entry);
             }
             _ => {}
         }
@@ -620,21 +610,13 @@ impl MediaHub {
     /// that already saw the previous epoch). Cache keyframe timestamps are in
     /// the MediaFrame.timeline_ts domain after `fanout_local_frame` stages
     /// remapped values.
-    fn inject_init_cache_live(
-        &self,
-        app: String,
-        stream: String,
-        epoch: u64,
-        metadata: Option<Vec<u8>>,
-        avc_header: Option<Vec<u8>>,
-        aac_header: Option<Vec<u8>>,
-        keyframe: Option<(u32, Vec<u8>)>,
-    ) {
+    fn inject_init_cache_live(&self, app: String, stream: String, entry: InitCacheEntry) {
+        let epoch = entry.epoch;
         let (inject_ts, kf_payload) = {
             let mut maps = self.timelines.lock();
             let key = (app.clone(), stream.clone());
             let remap = maps.entry(key).or_default();
-            match keyframe {
+            match entry.keyframe {
                 Some((ts, kf)) => {
                     let t = remap.map(epoch, ts);
                     (t, Some(kf))
@@ -642,7 +624,7 @@ impl MediaHub {
                 None => (remap.last_out(), None),
             }
         };
-        if let Some(md) = metadata {
+        if let Some(md) = entry.metadata {
             let _ = self.inject.try_send(InjectedFrame {
                 app: app.clone(),
                 stream: stream.clone(),
@@ -652,7 +634,7 @@ impl MediaHub {
                 payload: md,
             });
         }
-        if let Some(h) = avc_header {
+        if let Some(h) = entry.avc_header {
             let _ = self.inject.try_send(InjectedFrame {
                 app: app.clone(),
                 stream: stream.clone(),
@@ -662,7 +644,7 @@ impl MediaHub {
                 payload: h,
             });
         }
-        if let Some(h) = aac_header {
+        if let Some(h) = entry.aac_header {
             let _ = self.inject.try_send(InjectedFrame {
                 app: app.clone(),
                 stream: stream.clone(),

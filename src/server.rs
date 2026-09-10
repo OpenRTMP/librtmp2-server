@@ -212,6 +212,7 @@ fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedC
     entry.stream_id.clone()
 }
 
+#[cfg(test)]
 pub(crate) fn live_stream_ids_for_deleted_markers(
     tracked: &HashMap<u64, TrackedConn>,
     rtmp_bridge: &DbRtmpBridge,
