@@ -530,6 +530,14 @@ impl InboundMediaSink {
             return Err(());
         }
         let approx = approx_size(&msg);
+        let cur = self.queue_bytes.load(Ordering::Relaxed);
+        if cur.saturating_add(approx) > self.max_queue_bytes {
+            tracing::warn!(
+                peer = self.peer_id,
+                "inbound media queue full — dropping frame"
+            );
+            return Err(());
+        }
         self.queue_bytes.fetch_add(approx, Ordering::Relaxed);
         self.tx.send(msg).await.map_err(|_| {
             self.queue_bytes.fetch_sub(
