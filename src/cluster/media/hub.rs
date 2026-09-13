@@ -376,13 +376,13 @@ impl MediaHub {
         peer_id: NodeId,
         app: String,
         stream: String,
-        gen: u64,
+        generation: u64,
         send_retries: u8,
     ) {
         let hub = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(SUBSCRIBE_NACK_RETRY).await;
-            hub.run_subscribe_retry(peer_id, app, stream, gen, send_retries)
+            hub.run_subscribe_retry(peer_id, app, stream, generation, send_retries)
                 .await;
         });
     }
@@ -392,13 +392,13 @@ impl MediaHub {
         peer_id: NodeId,
         app: String,
         stream: String,
-        gen: u64,
+        generation: u64,
         send_retries: u8,
     ) {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        if self.sub_gen(peer_id, &app, &stream) != gen {
+        if self.sub_gen(peer_id, &app, &stream) != generation {
             return;
         }
         if !self.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
@@ -417,7 +417,7 @@ impl MediaHub {
             return;
         }
         if send_retries > 0 {
-            self.schedule_subscribe_retry(peer_id, app, stream, gen, send_retries - 1);
+            self.schedule_subscribe_retry(peer_id, app, stream, generation, send_retries - 1);
         }
     }
 
@@ -759,12 +759,12 @@ impl MediaHub {
                     );
                     return;
                 }
-                let gen = self.sub_gen(peer_id, &app, &stream);
+                let generation = self.sub_gen(peer_id, &app, &stream);
                 self.schedule_subscribe_retry(
                     peer_id,
                     app,
                     stream,
-                    gen,
+                    generation,
                     SUBSCRIBE_NACK_SEND_RETRIES,
                 );
             }
