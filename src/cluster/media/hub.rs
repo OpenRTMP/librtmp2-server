@@ -978,19 +978,20 @@ impl MediaHub {
 
         let sinks = self.inbound_sinks.lock().clone();
         let peers = self.peers.lock().clone();
-        self.subs.for_each_peer(&frame.app, &frame.stream, |peer_id| {
-            if let Some(sink) = sinks.get(&peer_id) {
-                if !sink.is_closed() {
-                    let _ = sink.try_send(msg.clone());
-                    return;
+        self.subs
+            .for_each_peer(&frame.app, &frame.stream, |peer_id| {
+                if let Some(sink) = sinks.get(&peer_id) {
+                    if !sink.is_closed() {
+                        let _ = sink.try_send(msg.clone());
+                        return;
+                    }
                 }
-            }
-            if let Some(peer) = peers.get(&peer_id) {
-                if !peer.is_closed() {
-                    let _ = peer.try_send(msg.clone());
+                if let Some(peer) = peers.get(&peer_id) {
+                    if !peer.is_closed() {
+                        let _ = peer.try_send(msg.clone());
+                    }
                 }
-            }
-        });
+            });
     }
 
     /// Update local init cache from librtmp2 snapshot (optional).
