@@ -613,9 +613,8 @@ impl MediaHub {
                             if sink.is_closed() {
                                 return Err(std::io::Error::other("inbound media sink closed"));
                             }
-                            let _ = sink.try_send(subscribe_denied_error(
-                                &app, &stream, generation,
-                            ));
+                            let _ =
+                                sink.try_send(subscribe_denied_error(&app, &stream, generation));
                             continue;
                         }
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;

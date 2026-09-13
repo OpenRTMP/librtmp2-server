@@ -11,7 +11,7 @@ use bytes::BytesMut;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cluster::NodeId;
