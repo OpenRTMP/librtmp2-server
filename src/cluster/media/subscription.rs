@@ -17,11 +17,23 @@ impl SubscriptionTable {
 
     /// Increment; returns true if this is the first subscription (need SUBSCRIBE wire msg).
     pub fn add(&self, peer: u64, app: &str, stream: &str) -> bool {
+        self.add_with(peer, app, stream, || Ok(()))
+            .expect("add_with with empty before cannot fail")
+    }
+
+    /// Like [`Self::add`], but runs `before` while the table lock is held so a
+    /// caller can enqueue InitCache before fan-out can observe the new ref.
+    /// If `before` fails, the refcount is left unchanged.
+    pub fn add_with<F>(&self, peer: u64, app: &str, stream: &str, before: F) -> Result<bool, ()>
+    where
+        F: FnOnce() -> Result<(), ()>,
+    {
         let mut g = self.inner.lock();
+        before()?;
         let key = (peer, app.to_string(), stream.to_string());
         let e = g.entry(key).or_insert(0);
         *e += 1;
-        *e == 1
+        Ok(*e == 1)
     }
 
     /// Decrement; returns true if count hit zero (need UNSUBSCRIBE).
@@ -57,12 +69,20 @@ impl SubscriptionTable {
     }
 
     pub fn peers_for_stream(&self, app: &str, stream: &str) -> Vec<u64> {
-        self.inner
-            .lock()
-            .iter()
-            .filter(|((_, a, s), _)| a == app && s == stream)
-            .map(|((peer, _, _), _)| *peer)
-            .collect()
+        let mut out = Vec::new();
+        self.for_each_peer(app, stream, |peer| out.push(peer));
+        out
+    }
+
+    /// Call `f` for each peer subscribed to this stream while the table lock
+    /// is held, so registration cannot interleave mid-fan-out.
+    pub fn for_each_peer(&self, app: &str, stream: &str, mut f: impl FnMut(u64)) {
+        let g = self.inner.lock();
+        for ((peer, a, s), _) in g.iter() {
+            if a == app && s == stream {
+                f(*peer);
+            }
+        }
     }
 
     pub fn streams_for_peer(&self, peer: u64) -> Vec<(String, String)> {
@@ -78,6 +98,13 @@ impl SubscriptionTable {
     pub fn clear_peer(&self, peer: u64) {
         let mut g = self.inner.lock();
         g.retain(|(p, _, _), _| *p != peer);
+    }
+
+    /// Drop every ref for this peer+stream (exhausted Subscribe NACK retries).
+    pub fn clear_entry(&self, peer: u64, app: &str, stream: &str) {
+        self.inner
+            .lock()
+            .remove(&(peer, app.to_string(), stream.to_string()));
     }
 
     pub fn count(&self) -> usize {
@@ -96,5 +123,14 @@ mod tests {
         assert!(!t.add(2, "live", "s1"));
         assert!(!t.remove(2, "live", "s1"));
         assert!(t.remove(2, "live", "s1"));
+    }
+
+    #[test]
+    fn add_with_abort_skips_increment() {
+        let t = SubscriptionTable::new();
+        assert!(t.add_with(2, "live", "s1", || Err(())).is_err());
+        assert_eq!(t.count(), 0);
+        assert!(t.add_with(2, "live", "s1", || Ok(())).unwrap());
+        assert_eq!(t.count(), 1);
     }
 }

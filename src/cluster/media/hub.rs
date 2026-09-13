@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use crate::cluster::NodeId;
 use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
 use crate::cluster::media::ownership::OwnershipTracker;
-use crate::cluster::media::peer::{self, MediaPeer};
-use crate::cluster::media::protocol::MediaMessage;
+use crate::cluster::media::peer::{self, InboundMediaSink, MediaPeer};
+use crate::cluster::media::protocol::{MediaMessage, SUBSCRIBE_DENIED};
 use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
 use crate::cluster::media::{InboundSubscribeGateFn, MediaMembershipFn};
@@ -33,6 +33,9 @@ const MAX_PREAUTH_MEDIA_CONN_PER_IP: usize = 16;
 /// briefly instead of dropping it permanently while the connection stays open.
 const SUBSCRIBE_GATE_RETRY_WINDOW: Duration = Duration::from_secs(2);
 const SUBSCRIBE_GATE_RETRY_DELAY: Duration = Duration::from_millis(50);
+const SUBSCRIBE_NACK_RETRY: Duration = Duration::from_millis(200);
+const SUBSCRIBE_NACK_MAX: u8 = 3;
+const SUBSCRIBE_NACK_SEND_RETRIES: u8 = 3;
 static MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
@@ -238,6 +241,13 @@ pub struct MediaHub {
     replicas: u32,
     ownership: Arc<OwnershipTracker>,
     peers: Mutex<HashMap<NodeId, Arc<MediaPeer>>>,
+    /// Write pumps for accepted inbound sessions, keyed by remote node.
+    inbound_sinks: Mutex<HashMap<NodeId, Arc<InboundMediaSink>>>,
+    /// Per-(owner, app, stream) NACK retries after `subscribe_denied`.
+    subscribe_nacks: Mutex<HashMap<(NodeId, String, String), u8>>,
+    /// Generation per owner+stream so delayed NACK retries cannot fire after
+    /// unsubscribe/resubscribe and double the owner's Subscribe refcount.
+    subscribe_gens: Mutex<HashMap<(NodeId, String, String), u64>>,
     subs: SubscriptionTable,
     cache: InitCacheStore,
     timelines: Mutex<HashMap<(String, String), TimelineRemapper>>,
@@ -277,6 +287,9 @@ impl MediaHub {
             replicas,
             ownership,
             peers: Mutex::new(HashMap::new()),
+            inbound_sinks: Mutex::new(HashMap::new()),
+            subscribe_nacks: Mutex::new(HashMap::new()),
+            subscribe_gens: Mutex::new(HashMap::new()),
             subs: SubscriptionTable::new(),
             cache: InitCacheStore::new(),
             timelines: Mutex::new(HashMap::new()),
@@ -309,6 +322,9 @@ impl MediaHub {
         for p in self.peers.lock().values() {
             p.close();
         }
+        for s in self.inbound_sinks.lock().values() {
+            s.close();
+        }
     }
 
     pub fn peer_count(&self) -> usize {
@@ -319,7 +335,125 @@ impl MediaHub {
         if let Some(p) = self.peers.lock().remove(&peer_id) {
             p.close();
         }
+        if let Some(s) = self.inbound_sinks.lock().remove(&peer_id) {
+            s.close();
+        }
+        let nack_keys: Vec<_> = self
+            .subscribe_nacks
+            .lock()
+            .keys()
+            .filter(|(owner, _, _)| *owner == peer_id)
+            .cloned()
+            .collect();
+        self.subscribe_nacks
+            .lock()
+            .retain(|(owner, _, _), _| *owner != peer_id);
+        let streams = self.subs.streams_for_peer(peer_id);
+        {
+            let mut gens = self.subscribe_gens.lock();
+            for key in nack_keys {
+                gens.entry(key).or_insert(0);
+            }
+            for (app, stream) in streams {
+                gens.entry((peer_id, app, stream)).or_insert(0);
+            }
+            for ((owner, _, _), generation) in gens.iter_mut() {
+                if *owner == peer_id {
+                    *generation = generation.wrapping_add(1);
+                }
+            }
+        }
         self.subs.clear_peer(peer_id);
+    }
+
+    fn sub_key(peer_id: NodeId, app: &str, stream: &str) -> (NodeId, String, String) {
+        (peer_id, app.to_string(), stream.to_string())
+    }
+
+    fn sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) -> u64 {
+        self.subscribe_gens
+            .lock()
+            .get(&Self::sub_key(peer_id, app, stream))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn bump_sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) {
+        let mut gens = self.subscribe_gens.lock();
+        let e = gens.entry(Self::sub_key(peer_id, app, stream)).or_insert(0);
+        *e = e.wrapping_add(1);
+    }
+
+    fn clear_subscribe_nacks(&self, peer_id: NodeId, app: &str, stream: &str) {
+        let had = self
+            .subscribe_nacks
+            .lock()
+            .remove(&Self::sub_key(peer_id, app, stream))
+            .is_some();
+        if had {
+            self.bump_sub_gen(peer_id, app, stream);
+        }
+    }
+
+    fn subscribe_message(
+        &self,
+        peer_id: NodeId,
+        app: &str,
+        stream: &str,
+        epoch: u64,
+    ) -> MediaMessage {
+        MediaMessage::Subscribe {
+            app: app.to_string(),
+            stream: stream.to_string(),
+            epoch,
+            generation: self.sub_gen(peer_id, app, stream),
+        }
+    }
+
+    fn schedule_subscribe_retry(
+        self: &Arc<Self>,
+        peer_id: NodeId,
+        app: String,
+        stream: String,
+        generation: u64,
+        send_retries: u8,
+    ) {
+        let hub = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(SUBSCRIBE_NACK_RETRY).await;
+            hub.run_subscribe_retry(peer_id, app, stream, generation, send_retries)
+                .await;
+        });
+    }
+
+    async fn run_subscribe_retry(
+        self: Arc<Self>,
+        peer_id: NodeId,
+        app: String,
+        stream: String,
+        generation: u64,
+        send_retries: u8,
+    ) {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.sub_gen(peer_id, &app, &stream) != generation {
+            return;
+        }
+        if !self.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
+            return;
+        }
+        let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
+        let Some(peer) = self.peers.lock().get(&peer_id).cloned() else {
+            return;
+        };
+        let msg = self.subscribe_message(peer_id, &app, &stream, epoch);
+        if peer.try_send(msg.clone()).is_ok() || peer.try_send(msg).is_ok() {
+            return;
+        }
+        if send_retries > 0 {
+            self.schedule_subscribe_retry(peer_id, app, stream, generation, send_retries - 1);
+        }
     }
 
     pub fn set_inbound_subscribe_gate(&self, gate: InboundSubscribeGateFn) {
@@ -419,8 +553,12 @@ impl MediaHub {
         // cannot leave stale SubscriptionTable entries for the peer.
         let mut conn_subs: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
+        let (mut rh, wh) = tokio::io::split(io);
+        let sink = Arc::new(InboundMediaSink::spawn(peer_id, self.queue_mb, wh));
+        if let Some(old) = self.inbound_sinks.lock().insert(peer_id, Arc::clone(&sink)) {
+            old.close();
+        }
         let result = async {
-            let (mut rh, mut wh) = tokio::io::split(io);
             loop {
                 let msg = peer::read_media_frame(&mut rh).await?;
                 match msg {
@@ -428,6 +566,7 @@ impl MediaHub {
                         app,
                         stream,
                         epoch: _,
+                        generation,
                     } => {
                         if !self.inbound_subscribe_allowed(peer_id, &app, &stream).await {
                             tracing::warn!(
@@ -436,32 +575,49 @@ impl MediaHub {
                                 %stream,
                                 "media subscribe rejected: peer not authorized"
                             );
+                            let _ = sink
+                                .send(subscribe_denied_error(&app, &stream, generation))
+                                .await;
                             continue;
                         }
-                        self.subs.add(peer_id, &app, &stream);
-                        *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
-                        if let Some(cache) = self.cache.get(&app, &stream) {
-                            // Send the epoch the cache was actually captured
-                            // under, not the subscriber-requested one — a
-                            // stale cache from a previous owner must not be
-                            // relabeled as belonging to the current epoch, or
-                            // receiver-side epoch fencing would accept and
-                            // inject old codec state.
-                            let cache_epoch = cache.epoch;
-                            let _ = peer::write_media_frame(
-                                &mut wh,
-                                &MediaMessage::InitCache {
-                                    app: app.clone(),
-                                    stream: stream.clone(),
-                                    epoch: cache_epoch,
-                                    metadata: cache.metadata,
-                                    avc_header: cache.avc_header,
-                                    aac_header: cache.aac_header,
-                                    keyframe: cache.keyframe,
-                                },
-                            )
-                            .await;
+                        let init_msg = if let Some(cache) = self.cache.get(&app, &stream) {
+                            Some(MediaMessage::InitCache {
+                                app: app.clone(),
+                                stream: stream.clone(),
+                                epoch: cache.epoch,
+                                metadata: cache.metadata,
+                                avc_header: cache.avc_header,
+                                aac_header: cache.aac_header,
+                                keyframe: cache.keyframe,
+                            })
+                        } else {
+                            None
+                        };
+                        // Enqueue InitCache (if any) under the subscription lock
+                        // so fan-out cannot observe the new ref until headers
+                        // are first in this sink's FIFO.
+                        if self
+                            .subs
+                            .add_with(peer_id, &app, &stream, || {
+                                if sink.is_closed() {
+                                    return Err(());
+                                }
+                                if let Some(msg) = init_msg {
+                                    sink.try_send(msg)
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .is_err()
+                        {
+                            if sink.is_closed() {
+                                return Err(std::io::Error::other("inbound media sink closed"));
+                            }
+                            let _ =
+                                sink.try_send(subscribe_denied_error(&app, &stream, generation));
+                            continue;
                         }
+                        *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
                     }
                     MediaMessage::Unsubscribe { app, stream } => {
                         self.subs.remove(peer_id, &app, &stream);
@@ -524,6 +680,7 @@ impl MediaHub {
                         self.inject_init_cache_live(app, stream, entry);
                     }
                     MediaMessage::StatsReq { stream_id: _ } => {}
+                    MediaMessage::Error { .. } => {}
                     other => {
                         let _ = self.inbound_tx.try_send((peer_id, other));
                     }
@@ -531,6 +688,13 @@ impl MediaHub {
             }
         }
         .await;
+        {
+            let mut sinks = self.inbound_sinks.lock();
+            if sinks.get(&peer_id).is_some_and(|s| Arc::ptr_eq(s, &sink)) {
+                sinks.remove(&peer_id);
+            }
+        }
+        sink.close();
         for ((app, stream), n) in conn_subs {
             // Release only this connection's Subscribe refs; outbound
             // subscribe_remote refcounts for the same peer are left intact.
@@ -541,7 +705,7 @@ impl MediaHub {
         result
     }
 
-    fn handle_inbound(&self, peer_id: NodeId, msg: MediaMessage) {
+    fn handle_inbound(self: &Arc<Self>, peer_id: NodeId, msg: MediaMessage) {
         match msg {
             MediaMessage::MediaFrame {
                 app,
@@ -558,6 +722,7 @@ impl MediaHub {
                 if !self.ownership.accepts_owner(&stream, peer_id, epoch) {
                     return;
                 }
+                self.clear_subscribe_nacks(peer_id, &app, &stream);
                 let timestamp = {
                     let mut maps = self.timelines.lock();
                     let key = (app.clone(), stream.clone());
@@ -590,6 +755,7 @@ impl MediaHub {
                 if !self.ownership.accepts_owner(&stream, peer_id, epoch) {
                     return;
                 }
+                self.clear_subscribe_nacks(peer_id, &app, &stream);
                 let entry = InitCacheEntry {
                     metadata: metadata.clone(),
                     avc_header: avc_header.clone(),
@@ -599,6 +765,52 @@ impl MediaHub {
                 };
                 self.cache.put(&app, &stream, entry.clone());
                 self.inject_init_cache_live(app, stream, entry);
+            }
+            MediaMessage::Error {
+                code,
+                message,
+                generation: req_gen,
+            } => {
+                if code != SUBSCRIBE_DENIED {
+                    return;
+                }
+                let Some((app, stream)) = parse_subscribe_denied(&message) else {
+                    return;
+                };
+                if !self.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
+                    return;
+                }
+                let generation = self.sub_gen(peer_id, &app, &stream);
+                if req_gen != 0 && req_gen != generation {
+                    return;
+                }
+                let n = {
+                    let mut nacks = self.subscribe_nacks.lock();
+                    let e = nacks
+                        .entry((peer_id, app.clone(), stream.clone()))
+                        .or_insert(0);
+                    *e = e.saturating_add(1);
+                    *e
+                };
+                if n > SUBSCRIBE_NACK_MAX {
+                    self.clear_subscribe_nacks(peer_id, &app, &stream);
+                    self.bump_sub_gen(peer_id, &app, &stream);
+                    self.subs.clear_entry(peer_id, &app, &stream);
+                    tracing::warn!(
+                        peer = peer_id,
+                        %app,
+                        %stream,
+                        "media subscribe denied after retries — dropping local refs"
+                    );
+                    return;
+                }
+                self.schedule_subscribe_retry(
+                    peer_id,
+                    app,
+                    stream,
+                    generation,
+                    SUBSCRIBE_NACK_SEND_RETRIES,
+                );
             }
             _ => {}
         }
@@ -618,7 +830,14 @@ impl MediaHub {
             let remap = maps.entry(key).or_default();
             match entry.keyframe {
                 Some((ts, kf)) => {
-                    let t = remap.map(epoch, ts);
+                    // Mid-stream InitCache must not run map() on a GOP-behind
+                    // keyframe: the within-epoch non-monotonic guard would
+                    // permanently bump offset and jump every later MediaFrame.
+                    let t = if remap.last_out() == 0 {
+                        remap.map(epoch, ts)
+                    } else {
+                        remap.last_out()
+                    };
                     (t, Some(kf))
                 }
                 None => (remap.last_out(), None),
@@ -712,7 +931,7 @@ impl MediaHub {
             // Soft control: if the queue rejects, leave the refcount in place
             // for a later reconnect/resubscribe — this path is only entered
             // after a fresh connection already exists.
-            let _ = peer.try_send(MediaMessage::Subscribe { app, stream, epoch });
+            let _ = peer.try_send(self.subscribe_message(peer_id, &app, &stream, epoch));
         }
     }
 
@@ -732,22 +951,16 @@ impl MediaHub {
         // this peer, including the one just added above — sending it again
         // here would just double the owner's per-connection subscribe tally.
         if !fresh {
-            let ok = peer.try_send(MediaMessage::Subscribe {
-                app: app.to_string(),
-                stream: stream.to_string(),
-                epoch,
-            });
+            let ok = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
             if ok.is_err() {
                 // Sole first-subscriber: roll back so a later player retries.
                 // Concurrent holders already saw add==false and expect wire
                 // Subscribe — keep our refcount and retry the send instead of
                 // leaving them with refs and no owner fan-out.
                 if !self.subs.remove_if_sole(peer_id, app, stream) {
-                    let _ = peer.try_send(MediaMessage::Subscribe {
-                        app: app.to_string(),
-                        stream: stream.to_string(),
-                        epoch,
-                    });
+                    let _ = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
+                } else {
+                    self.bump_sub_gen(peer_id, app, stream);
                 }
             }
         }
@@ -757,6 +970,10 @@ impl MediaHub {
         if !self.subs.remove(peer_id, app, stream) {
             return;
         }
+        self.bump_sub_gen(peer_id, app, stream);
+        self.subscribe_nacks
+            .lock()
+            .remove(&(peer_id, app.to_string(), stream.to_string()));
         if let Some(peer) = self.peers.lock().get(&peer_id) {
             let _ = peer.try_send(MediaMessage::Unsubscribe {
                 app: app.to_string(),
@@ -795,22 +1012,21 @@ impl MediaHub {
             payload: frame.payload.clone(),
         };
 
-        let peers: Vec<_> = self.peers.lock().values().cloned().collect();
-        for peer in peers {
-            if peer.is_closed() {
-                continue;
-            }
-            let subscribed = self
-                .subs
-                .peers_for_stream(&frame.app, &frame.stream)
-                .contains(&peer.peer_id);
-            // Only push continuous media to active subscribers. Standby
-            // replicas get InitCache via Subscribe replies — flooding them
-            // with MediaFrames fills remote InjectQueues with no local players.
-            if subscribed {
-                let _ = peer.try_send(msg.clone());
-            }
-        }
+        let sinks = self.inbound_sinks.lock().clone();
+        let peers = self.peers.lock().clone();
+        self.subs
+            .for_each_peer(&frame.app, &frame.stream, |peer_id| {
+                if let Some(sink) = sinks.get(&peer_id) {
+                    if !sink.is_closed() && sink.try_send(msg.clone()).is_ok() {
+                        return;
+                    }
+                }
+                if let Some(peer) = peers.get(&peer_id) {
+                    if !peer.is_closed() {
+                        let _ = peer.try_send(msg.clone());
+                    }
+                }
+            });
     }
 
     /// Update local init cache from librtmp2 snapshot (optional).
@@ -861,4 +1077,24 @@ impl MediaHub {
         let _ = self.ensure_peer(peer_id, media_addr);
         Ok(())
     }
+}
+
+fn subscribe_denied_error(app: &str, stream: &str, generation: u64) -> MediaMessage {
+    MediaMessage::Error {
+        code: SUBSCRIBE_DENIED.to_string(),
+        message: subscribe_denied_payload(app, stream),
+        generation,
+    }
+}
+
+fn subscribe_denied_payload(app: &str, stream: &str) -> String {
+    format!("{app}\t{stream}")
+}
+
+fn parse_subscribe_denied(message: &str) -> Option<(String, String)> {
+    let (app, stream) = message.split_once('\t')?;
+    if app.is_empty() || stream.is_empty() {
+        return None;
+    }
+    Some((app.to_string(), stream.to_string()))
 }
