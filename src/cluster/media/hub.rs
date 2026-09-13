@@ -15,7 +15,7 @@ use crate::cluster::NodeId;
 use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::media::peer::{self, InboundMediaSink, MediaPeer};
-use crate::cluster::media::protocol::{SUBSCRIBE_DENIED, MediaMessage};
+use crate::cluster::media::protocol::{MediaMessage, SUBSCRIBE_DENIED};
 use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
 use crate::cluster::media::{InboundSubscribeGateFn, MediaMembershipFn};
@@ -438,11 +438,7 @@ impl MediaHub {
             std::collections::HashMap::new();
         let (mut rh, wh) = tokio::io::split(io);
         let sink = Arc::new(InboundMediaSink::spawn(peer_id, self.queue_mb, wh));
-        if let Some(old) = self
-            .inbound_sinks
-            .lock()
-            .insert(peer_id, Arc::clone(&sink))
-        {
+        if let Some(old) = self.inbound_sinks.lock().insert(peer_id, Arc::clone(&sink)) {
             old.close();
         }
         let result = async {
@@ -559,10 +555,7 @@ impl MediaHub {
         .await;
         {
             let mut sinks = self.inbound_sinks.lock();
-            if sinks
-                .get(&peer_id)
-                .is_some_and(|s| Arc::ptr_eq(s, &sink))
-            {
+            if sinks.get(&peer_id).is_some_and(|s| Arc::ptr_eq(s, &sink)) {
                 sinks.remove(&peer_id);
             }
         }
@@ -646,16 +639,14 @@ impl MediaHub {
                 let Some((app, stream)) = parse_subscribe_denied(&message) else {
                     return;
                 };
-                if !self
-                    .subs
-                    .peers_for_stream(&app, &stream)
-                    .contains(&peer_id)
-                {
+                if !self.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
                     return;
                 }
                 let n = {
                     let mut nacks = self.subscribe_nacks.lock();
-                    let e = nacks.entry((peer_id, app.clone(), stream.clone())).or_insert(0);
+                    let e = nacks
+                        .entry((peer_id, app.clone(), stream.clone()))
+                        .or_insert(0);
                     *e = e.saturating_add(1);
                     *e
                 };
@@ -678,11 +669,7 @@ impl MediaHub {
                     if hub.shutdown.load(Ordering::Relaxed) {
                         return;
                     }
-                    if !hub
-                        .subs
-                        .peers_for_stream(&app, &stream)
-                        .contains(&peer_id)
-                    {
+                    if !hub.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
                         return;
                     }
                     let epoch = hub.ownership.epoch_of(&app, &stream).unwrap_or(0);
