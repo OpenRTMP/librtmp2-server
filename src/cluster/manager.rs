@@ -2069,7 +2069,13 @@ impl ClusterManager {
                         NodeHealthState::Learner
                     };
                     self.health.set_local(restored);
-                    self.reconcile_publishers_after_isolation();
+                    if restored == NodeHealthState::Ready {
+                        self.reconcile_publishers_after_isolation();
+                    } else {
+                        for p in self.db.publisher_list_all() {
+                            self.force_unpublish_and_drain(&p.stream_id);
+                        }
+                    }
                 }
             }
         }

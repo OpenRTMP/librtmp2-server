@@ -843,25 +843,35 @@ impl Db {
     /// Returns `Some(false)` when the row is missing or not pending (stale
     /// finalize must be a no-op).
     pub fn stream_delete_if_pending(&self, id: &str) -> Option<bool> {
-        let pending = {
-            let conn = self.conn.lock();
-            match conn.query_row(
-                "SELECT pending_delete FROM streams WHERE id=?",
-                params![id],
-                |r| r.get::<_, i64>(0),
-            ) {
-                Ok(v) => Some(v != 0),
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Some(false),
-                Err(e) => {
-                    crate::log_error!("stream_delete_if_pending: lookup failed for {id}: {e}");
-                    return None;
-                }
+        let conn = self.conn.lock();
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                crate::log_error!("DB error starting pending-delete transaction: {e}");
+                return None;
             }
         };
-        if pending != Some(true) {
-            return Some(false);
+        // Conditional delete under the same lock/transaction so
+        // `stream_set_enabled` cannot restore the row in a gap before
+        // cascade. `ON DELETE CASCADE` drops publishers/players/stats/viewers/owners.
+        let result = tx.execute(
+            "DELETE FROM streams WHERE id=? AND pending_delete=1",
+            params![id],
+        );
+        match result {
+            Ok(rows) => match tx.commit() {
+                Ok(()) => Some(rows > 0),
+                Err(e) => {
+                    crate::log_error!("DB pending-delete commit error for {id}: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                crate::log_error!("DB pending-delete error for {id}: {e}");
+                let _ = tx.rollback();
+                None
+            }
         }
-        self.stream_delete(id)
     }
 
     /// Returns `Some(true)` = deleted, `Some(false)` = not found, `None` = DB error.

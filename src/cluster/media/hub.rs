@@ -338,12 +338,31 @@ impl MediaHub {
         if let Some(s) = self.inbound_sinks.lock().remove(&peer_id) {
             s.close();
         }
+        let nack_keys: Vec<_> = self
+            .subscribe_nacks
+            .lock()
+            .keys()
+            .filter(|(owner, _, _)| *owner == peer_id)
+            .cloned()
+            .collect();
         self.subscribe_nacks
             .lock()
             .retain(|(owner, _, _), _| *owner != peer_id);
-        self.subscribe_gens
-            .lock()
-            .retain(|(owner, _, _), _| *owner != peer_id);
+        let streams = self.subs.streams_for_peer(peer_id);
+        {
+            let mut gens = self.subscribe_gens.lock();
+            for key in nack_keys {
+                gens.entry(key).or_insert(0);
+            }
+            for (app, stream) in streams {
+                gens.entry((peer_id, app, stream)).or_insert(0);
+            }
+            for ((owner, _, _), generation) in gens.iter_mut() {
+                if *owner == peer_id {
+                    *generation = generation.wrapping_add(1);
+                }
+            }
+        }
         self.subs.clear_peer(peer_id);
     }
 
@@ -366,9 +385,29 @@ impl MediaHub {
     }
 
     fn clear_subscribe_nacks(&self, peer_id: NodeId, app: &str, stream: &str) {
-        self.subscribe_nacks
+        let had = self
+            .subscribe_nacks
             .lock()
-            .remove(&Self::sub_key(peer_id, app, stream));
+            .remove(&Self::sub_key(peer_id, app, stream))
+            .is_some();
+        if had {
+            self.bump_sub_gen(peer_id, app, stream);
+        }
+    }
+
+    fn subscribe_message(
+        &self,
+        peer_id: NodeId,
+        app: &str,
+        stream: &str,
+        epoch: u64,
+    ) -> MediaMessage {
+        MediaMessage::Subscribe {
+            app: app.to_string(),
+            stream: stream.to_string(),
+            epoch,
+            generation: self.sub_gen(peer_id, app, stream),
+        }
     }
 
     fn schedule_subscribe_retry(
@@ -408,11 +447,7 @@ impl MediaHub {
         let Some(peer) = self.peers.lock().get(&peer_id).cloned() else {
             return;
         };
-        let msg = MediaMessage::Subscribe {
-            app: app.clone(),
-            stream: stream.clone(),
-            epoch,
-        };
+        let msg = self.subscribe_message(peer_id, &app, &stream, epoch);
         if peer.try_send(msg.clone()).is_ok() || peer.try_send(msg).is_ok() {
             return;
         }
@@ -531,6 +566,7 @@ impl MediaHub {
                         app,
                         stream,
                         epoch: _,
+                        generation,
                     } => {
                         if !self.inbound_subscribe_allowed(peer_id, &app, &stream).await {
                             tracing::warn!(
@@ -540,10 +576,7 @@ impl MediaHub {
                                 "media subscribe rejected: peer not authorized"
                             );
                             let _ = sink
-                                .send(MediaMessage::Error {
-                                    code: SUBSCRIBE_DENIED.to_string(),
-                                    message: subscribe_denied_payload(&app, &stream),
-                                })
+                                .send(subscribe_denied_error(&app, &stream, generation))
                                 .await;
                             continue;
                         }
@@ -566,6 +599,9 @@ impl MediaHub {
                         if self
                             .subs
                             .add_with(peer_id, &app, &stream, || {
+                                if sink.is_closed() {
+                                    return Err(());
+                                }
                                 if let Some(msg) = init_msg {
                                     sink.try_send(msg)
                                 } else {
@@ -574,10 +610,12 @@ impl MediaHub {
                             })
                             .is_err()
                         {
-                            let _ = sink.try_send(MediaMessage::Error {
-                                code: SUBSCRIBE_DENIED.to_string(),
-                                message: subscribe_denied_payload(&app, &stream),
-                            });
+                            if sink.is_closed() {
+                                return Err(std::io::Error::other("inbound media sink closed"));
+                            }
+                            let _ = sink.try_send(subscribe_denied_error(
+                                &app, &stream, generation,
+                            ));
                             continue;
                         }
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
@@ -729,7 +767,11 @@ impl MediaHub {
                 self.cache.put(&app, &stream, entry.clone());
                 self.inject_init_cache_live(app, stream, entry);
             }
-            MediaMessage::Error { code, message } => {
+            MediaMessage::Error {
+                code,
+                message,
+                generation: req_gen,
+            } => {
                 if code != SUBSCRIBE_DENIED {
                     return;
                 }
@@ -737,6 +779,10 @@ impl MediaHub {
                     return;
                 };
                 if !self.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
+                    return;
+                }
+                let generation = self.sub_gen(peer_id, &app, &stream);
+                if req_gen != 0 && req_gen != generation {
                     return;
                 }
                 let n = {
@@ -759,7 +805,6 @@ impl MediaHub {
                     );
                     return;
                 }
-                let generation = self.sub_gen(peer_id, &app, &stream);
                 self.schedule_subscribe_retry(
                     peer_id,
                     app,
@@ -887,7 +932,7 @@ impl MediaHub {
             // Soft control: if the queue rejects, leave the refcount in place
             // for a later reconnect/resubscribe — this path is only entered
             // after a fresh connection already exists.
-            let _ = peer.try_send(MediaMessage::Subscribe { app, stream, epoch });
+            let _ = peer.try_send(self.subscribe_message(peer_id, &app, &stream, epoch));
         }
     }
 
@@ -907,22 +952,14 @@ impl MediaHub {
         // this peer, including the one just added above — sending it again
         // here would just double the owner's per-connection subscribe tally.
         if !fresh {
-            let ok = peer.try_send(MediaMessage::Subscribe {
-                app: app.to_string(),
-                stream: stream.to_string(),
-                epoch,
-            });
+            let ok = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
             if ok.is_err() {
                 // Sole first-subscriber: roll back so a later player retries.
                 // Concurrent holders already saw add==false and expect wire
                 // Subscribe — keep our refcount and retry the send instead of
                 // leaving them with refs and no owner fan-out.
                 if !self.subs.remove_if_sole(peer_id, app, stream) {
-                    let _ = peer.try_send(MediaMessage::Subscribe {
-                        app: app.to_string(),
-                        stream: stream.to_string(),
-                        epoch,
-                    });
+                    let _ = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
                 } else {
                     self.bump_sub_gen(peer_id, app, stream);
                 }
@@ -981,8 +1018,7 @@ impl MediaHub {
         self.subs
             .for_each_peer(&frame.app, &frame.stream, |peer_id| {
                 if let Some(sink) = sinks.get(&peer_id) {
-                    if !sink.is_closed() {
-                        let _ = sink.try_send(msg.clone());
+                    if !sink.is_closed() && sink.try_send(msg.clone()).is_ok() {
                         return;
                     }
                 }
@@ -1041,6 +1077,14 @@ impl MediaHub {
     pub async fn connect_peer(&self, peer_id: NodeId, media_addr: &str) -> Result<(), String> {
         let _ = self.ensure_peer(peer_id, media_addr);
         Ok(())
+    }
+}
+
+fn subscribe_denied_error(app: &str, stream: &str, generation: u64) -> MediaMessage {
+    MediaMessage::Error {
+        code: SUBSCRIBE_DENIED.to_string(),
+        message: subscribe_denied_payload(app, stream),
+        generation,
     }
 }
 

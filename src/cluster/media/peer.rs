@@ -11,7 +11,7 @@ use bytes::BytesMut;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cluster::NodeId;
@@ -174,12 +174,10 @@ impl MediaPeer {
             return Err(());
         }
         let approx = approx_size(&msg);
-        let cur = self.queue_bytes.load(Ordering::Relaxed);
-        if cur.saturating_add(approx) > self.max_queue_bytes {
+        if try_reserve_queue_bytes(&self.queue_bytes, self.max_queue_bytes, approx).is_err() {
             tracing::warn!(peer = self.peer_id, "media queue full — dropping frame");
             return Err(());
         }
-        self.queue_bytes.fetch_add(approx, Ordering::Relaxed);
         self.tx.try_send(msg).map_err(|_| {
             self.queue_bytes.fetch_sub(approx, Ordering::Relaxed);
         })
@@ -191,6 +189,28 @@ impl MediaPeer {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+fn try_reserve_queue_bytes(
+    queue_bytes: &AtomicUsize,
+    max_queue_bytes: usize,
+    approx: usize,
+) -> Result<(), ()> {
+    loop {
+        let cur = queue_bytes.load(Ordering::Acquire);
+        let Some(new) = cur.checked_add(approx) else {
+            return Err(());
+        };
+        if new > max_queue_bytes {
+            return Err(());
+        }
+        if queue_bytes
+            .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(());
+        }
     }
 }
 
@@ -396,6 +416,7 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
             &MediaMessage::Error {
                 code: "VERSION".into(),
                 message: "unsupported media protocol".into(),
+                generation: 0,
             },
         )
         .await?;
@@ -468,6 +489,7 @@ pub struct InboundMediaSink {
     queue_bytes: Arc<AtomicUsize>,
     max_queue_bytes: usize,
     closed: Arc<AtomicBool>,
+    close_notify: Arc<Notify>,
 }
 
 impl InboundMediaSink {
@@ -481,18 +503,41 @@ impl InboundMediaSink {
         let (tx, mut rx) = mpsc::channel::<MediaMessage>(256);
         let queue_bytes = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let close_notify = Arc::new(Notify::new());
         let qb = Arc::clone(&queue_bytes);
         let cl = Arc::clone(&closed);
+        let notify = Arc::clone(&close_notify);
         tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
+            loop {
                 if cl.load(Ordering::Relaxed) {
                     break;
                 }
-                let size = approx_size(&msg);
-                qb.fetch_sub(size.min(qb.load(Ordering::Relaxed)), Ordering::Relaxed);
-                match tokio::time::timeout(WRITE_TIMEOUT, write_media_frame(&mut wh, &msg)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) | Err(_) => break,
+                tokio::select! {
+                    biased;
+                    _ = notify.notified() => {
+                        if cl.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if cl.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    msg = rx.recv() => {
+                        let Some(msg) = msg else {
+                            break;
+                        };
+                        if cl.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let size = approx_size(&msg);
+                        qb.fetch_sub(size.min(qb.load(Ordering::Relaxed)), Ordering::Relaxed);
+                        match tokio::time::timeout(WRITE_TIMEOUT, write_media_frame(&mut wh, &msg)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) | Err(_) => break,
+                        }
+                    }
                 }
             }
             cl.store(true, Ordering::Relaxed);
@@ -503,6 +548,7 @@ impl InboundMediaSink {
             queue_bytes,
             max_queue_bytes,
             closed,
+            close_notify,
         }
     }
 
@@ -511,15 +557,13 @@ impl InboundMediaSink {
             return Err(());
         }
         let approx = approx_size(&msg);
-        let cur = self.queue_bytes.load(Ordering::Relaxed);
-        if cur.saturating_add(approx) > self.max_queue_bytes {
+        if try_reserve_queue_bytes(&self.queue_bytes, self.max_queue_bytes, approx).is_err() {
             tracing::warn!(
                 peer = self.peer_id,
                 "inbound media queue full — dropping frame"
             );
             return Err(());
         }
-        self.queue_bytes.fetch_add(approx, Ordering::Relaxed);
         self.tx.try_send(msg).map_err(|_| {
             self.queue_bytes.fetch_sub(approx, Ordering::Relaxed);
         })
@@ -530,15 +574,13 @@ impl InboundMediaSink {
             return Err(());
         }
         let approx = approx_size(&msg);
-        let cur = self.queue_bytes.load(Ordering::Relaxed);
-        if cur.saturating_add(approx) > self.max_queue_bytes {
+        if try_reserve_queue_bytes(&self.queue_bytes, self.max_queue_bytes, approx).is_err() {
             tracing::warn!(
                 peer = self.peer_id,
                 "inbound media queue full — dropping frame"
             );
             return Err(());
         }
-        self.queue_bytes.fetch_add(approx, Ordering::Relaxed);
         self.tx.send(msg).await.map_err(|_| {
             self.queue_bytes.fetch_sub(
                 approx.min(self.queue_bytes.load(Ordering::Relaxed)),
@@ -553,5 +595,6 @@ impl InboundMediaSink {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+        self.close_notify.notify_waiters();
     }
 }

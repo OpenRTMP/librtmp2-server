@@ -26,6 +26,9 @@ pub enum MediaMessage {
         app: String,
         stream: String,
         epoch: u64,
+        /// Subscriber-local generation; echoed on `SUBSCRIBE_DENIED`.
+        #[serde(default)]
+        generation: u64,
     },
     Unsubscribe {
         app: String,
@@ -65,6 +68,9 @@ pub enum MediaMessage {
     Error {
         code: String,
         message: String,
+        /// Echoed `Subscribe.generation` for `SUBSCRIBE_DENIED` (`0` = legacy).
+        #[serde(default)]
+        generation: u64,
     },
     StatsReq {
         stream_id: String,
