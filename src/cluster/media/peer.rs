@@ -456,3 +456,94 @@ pub(crate) async fn accept_tls_then_auth(
     }
     Ok((peer_id, io))
 }
+
+/// Write pump for an accepted inbound media session.
+///
+/// Owners receive `Subscribe` on this socket; live `MediaFrame`s must go back
+/// on the same connection when the owner has no outbound `MediaPeer` (default
+/// plaintext clustering never dials from heartbeats).
+pub struct InboundMediaSink {
+    pub peer_id: NodeId,
+    tx: mpsc::Sender<MediaMessage>,
+    queue_bytes: Arc<AtomicUsize>,
+    max_queue_bytes: usize,
+    closed: Arc<AtomicBool>,
+}
+
+impl InboundMediaSink {
+    pub fn spawn<W>(peer_id: NodeId, max_queue_mb: u32, mut wh: W) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let max_queue_bytes = (max_queue_mb as usize)
+            .saturating_mul(1024 * 1024)
+            .max(1024 * 1024);
+        let (tx, mut rx) = mpsc::channel::<MediaMessage>(256);
+        let queue_bytes = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let qb = Arc::clone(&queue_bytes);
+        let cl = Arc::clone(&closed);
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if cl.load(Ordering::Relaxed) {
+                    break;
+                }
+                let size = approx_size(&msg);
+                qb.fetch_sub(size.min(qb.load(Ordering::Relaxed)), Ordering::Relaxed);
+                match tokio::time::timeout(WRITE_TIMEOUT, write_media_frame(&mut wh, &msg)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+            cl.store(true, Ordering::Relaxed);
+        });
+        Self {
+            peer_id,
+            tx,
+            queue_bytes,
+            max_queue_bytes,
+            closed,
+        }
+    }
+
+    pub fn try_send(&self, msg: MediaMessage) -> Result<(), ()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(());
+        }
+        let approx = approx_size(&msg);
+        let cur = self.queue_bytes.load(Ordering::Relaxed);
+        if cur.saturating_add(approx) > self.max_queue_bytes {
+            tracing::warn!(
+                peer = self.peer_id,
+                "inbound media queue full — dropping frame"
+            );
+            return Err(());
+        }
+        self.queue_bytes.fetch_add(approx, Ordering::Relaxed);
+        self.tx.try_send(msg).map_err(|_| {
+            self.queue_bytes.fetch_sub(approx, Ordering::Relaxed);
+        })
+    }
+
+    pub async fn send(&self, msg: MediaMessage) -> Result<(), ()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(());
+        }
+        let approx = approx_size(&msg);
+        self.queue_bytes.fetch_add(approx, Ordering::Relaxed);
+        self.tx.send(msg).await.map_err(|_| {
+            self.queue_bytes.fetch_sub(
+                approx.min(self.queue_bytes.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
+        })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+}

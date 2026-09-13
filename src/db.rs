@@ -133,6 +133,15 @@ pub enum ViewerAddError {
     Db,
 }
 
+/// Outcome of [`Db::viewer_delete_if_not_last`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerDeleteResult {
+    Deleted,
+    NotFound,
+    LastRemaining,
+    DbError,
+}
+
 /// Result of a single-row lookup: found, not found, or a real DB error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbLookup<T> {
@@ -1062,6 +1071,57 @@ impl Db {
             Err(e) => {
                 crate::log_error!("viewer_delete error for {viewer_id}: {e}");
                 None
+            }
+        }
+    }
+
+    /// Delete a play key only when another key remains. Holds the DB mutex
+    /// across the count and delete so two concurrent last-key deletes cannot
+    /// both succeed.
+    pub fn viewer_delete_if_not_last(
+        &self,
+        stream_id: &str,
+        viewer_id: &str,
+    ) -> ViewerDeleteResult {
+        let conn = self.conn.lock();
+        let count: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM stream_viewers WHERE stream_id=?",
+            params![stream_id],
+            |r| r.get(0),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                crate::log_error!("viewer_delete_if_not_last count failed for {stream_id}: {e}");
+                return ViewerDeleteResult::DbError;
+            }
+        };
+        let exists = match conn.query_row(
+            "SELECT 1 FROM stream_viewers WHERE stream_id=? AND id=?",
+            params![stream_id, viewer_id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                crate::log_error!("viewer_delete_if_not_last lookup failed for {viewer_id}: {e}");
+                return ViewerDeleteResult::DbError;
+            }
+        };
+        if !exists {
+            return ViewerDeleteResult::NotFound;
+        }
+        if count <= 1 {
+            return ViewerDeleteResult::LastRemaining;
+        }
+        match conn.execute(
+            "DELETE FROM stream_viewers WHERE stream_id=? AND id=?",
+            params![stream_id, viewer_id],
+        ) {
+            Ok(rows) if rows > 0 => ViewerDeleteResult::Deleted,
+            Ok(_) => ViewerDeleteResult::NotFound,
+            Err(e) => {
+                crate::log_error!("viewer_delete_if_not_last delete failed for {viewer_id}: {e}");
+                ViewerDeleteResult::DbError
             }
         }
     }

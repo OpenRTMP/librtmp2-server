@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::db::{Db, Stream, StreamAddError, StreamViewer};
+use crate::db::{Db, Stream, StreamAddError, StreamViewer, ViewerDeleteResult};
 
 #[cfg(feature = "cluster")]
 use crate::cluster::ClusterManager;
@@ -97,7 +97,7 @@ impl StateCoordinator {
 
     pub fn finalize_delete_stream(&self, id: &str) -> Result<(), CoordError> {
         match self {
-            StateCoordinator::Standalone(db) => match db.stream_delete(id) {
+            StateCoordinator::Standalone(db) => match db.stream_delete_if_pending(id) {
                 Some(true) => Ok(()),
                 Some(false) => Err(CoordError::NotFound),
                 None => Err(CoordError::Db),
@@ -138,10 +138,12 @@ impl StateCoordinator {
 
     pub fn delete_viewer(&self, stream_id: &str, viewer_id: &str) -> Result<(), CoordError> {
         match self {
-            StateCoordinator::Standalone(db) => match db.viewer_delete(stream_id, viewer_id) {
-                Some(true) => Ok(()),
-                Some(false) => Err(CoordError::NotFound),
-                None => Err(CoordError::Db),
+            StateCoordinator::Standalone(db) => match db.viewer_delete_if_not_last(stream_id, viewer_id)
+            {
+                ViewerDeleteResult::Deleted => Ok(()),
+                ViewerDeleteResult::NotFound => Err(CoordError::NotFound),
+                ViewerDeleteResult::LastRemaining => Err(CoordError::Conflict),
+                ViewerDeleteResult::DbError => Err(CoordError::Db),
             },
             #[cfg(feature = "cluster")]
             StateCoordinator::Cluster(mgr) => mgr.delete_viewer(stream_id, viewer_id),

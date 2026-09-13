@@ -80,6 +80,13 @@ impl SubscriptionTable {
         g.retain(|(p, _, _), _| *p != peer);
     }
 
+    /// Drop every ref for this peer+stream (exhausted Subscribe NACK retries).
+    pub fn clear_entry(&self, peer: u64, app: &str, stream: &str) {
+        self.inner
+            .lock()
+            .remove(&(peer, app.to_string(), stream.to_string()));
+    }
+
     pub fn count(&self) -> usize {
         self.inner.lock().len()
     }

@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const MEDIA_PROTOCOL_VERSION: u16 = 1;
+/// `Error.code` when an inbound `Subscribe` is rejected after the gate window.
+pub const SUBSCRIBE_DENIED: &str = "subscribe_denied";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MediaMessage {

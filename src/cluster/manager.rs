@@ -348,15 +348,20 @@ impl ClusterManager {
                         media_a.clone(),
                     );
                     if counts_hb.config.tls_enabled {
-                        if let (Some(c), Some(m)) = (ctrl, media_a) {
+                        if let (Some(c), Some(m)) = (ctrl.as_ref(), media_a.as_ref()) {
                             meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
-                            network_hb.upsert_node(info.node_id, c);
-                            let hub = Arc::clone(&media_hb);
-                            let mid = info.node_id;
-                            tokio::spawn(async move {
-                                let _ = hub.connect_peer(mid, &m).await;
-                            });
+                            network_hb.upsert_node(info.node_id, c.clone());
                         }
+                    }
+                    // Dial known membership media addrs in both TLS and plaintext.
+                    // Plaintext still must not `set_addrs` from advertised values;
+                    // `media_a` is already the trusted join/topology address.
+                    if let Some(m) = media_a {
+                        let hub = Arc::clone(&media_hb);
+                        let mid = info.node_id;
+                        tokio::spawn(async move {
+                            let _ = hub.connect_peer(mid, &m).await;
+                        });
                     }
                     // Plaintext clustering explicitly uses possession of CLUSTER_SECRET
                     // plus Raft membership as its trust boundary; mTLS strengthens that
@@ -2058,7 +2063,12 @@ impl ClusterManager {
                     }
                 } else if self.health.local() == NodeHealthState::Isolated {
                     crate::log_info!("Cluster: quorum restored");
-                    self.health.set_local(NodeHealthState::Ready);
+                    let restored = if voters.iter().any(|&id| id == self.config.node_id) {
+                        NodeHealthState::Ready
+                    } else {
+                        NodeHealthState::Learner
+                    };
+                    self.health.set_local(restored);
                     self.reconcile_publishers_after_isolation();
                 }
             }
