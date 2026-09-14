@@ -1455,10 +1455,9 @@ fn resolve_active_hls_session(root: &Path, stream_id: &str) -> Result<String, St
 async fn active_hls_redirect(state: &HlsState, stream_id: &str, key: Option<&str>) -> Response {
     let root = state.root.clone();
     let path_stream_id = stream_id.to_owned();
-    let result = tokio::task::spawn_blocking(move || {
-        resolve_active_hls_session(&root, &path_stream_id)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || resolve_active_hls_session(&root, &path_stream_id))
+            .await;
     let session = match result {
         Ok(Ok(session)) => session,
         Ok(Err(status)) => return status.into_response(),
