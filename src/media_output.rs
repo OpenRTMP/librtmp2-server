@@ -1442,22 +1442,26 @@ fn latest_hls_session(stream_root: &Path) -> io::Result<String> {
     latest.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no active HLS session"))
 }
 
-async fn active_hls_redirect(state: &HlsState, stream_id: &str, key: Option<&str>) -> Response {
-    let root = match fs::canonicalize(&state.root) {
-        Ok(root) => root,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let stream_root = state.root.join(stream_id);
-    let stream_root = match fs::canonicalize(&stream_root) {
-        Ok(path) => path,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    if !stream_root.starts_with(&root) {
-        return StatusCode::BAD_REQUEST.into_response();
+fn resolve_active_hls_session(root: &Path, stream_id: &str) -> Result<String, StatusCode> {
+    let hls_root = fs::canonicalize(root).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let stream_root = root.join(stream_id);
+    let stream_root = fs::canonicalize(&stream_root).map_err(|_| StatusCode::NOT_FOUND)?;
+    if !stream_root.starts_with(&hls_root) {
+        return Err(StatusCode::BAD_REQUEST);
     }
-    let result = tokio::task::spawn_blocking(move || latest_hls_session(&stream_root)).await;
-    let Ok(Ok(session)) = result else {
-        return StatusCode::NOT_FOUND.into_response();
+    latest_hls_session(&stream_root).map_err(|_| StatusCode::NOT_FOUND)
+}
+
+async fn active_hls_redirect(state: &HlsState, stream_id: &str, key: Option<&str>) -> Response {
+    let root = state.root.clone();
+    let path_stream_id = stream_id.to_owned();
+    let result =
+        tokio::task::spawn_blocking(move || resolve_active_hls_session(&root, &path_stream_id))
+            .await;
+    let session = match result {
+        Ok(Ok(session)) => session,
+        Ok(Err(status)) => return status.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let mut location = format!("/hls/{}/{session}/index.m3u8", url_component(stream_id));
     if let Some(key) = key {
