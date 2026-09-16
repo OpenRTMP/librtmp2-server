@@ -22,7 +22,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::db::{Db, DbLookup, Player};
+use crate::db::{Db, DbLookup, Player, Stream, StreamViewer};
 use librtmp2::session::conn::RelayFrame;
 use librtmp2::types::FrameType;
 use tokio_util::io::ReaderStream;
@@ -1410,6 +1410,14 @@ impl HlsSessionRegistry {
         }
     }
 
+    fn release_expired(db: &Db, session: &HlsViewerSession) -> bool {
+        match db.stream_get(&session.player.stream_id) {
+            DbLookup::Missing => true,
+            DbLookup::Failed => false,
+            DbLookup::Ok(_) => Self::deactivate(db, session),
+        }
+    }
+
     fn purge_stale_locked(
         guard: &mut HashMap<String, HashMap<IpAddr, HlsViewerSession>>,
         db: &Db,
@@ -1421,7 +1429,7 @@ impl HlsSessionRegistry {
                 let expired = now
                     .checked_duration_since(session.last_seen)
                     .is_some_and(|age| age >= ttl);
-                !expired || !Self::deactivate(db, session)
+                !expired || !Self::release_expired(db, session)
             });
             !entries.is_empty()
         });
@@ -1435,10 +1443,8 @@ impl HlsSessionRegistry {
     fn reserve_or_renew(
         &self,
         db: &Db,
-        viewer_id: &str,
-        stream_id: &str,
-        app: &str,
-        stream_name: &str,
+        viewer: &StreamViewer,
+        stream: &Stream,
         client: IpAddr,
         ttl: Duration,
         remote_sessions: u64,
@@ -1448,14 +1454,14 @@ impl HlsSessionRegistry {
         Self::purge_stale_locked(&mut guard, db, now, ttl);
 
         if let Some(existing) = guard
-            .get_mut(viewer_id)
+            .get_mut(&viewer.id)
             .and_then(|entries| entries.get_mut(&client))
         {
             existing.last_seen = now;
             return true;
         }
 
-        let local = db.player_active_count_for_viewer(viewer_id);
+        let local = db.player_active_count_for_viewer(&viewer.id);
         if local.saturating_add(remote_sessions) >= crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64 {
             return false;
         }
@@ -1469,10 +1475,10 @@ impl HlsSessionRegistry {
         };
         let player = Player {
             id: player_id,
-            stream_id: stream_id.to_string(),
-            viewer_id: viewer_id.to_string(),
-            app: app.to_string(),
-            stream_name: stream_name.to_string(),
+            stream_id: stream.id.clone(),
+            viewer_id: viewer.id.clone(),
+            app: stream.app.clone(),
+            stream_name: stream.name.clone(),
             active: true,
             connected_at: crate::db::now_ts(),
             ..Default::default()
@@ -1485,7 +1491,7 @@ impl HlsSessionRegistry {
             return false;
         }
 
-        guard.entry(viewer_id.to_string()).or_default().insert(
+        guard.entry(viewer.id.clone()).or_default().insert(
             client,
             HlsViewerSession {
                 last_seen: now,
@@ -1585,10 +1591,8 @@ fn authorize_hls_request(
         .unwrap_or(0);
     if !state.sessions.reserve_or_renew(
         &state.db,
-        &viewer.id,
-        &stream.id,
-        &stream.app,
-        &stream.name,
+        &viewer,
+        &stream,
         client,
         state.session_ttl,
         remote,
@@ -1918,45 +1922,27 @@ mod tests {
             assert!(db.player_try_acquire(&player));
         }
         assert!(!sessions.reserve_or_renew(
-            &db,
-            &viewer.id,
-            &stream.id,
-            &stream.app,
-            &stream.name,
-            client,
-            ttl,
-            0,
+            &db, &viewer, &stream, client, ttl, 0,
         ));
 
         db.players_deactivate_for_viewer(&viewer.id);
         for i in 0..cap {
             assert!(sessions.reserve_or_renew(
                 &db,
-                &viewer.id,
-                &stream.id,
-                &stream.app,
-                &stream.name,
+                &viewer,
+                &stream,
                 IpAddr::from([198, 51, 100, i as u8]),
                 ttl,
                 0,
             ));
         }
         assert!(!sessions.reserve_or_renew(
-            &db,
-            &viewer.id,
-            &stream.id,
-            &stream.app,
-            &stream.name,
-            client,
-            ttl,
-            0,
+            &db, &viewer, &stream, client, ttl, 0,
         ));
         assert!(sessions.reserve_or_renew(
             &db,
-            &viewer.id,
-            &stream.id,
-            &stream.app,
-            &stream.name,
+            &viewer,
+            &stream,
             IpAddr::from([198, 51, 100, 0]),
             ttl,
             0,
