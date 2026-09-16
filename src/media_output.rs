@@ -12,9 +12,9 @@ use axum::{Router, body::Body};
 use parking_lot::Mutex as ParkingMutex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1637,9 +1637,7 @@ async fn handle_hls(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let client = addr.ip();
-    if let Err(status) =
-        authorize_hls_request(&state, &stream_id, query.key.as_deref(), client)
-    {
+    if let Err(status) = authorize_hls_request(&state, &stream_id, query.key.as_deref(), client) {
         return status.into_response();
     }
     if raw_path == "index.m3u8" {
@@ -1788,7 +1786,9 @@ mod tests {
     #[test]
     fn hls_connection_cap_counts_rtmp_and_hls_clients() {
         use crate::db::{Db, Stream, StreamViewer};
-        use crate::keygen::{PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY, PREFIX_STATS_KEY, PREFIX_VIEWER_ID};
+        use crate::keygen::{
+            PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY, PREFIX_STATS_KEY, PREFIX_VIEWER_ID,
+        };
 
         let db = Arc::new(Db::open(":memory:").unwrap());
         let stream = Stream {
@@ -1827,22 +1827,24 @@ mod tests {
             };
             assert!(db.player_try_acquire(&player));
         }
-        assert!(viewer_connection_cap_reached(&db, &sessions, &viewer.id, client, 0));
+        assert!(viewer_connection_cap_reached(
+            &db, &sessions, &viewer.id, client, 0
+        ));
 
         db.players_deactivate_for_viewer(&viewer.id);
         for i in 0..cap {
             sessions.touch(&viewer.id, IpAddr::from([198, 51, 100, i as u8]));
         }
-        assert!(viewer_connection_cap_reached(&db, &sessions, &viewer.id, client, 0));
-        assert!(
-            !viewer_connection_cap_reached(
-                &db,
-                &sessions,
-                &viewer.id,
-                IpAddr::from([198, 51, 100, 0]),
-                0
-            )
-        );
+        assert!(viewer_connection_cap_reached(
+            &db, &sessions, &viewer.id, client, 0
+        ));
+        assert!(!viewer_connection_cap_reached(
+            &db,
+            &sessions,
+            &viewer.id,
+            IpAddr::from([198, 51, 100, 0]),
+            0
+        ));
     }
 
     #[test]

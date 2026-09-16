@@ -891,7 +891,8 @@ impl ServerApp {
                         .cluster_manager()
                         .map(|mgr| mgr.remote_viewer_session_count_cached(viewer_id))
                         .unwrap_or(0)
-                }) as crate::media_output::ViewerRemoteSessionCountFn)
+                })
+                    as crate::media_output::ViewerRemoteSessionCountFn)
             };
             #[cfg(not(feature = "cluster"))]
             let remote_viewer_sessions = None;
