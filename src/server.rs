@@ -900,6 +900,8 @@ impl ServerApp {
                 media_output_config.hls_path.clone(),
                 Arc::clone(&self.db),
                 media_output_config.hls_require_key,
+                media_output_config.hls_time_secs,
+                self.config.http_trusted_proxies.clone(),
                 remote_viewer_sessions,
             )
             .layer(axum::middleware::from_fn_with_state(
