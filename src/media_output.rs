@@ -14,6 +14,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -21,7 +22,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::db::{Db, DbLookup};
+use crate::db::{Db, DbLookup, Player, Stream, StreamViewer};
 use librtmp2::session::conn::RelayFrame;
 use librtmp2::types::FrameType;
 use tokio_util::io::ReaderStream;
@@ -1374,11 +1375,144 @@ fn flv_tag(frame_type: FrameType, timestamp: u32, payload: &[u8]) -> Option<Vec<
     Some(out)
 }
 
+fn hls_session_ttl(segment_secs: u32) -> Duration {
+    let scaled = (segment_secs as u64).saturating_mul(2).saturating_add(5);
+    Duration::from_secs(scaled.max(30))
+}
+
+#[derive(Debug, Clone)]
+struct HlsViewerSession {
+    last_seen: Instant,
+    player: Player,
+}
+
+/// Tracks distinct HLS clients while reserving their slots through the same
+/// `players` table used by RTMP. This makes HLS↔RTMP admission atomic at the
+/// DB layer and also causes cluster heartbeats to include HLS sessions.
+#[derive(Default)]
+struct HlsSessionRegistry {
+    inner: ParkingMutex<HashMap<String, HashMap<IpAddr, HlsViewerSession>>>,
+}
+
+impl HlsSessionRegistry {
+    fn deactivate(db: &Db, session: &HlsViewerSession) -> bool {
+        let mut player = session.player.clone();
+        player.active = false;
+        if db.player_update(&player.id, &player) {
+            true
+        } else {
+            crate::log_warn!(
+                "HLS: failed to release viewer slot {} for viewer {}",
+                player.id,
+                player.viewer_id
+            );
+            false
+        }
+    }
+
+    fn release_expired(db: &Db, session: &HlsViewerSession) -> bool {
+        match db.stream_get(&session.player.stream_id) {
+            DbLookup::Missing => true,
+            DbLookup::Failed => false,
+            DbLookup::Ok(_) => Self::deactivate(db, session),
+        }
+    }
+
+    fn purge_stale_locked(
+        guard: &mut HashMap<String, HashMap<IpAddr, HlsViewerSession>>,
+        db: &Db,
+        now: Instant,
+        ttl: Duration,
+    ) {
+        guard.retain(|_, entries| {
+            entries.retain(|_, session| {
+                let expired = now
+                    .checked_duration_since(session.last_seen)
+                    .is_some_and(|age| age >= ttl);
+                !expired || !Self::release_expired(db, session)
+            });
+            !entries.is_empty()
+        });
+    }
+
+    fn purge_stale(&self, db: &Db, ttl: Duration) {
+        let mut guard = self.inner.lock();
+        Self::purge_stale_locked(&mut guard, db, Instant::now(), ttl);
+    }
+
+    fn reserve_or_renew(
+        &self,
+        db: &Db,
+        viewer: &StreamViewer,
+        stream: &Stream,
+        client: IpAddr,
+        ttl: Duration,
+        remote_sessions: u64,
+    ) -> bool {
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+        Self::purge_stale_locked(&mut guard, db, now, ttl);
+
+        if let Some(existing) = guard
+            .get_mut(&viewer.id)
+            .and_then(|entries| entries.get_mut(&client))
+        {
+            existing.last_seen = now;
+            return true;
+        }
+
+        let local = db.player_active_count_for_viewer(&viewer.id);
+        if local.saturating_add(remote_sessions) >= crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64 {
+            return false;
+        }
+
+        let player_id = match crate::keygen::keygen_stream_key("hls_") {
+            Ok(id) => id,
+            Err(e) => {
+                crate::log_error!("HLS: viewer session id generation failed: {e}");
+                return false;
+            }
+        };
+        let player = Player {
+            id: player_id,
+            stream_id: stream.id.clone(),
+            viewer_id: viewer.id.clone(),
+            app: stream.app.clone(),
+            stream_name: stream.name.clone(),
+            active: true,
+            connected_at: crate::db::now_ts(),
+            ..Default::default()
+        };
+
+        // `player_try_acquire` performs the local count+insert in one SQLite
+        // transaction. RTMP uses the same method, so an HLS/RTMP race cannot
+        // over-admit the play key on this node.
+        if !db.player_try_acquire(&player) {
+            return false;
+        }
+
+        guard.entry(viewer.id.clone()).or_default().insert(
+            client,
+            HlsViewerSession {
+                last_seen: now,
+                player,
+            },
+        );
+        true
+    }
+}
+
+pub type ViewerRemoteSessionCountFn = Arc<dyn Fn(&str) -> u64 + Send + Sync>;
+
 #[derive(Clone)]
 struct HlsState {
     root: PathBuf,
     db: Arc<Db>,
     require_key: bool,
+    sessions: Arc<HlsSessionRegistry>,
+    session_ttl: Duration,
+    trusted_proxies: Arc<Vec<IpAddr>>,
+    remote_viewer_sessions: Option<ViewerRemoteSessionCountFn>,
 }
 
 #[derive(Deserialize)]
@@ -1388,11 +1522,40 @@ struct HlsQuery {
 
 /// Serve generated HLS from the existing HTTP listener. When key protection
 /// is enabled, the same enabled play/viewer keys accepted by RTMP are used.
-pub fn hls_router(root: PathBuf, db: Arc<Db>, require_key: bool) -> Router {
+pub fn hls_router(
+    root: PathBuf,
+    db: Arc<Db>,
+    require_key: bool,
+    hls_time_secs: u32,
+    trusted_proxies: Vec<IpAddr>,
+    remote_viewer_sessions: Option<ViewerRemoteSessionCountFn>,
+) -> Router {
+    let session_ttl = hls_session_ttl(hls_time_secs);
+    let sessions = Arc::new(HlsSessionRegistry::default());
+
+    // Expired HLS reservations must be released even if that viewer never
+    // sends another request; otherwise stale DB rows could block later RTMP
+    // viewers indefinitely. Sweep all viewer buckets in the background.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let cleanup_sessions = Arc::clone(&sessions);
+        let cleanup_db = Arc::clone(&db);
+        let interval = Duration::from_secs((session_ttl.as_secs() / 2).clamp(1, 30));
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                cleanup_sessions.purge_stale(&cleanup_db, session_ttl);
+            }
+        });
+    }
+
     let state = HlsState {
         root,
         db,
         require_key,
+        sessions,
+        session_ttl,
+        trusted_proxies: Arc::new(trusted_proxies),
+        remote_viewer_sessions,
     };
     Router::new()
         .route("/hls/{stream_id}/{*path}", get(handle_hls))
@@ -1403,22 +1566,40 @@ fn authorize_hls_request(
     state: &HlsState,
     stream_id: &str,
     key: Option<&str>,
+    client: IpAddr,
 ) -> Result<(), StatusCode> {
     if !state.require_key {
         return Ok(());
     }
     let key = key.ok_or(StatusCode::UNAUTHORIZED)?;
-    let viewer_allowed = matches!(
-        state.db.viewer_find_by_play_key(key),
-        DbLookup::Ok(ref viewer) if viewer.stream_id == stream_id
-    );
-    let stream_enabled =
-        matches!(state.db.stream_get(stream_id), DbLookup::Ok(ref stream) if stream.enabled);
-    if viewer_allowed && stream_enabled {
-        Ok(())
-    } else {
-        Err(StatusCode::FORBIDDEN)
+    let DbLookup::Ok(viewer) = state.db.viewer_find_by_play_key(key) else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if viewer.stream_id != stream_id {
+        return Err(StatusCode::FORBIDDEN);
     }
+    let DbLookup::Ok(stream) = state.db.stream_get(stream_id) else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if !stream.enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let remote = state
+        .remote_viewer_sessions
+        .as_ref()
+        .map(|f| f(&viewer.id))
+        .unwrap_or(0);
+    if !state.sessions.reserve_or_renew(
+        &state.db,
+        &viewer,
+        &stream,
+        client,
+        state.session_ttl,
+        remote,
+    ) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
 }
 
 fn latest_hls_session(stream_root: &Path) -> io::Result<String> {
@@ -1542,13 +1723,20 @@ async fn serve_hls_playlist(
 
 async fn handle_hls(
     State(state): State<HlsState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     AxumPath((stream_id, raw_path)): AxumPath<(String, String)>,
     Query(query): Query<HlsQuery>,
 ) -> Response {
     if safe_component(&stream_id) != stream_id {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Err(status) = authorize_hls_request(&state, &stream_id, query.key.as_deref()) {
+    let client = crate::rate_limit::resolve_client_ip(
+        addr.ip(),
+        headers.get("X-Forwarded-For"),
+        state.trusted_proxies.as_slice(),
+    );
+    if let Err(status) = authorize_hls_request(&state, &stream_id, query.key.as_deref(), client) {
         return status.into_response();
     }
     if raw_path == "index.m3u8" {
@@ -1692,6 +1880,69 @@ mod tests {
     fn safe_component_never_allows_parent_components() {
         assert_eq!(safe_component("../../x"), ".._.._x");
         assert_eq!(safe_component(".."), "stream");
+    }
+
+    #[test]
+    fn hls_session_ttl_scales_with_segment_duration() {
+        assert_eq!(hls_session_ttl(4), Duration::from_secs(30));
+        assert!(hls_session_ttl(60) >= Duration::from_secs(120));
+    }
+
+    #[test]
+    fn hls_connection_cap_counts_rtmp_and_hls_clients() {
+        use crate::db::{Db, Stream};
+        use crate::keygen::{PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY, PREFIX_STATS_KEY};
+
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let stream = Stream {
+            id: "s1".to_string(),
+            name: "cam".to_string(),
+            app: "live".to_string(),
+            publish_key: format!("{PREFIX_PUBLISH_KEY}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            play_key: format!("{PREFIX_PLAY_KEY}bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            stats_key: format!("{PREFIX_STATS_KEY}cccccccccccccccccccccccccccccccc"),
+            enabled: true,
+            created_at: 0,
+        };
+        let viewer = db.stream_add(&stream).unwrap();
+        let sessions = HlsSessionRegistry::default();
+        let ttl = Duration::from_secs(30);
+        let cap = crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64;
+        let client = IpAddr::from([203, 0, 113, 9]);
+
+        for i in 0..cap {
+            let player = crate::db::Player {
+                id: format!("pl{i}"),
+                stream_id: stream.id.clone(),
+                viewer_id: viewer.id.clone(),
+                active: true,
+                connected_at: 0,
+                ..Default::default()
+            };
+            assert!(db.player_try_acquire(&player));
+        }
+        assert!(!sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0,));
+
+        db.players_deactivate_for_viewer(&viewer.id);
+        for i in 0..cap {
+            assert!(sessions.reserve_or_renew(
+                &db,
+                &viewer,
+                &stream,
+                IpAddr::from([198, 51, 100, i as u8]),
+                ttl,
+                0,
+            ));
+        }
+        assert!(!sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0,));
+        assert!(sessions.reserve_or_renew(
+            &db,
+            &viewer,
+            &stream,
+            IpAddr::from([198, 51, 100, 0]),
+            ttl,
+            0,
+        ));
     }
 
     #[test]
