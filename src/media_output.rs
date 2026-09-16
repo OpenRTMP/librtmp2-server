@@ -1785,10 +1785,8 @@ mod tests {
 
     #[test]
     fn hls_connection_cap_counts_rtmp_and_hls_clients() {
-        use crate::db::{Db, Stream, StreamViewer};
-        use crate::keygen::{
-            PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY, PREFIX_STATS_KEY, PREFIX_VIEWER_ID,
-        };
+        use crate::db::{Db, Stream};
+        use crate::keygen::{PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY, PREFIX_STATS_KEY};
 
         let db = Arc::new(Db::open(":memory:").unwrap());
         let stream = Stream {
@@ -1801,16 +1799,7 @@ mod tests {
             enabled: true,
             created_at: 0,
         };
-        let viewer = StreamViewer {
-            id: format!("{PREFIX_VIEWER_ID}dddddddddddddddddddddddddddddddd"),
-            stream_id: stream.id.clone(),
-            name: "default".to_string(),
-            play_key: stream.play_key.clone(),
-            enabled: true,
-            created_at: 0,
-        };
-        assert!(db.stream_add(&stream).is_ok());
-        assert!(db.viewer_add(&viewer).is_ok());
+        let viewer = db.stream_add(&stream).unwrap();
 
         let sessions = HlsSessionRegistry::default();
         let cap = crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64;
