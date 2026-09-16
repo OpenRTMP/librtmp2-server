@@ -1921,9 +1921,7 @@ mod tests {
             };
             assert!(db.player_try_acquire(&player));
         }
-        assert!(!sessions.reserve_or_renew(
-            &db, &viewer, &stream, client, ttl, 0,
-        ));
+        assert!(!sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0,));
 
         db.players_deactivate_for_viewer(&viewer.id);
         for i in 0..cap {
@@ -1936,9 +1934,7 @@ mod tests {
                 0,
             ));
         }
-        assert!(!sessions.reserve_or_renew(
-            &db, &viewer, &stream, client, ttl, 0,
-        ));
+        assert!(!sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0,));
         assert!(sessions.reserve_or_renew(
             &db,
             &viewer,
