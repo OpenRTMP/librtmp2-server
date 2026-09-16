@@ -883,10 +883,23 @@ impl ServerApp {
                 self.config.http_trusted_proxies.clone(),
                 Arc::clone(&state.api_token),
             );
+            #[cfg(feature = "cluster")]
+            let remote_viewer_sessions = {
+                let coordinator = Arc::clone(&coordinator);
+                Some(Arc::new(move |viewer_id: &str| {
+                    coordinator
+                        .cluster_manager()
+                        .map(|mgr| mgr.remote_viewer_session_count_cached(viewer_id))
+                        .unwrap_or(0)
+                }) as crate::media_output::ViewerRemoteSessionCountFn)
+            };
+            #[cfg(not(feature = "cluster"))]
+            let remote_viewer_sessions = None;
             let hls_app = crate::media_output::hls_router(
                 media_output_config.hls_path.clone(),
                 Arc::clone(&self.db),
                 media_output_config.hls_require_key,
+                remote_viewer_sessions,
             )
             .layer(axum::middleware::from_fn_with_state(
                 hls_limiter,

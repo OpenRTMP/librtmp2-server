@@ -12,6 +12,7 @@ use axum::{Router, body::Body};
 use parking_lot::Mutex as ParkingMutex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -32,6 +33,8 @@ const RETIRED_SESSION_QUEUE: usize = 16;
 const MAX_FLV_PAYLOAD: usize = 0x00ff_ffff;
 static HLS_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_HLS_PLAYLIST_BYTES: u64 = 1024 * 1024;
+/// Active HLS viewer slots expire when a client stops requesting segments.
+const HLS_SESSION_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushTarget {
@@ -1374,11 +1377,63 @@ fn flv_tag(frame_type: FrameType, timestamp: u32, payload: &[u8]) -> Option<Vec<
     Some(out)
 }
 
+/// Tracks distinct client IPs currently consuming HLS for each viewer slot so
+/// the per-play-key connection cap enforced on RTMP also applies to HLS.
+#[derive(Default)]
+struct HlsSessionRegistry {
+    inner: ParkingMutex<HashMap<String, HashMap<IpAddr, Instant>>>,
+}
+
+impl HlsSessionRegistry {
+    fn purge_stale(entries: &mut HashMap<IpAddr, Instant>, now: Instant) {
+        entries.retain(|_, seen| {
+            now.checked_duration_since(*seen)
+                .is_none_or(|age| age < HLS_SESSION_TTL)
+        });
+    }
+
+    fn active_count(&self, viewer_id: &str) -> u64 {
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+        let Some(entries) = guard.get_mut(viewer_id) else {
+            return 0;
+        };
+        Self::purge_stale(entries, now);
+        if entries.is_empty() {
+            guard.remove(viewer_id);
+            return 0;
+        }
+        entries.len() as u64
+    }
+
+    fn has_client(&self, viewer_id: &str, client: IpAddr) -> bool {
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+        let Some(entries) = guard.get_mut(viewer_id) else {
+            return false;
+        };
+        Self::purge_stale(entries, now);
+        entries.contains_key(&client)
+    }
+
+    fn touch(&self, viewer_id: &str, client: IpAddr) {
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+        let entries = guard.entry(viewer_id.to_string()).or_default();
+        Self::purge_stale(entries, now);
+        entries.insert(client, now);
+    }
+}
+
+pub type ViewerRemoteSessionCountFn = Arc<dyn Fn(&str) -> u64 + Send + Sync>;
+
 #[derive(Clone)]
 struct HlsState {
     root: PathBuf,
     db: Arc<Db>,
     require_key: bool,
+    sessions: Arc<HlsSessionRegistry>,
+    remote_viewer_sessions: Option<ViewerRemoteSessionCountFn>,
 }
 
 #[derive(Deserialize)]
@@ -1388,37 +1443,69 @@ struct HlsQuery {
 
 /// Serve generated HLS from the existing HTTP listener. When key protection
 /// is enabled, the same enabled play/viewer keys accepted by RTMP are used.
-pub fn hls_router(root: PathBuf, db: Arc<Db>, require_key: bool) -> Router {
+pub fn hls_router(
+    root: PathBuf,
+    db: Arc<Db>,
+    require_key: bool,
+    remote_viewer_sessions: Option<ViewerRemoteSessionCountFn>,
+) -> Router {
     let state = HlsState {
         root,
         db,
         require_key,
+        sessions: Arc::new(HlsSessionRegistry::default()),
+        remote_viewer_sessions,
     };
     Router::new()
         .route("/hls/{stream_id}/{*path}", get(handle_hls))
         .with_state(state)
 }
 
+fn viewer_connection_cap_reached(
+    db: &Db,
+    sessions: &HlsSessionRegistry,
+    viewer_id: &str,
+    client: IpAddr,
+    remote_sessions: u64,
+) -> bool {
+    let rtmp = db.player_active_count_for_viewer(viewer_id);
+    let hls = sessions.active_count(viewer_id);
+    let is_renewal = sessions.has_client(viewer_id, client);
+    let occupied = rtmp.saturating_add(remote_sessions).saturating_add(hls);
+    !is_renewal && occupied >= crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64
+}
+
 fn authorize_hls_request(
     state: &HlsState,
     stream_id: &str,
     key: Option<&str>,
+    client: IpAddr,
 ) -> Result<(), StatusCode> {
     if !state.require_key {
         return Ok(());
     }
     let key = key.ok_or(StatusCode::UNAUTHORIZED)?;
-    let viewer_allowed = matches!(
-        state.db.viewer_find_by_play_key(key),
-        DbLookup::Ok(ref viewer) if viewer.stream_id == stream_id
-    );
+    let DbLookup::Ok(viewer) = state.db.viewer_find_by_play_key(key) else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if viewer.stream_id != stream_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let stream_enabled =
         matches!(state.db.stream_get(stream_id), DbLookup::Ok(ref stream) if stream.enabled);
-    if viewer_allowed && stream_enabled {
-        Ok(())
-    } else {
-        Err(StatusCode::FORBIDDEN)
+    if !stream_enabled {
+        return Err(StatusCode::FORBIDDEN);
     }
+    let remote = state
+        .remote_viewer_sessions
+        .as_ref()
+        .map(|f| f(&viewer.id))
+        .unwrap_or(0);
+    if viewer_connection_cap_reached(&state.db, &state.sessions, &viewer.id, client, remote) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    state.sessions.touch(&viewer.id, client);
+    Ok(())
 }
 
 fn latest_hls_session(stream_root: &Path) -> io::Result<String> {
@@ -1542,13 +1629,17 @@ async fn serve_hls_playlist(
 
 async fn handle_hls(
     State(state): State<HlsState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     AxumPath((stream_id, raw_path)): AxumPath<(String, String)>,
     Query(query): Query<HlsQuery>,
 ) -> Response {
     if safe_component(&stream_id) != stream_id {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Err(status) = authorize_hls_request(&state, &stream_id, query.key.as_deref()) {
+    let client = addr.ip();
+    if let Err(status) =
+        authorize_hls_request(&state, &stream_id, query.key.as_deref(), client)
+    {
         return status.into_response();
     }
     if raw_path == "index.m3u8" {
@@ -1692,6 +1783,66 @@ mod tests {
     fn safe_component_never_allows_parent_components() {
         assert_eq!(safe_component("../../x"), ".._.._x");
         assert_eq!(safe_component(".."), "stream");
+    }
+
+    #[test]
+    fn hls_connection_cap_counts_rtmp_and_hls_clients() {
+        use crate::db::{Db, Stream, StreamViewer};
+        use crate::keygen::{PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY, PREFIX_STATS_KEY, PREFIX_VIEWER_ID};
+
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let stream = Stream {
+            id: "s1".to_string(),
+            name: "cam".to_string(),
+            app: "live".to_string(),
+            publish_key: format!("{PREFIX_PUBLISH_KEY}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            play_key: format!("{PREFIX_PLAY_KEY}bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            stats_key: format!("{PREFIX_STATS_KEY}cccccccccccccccccccccccccccccccc"),
+            enabled: true,
+            created_at: 0,
+        };
+        let viewer = StreamViewer {
+            id: format!("{PREFIX_VIEWER_ID}dddddddddddddddddddddddddddddddd"),
+            stream_id: stream.id.clone(),
+            name: "default".to_string(),
+            play_key: stream.play_key.clone(),
+            enabled: true,
+            created_at: 0,
+        };
+        assert!(db.stream_add(&stream).is_ok());
+        assert!(db.viewer_add(&viewer).is_ok());
+
+        let sessions = HlsSessionRegistry::default();
+        let cap = crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64;
+        let client = IpAddr::from([203, 0, 113, 9]);
+
+        for i in 0..cap {
+            let player = crate::db::Player {
+                id: format!("pl{i}"),
+                stream_id: stream.id.clone(),
+                viewer_id: viewer.id.clone(),
+                active: true,
+                connected_at: 0,
+                ..Default::default()
+            };
+            assert!(db.player_try_acquire(&player));
+        }
+        assert!(viewer_connection_cap_reached(&db, &sessions, &viewer.id, client, 0));
+
+        db.players_deactivate_for_viewer(&viewer.id);
+        for i in 0..cap {
+            sessions.touch(&viewer.id, IpAddr::from([198, 51, 100, i as u8]));
+        }
+        assert!(viewer_connection_cap_reached(&db, &sessions, &viewer.id, client, 0));
+        assert!(
+            !viewer_connection_cap_reached(
+                &db,
+                &sessions,
+                &viewer.id,
+                IpAddr::from([198, 51, 100, 0]),
+                0
+            )
+        );
     }
 
     #[test]
