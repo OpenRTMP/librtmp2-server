@@ -13,6 +13,54 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-18
+
+### Added
+- Recording, HLS, push-relay, and exec media outputs, wired into the RTMP
+  and HTTP lifecycle (HLS and push outputs require FFmpeg on `PATH`); see
+  the updated documentation for configuration.
+- Depends on `librtmp2` `0.8.1`.
+
+### Security
+- HLS viewer requests now count against `MAX_CONNECTIONS_PER_PLAY_KEY`
+  (including cluster-remote RTMP viewer counts), closing a gap where RTMP
+  play was capped at five sessions per key but HTTP HLS clients were
+  unlimited.
+- Recording and HLS output directories/files are created with private
+  permissions (0700/0600, mirroring the existing SQLite hardening) instead
+  of world-readable under the default umask.
+- The new HLS output module validates active-session path resolution stays
+  contained under the configured media root.
+- `LRTMP2_DB` is opened with `SQLITE_OPEN_NOFOLLOW`, rejecting a symlinked
+  database path a local attacker planted before startup.
+- Cluster control-plane and media-plane frame reads are now capped by a
+  process-wide in-flight byte budget, closing a `CLUSTER_SECRET`-only
+  memory-exhaustion DoS from parallel max-size frames.
+- The per-IP cluster auth-failure tracker now LRU-evicts only
+  non-throttled buckets once full instead of rejecting every new source
+  IP — including ones presenting a valid `CLUSTER_SECRET` — once its
+  10k-entry map filled.
+- A failed cluster join no longer poisons `ClusterMeta` state.
+
+### Fixed
+- Cluster owners fan out live `MediaFrame`s on the subscriber inbound
+  session and retry a rejected `Subscribe` on protocol `Error` instead of
+  dropping it; standalone stream delete honors `pending_delete` and
+  refuses removing the last play key.
+- Cluster `InitCache` timeline remapping is staged and saturates at
+  `u32::MAX` instead of overflowing, and deleted streams are no longer
+  pruned by live-session presence during Raft delete ambiguity.
+- Stats/RTT flushes from stale cluster nodes can no longer resurrect a
+  session that was already released (guarded by `active=1`).
+- HLS redirect path resolution moved off the async request path via
+  `spawn_blocking`, avoiding a blocking `fs::canonicalize` call in an
+  async handler.
+
+### Changed
+- GitHub Actions pinned to full commit SHAs (Dependabot keeps them
+  current).
+- Package version `0.2.2` → `0.3.0`.
+
 ## [0.2.2] — 2026-09-03
 
 ### Security
@@ -495,7 +543,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.1.9...v0.2.0
