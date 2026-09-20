@@ -233,9 +233,12 @@ ingress eligibility rapidly.
 - Control/media use shared-secret challenge-response auth; enable
   `CLUSTER_TLS_ENABLED` with cert/key/CA for mTLS in production.
 - When mTLS is enabled, each node client certificate must embed its
-  `CLUSTER_NODE_ID` as the printable string `lrtmp2-node-{id}` in the
-  subject CN or SAN (the server scans the DER for this marker). The
-  authenticated control/media `node_id` must match the certificate.
+  `CLUSTER_NODE_ID` as the exact printable string `lrtmp2-node-{id}` in the
+  leaf certificate's subject CN or SAN. The authenticated control/media
+  `node_id` must match that leaf-certificate identity; issuer certificates
+  and arbitrary certificate data are not considered. Existing certificates
+  whose CN/SAN merely contains the marker (for example,
+  `node-lrtmp2-node-42`) must be reissued before upgrading.
 - HA relay export carries live frames only. Peers that join after export
   starts must also fetch `stream_init_snapshot` (or receive init-cache via
   the media mesh `InitCache` subscribe path) before playing.

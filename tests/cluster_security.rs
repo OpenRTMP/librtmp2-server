@@ -98,12 +98,11 @@ fn admin_proof_is_deterministic_so_replay_cache_is_required() {
 }
 
 #[test]
-fn tls_identity_requires_cert_marker_when_tls_on() {
+fn tls_identity_rejects_unparsed_certificate_bytes() {
     let mut der = Vec::new();
     der.extend_from_slice(b"noise-lrtmp2-node-99-trailer");
     let cert_id = node_id_from_peer_certs(&[rustls::pki_types::CertificateDer::from(der)]);
-    assert_eq!(cert_id, Some(99));
-    assert!(verify_tls_node_identity(true, cert_id, 99).is_ok());
-    assert!(verify_tls_node_identity(true, cert_id, 1).is_err());
+    assert_eq!(cert_id, None);
+    assert!(verify_tls_node_identity(true, cert_id, 99).is_err());
     assert!(verify_tls_node_identity(true, None, 1).is_err());
 }
