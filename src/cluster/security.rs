@@ -211,12 +211,7 @@ pub fn auth_nonce() -> Vec<u8> {
 /// Extract `node_id` embedded in a peer client certificate (SAN/CN string
 /// `lrtmp2-node-{id}`). Returns `None` when TLS is off or the pattern is absent.
 pub fn node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Option<u64> {
-    for cert in certs {
-        if let Some(id) = node_id_from_cert_der(cert.as_ref()) {
-            return Some(id);
-        }
-    }
-    None
+    node_id_from_cert_der(certs.first()?.as_ref())
 }
 
 /// When mTLS is active, the authenticated `node_id` must match the client cert.
@@ -384,6 +379,13 @@ mod tests {
         der.extend_from_slice(b"prefix-lrtmp2-node-42-suffix");
         let id = node_id_from_peer_certs(&[CertificateDer::from(der)]);
         assert_eq!(id, None);
+    }
+
+    #[test]
+    fn node_id_ignores_identity_in_issuer_certificate_bytes() {
+        let leaf = CertificateDer::from(b"identity-free-leaf".to_vec());
+        let issuer = CertificateDer::from(b"issuer-lrtmp2-node-42".to_vec());
+        assert_eq!(node_id_from_peer_certs(&[leaf, issuer]), None);
     }
 
     #[test]
