@@ -1210,7 +1210,10 @@ impl Db {
     }
 
     /// Read all Raft-replicated app tables + settings from one SQLite snapshot
-    /// transaction so a concurrent apply cannot interleave mid-read.
+    /// transaction so a concurrent apply cannot interleave mid-read. The
+    /// pending-delete stream ids are read in the same transaction so the
+    /// snapshot is internally consistent (a stream's `enabled` flag and its
+    /// pending-delete state cannot disagree).
     #[cfg(feature = "cluster")]
     pub fn read_replicated_snapshot(
         &self,
@@ -1221,6 +1224,7 @@ impl Db {
             Vec<StreamOwner>,
             Option<String>,
             Option<String>,
+            Vec<String>,
         ),
         String,
     > {
@@ -1298,9 +1302,29 @@ impl Db {
             .map_err(|e| format!("snapshot cluster_id: {e}"))?
             .filter(|v| !v.is_empty());
 
+        let mut stmt = tx
+            .prepare("SELECT id FROM streams WHERE pending_delete=1")
+            .map_err(|e| format!("snapshot pending_delete prepare: {e}"))?;
+        let pending_rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("snapshot pending_delete query: {e}"))?;
+        let mut pending_delete_stream_ids = Vec::new();
+        for row in pending_rows {
+            pending_delete_stream_ids
+                .push(row.map_err(|e| format!("snapshot pending_delete row: {e}"))?);
+        }
+        drop(stmt);
+
         // Read-only snapshot: rollback is fine (no writes).
         let _ = tx.rollback();
-        Ok((streams, viewers, owners, api_token, cluster_id))
+        Ok((
+            streams,
+            viewers,
+            owners,
+            api_token,
+            cluster_id,
+            pending_delete_stream_ids,
+        ))
     }
 
     pub fn stream_owner_list(&self) -> Vec<StreamOwner> {

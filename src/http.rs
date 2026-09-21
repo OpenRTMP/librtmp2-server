@@ -1213,10 +1213,20 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
             Ok(())
         }
         Err(CoordError::NotFound) => {
-            // Already gone — success. Do not propose SetStreamEnabled(true),
-            // which would Error-stall Raft when the row no longer exists.
-            clear_http_delete_marker(state, id);
-            Ok(())
+            // `stream_delete_if_pending` (and the cluster `FinalizeDeleteStream`
+            // apply) also returns NotFound when the row still exists with
+            // `pending_delete=0` — i.e. BeginDeleteStream rolled back or never
+            // committed. That is not a completed delete: the stream is still
+            // present and may be enabled/publishable, so only a genuinely
+            // absent row counts as success. Do not propose SetStreamEnabled(true)
+            // here — the row, if present, was never disabled by this delete.
+            if matches!(state.db.stream_get(id), DbLookup::Missing) {
+                clear_http_delete_marker(state, id);
+                Ok(())
+            } else {
+                clear_http_delete_marker(state, id);
+                Err(())
+            }
         }
         Err(_) => {
             // Only re-enable when the stream still exists (disable-not-delete

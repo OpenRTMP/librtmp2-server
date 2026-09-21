@@ -325,9 +325,8 @@ impl SqliteStateMachine {
     }
 
     fn build_app_snapshot(&self) -> Result<AppSnapshot, String> {
-        let (streams, viewers, owners, api_token, cluster_id) =
+        let (streams, viewers, owners, api_token, cluster_id, pending_delete_stream_ids) =
             self.db.read_replicated_snapshot()?;
-        let pending_delete_stream_ids = self.db.stream_ids_pending_delete();
         Ok(AppSnapshot {
             streams,
             viewers,

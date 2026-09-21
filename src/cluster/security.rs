@@ -277,12 +277,24 @@ pub fn validate_cluster_peer_addr(addr: &str, allow_loopback: bool) -> Result<()
                 "peer address '{trimmed}' must not be link-local (includes cloud metadata endpoints)"
             ));
         }
+        std::net::IpAddr::V4(v4) if is_rfc6598_shared_address(v4) => {
+            return Err(format!(
+                "peer address '{trimmed}' must not be RFC 6598 shared address space (includes cloud metadata endpoints)"
+            ));
+        }
         std::net::IpAddr::V6(v6) if v6.is_unicast_link_local() => {
             return Err(format!("peer address '{trimmed}' must not be link-local"));
         }
         _ => {}
     }
     Ok(())
+}
+
+/// RFC 6598 carrier-grade NAT / shared address space `100.64.0.0/10`, which
+/// includes the Alibaba Cloud metadata endpoint `100.100.100.200`.
+fn is_rfc6598_shared_address(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 64
 }
 
 /// Canonical payload for an HTTP-API-signed cluster join (`admin_proof`).
@@ -411,6 +423,10 @@ mod tests {
         assert!(validate_cluster_peer_addr("127.0.0.1:1940", false).is_err());
         assert!(validate_cluster_peer_addr("[::1]:1940", false).is_err());
         assert!(validate_cluster_peer_addr("169.254.169.254:80", false).is_err());
+        assert!(validate_cluster_peer_addr("100.100.100.200:80", false).is_err());
+        assert!(validate_cluster_peer_addr("100.64.0.1:1940", false).is_err());
+        assert!(validate_cluster_peer_addr("[::ffff:100.100.100.200]:80", false).is_err());
+        assert!(validate_cluster_peer_addr("100.128.0.1:1940", false).is_ok());
         assert!(validate_cluster_peer_addr("[::ffff:127.0.0.1]:1940", false).is_err());
         assert!(validate_cluster_peer_addr("[::ffff:169.254.169.254]:80", false).is_err());
         assert!(validate_cluster_peer_addr("0.0.0.0:1940", false).is_err());

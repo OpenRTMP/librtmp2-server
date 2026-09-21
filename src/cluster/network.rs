@@ -254,11 +254,36 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
 pub async fn read_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<ControlMessage, std::io::Error> {
-    read_frame_max(r, MAX_CONTROL_FRAME).await
+    // Client-side response reader: a peer may legally write a response up to
+    // MAX_FRAME (e.g. a large StatsProxyResp), so allow large non-snapshot
+    // frames here. Budgeting is still applied inside the shared reader.
+    read_budgeted_frame(r, true).await.map(|(msg, _)| msg)
 }
 
 async fn read_control_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
+) -> Result<
+    (
+        ControlMessage,
+        Option<crate::cluster::security::InflightByteBudgetGuard>,
+    ),
+    std::io::Error,
+> {
+    read_budgeted_frame(r, false).await
+}
+
+/// Read one length-prefixed JSON control frame and reserve it against the
+/// matching in-flight byte budget.
+///
+/// The budget class is chosen by peeking the JSON variant prefix, not the
+/// attacker-declared length: serde externally-tagged enums serialize as
+/// `{"Variant":...}`, so a non-snapshot frame cannot charge the shared
+/// snapshot budget merely by advertising a snapshot-sized length.
+/// `allow_large_non_snapshot` permits response types (e.g. `StatsProxyResp`)
+/// that may legally exceed `MAX_CONTROL_FRAME` up to `MAX_FRAME`.
+async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    allow_large_non_snapshot: bool,
 ) -> Result<
     (
         ControlMessage,
@@ -274,10 +299,17 @@ async fn read_control_frame<R: AsyncReadExt + Unpin>(
         if len > MAX_FRAME {
             return Err(std::io::Error::other("frame too large"));
         }
+        // Peek the variant tag before allocating/reserving so the budget class
+        // matches the actual message type.
+        const PEEK: usize = 32;
+        let mut prefix = [0u8; PEEK];
+        let prefix_len = (len as usize).min(PEEK);
+        r.read_exact(&mut prefix[..prefix_len]).await?;
+        let snapshot_prefix = prefix[..prefix_len].starts_with(b"{\"RaftSnapshot");
         let read_budget = if len <= MAX_UNBUDGETED_CONTROL_FRAME {
             None
         } else {
-            let (counter, max, error) = if len > MAX_CONTROL_FRAME {
+            let (counter, max, error) = if snapshot_prefix {
                 (
                     &SNAPSHOT_READ_BYTES_INFLIGHT,
                     MAX_SNAPSHOT_READ_BYTES_INFLIGHT,
@@ -295,14 +327,18 @@ async fn read_control_frame<R: AsyncReadExt + Unpin>(
                     .map_err(|_| std::io::Error::other(error))?,
             )
         };
-        let mut buf = vec![0u8; len as usize];
-        r.read_exact(&mut buf).await?;
+        let mut buf = Vec::with_capacity(len as usize);
+        buf.extend_from_slice(&prefix[..prefix_len]);
+        if (len as usize) > prefix_len {
+            buf.resize(len as usize, 0);
+            r.read_exact(&mut buf[prefix_len..]).await?;
+        }
         let msg: ControlMessage =
             serde_json::from_slice(&buf).map_err(|e| std::io::Error::other(e))?;
         let allow_large = matches!(
             msg,
             ControlMessage::RaftSnapshot(_) | ControlMessage::RaftSnapshotResp(_)
-        );
+        ) || allow_large_non_snapshot;
         if !allow_large && len > MAX_CONTROL_FRAME {
             return Err(std::io::Error::other("frame too large"));
         }

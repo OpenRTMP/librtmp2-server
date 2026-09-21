@@ -60,17 +60,19 @@ impl InitCacheStore {
         let kind = classify_cache_frame(ft, payload);
         let mut g = self.inner.lock();
         let e = g.entry((app.to_string(), stream.to_string())).or_default();
-        // A new ownership epoch must not keep the previous publisher's
-        // metadata/headers/keyframe under the new epoch label — subscribers
-        // joining mid-handoff (or when the new publisher omits a media type)
-        // would otherwise accept incompatible init fields.
-        if e.epoch != epoch {
+        // A stale publisher under an old epoch must not wipe the current
+        // owner's staged init fields, and a newer epoch must not keep the
+        // previous publisher's metadata/headers/keyframe under the new epoch
+        // label — subscribers joining mid-handoff (or when the new publisher
+        // omits a media type) would otherwise accept incompatible init fields.
+        if epoch < e.epoch {
+            return;
+        }
+        if epoch > e.epoch {
             *e = InitCacheEntry {
                 epoch,
                 ..InitCacheEntry::default()
             };
-        } else {
-            e.epoch = epoch;
         }
         match kind {
             CacheFrameKind::VideoSequenceHeader => e.avc_header = Some(payload.to_vec()),

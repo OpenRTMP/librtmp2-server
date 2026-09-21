@@ -248,6 +248,11 @@ pub struct MediaHub {
     /// Generation per owner+stream so delayed NACK retries cannot fire after
     /// unsubscribe/resubscribe and double the owner's Subscribe refcount.
     subscribe_gens: Mutex<HashMap<(NodeId, String, String), u64>>,
+    /// Serializes `subs.add` + peer (re)creation + resubscribe snapshot so a
+    /// concurrent `subscribe_remote` cannot slip a new stream into the
+    /// snapshot and have it sent twice (once by the fresh-peer resubscribe,
+    /// once by the caller's direct send).
+    subscribe_lock: Mutex<()>,
     subs: SubscriptionTable,
     cache: InitCacheStore,
     timelines: Mutex<HashMap<(String, String), TimelineRemapper>>,
@@ -290,6 +295,7 @@ impl MediaHub {
             inbound_sinks: Mutex::new(HashMap::new()),
             subscribe_nacks: Mutex::new(HashMap::new()),
             subscribe_gens: Mutex::new(HashMap::new()),
+            subscribe_lock: Mutex::new(()),
             subs: SubscriptionTable::new(),
             cache: InitCacheStore::new(),
             timelines: Mutex::new(HashMap::new()),
@@ -893,6 +899,11 @@ impl MediaHub {
     /// wire-level `Subscribe` state on the old connection does not, and
     /// without resending it the new connection carries none.
     fn ensure_peer(&self, peer_id: NodeId, addr: &str) -> (Arc<MediaPeer>, bool) {
+        let _guard = self.subscribe_lock.lock();
+        self.ensure_peer_locked(peer_id, addr)
+    }
+
+    fn ensure_peer_locked(&self, peer_id: NodeId, addr: &str) -> (Arc<MediaPeer>, bool) {
         let (peer, fresh) = {
             let mut peers = self.peers.lock();
             if let Some(p) = peers.get(&peer_id) {
@@ -917,12 +928,17 @@ impl MediaHub {
             (peer, true)
         };
         if fresh {
-            self.resubscribe_peer(peer_id);
+            self.resubscribe_peer_locked(peer_id);
         }
         (peer, fresh)
     }
 
     fn resubscribe_peer(&self, peer_id: NodeId) {
+        let _guard = self.subscribe_lock.lock();
+        self.resubscribe_peer_locked(peer_id);
+    }
+
+    fn resubscribe_peer_locked(&self, peer_id: NodeId) {
         let Some(peer) = self.peers.lock().get(&peer_id).cloned() else {
             return;
         };
@@ -943,10 +959,15 @@ impl MediaHub {
         stream: &str,
         epoch: u64,
     ) {
+        // Hold `subscribe_lock` across add + peer creation + the fresh-peer
+        // resubscribe snapshot so a concurrent subscribe for another stream
+        // cannot be added between the peer-map insert and the snapshot (which
+        // would send that stream's Subscribe twice).
+        let _guard = self.subscribe_lock.lock();
         if !self.subs.add(peer_id, app, stream) {
             return; // already subscribed (refcount)
         }
-        let (peer, fresh) = self.ensure_peer(peer_id, media_addr);
+        let (peer, fresh) = self.ensure_peer_locked(peer_id, media_addr);
         // A fresh connection already resent every tracked subscription for
         // this peer, including the one just added above — sending it again
         // here would just double the owner's per-connection subscribe tally.
