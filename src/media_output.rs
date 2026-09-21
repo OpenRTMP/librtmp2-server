@@ -394,7 +394,15 @@ impl MediaOutputManager {
             .sessions
             .get(&frame.publisher_conn_id)
             .and_then(|session| session.last_timestamp)
-            .is_some_and(|last| frame.timestamp.saturating_add(1000) < last);
+            .is_some_and(|last| {
+                // A backward jump of more than 1s marks a same-connection
+                // republish boundary. A "backward" delta that is really a u32
+                // millisecond wraparound (~49.7 days) is a continuation, not a
+                // republish — only treat plausible (sub-half-range) backward
+                // deltas as a reset.
+                let backward = last.wrapping_sub(frame.timestamp);
+                backward > 1000 && backward < u32::MAX / 2
+            });
         if timestamp_reset {
             if let Some(old) = self.sessions.remove(&frame.publisher_conn_id) {
                 self.retire(old);

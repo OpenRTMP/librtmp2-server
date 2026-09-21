@@ -1722,10 +1722,19 @@ impl ClusterManager {
     }
 
     /// Proxy stats from the owning node when this node is not the owner.
-    pub async fn proxy_stream_stats(&self, stream_id: &str) -> Option<serde_json::Value> {
+    ///
+    /// The returned read-budget guard keeps a large `StatsProxyResp` accounted
+    /// for against the control-read budget until the caller drops it.
+    pub async fn proxy_stream_stats(
+        &self,
+        stream_id: &str,
+    ) -> Option<(
+        serde_json::Value,
+        Option<crate::cluster::security::InflightByteBudgetGuard>,
+    )> {
         let owner = self.db.stream_owner_get(stream_id)?;
         if owner.owner_node_id == self.config.node_id {
-            return Some(self.local_stream_stats_json(stream_id));
+            return Some((self.local_stream_stats_json(stream_id), None));
         }
         let addr = self.meta.get(owner.owner_node_id).map(|(c, _)| c)?;
         network::send_stats_proxy(

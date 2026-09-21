@@ -2,7 +2,7 @@
 //! and the RTMP listener(s), then runs until a shutdown signal arrives.
 
 use parking_lot::Mutex;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -51,6 +51,14 @@ thread_local! {
     static RTMP_POLL_SERVER: Cell<Option<*mut librtmp2::server::Server>> = const {
         Cell::new(None)
     };
+}
+
+thread_local! {
+    /// conn_ids whose callback ran during the current `server.poll()`. A
+    /// connection that authorizes publish/play and is then reaped by the
+    /// library in the same poll never enters `tracked`, so the poll loop uses
+    /// this to close its bridge state instead of leaking an active row.
+    static RTMP_POLL_TOUCHED_CONNS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
 
 /// Pin the active RTMP server for the duration of `poll()` so publish/play
@@ -115,6 +123,9 @@ where
 /// `process_server_connections` reaches `on_connect`, which would otherwise
 /// skip per-IP auth-failure tracking and rate limiting.
 fn ensure_conn_registered_for_auth(conn_id: u64) {
+    RTMP_POLL_TOUCHED_CONNS.with(|set| {
+        set.borrow_mut().insert(conn_id);
+    });
     // Skip the pointer walk entirely once the normal `on_connect` pass (or an
     // earlier call from this same function) has already registered the
     // remote IP. Without this check every publish/play attempt on an
@@ -1194,6 +1205,29 @@ impl ServerApp {
                     .collect();
                 for conn_id in closed_ids {
                     tracked.remove(&conn_id);
+                    rtmp_bridge.on_close(conn_id);
+                    clear_publish_generation(conn_id);
+                }
+
+                // A connection whose publish/play/media callback ran during
+                // this poll but whose socket the library reaped in the same
+                // `poll(0)` never appears in `current_ids`, so it never entered
+                // `tracked` and the `closed_ids` sweep above cannot see it. Its
+                // bridge ConnState and any active publisher/player row were
+                // created by the callback, so close them explicitly or the row
+                // stays active (blocking future publishes) and conn/ownership
+                // state leaks. Only ids absent from `current_ids` are touched,
+                // so live connections are unaffected.
+                let touched: Vec<u64> =
+                    RTMP_POLL_TOUCHED_CONNS.with(|set| set.borrow_mut().drain().collect());
+                for conn_id in touched {
+                    if current_ids.contains(&conn_id)
+                        || (!rtmp_bridge.is_registered(conn_id)
+                            && !rtmp_bridge.has_publisher(conn_id)
+                            && !rtmp_bridge.has_player(conn_id))
+                    {
+                        continue;
+                    }
                     rtmp_bridge.on_close(conn_id);
                     clear_publish_generation(conn_id);
                 }

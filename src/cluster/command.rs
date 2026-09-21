@@ -54,6 +54,10 @@ pub enum ClusterCommand {
         streams: Vec<Stream>,
         viewers: Vec<StreamViewer>,
         api_token: Option<String>,
+        /// Streams the standalone DB had left mid-delete (`pending_delete=1`);
+        /// the apply path re-marks them so `FinalizeDeleteStream` can complete
+        /// instead of leaving a disabled ghost stream.
+        pending_delete_stream_ids: Vec<String>,
     },
     /// Replicated cluster identity (UUID); written on bootstrap, restored via snapshot.
     SetClusterId {

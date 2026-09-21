@@ -99,7 +99,14 @@ impl StateCoordinator {
         match self {
             StateCoordinator::Standalone(db) => match db.stream_delete_if_pending(id) {
                 Some(true) => Ok(()),
-                Some(false) => Err(CoordError::NotFound),
+                // `Some(false)` means "not deleted": either the row is gone
+                // (NotFound) or it still exists with pending_delete=0
+                // (Conflict — the delete rolled back or never began).
+                Some(false) => match db.stream_get(id) {
+                    crate::db::DbLookup::Missing => Err(CoordError::NotFound),
+                    crate::db::DbLookup::Failed => Err(CoordError::Db),
+                    crate::db::DbLookup::Ok(_) => Err(CoordError::Conflict),
+                },
                 None => Err(CoordError::Db),
             },
             #[cfg(feature = "cluster")]

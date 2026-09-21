@@ -186,7 +186,15 @@ impl SqliteStateMachine {
                         self.emit_effect(StateEffect::ClearDrainStream(id.clone()));
                         ClusterResponse::Ok
                     }
-                    Some(false) => ClusterResponse::NotFound,
+                    // Authoritative on the leader: distinguish a genuinely
+                    // absent row (NotFound) from one that still exists but is
+                    // no longer pending (Conflict), so a requesting follower
+                    // never has to re-check its possibly-stale local state.
+                    Some(false) => match self.db.stream_get(id) {
+                        crate::db::DbLookup::Missing => ClusterResponse::NotFound,
+                        crate::db::DbLookup::Failed => ClusterResponse::Error("db".into()),
+                        crate::db::DbLookup::Ok(_) => ClusterResponse::Conflict,
+                    },
                     None => ClusterResponse::Error("db".into()),
                 }
             }
@@ -286,6 +294,7 @@ impl SqliteStateMachine {
                 streams,
                 viewers,
                 api_token,
+                pending_delete_stream_ids,
             } => {
                 // Bootstrap node already has these rows; Duplicate is expected.
                 // Any other failure must surface so last_applied does not advance.
@@ -315,6 +324,20 @@ impl SqliteStateMachine {
                     }
                     self.emit_effect(StateEffect::ApiToken(token.clone()));
                 }
+                // A standalone DB can hold streams left mid-delete; replicate
+                // that state so followers mark them pending too and
+                // FinalizeDeleteStream can complete instead of leaving a
+                // disabled ghost stream behind.
+                for stream_id in pending_delete_stream_ids {
+                    if self.db.stream_disable(&stream_id).is_none() {
+                        return ClusterResponse::Error(
+                            "stream_disable failed during SeedFromStandalone".into(),
+                        );
+                    }
+                    // Mirror BeginDeleteStream: kick local sessions and stop
+                    // advertising the stream so the leader can finalize.
+                    self.emit_effect(StateEffect::DrainStream(stream_id.clone()));
+                }
                 ClusterResponse::Ok
             }
             ClusterCommand::SetClusterId { id } => match self.db.setting_set("cluster_id", id) {
@@ -325,9 +348,8 @@ impl SqliteStateMachine {
     }
 
     fn build_app_snapshot(&self) -> Result<AppSnapshot, String> {
-        let (streams, viewers, owners, api_token, cluster_id) =
+        let (streams, viewers, owners, api_token, cluster_id, pending_delete_stream_ids) =
             self.db.read_replicated_snapshot()?;
-        let pending_delete_stream_ids = self.db.stream_ids_pending_delete();
         Ok(AppSnapshot {
             streams,
             viewers,

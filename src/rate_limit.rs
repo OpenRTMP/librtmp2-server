@@ -35,13 +35,21 @@ impl Default for HttpRateLimitConfig {
 
 #[derive(Clone)]
 pub struct RateLimiter {
-    inner: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    inner: Arc<Mutex<HashMap<String, Bucket>>>,
     config: HttpRateLimitConfig,
     trusted_proxies: Arc<Vec<IpAddr>>,
     /// Live API bearer token (shared with AppState; refreshed on cluster join).
     /// Used only to preview whether an `/api/*` request is authenticated for
     /// rate-limit bucket selection — handlers still enforce auth independently.
     api_token: Arc<parking_lot::RwLock<String>>,
+}
+
+/// A tracked client's sliding window plus the cap it was created under, so
+/// eviction can judge "currently rate-limited" against this bucket's own cap
+/// rather than the incoming request's (possibly larger) cap.
+struct Bucket {
+    entries: Vec<Instant>,
+    max_requests: usize,
 }
 
 impl RateLimiter {
@@ -72,26 +80,29 @@ impl RateLimiter {
     }
 
     /// Drop client keys whose sliding window has fully expired.
-    fn purge_expired(&self, guard: &mut HashMap<String, Vec<Instant>>, now: Instant) {
-        guard.retain(|_, entries| {
-            entries.retain(|t| self.timestamp_in_window(now, *t));
-            !entries.is_empty()
+    fn purge_expired(&self, guard: &mut HashMap<String, Bucket>, now: Instant) {
+        guard.retain(|_, bucket| {
+            bucket.entries.retain(|t| self.timestamp_in_window(now, *t));
+            !bucket.entries.is_empty()
         });
     }
 
     /// Remove the least-recently-active bucket that is not currently
     /// rate-limited. Actively throttled buckets are never evicted — dropping
     /// one would reset its window and let a client immediately resume.
+    /// Each bucket is judged against its own stored cap, not the incoming
+    /// request's, since buckets with different caps share this map.
     fn evict_oldest_eligible_client(
         &self,
-        guard: &mut HashMap<String, Vec<Instant>>,
+        guard: &mut HashMap<String, Bucket>,
         now: Instant,
-        max_requests: usize,
     ) -> bool {
         let Some(oldest_key) = guard
             .iter()
-            .filter(|(_, entries)| self.active_request_count(entries, now) < max_requests)
-            .min_by_key(|(_, entries)| entries.last().copied().unwrap_or_else(Instant::now))
+            .filter(|(_, bucket)| {
+                self.active_request_count(&bucket.entries, now) < bucket.max_requests
+            })
+            .min_by_key(|(_, bucket)| bucket.entries.last().copied().unwrap_or_else(Instant::now))
             .map(|(key, _)| key.clone())
         else {
             return false;
@@ -108,13 +119,13 @@ impl RateLimiter {
         let mut guard = self.inner.lock();
         let now = Instant::now();
 
-        if let Some(entries) = guard.get_mut(key) {
-            entries.retain(|t| self.timestamp_in_window(now, *t));
-            if entries.len() >= max_requests {
+        if let Some(bucket) = guard.get_mut(key) {
+            bucket.entries.retain(|t| self.timestamp_in_window(now, *t));
+            if bucket.entries.len() >= max_requests {
                 return false;
             }
-            if !entries.is_empty() {
-                entries.push(now);
+            if !bucket.entries.is_empty() {
+                bucket.entries.push(now);
                 return true;
             }
             guard.remove(key);
@@ -123,7 +134,7 @@ impl RateLimiter {
         if guard.len() >= MAX_TRACKED_KEYS {
             self.purge_expired(&mut guard, now);
             if guard.len() >= MAX_TRACKED_KEYS
-                && !self.evict_oldest_eligible_client(&mut guard, now, max_requests)
+                && !self.evict_oldest_eligible_client(&mut guard, now)
             {
                 // Every tracked bucket is actively rate-limited; fail closed
                 // rather than freeing a throttled bucket.
@@ -131,7 +142,13 @@ impl RateLimiter {
             }
         }
 
-        guard.insert(key.to_string(), vec![now]);
+        guard.insert(
+            key.to_string(),
+            Bucket {
+                entries: vec![now],
+                max_requests,
+            },
+        );
         true
     }
 
@@ -313,9 +330,9 @@ mod tests {
         {
             let mut guard = limiter.inner.lock();
             let stale = Instant::now() - Duration::from_secs(61);
-            for entries in guard.values_mut() {
-                entries.clear();
-                entries.push(stale);
+            for bucket in guard.values_mut() {
+                bucket.entries.clear();
+                bucket.entries.push(stale);
             }
         }
 
@@ -337,12 +354,18 @@ mod tests {
             let mut guard = limiter.inner.lock();
             guard.insert(
                 limited_key.to_string(),
-                vec![now - Duration::from_secs(1); max],
+                Bucket {
+                    entries: vec![now - Duration::from_secs(1); max],
+                    max_requests: max,
+                },
             );
             for i in 1..MAX_TRACKED_KEYS {
                 guard.insert(
                     format!("198.51.100.{i}:api"),
-                    vec![now - Duration::from_secs(30)],
+                    Bucket {
+                        entries: vec![now - Duration::from_secs(30)],
+                        max_requests: max,
+                    },
                 );
             }
         }
@@ -367,7 +390,13 @@ mod tests {
         {
             let mut guard = limiter.inner.lock();
             for i in 0..MAX_TRACKED_KEYS {
-                guard.insert(format!("203.0.113.{i}:api"), vec![now; max]);
+                guard.insert(
+                    format!("203.0.113.{i}:api"),
+                    Bucket {
+                        entries: vec![now; max],
+                        max_requests: max,
+                    },
+                );
             }
         }
 

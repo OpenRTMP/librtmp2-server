@@ -33,11 +33,9 @@ impl TimelineRemapper {
         let out = ts_in.wrapping_add(self.offset);
         // Guard against non-monotonic within epoch (encoder reset).
         if self.current_epoch.is_some() && out < self.last_out {
-            // At u32::MAX, wrapping_add(1) collapses to 0 and snaps the
-            // timeline backward — saturate instead of wrapping.
-            if self.last_out == u32::MAX {
-                return u32::MAX;
-            }
+            // Re-anchor to last_out + 1. At u32::MAX this wraps through zero
+            // once and then keeps progressing, instead of freezing at the
+            // ceiling forever.
             self.offset = self.last_out.wrapping_add(1).wrapping_sub(ts_in);
             let out2 = ts_in.wrapping_add(self.offset);
             self.last_out = out2;
@@ -74,5 +72,17 @@ mod tests {
         let a = t.map(1, u32::MAX - 10);
         let b = t.map(1, 5); // would wrap on wire
         assert!(b > a || a > u32::MAX / 2);
+    }
+
+    #[test]
+    fn reanchors_after_reaching_max_instead_of_freezing() {
+        let mut t = TimelineRemapper::new();
+        assert_eq!(t.map(1, u32::MAX - 5), u32::MAX - 5);
+        assert_eq!(t.map(1, u32::MAX), u32::MAX);
+        // A later frame must not freeze at u32::MAX forever.
+        let c = t.map(1, 100);
+        let d = t.map(1, 200);
+        assert_ne!(c, u32::MAX);
+        assert!(d > c);
     }
 }

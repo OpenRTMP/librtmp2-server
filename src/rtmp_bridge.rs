@@ -271,14 +271,18 @@ impl DbRtmpBridge {
             .is_some_and(|cs| !cs.remote_ip.is_empty())
     }
 
-    fn auth_rate_key(conn: ConnId, remote_ip: &str) -> String {
+    /// Auth-failure bucket key. The role is part of the key so a successful
+    /// publish cannot clear a play-failure window (and vice versa) from the
+    /// same IP, which would otherwise let one legitimate role defeat
+    /// `RTMP_AUTH_MAX_FAILURES` for the other.
+    fn auth_rate_key(conn: ConnId, remote_ip: &str, role: &str) -> String {
         if remote_ip.is_empty() {
             // Per-connection bucket when on_connect has not run yet (unit tests
             // calling the bridge directly) — avoids a shared "" bucket while
             // still bounding brute-force attempts per TCP session.
-            format!("conn:{conn}")
+            format!("conn:{conn}:{role}")
         } else {
-            remote_ip.to_string()
+            format!("{remote_ip}:{role}")
         }
     }
 
@@ -593,20 +597,15 @@ impl DbRtmpBridge {
             }
         }
 
+        for conn_id in abandoned_pubs {
+            self.try_release_ownership_for_conn(conn_id);
+        }
         #[cfg(feature = "cluster")]
-        {
-            for conn_id in abandoned_pubs {
-                self.try_release_ownership_for_conn(conn_id);
-            }
-            if abandoned_any_play {
-                self.maybe_unsubscribe_remote_play(stream_id);
-            }
+        if abandoned_any_play {
+            self.maybe_unsubscribe_remote_play(stream_id);
         }
         #[cfg(not(feature = "cluster"))]
-        {
-            let _ = abandoned_pubs;
-            let _ = abandoned_any_play;
-        }
+        let _ = abandoned_any_play;
 
         if !force_close.is_empty() {
             let mut pending = self.pending_force_close.lock();
@@ -654,7 +653,6 @@ impl DbRtmpBridge {
             pub_row.id
         );
 
-        #[cfg(feature = "cluster")]
         self.try_release_ownership_for_conn(conn);
 
         let mut guard = self.conns.lock();
@@ -1326,7 +1324,7 @@ impl RtmpEventHandler for DbRtmpBridge {
 
     fn authorize_publish(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         let (remote_ip, peer) = self.remote_ip_and_peer(conn);
-        let rate_key = Self::auth_rate_key(conn, &remote_ip);
+        let rate_key = Self::auth_rate_key(conn, &remote_ip, "publish");
         if self.is_auth_rate_limited(&rate_key) {
             crate::log_warn!(
                 "RTMP: publish rejected — auth rate limit exceeded conn={conn} from {peer}"
@@ -1349,7 +1347,7 @@ impl RtmpEventHandler for DbRtmpBridge {
 
     fn authorize_play(&self, conn: ConnId, app: &str, stream_key: &str) -> Result<(), ()> {
         let (remote_ip, peer) = self.remote_ip_and_peer(conn);
-        let rate_key = Self::auth_rate_key(conn, &remote_ip);
+        let rate_key = Self::auth_rate_key(conn, &remote_ip, "play");
         if self.is_auth_rate_limited(&rate_key) {
             crate::log_warn!(
                 "RTMP: play rejected — auth rate limit exceeded conn={conn} from {peer}"
@@ -1420,7 +1418,6 @@ impl RtmpEventHandler for DbRtmpBridge {
             }
         }
 
-        #[cfg(feature = "cluster")]
         self.try_release_ownership_for_conn(conn);
 
         if let Some(mut player_row) = cs.player {
@@ -1449,7 +1446,9 @@ impl RtmpEventHandler for DbRtmpBridge {
 }
 
 impl DbRtmpBridge {
-    #[cfg(feature = "cluster")]
+    // Compiled for both standalone and cluster builds: a standalone node still
+    // records a per-connection ownership epoch on publish, so the entry must be
+    // removed on close/release to keep `ownership_epochs` bounded.
     fn try_release_ownership_for_conn(&self, conn: ConnId) {
         let release = {
             let epochs = self.ownership_epochs.lock();
@@ -1473,6 +1472,7 @@ impl DbRtmpBridge {
                     "RTMP: failed to release stream ownership conn={conn} stream={stream_id}: {e}"
                 );
                 self.ownership_epochs.lock().remove(&conn);
+                #[cfg(feature = "cluster")]
                 self.pending_ownership_releases
                     .lock()
                     .push((stream_id, epoch));
@@ -1596,7 +1596,7 @@ mod tests {
             bridge.on_connect(conn, &format!("{victim_ip}:1935"));
             assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
         }
-        assert!(bridge.is_auth_rate_limited(victim_ip));
+        assert!(bridge.is_auth_rate_limited(&format!("{victim_ip}:publish")));
 
         let now = Instant::now();
         let stale = now - Duration::from_secs(1);
@@ -1615,7 +1615,7 @@ mod tests {
 
         bridge.on_connect(10_000, &format!("{victim_ip}:1935"));
         assert!(
-            bridge.is_auth_rate_limited(victim_ip),
+            bridge.is_auth_rate_limited(&format!("{victim_ip}:publish")),
             "victim IP must stay throttled after auth-failure map saturation"
         );
         assert!(
@@ -1640,7 +1640,7 @@ mod tests {
         let overflow_ip = "203.0.113.200";
         bridge.on_connect(9_999, &format!("{overflow_ip}:1935"));
         assert!(
-            bridge.is_auth_rate_limited(overflow_ip),
+            bridge.is_auth_rate_limited(&format!("{overflow_ip}:publish")),
             "an untracked IP must be rejected, not silently let through, \
              while every bucket in a full auth-failure map is actively throttled"
         );
@@ -1659,7 +1659,7 @@ mod tests {
         }
 
         bridge.on_connect(RTMP_AUTH_MAX_FAILURES as u64, ip);
-        assert!(bridge.is_auth_rate_limited(&remote_ip_of(ip)));
+        assert!(bridge.is_auth_rate_limited(&format!("{}:publish", remote_ip_of(ip))));
     }
 
     #[test]
@@ -1675,7 +1675,7 @@ mod tests {
                 "each failed attempt must reuse the same connection id"
             );
         }
-        let conn_key = format!("conn:{CONN}");
+        let conn_key = format!("conn:{CONN}:publish");
         assert!(
             bridge.is_auth_rate_limited(&conn_key),
             "a single connection must be throttled after exhausting its auth budget"
@@ -1690,7 +1690,7 @@ mod tests {
         bridge.on_connect(CONN, ip);
         bridge.on_connect(2, ip);
         assert!(
-            !bridge.is_auth_rate_limited(&remote_ip_of(ip)),
+            !bridge.is_auth_rate_limited(&format!("{}:publish", remote_ip_of(ip))),
             "pre-on_connect per-conn buckets must not throttle the shared IP"
         );
     }
@@ -1715,7 +1715,7 @@ mod tests {
         // which would fail either way) to actually prove rate limiting.
         let next_conn = RTMP_AUTH_MAX_FAILURES as u64;
         bridge.on_connect(next_conn, ip);
-        assert!(bridge.is_auth_rate_limited(&remote_ip_of(ip)));
+        assert!(bridge.is_auth_rate_limited(&format!("{}:publish", remote_ip_of(ip))));
         assert!(
             bridge
                 .authorize_publish(next_conn, "live", "bogus")
@@ -1725,11 +1725,43 @@ mod tests {
         // A different client IP is unaffected.
         let other_ip = "198.51.100.1:1935";
         bridge.on_connect(next_conn + 1, other_ip);
-        assert!(!bridge.is_auth_rate_limited(&remote_ip_of(other_ip)));
+        assert!(!bridge.is_auth_rate_limited(&format!("{}:publish", remote_ip_of(other_ip))));
         assert!(
             bridge
                 .authorize_publish(next_conn + 1, "live", "bogus")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn successful_publish_does_not_clear_play_failures_from_same_ip() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(db);
+        let ip = "203.0.113.77:1935";
+
+        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
+            bridge.on_connect(conn, ip);
+            assert!(bridge.authorize_play(conn, "live", "bogus").is_err());
+            bridge.on_close(conn);
+        }
+        assert!(bridge.is_auth_rate_limited(&format!("{}:play", remote_ip_of(ip))));
+
+        // A successful publish from the same IP must not reset the play window.
+        bridge.on_connect(1_000, ip);
+        assert!(
+            bridge
+                .authorize_publish(1_000, "live", &s.publish_key)
+                .is_ok()
+        );
+        assert!(
+            bridge.is_auth_rate_limited(&format!("{}:play", remote_ip_of(ip))),
+            "a successful publish must not clear play-failure tracking"
+        );
+        bridge.on_connect(1_001, ip);
+        assert!(
+            bridge.authorize_play(1_001, "live", "bogus").is_err(),
+            "play from a throttled IP must stay rejected despite a successful publish"
         );
     }
 
@@ -1767,7 +1799,7 @@ mod tests {
             bridge.on_close(conn);
         }
 
-        assert!(bridge.is_auth_rate_limited(&remote_ip_of(ip)));
+        assert!(bridge.is_auth_rate_limited(&format!("{}:publish", remote_ip_of(ip))));
     }
 
     #[test]
@@ -1793,7 +1825,7 @@ mod tests {
         }
 
         assert!(
-            bridge.is_auth_rate_limited(&remote_ip),
+            bridge.is_auth_rate_limited(&format!("{remote_ip}:publish")),
             "recognized-key probe followed by bogus guesses must hit the same limit as invalid keys alone"
         );
     }

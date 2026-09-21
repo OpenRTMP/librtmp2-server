@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cluster::security::try_reserve_inflight_bytes;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use rustls::{ClientConfig, ServerConfig};
@@ -128,6 +128,7 @@ impl MediaPeer {
                 if cl.load(Ordering::Relaxed) {
                     break;
                 }
+                let attempt_started = Instant::now();
                 match connect_and_run(
                     &addr_c,
                     &secret,
@@ -145,6 +146,12 @@ impl MediaPeer {
                     Ok(ConnectEnd::Shutdown) => break,
                     Ok(ConnectEnd::Transient) => {
                         tracing::debug!(peer = peer_id, "media peer reconnect after disconnect");
+                        // A session that stayed up for a while is evidence of a
+                        // healthy peer; reset backoff so a later transient drop
+                        // reconnects promptly instead of inheriting a long delay.
+                        if attempt_started.elapsed() >= Duration::from_secs(5) {
+                            backoff_ms = 500;
+                        }
                         let _ = on_reconnected.send(peer_id);
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         backoff_ms = (backoff_ms.saturating_mul(2)).min(8_000);

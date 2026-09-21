@@ -118,7 +118,8 @@ pub async fn seed_from_local_db(raft: &Raft, db: &Arc<Db>) -> Result<(), String>
     // decode, which would permanently omit them from the seeded cluster.
     // read_replicated_snapshot() reads both tables in one transaction and
     // surfaces every row/query failure instead.
-    let (streams, viewers, _owners, api_token, _cluster_id) = db.read_replicated_snapshot()?;
+    let (streams, viewers, _owners, api_token, _cluster_id, pending_delete_stream_ids) =
+        db.read_replicated_snapshot()?;
     if streams.is_empty() && viewers.is_empty() && api_token.is_none() {
         return Ok(());
     }
@@ -127,6 +128,7 @@ pub async fn seed_from_local_db(raft: &Raft, db: &Arc<Db>) -> Result<(), String>
         streams,
         viewers,
         api_token,
+        pending_delete_stream_ids,
     })
     .await
     .map_err(|e| format!("seed write: {e}"))?;
