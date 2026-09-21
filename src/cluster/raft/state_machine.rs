@@ -186,7 +186,15 @@ impl SqliteStateMachine {
                         self.emit_effect(StateEffect::ClearDrainStream(id.clone()));
                         ClusterResponse::Ok
                     }
-                    Some(false) => ClusterResponse::NotFound,
+                    // Authoritative on the leader: distinguish a genuinely
+                    // absent row (NotFound) from one that still exists but is
+                    // no longer pending (Conflict), so a requesting follower
+                    // never has to re-check its possibly-stale local state.
+                    Some(false) => match self.db.stream_get(id) {
+                        crate::db::DbLookup::Missing => ClusterResponse::NotFound,
+                        crate::db::DbLookup::Failed => ClusterResponse::Error("db".into()),
+                        crate::db::DbLookup::Ok(_) => ClusterResponse::Conflict,
+                    },
                     None => ClusterResponse::Error("db".into()),
                 }
             }

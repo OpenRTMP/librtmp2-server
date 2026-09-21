@@ -253,11 +253,19 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
 
 pub async fn read_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
-) -> Result<ControlMessage, std::io::Error> {
+) -> Result<
+    (
+        ControlMessage,
+        Option<crate::cluster::security::InflightByteBudgetGuard>,
+    ),
+    std::io::Error,
+> {
     // Client-side response reader: a peer may legally write a response up to
     // MAX_FRAME (e.g. a large StatsProxyResp), so allow large non-snapshot
-    // frames here. Budgeting is still applied inside the shared reader.
-    read_budgeted_frame(r, true).await.map(|(msg, _)| msg)
+    // frames here. Budgeting is still applied inside the shared reader, and the
+    // guard is returned so the caller keeps it alive until the decoded payload
+    // has been consumed instead of releasing the budget at decode time.
+    read_budgeted_frame(r, true).await
 }
 
 async fn read_control_frame<R: AsyncReadExt + Unpin>(
@@ -427,6 +435,7 @@ impl NetworkConnection {
             req,
         )
         .await
+        .map(|(msg, _read_budget)| msg)
         .map_err(|e| {
             if e.contains("connect") || e.contains("tcp") {
                 RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e)))
@@ -1113,7 +1122,13 @@ async fn authed_roundtrip_inner(
     local_id: NodeId,
     tls_client: Option<Arc<ClientConfig>>,
     msg: ControlMessage,
-) -> Result<ControlMessage, String> {
+) -> Result<
+    (
+        ControlMessage,
+        Option<crate::cluster::security::InflightByteBudgetGuard>,
+    ),
+    String,
+> {
     let timeout = match &msg {
         ControlMessage::RaftSnapshot(_) | ControlMessage::RaftSnapshotResp(_) => {
             SNAPSHOT_ROUNDTRIP_TIMEOUT
@@ -1134,7 +1149,13 @@ async fn authed_roundtrip_unbounded(
     local_id: NodeId,
     tls_client: Option<Arc<ClientConfig>>,
     msg: ControlMessage,
-) -> Result<ControlMessage, String> {
+) -> Result<
+    (
+        ControlMessage,
+        Option<crate::cluster::security::InflightByteBudgetGuard>,
+    ),
+    String,
+> {
     let mut stream = connect_raw(addr, tls_client).await?;
     client_auth_handshake(&mut stream, secret, local_id)
         .await
@@ -1187,7 +1208,7 @@ async fn send_join_with_hops(
     tls_client: Option<Arc<ClientConfig>>,
     hops: u8,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
-    match authed_roundtrip_inner(
+    let (msg, _read_budget) = authed_roundtrip_inner(
         leader_addr,
         secret,
         local_id,
@@ -1199,8 +1220,8 @@ async fn send_join_with_hops(
             proof: proof.clone(),
         },
     )
-    .await?
-    {
+    .await?;
+    match msg {
         ControlMessage::JoinResponse {
             ok: true,
             cluster_id,
@@ -1254,7 +1275,7 @@ pub async fn forward_join(
     proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
-    match authed_roundtrip_inner(
+    let (msg, _read_budget) = authed_roundtrip_inner(
         leader_addr,
         secret,
         local_id,
@@ -1266,8 +1287,8 @@ pub async fn forward_join(
             proof,
         },
     )
-    .await?
-    {
+    .await?;
+    match msg {
         ControlMessage::JoinResponse {
             ok: true,
             cluster_id,
@@ -1287,15 +1308,15 @@ pub async fn send_topology(
     local_id: NodeId,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
-    match authed_roundtrip_inner(
+    let (msg, _read_budget) = authed_roundtrip_inner(
         peer_addr,
         secret,
         local_id,
         tls_client,
         ControlMessage::TopologyReq,
     )
-    .await?
-    {
+    .await?;
+    match msg {
         ControlMessage::TopologyResp {
             ok: true,
             cluster_id,
@@ -1353,15 +1374,15 @@ pub async fn send_session_count(
     stream_id: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<u64, String> {
-    match authed_roundtrip_inner(
+    let (msg, _read_budget) = authed_roundtrip_inner(
         peer_addr,
         secret,
         local_id,
         tls_client,
         ControlMessage::SessionCountReq { stream_id },
     )
-    .await?
-    {
+    .await?;
+    match msg {
         ControlMessage::SessionCountResp { count } => Ok(count),
         ControlMessage::AdminErr { message } => Err(message),
         _ => Err("unexpected session count response".into()),
@@ -1375,7 +1396,9 @@ pub async fn send_admin(
     msg: ControlMessage,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(), String> {
-    match authed_roundtrip_inner(peer_addr, secret, local_id, tls_client, msg).await? {
+    let (msg, _read_budget) =
+        authed_roundtrip_inner(peer_addr, secret, local_id, tls_client, msg).await?;
+    match msg {
         ControlMessage::AdminOk => Ok(()),
         ControlMessage::AdminErr { message } => Err(message),
         _ => Err("unexpected admin response".into()),
@@ -1388,17 +1411,25 @@ pub async fn send_stats_proxy(
     local_id: NodeId,
     stream_id: String,
     tls_client: Option<Arc<ClientConfig>>,
-) -> Result<serde_json::Value, String> {
-    match authed_roundtrip_inner(
+) -> Result<
+    (
+        serde_json::Value,
+        Option<crate::cluster::security::InflightByteBudgetGuard>,
+    ),
+    String,
+> {
+    let (msg, read_budget) = authed_roundtrip_inner(
         peer_addr,
         secret,
         local_id,
         tls_client,
         ControlMessage::StatsProxyReq { stream_id },
     )
-    .await?
-    {
-        ControlMessage::StatsProxyResp { body } => Ok(body),
+    .await?;
+    match msg {
+        // Keep the read-budget guard coupled to the returned body so a large
+        // StatsProxyResp stays accounted for until the caller has consumed it.
+        ControlMessage::StatsProxyResp { body } => Ok((body, read_budget)),
         ControlMessage::AdminErr { message } => Err(message),
         _ => Err("unexpected stats proxy response".into()),
     }
@@ -1414,15 +1445,15 @@ pub async fn send_client_write(
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<crate::cluster::command::ClusterResponse, String> {
     let req = serde_json::to_value(&cmd).map_err(|e| e.to_string())?;
-    match authed_roundtrip_inner(
+    let (msg, _read_budget) = authed_roundtrip_inner(
         leader_addr,
         secret,
         local_id,
         tls_client,
         ControlMessage::ClientWrite { req, proof },
     )
-    .await?
-    {
+    .await?;
+    match msg {
         ControlMessage::ClientWriteResp(body) => {
             let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             if ok {
@@ -1454,15 +1485,15 @@ pub async fn send_change_membership(
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<(), String> {
     let req = serde_json::to_value(&change).map_err(|e| e.to_string())?;
-    match authed_roundtrip_inner(
+    let (msg, _read_budget) = authed_roundtrip_inner(
         leader_addr,
         secret,
         local_id,
         tls_client,
         ControlMessage::ChangeMembership { req, proof },
     )
-    .await?
-    {
+    .await?;
+    match msg {
         ControlMessage::ChangeMembershipResp { ok: true, .. } => Ok(()),
         ControlMessage::ChangeMembershipResp { ok: false, message } => Err(message),
         ControlMessage::AdminErr { message } => Err(message),

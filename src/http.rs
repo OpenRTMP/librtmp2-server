@@ -1213,20 +1213,20 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
             Ok(())
         }
         Err(CoordError::NotFound) => {
-            // `stream_delete_if_pending` (and the cluster `FinalizeDeleteStream`
-            // apply) also returns NotFound when the row still exists with
-            // `pending_delete=0` — i.e. BeginDeleteStream rolled back or never
-            // committed. That is not a completed delete: the stream is still
-            // present and may be enabled/publishable, so only a genuinely
-            // absent row counts as success. Do not propose SetStreamEnabled(true)
-            // here — the row, if present, was never disabled by this delete.
-            if matches!(state.db.stream_get(id), DbLookup::Missing) {
-                clear_http_delete_marker(state, id);
-                Ok(())
-            } else {
-                clear_http_delete_marker(state, id);
-                Err(())
-            }
+            // Authoritative "row is gone" result from the coordinator (the
+            // replicated state machine in cluster mode, the local DB in
+            // standalone mode). A present-but-not-pending row is reported as
+            // Conflict instead, so no follower-local read is needed here —
+            // that read could see a stale row before the delete applies.
+            clear_http_delete_marker(state, id);
+            Ok(())
+        }
+        Err(CoordError::Conflict) => {
+            // Row still exists with `pending_delete=0` (BeginDeleteStream
+            // rolled back or never committed): the stream may still be
+            // enabled/publishable, so this is not a completed delete.
+            clear_http_delete_marker(state, id);
+            Err(())
         }
         Err(_) => {
             // Only re-enable when the stream still exists (disable-not-delete
@@ -1894,7 +1894,9 @@ async fn handle_stream_stats(
                             .as_ref()
                             .map(|o| o.owner_node_id == mgr.node_id())
                             .unwrap_or(true);
-                        if !local_owner && let Some(proxied) = mgr.proxy_stream_stats(&id).await {
+                        if !local_owner
+                            && let Some((proxied, _read_budget)) = mgr.proxy_stream_stats(&id).await
+                        {
                             let mut body = build_json_stats(&state.db, Some(&id));
                             if let Some(obj) = body.as_object_mut() {
                                 obj.insert("cluster_proxy".into(), proxied);
