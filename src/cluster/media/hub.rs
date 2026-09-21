@@ -988,6 +988,11 @@ impl MediaHub {
     }
 
     pub async fn unsubscribe_remote(&self, peer_id: NodeId, app: &str, stream: &str) {
+        // Hold the same lock as subscribe_remote/ensure_peer/resubscribe_peer so
+        // a fresh-peer resubscribe snapshot cannot enqueue Subscribe after this
+        // Unsubscribe (the owner would keep a phantom subscription). No `.await`
+        // is held across the guard.
+        let _guard = self.subscribe_lock.lock();
         if !self.subs.remove(peer_id, app, stream) {
             return;
         }

@@ -286,6 +286,7 @@ impl SqliteStateMachine {
                 streams,
                 viewers,
                 api_token,
+                pending_delete_stream_ids,
             } => {
                 // Bootstrap node already has these rows; Duplicate is expected.
                 // Any other failure must surface so last_applied does not advance.
@@ -314,6 +315,20 @@ impl SqliteStateMachine {
                         return ClusterResponse::Error(e);
                     }
                     self.emit_effect(StateEffect::ApiToken(token.clone()));
+                }
+                // A standalone DB can hold streams left mid-delete; replicate
+                // that state so followers mark them pending too and
+                // FinalizeDeleteStream can complete instead of leaving a
+                // disabled ghost stream behind.
+                for stream_id in pending_delete_stream_ids {
+                    if self.db.stream_disable(&stream_id).is_none() {
+                        return ClusterResponse::Error(
+                            "stream_disable failed during SeedFromStandalone".into(),
+                        );
+                    }
+                    // Mirror BeginDeleteStream: kick local sessions and stop
+                    // advertising the stream so the leader can finalize.
+                    self.emit_effect(StateEffect::DrainStream(stream_id.clone()));
                 }
                 ClusterResponse::Ok
             }
