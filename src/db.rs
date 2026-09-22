@@ -335,7 +335,18 @@ impl Db {
             Connection::open_with_flags(path, on_disk_db_open_flags())?
         };
         conn.busy_timeout(std::time::Duration::from_millis(1000))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // `synchronous=NORMAL` is the documented-safe pairing for WAL mode: it
+        // still fsyncs at checkpoints (no corruption risk), it just skips the
+        // fsync-per-commit that the default FULL setting does. Every RTMP
+        // publish/play authorization commits a write transaction
+        // (player_try_acquire, publisher inserts, etc.) from the single RTMP
+        // poll thread, so under FULL, N simultaneous joins each block that
+        // thread on their own fsync in turn — the dominant cost behind
+        // per-connection join latency growing with concurrency (see
+        // BENCHMARKS.md's 100-viewer numbers).
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        )?;
         conn.execute_batch(SCHEMA)?;
         // Migrate pre-existing databases created before `pending_delete` was
         // added to the `streams` table (CREATE TABLE IF NOT EXISTS above is a

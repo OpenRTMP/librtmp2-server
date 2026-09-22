@@ -30,6 +30,17 @@ tick before a reply went out. It now polls every 5ms while any connection
 hasn't yet reached a steady publish/play state, and only backs off to 50ms
 once nothing is negotiating — see the tables below for the effect.
 
+**Update 2:** the remaining gap at 100 concurrent viewers (each publish/play
+authorization committed a SQLite write transaction, and `src/db.rs` never set
+`PRAGMA synchronous`, so it defaulted to `FULL` — an fsync on *every* commit,
+not just at WAL checkpoints) is now fixed by setting `synchronous=NORMAL`,
+which is the documented-safe pairing for WAL mode (no corruption risk, only a
+small window of the most recent commits that could be lost on an OS
+crash/power loss — an acceptable trade-off for ephemeral viewer-session rows).
+100 simultaneous joins each blocked the single RTMP thread on their own
+fsync in turn; skipping that dropped 100-viewer join latency from 227 ms to
+142 ms — see the updated tables below.
+
 ## What's being compared
 
 | | librtmp2-server | nginx-rtmp | MediaMTX |
@@ -108,20 +119,22 @@ Full commands, including exact server configs, are in
 - CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
 - rustc 1.98.1, ffmpeg 6.1.1
-- Date: 2026-09-22 (re-run same day after the poll-loop and script fixes above)
+- Date: 2026-09-22 (re-run same day after the poll-loop, script, and SQLite
+  `synchronous` fixes above)
 
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| librtmp2-server | 100% | 397.5/s | 73.5 ms | 68.7 ms | 92.7 ms | 92.8 ms | 92.8 ms |
-| nginx-rtmp | 100% | 330.9/s | 85.4 ms | 88.0 ms | 92.4 ms | 92.7 ms | 92.7 ms |
-| MediaMTX | 100% | 607.4/s | 43.1 ms | 47.3 ms | 50.4 ms | 51.6 ms | 56.6 ms |
+| librtmp2-server | 100% | 471.4/s | 61.3 ms | 59.5 ms | 73.9 ms | 78.0 ms | 80.2 ms |
+| nginx-rtmp | 100% | 325.9/s | 87.3 ms | 88.0 ms | 95.8 ms | 96.0 ms | 96.1 ms |
+| MediaMTX | 100% | 622.9/s | 42.0 ms | 47.0 ms | 48.9 ms | 49.4 ms | 49.5 ms |
 
 After the poll-loop fix, `librtmp2-server`'s handshake latency dropped from
-139.4 ms avg to 73.5 ms — now faster than nginx-rtmp and second only to
+139.4 ms avg to 73.5 ms; the `synchronous=NORMAL` fix (Update 2 above) took
+it further to 61.3 ms — now clearly faster than nginx-rtmp and second only to
 MediaMTX. (An earlier version of this table showed 211.9 handshakes/s for
-`librtmp2-server`; that was measured before the fix, at avg 139.4 ms.)
+`librtmp2-server`; that was measured before either fix, at avg 139.4 ms.)
 
 ## Concurrent-viewer relay throughput and join latency
 
@@ -131,15 +144,15 @@ viewer received the full stream with no drops.
 
 | Server | Players | Join latency avg / p95 / max | Steady throughput | Steady fps/player |
 |---|---|---|---|---|
-| librtmp2-server | 1 | 136.9 / 136.9 / 136.9 ms | 1.09 Mbps | 72.8 |
-| librtmp2-server | 25 | 138.0 / 140.1 / 140.2 ms | 27.40 Mbps | 73.0 |
-| librtmp2-server | 100 | 226.9 / 229.7 / 230.4 ms | 109.45 Mbps | 72.8 |
-| nginx-rtmp (1 worker) | 1 | 130.7 / 130.7 / 130.7 ms | 1.10 Mbps | 73.0 |
-| nginx-rtmp (1 worker) | 25 | 130.2 / 133.6 / 133.7 ms | 27.35 Mbps | 72.9 |
-| nginx-rtmp (1 worker) | 100 | 133.3 / 138.0 / 138.5 ms | 109.52 Mbps | 73.0 |
-| MediaMTX | 1 | 50.9 / 50.9 / 50.9 ms | 1.10 Mbps | 73.1 |
-| MediaMTX | 25 | 45.5 / 47.7 / 48.1 ms | 27.42 Mbps | 73.1 |
-| MediaMTX | 100 | 56.6 / 68.3 / 69.9 ms | 109.78 Mbps | 73.2 |
+| librtmp2-server | 1 | 118.3 / 118.3 / 118.3 ms | 1.09 Mbps | 72.8 |
+| librtmp2-server | 25 | 122.7 / 133.7 / 133.9 ms | 27.42 Mbps | 73.1 |
+| librtmp2-server | 100 | 142.1 / 148.5 / 149.5 ms | 109.52 Mbps | 72.9 |
+| nginx-rtmp (1 worker) | 1 | 129.4 / 129.4 / 129.4 ms | 1.10 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 25 | 130.3 / 133.1 / 133.1 ms | 27.43 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 100 | 129.5 / 133.8 / 134.8 ms | 109.72 Mbps | 73.1 |
+| MediaMTX | 1 | 41.9 / 41.9 / 41.9 ms | 1.10 Mbps | 73.2 |
+| MediaMTX | 25 | 44.4 / 49.2 / 49.8 ms | 27.44 Mbps | 73.2 |
+| MediaMTX | 100 | 55.4 / 71.2 / 72.6 ms | 109.65 Mbps | 73.1 |
 
 Takeaways:
 
@@ -147,21 +160,17 @@ Takeaways:
   100 concurrent viewers of one stream on this 4-vCPU box (steady fps/player
   ≈ 73 across the board) — none of the three is anywhere near saturated at
   this concurrency on this hardware.
-- **Join latency at 1 and 25 viewers**: after the poll-loop fix,
-  `librtmp2-server` (137-138 ms) is now in the same range as nginx-rtmp
-  (130-134 ms); MediaMTX is fastest to join at this concurrency (46-51 ms).
-  (An earlier version of this table showed `librtmp2-server` at 201-205 ms
-  here — that was before the fix.)
-- **Join latency at 100 viewers is `librtmp2-server`'s one remaining, real
-  gap**: 227 ms vs. 133 ms (nginx-rtmp) and 57 ms (MediaMTX), and the only
-  one of the three whose join latency clearly increases with viewer count.
-  The poll-loop fix (5ms polling while any connection is still negotiating)
-  fixes the *wait-for-the-next-tick* cost per round trip, but 100
-  simultaneous new connections still have their handshake/connect/play steps
-  processed one after another on the single RTMP thread — that per-connection
-  processing time, not a poll-interval sleep, is the next thing to profile
-  (e.g. whether any of it can move off the single accept/poll thread, or
-  become cheaper per connection) if this needs to come down further.
+- **Join latency at 1 and 25 viewers**: `librtmp2-server` (118-123 ms) is now
+  at or ahead of nginx-rtmp (129-130 ms); MediaMTX is fastest to join at this
+  concurrency (42-44 ms).
+- **Join latency at 100 viewers, after the `synchronous=NORMAL` fix
+  (Update 2 above), is 142 ms** — down from 227 ms, and now within ~13 ms of
+  nginx-rtmp (129.5 ms) rather than the earlier ~94 ms gap. `librtmp2-server`
+  is still the one of the three whose join latency increases most with
+  viewer count (118 ms at 1 viewer → 142 ms at 100), and MediaMTX remains
+  fastest in absolute terms (55 ms) — profiling further per-connection cost
+  in the publish/play path (beyond the fsync-per-commit this fix removed) is
+  the next thing to look at if this needs to come down further.
 - Aggregate throughput scales linearly with viewer count for all three, as
   expected for a simple relay (no transcoding) — 100 viewers at ~1.1 Mbps
   each is ~110 Mbps served, consistent across all three implementations.
