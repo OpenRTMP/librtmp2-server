@@ -175,7 +175,7 @@ impl TestServer {
                 let revoked_now: HashSet<String> =
                     revoked_for_rtmp.lock().iter().cloned().collect();
 
-                let current_ids = process_server_connections(
+                let (current_ids, _just_authorized) = process_server_connections(
                     &mut server,
                     &mut tracked,
                     &rtmp_bridge,

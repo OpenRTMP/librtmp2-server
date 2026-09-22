@@ -90,14 +90,17 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 
 /// Poll interval used instead of `POLL_INTERVAL_MS` while at least one
 /// tracked connection is still negotiating (handshake / connect /
-/// createStream / publish|play command) rather than actively publishing or
-/// playing. Handshake and stream-join round trips each wait for the next
-/// poll tick before the server's reply goes out, so the fixed 50ms interval
-/// alone adds up to tens of milliseconds of avoidable latency per step;
-/// polling faster only during this comparatively brief, comparatively rare
-/// window keeps that cost low without paying the CPU cost of fast-polling
+/// createStream / publish|play command, including a publish|play command
+/// still waiting on the async auth worker) rather than actively publishing
+/// or playing, and for one tick right after the async auth worker resolves
+/// a publish/play authorization (see `just_authorized` in the poll loop).
+/// Handshake and stream-join round trips each wait for the next poll tick
+/// before the server's reply goes out, so the fixed 50ms interval alone
+/// adds up to tens of milliseconds of avoidable latency per step; polling
+/// faster only during this comparatively brief, comparatively rare window
+/// keeps that cost low without paying the CPU cost of fast-polling
 /// steady-state connections that no longer need it.
-pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 5;
+pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 
 /// Normalize a bind string so passing it to librtmp2 cannot fall back to the
 /// RTMP library default port. In particular, RTMPS host-only binds such as
@@ -217,14 +220,20 @@ pub(crate) fn rtmp_play_auth_cb(conn_id: u64, app: &str, play_key: &str) -> Auth
 /// a `Pending` result the worker resolved between poll ticks turns into the
 /// connection's actual publish/play state -- and its `onStatus` reply -- as
 /// soon as possible, without ever blocking this thread on the worker.
-fn drain_auth_completions(server: &mut librtmp2::server::Server) {
+///
+/// Returns whether at least one completion was applied, so the caller can
+/// poll again immediately (rather than take the full idle sleep) and pick
+/// up whatever the client sends right after receiving that `onStatus` reply.
+fn drain_auth_completions(server: &mut librtmp2::server::Server) -> bool {
     let Ok(guard) = AUTH_COMPLETIONS_RX.lock() else {
-        return;
+        return false;
     };
     let Some(rx) = guard.as_ref() else {
-        return;
+        return false;
     };
+    let mut any_completed = false;
     while let Ok(completion) = rx.try_recv() {
+        any_completed = true;
         match completion.kind {
             AuthKind::Publish => {
                 if completion.allow {
@@ -237,6 +246,7 @@ fn drain_auth_completions(server: &mut librtmp2::server::Server) {
             }
         }
     }
+    any_completed
 }
 
 pub(crate) fn rtmp_media_cb(
@@ -447,8 +457,8 @@ pub(crate) fn process_server_connections(
     deleted_now: &HashSet<String>,
     revoked_now: &HashSet<String>,
     idle_timeout: Duration,
-) -> HashSet<u64> {
-    drain_auth_completions(server);
+) -> (HashSet<u64>, bool) {
+    let just_authorized = drain_auth_completions(server);
 
     let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
@@ -689,7 +699,7 @@ pub(crate) fn process_server_connections(
         server.connections.remove(idx);
     }
 
-    current_ids
+    (current_ids, just_authorized)
 }
 
 fn is_valid_env_api_token(token: &str) -> bool {
@@ -1152,7 +1162,7 @@ impl ServerApp {
                 let deleted_now: HashSet<String> = deleted_streams.lock().iter().cloned().collect();
                 let revoked_now: HashSet<String> = revoked_viewers.lock().iter().cloned().collect();
 
-                let current_ids = process_server_connections(
+                let (current_ids, just_authorized) = process_server_connections(
                     &mut server,
                     &mut tracked,
                     &rtmp_bridge,
@@ -1342,7 +1352,7 @@ impl ServerApp {
                     .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
 
                 let negotiating = tracked.values().any(|c| !c.publishing && !c.playing);
-                let poll_interval_ms = if negotiating {
+                let poll_interval_ms = if negotiating || just_authorized {
                     POLL_INTERVAL_FAST_MS
                 } else {
                     POLL_INTERVAL_MS
@@ -1441,14 +1451,17 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerApp, TrackedConn, bind_with_default_port, drain_deleted_stream_roles,
-        eviction_stream_id, live_stream_ids_for_deleted_markers, should_evict_idle_conn,
+        AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, bind_with_default_port,
+        drain_auth_completions, drain_deleted_stream_roles, eviction_stream_id,
+        live_stream_ids_for_deleted_markers, should_evict_idle_conn,
     };
+    use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
     use crate::db::Db;
     use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::mpsc::sync_channel;
     use std::time::{Duration, Instant};
 
     fn stale_first_seen(now: Instant) -> Option<Instant> {
@@ -1495,6 +1508,55 @@ mod tests {
             now,
             Duration::from_secs(30)
         ));
+    }
+
+    #[test]
+    fn drain_auth_completions_reports_when_a_completion_was_applied() {
+        let cfg = librtmp2::types::ServerConfig {
+            max_connections: 8,
+            chunk_size: 4096,
+            tls_enabled: 0,
+            tls_cert_file: std::ptr::null(),
+            tls_key_file: std::ptr::null(),
+            tls_ca_file: std::ptr::null(),
+            tls_insecure: 0,
+            max_pending_tls_per_addr: i32::MAX,
+            max_connections_per_addr: i32::MAX,
+        };
+        let mut server = librtmp2::server::Server::new(cfg).unwrap();
+
+        // Nothing queued: the poll loop must not force a fast follow-up tick.
+        assert!(!drain_auth_completions(&mut server));
+
+        // conn_id 999 doesn't exist on this server, so resolving it is a
+        // harmless no-op (see `Server::complete_publish_authorization`) --
+        // what this test checks is that the drain is still reported, which
+        // is what lets the poll loop pick a fast follow-up tick regardless
+        // of whether the connection was still around to receive it.
+        let (tx, rx) = sync_channel(4);
+        tx.send(AuthCompletion {
+            kind: AuthKind::Publish,
+            conn_id: 999,
+            allow: true,
+        })
+        .unwrap();
+        if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+            *guard = Some(rx);
+        }
+
+        assert!(
+            drain_auth_completions(&mut server),
+            "a drained completion must be reported so the poll loop can skip \
+             the idle sleep on this tick"
+        );
+        assert!(
+            !drain_auth_completions(&mut server),
+            "the channel is now empty; no fast follow-up is needed"
+        );
+
+        if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+            *guard = None;
+        }
     }
 
     #[test]
