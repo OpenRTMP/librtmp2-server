@@ -13,6 +13,23 @@ results — where the numbers behave the same or differently across servers —
 as the useful signal, and re-run `scripts/run_rtmp_benchmarks.sh` on your
 own target hardware before using any of this for capacity planning.
 
+**Update:** the first version of this document showed `librtmp2-server`
+noticeably slower than nginx-rtmp on both handshake and join latency. That
+was real, but overstated by two bugs in `scripts/run_rtmp_benchmarks.sh`
+itself: the nginx/MediaMTX relay sweeps had the publisher and viewer on two
+different stream names (so those two servers were never actually relaying
+anything — nginx's numbers for that section were single stray control
+frames, and MediaMTX's `play()` call failed outright), and the
+`librtmp2-server` relay sweep appended the sweep index to its exact publish
+key, corrupting it. Both are fixed. Separately, the actual root cause of
+`librtmp2-server`'s connect/join latency was found and fixed: `src/server.rs`'s
+main poll loop slept a fixed 50ms every cycle regardless of whether any
+connection was still negotiating (handshake/connect/createStream/publish or
+play), so every step of that exchange could wait up to 50ms for the next
+tick before a reply went out. It now polls every 5ms while any connection
+hasn't yet reached a steady publish/play state, and only backs off to 50ms
+once nothing is negotiating — see the tables below for the effect.
+
 ## What's being compared
 
 | | librtmp2-server | nginx-rtmp | MediaMTX |
@@ -91,20 +108,20 @@ Full commands, including exact server configs, are in
 - CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
 - rustc 1.98.1, ffmpeg 6.1.1
-- Date: 2026-09-22
+- Date: 2026-09-22 (re-run same day after the poll-loop and script fixes above)
 
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| librtmp2-server | 100% | 211.9/s | 139.4 ms | 145.5 ms | 157.4 ms | 179.3 ms | 179.4 ms |
-| nginx-rtmp | 100% | 329.2/s | 87.0 ms | 89.3 ms | 92.4 ms | 95.4 ms | 96.1 ms |
-| MediaMTX | 100% | 656.7/s | 42.8 ms | 43.9 ms | 49.0 ms | 49.8 ms | 49.9 ms |
+| librtmp2-server | 100% | 397.5/s | 73.5 ms | 68.7 ms | 92.7 ms | 92.8 ms | 92.8 ms |
+| nginx-rtmp | 100% | 330.9/s | 85.4 ms | 88.0 ms | 92.4 ms | 92.7 ms | 92.7 ms |
+| MediaMTX | 100% | 607.4/s | 43.1 ms | 47.3 ms | 50.4 ms | 51.6 ms | 56.6 ms |
 
-librtmp2-server's higher handshake latency here lines up with it being the
-newest, least-optimized-for-this-path implementation of the three; it's a
-reasonable first profiling target if connect-time latency matters for a
-given deployment (e.g. very short clips, fast channel-surfing UIs).
+After the poll-loop fix, `librtmp2-server`'s handshake latency dropped from
+139.4 ms avg to 73.5 ms — now faster than nginx-rtmp and second only to
+MediaMTX. (An earlier version of this table showed 211.9 handshakes/s for
+`librtmp2-server`; that was measured before the fix, at avg 139.4 ms.)
 
 ## Concurrent-viewer relay throughput and join latency
 
@@ -114,15 +131,15 @@ viewer received the full stream with no drops.
 
 | Server | Players | Join latency avg / p95 / max | Steady throughput | Steady fps/player |
 |---|---|---|---|---|
-| librtmp2-server | 1 | 204.7 / 204.7 / 204.7 ms | 1.10 Mbps | 73.1 |
-| librtmp2-server | 25 | 201.1 / 202.0 / 202.0 ms | 27.36 Mbps | 72.8 |
-| librtmp2-server | 100 | 291.2 / 295.1 / 296.0 ms | 109.93 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 1 | 129.3 / 129.3 / 129.3 ms | 1.10 Mbps | 73.2 |
-| nginx-rtmp (1 worker) | 25 | 129.5 / 134.5 / 135.1 ms | 27.38 Mbps | 73.0 |
-| nginx-rtmp (1 worker) | 100 | 137.9 / 148.1 / 148.5 ms | 109.62 Mbps | 73.0 |
-| MediaMTX | 1 | 46.0 / 46.0 / 46.0 ms | 1.10 Mbps | 73.1 |
-| MediaMTX | 25 | 43.0 / 51.3 / 51.4 ms | 27.42 Mbps | 73.1 |
-| MediaMTX | 100 | 63.0 / 81.7 / 84.9 ms | 109.65 Mbps | 73.1 |
+| librtmp2-server | 1 | 136.9 / 136.9 / 136.9 ms | 1.09 Mbps | 72.8 |
+| librtmp2-server | 25 | 138.0 / 140.1 / 140.2 ms | 27.40 Mbps | 73.0 |
+| librtmp2-server | 100 | 226.9 / 229.7 / 230.4 ms | 109.45 Mbps | 72.8 |
+| nginx-rtmp (1 worker) | 1 | 130.7 / 130.7 / 130.7 ms | 1.10 Mbps | 73.0 |
+| nginx-rtmp (1 worker) | 25 | 130.2 / 133.6 / 133.7 ms | 27.35 Mbps | 72.9 |
+| nginx-rtmp (1 worker) | 100 | 133.3 / 138.0 / 138.5 ms | 109.52 Mbps | 73.0 |
+| MediaMTX | 1 | 50.9 / 50.9 / 50.9 ms | 1.10 Mbps | 73.1 |
+| MediaMTX | 25 | 45.5 / 47.7 / 48.1 ms | 27.42 Mbps | 73.1 |
+| MediaMTX | 100 | 56.6 / 68.3 / 69.9 ms | 109.78 Mbps | 73.2 |
 
 Takeaways:
 
@@ -130,13 +147,21 @@ Takeaways:
   100 concurrent viewers of one stream on this 4-vCPU box (steady fps/player
   ≈ 73 across the board) — none of the three is anywhere near saturated at
   this concurrency on this hardware.
-- **Join latency**: MediaMTX joins fastest (43-85 ms), nginx-rtmp next
-  (129-148 ms), librtmp2-server slowest (201-296 ms) and the only one whose
-  join latency clearly increases with viewer count. This is the most
-  actionable finding here for `librtmp2-server`'s own roadmap — worth
-  profiling the play/subscribe path (GOP replay, cache-lookup, or per-viewer
-  setup cost) since 100 viewers joining an already-live stream is a very
-  ordinary "stream just went viral" scenario.
+- **Join latency at 1 and 25 viewers**: after the poll-loop fix,
+  `librtmp2-server` (137-138 ms) is now in the same range as nginx-rtmp
+  (130-134 ms); MediaMTX is fastest to join at this concurrency (46-51 ms).
+  (An earlier version of this table showed `librtmp2-server` at 201-205 ms
+  here — that was before the fix.)
+- **Join latency at 100 viewers is `librtmp2-server`'s one remaining, real
+  gap**: 227 ms vs. 133 ms (nginx-rtmp) and 57 ms (MediaMTX), and the only
+  one of the three whose join latency clearly increases with viewer count.
+  The poll-loop fix (5ms polling while any connection is still negotiating)
+  fixes the *wait-for-the-next-tick* cost per round trip, but 100
+  simultaneous new connections still have their handshake/connect/play steps
+  processed one after another on the single RTMP thread — that per-connection
+  processing time, not a poll-interval sleep, is the next thing to profile
+  (e.g. whether any of it can move off the single accept/poll thread, or
+  become cheaper per connection) if this needs to come down further.
 - Aggregate throughput scales linearly with viewer count for all three, as
   expected for a simple relay (no transcoding) — 100 viewers at ~1.1 Mbps
   each is ~110 Mbps served, consistent across all three implementations.

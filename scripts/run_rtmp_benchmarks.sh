@@ -32,14 +32,14 @@ mkdir -p "$WORK_DIR"/{logs,lrtmp2-server,nginx,mediamtx}
 echo "Work dir: $WORK_DIR"
 
 for bin in "$BENCH_HANDSHAKE" "$BENCH_RELAY"; do
-  if [ ! -x "$bin" ]; then
+  if [[ ! -x "$bin" ]]; then
     echo "error: $bin not found — build librtmp2 first:" >&2
     echo "  (cd $LIBRTMP2_DIR && cargo build --release --example bench_handshake --example bench_relay)" >&2
     exit 1
   fi
 done
 
-command -v ffmpeg >/dev/null || { echo "error: ffmpeg not found"; exit 1; }
+command -v ffmpeg >/dev/null || { echo "error: ffmpeg not found" >&2; exit 1; }
 
 PIDS=()
 cleanup() {
@@ -63,10 +63,18 @@ relay_sweep() {
   local label="$1" pub_url="$2" play_arg_kind="$3" play_arg="$4"
   for n in 1 25 100; do
     echo "=== $label relay, players=$n ==="
-    local pid
-    pid=$(publish "${pub_url}${n}" "$WORK_DIR/logs/pub-$label-$n.log")
+    local pid target_url
+    if [[ "$play_arg_kind" = "list" ]]; then
+      # pub_url is one exact, pre-provisioned publish key (e.g.
+      # librtmp2-server, which validates it exactly) — reuse it as-is rather
+      # than appending $n, which would turn it into a key nothing provisioned.
+      target_url="$pub_url"
+    else
+      target_url="${pub_url}${n}"
+    fi
+    pid=$(publish "$target_url" "$WORK_DIR/logs/pub-$label-$n.log")
     sleep 3
-    if [ "$play_arg_kind" = "list" ]; then
+    if [[ "$play_arg_kind" = "list" ]]; then
       "$BENCH_RELAY" --url-list "$play_arg" --players "$n" --run-secs 15 --warmup-ms 3000
     else
       "$BENCH_RELAY" "${play_arg}${n}" --players "$n" --run-secs 15 --warmup-ms 3000
@@ -123,7 +131,7 @@ relay_sweep "lrtmp2-server" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$PLA
 kill "$(cat "$WORK_DIR/lrtmp2-server.pid")" >/dev/null 2>&1 || true
 
 ### 2. nginx-rtmp ###
-if command -v nginx >/dev/null && [ -e /usr/lib/nginx/modules/ngx_rtmp_module.so ]; then
+if command -v nginx >/dev/null && [[ -e /usr/lib/nginx/modules/ngx_rtmp_module.so ]]; then
   echo "--- starting nginx-rtmp on :1936 ---"
   cat > "$WORK_DIR/nginx/nginx.conf" <<EOF
 load_module /usr/lib/nginx/modules/ngx_rtmp_module.so;
@@ -142,14 +150,14 @@ EOF
   nginx -c "$WORK_DIR/nginx/nginx.conf"
   echo "=== nginx-rtmp handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1936/live/hsbench --count 120 --concurrency 30
-  relay_sweep "nginx" "rtmp://127.0.0.1:1936/live/bench" prefix "rtmp://127.0.0.1:1936/live/nginxsweep"
+  relay_sweep "nginx" "rtmp://127.0.0.1:1936/live/bench" prefix "rtmp://127.0.0.1:1936/live/bench"
   nginx -c "$WORK_DIR/nginx/nginx.conf" -s stop || true
 else
   echo "skipping nginx-rtmp: nginx or ngx_rtmp_module.so not found"
 fi
 
 ### 3. MediaMTX ###
-if [ -n "$MEDIAMTX_BIN" ] && [ -x "$MEDIAMTX_BIN" ]; then
+if [[ -n "$MEDIAMTX_BIN" ]] && [[ -x "$MEDIAMTX_BIN" ]]; then
   echo "--- starting MediaMTX on :1937 ---"
   cat > "$WORK_DIR/mediamtx/mediamtx.yml" <<EOF
 logLevel: info
@@ -175,7 +183,7 @@ EOF
   sleep 2
   echo "=== MediaMTX handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1937/live/hsbench --count 120 --concurrency 30
-  relay_sweep "mediamtx" "rtmp://127.0.0.1:1937/live/bench" prefix "rtmp://127.0.0.1:1937/live/mediamtxsweep"
+  relay_sweep "mediamtx" "rtmp://127.0.0.1:1937/live/bench" prefix "rtmp://127.0.0.1:1937/live/bench"
   kill "$(cat "$WORK_DIR/mediamtx.pid")" >/dev/null 2>&1 || true
 else
   echo "skipping MediaMTX: set MEDIAMTX_BIN to a built binary to include it"
