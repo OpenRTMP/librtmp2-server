@@ -4,6 +4,10 @@ RTMP / E-RTMP media server built on [librtmp2](https://github.com/OpenRTMP/librt
 
 Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
+![librtmp2-server demo: starting the server, then curl against the real HTTP API — health check, creating a stream, and reading its stats](docs/screenshots/quickstart-demo.png)
+
+*A real terminal session: `librtmp2-server -c .env`, then `curl` against the live HTTP API — health check, `POST /api/v1/streams`, and `/stats?key=...`. The stream goes from "offline" to live JSON stats the moment an encoder like OBS or ffmpeg publishes to it.*
+
 [![License](https://img.shields.io/github/license/OpenRTMP/librtmp2-server)](LICENSE)
 ![GitHub Release](https://img.shields.io/github/v/release/OpenRTMP/librtmp2-server)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
