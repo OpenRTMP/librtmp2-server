@@ -71,8 +71,20 @@ pub(crate) fn clear_rtmp_poll_server() {
     RTMP_POLL_SERVER.with(|cell| cell.set(None));
 }
 
-/// How often the poll loop wakes up to service the RTMP/RTMPS listener(s).
+/// How often the poll loop wakes up to service the RTMP/RTMPS listener(s)
+/// once every tracked connection has reached a steady publish/play state.
 pub(crate) const POLL_INTERVAL_MS: u64 = 50;
+
+/// Poll interval used instead of `POLL_INTERVAL_MS` while at least one
+/// tracked connection is still negotiating (handshake / connect /
+/// createStream / publish|play command) rather than actively publishing or
+/// playing. Handshake and stream-join round trips each wait for the next
+/// poll tick before the server's reply goes out, so the fixed 50ms interval
+/// alone adds up to tens of milliseconds of avoidable latency per step;
+/// polling faster only during this comparatively brief, comparatively rare
+/// window keeps that cost low without paying the CPU cost of fast-polling
+/// steady-state connections that no longer need it.
+pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 5;
 
 /// Normalize a bind string so passing it to librtmp2 cannot fall back to the
 /// RTMP library default port. In particular, RTMPS host-only binds such as
@@ -1259,7 +1271,13 @@ impl ServerApp {
                     .lock()
                     .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
 
-                std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+                let negotiating = tracked.values().any(|c| !c.publishing && !c.playing);
+                let poll_interval_ms = if negotiating {
+                    POLL_INTERVAL_FAST_MS
+                } else {
+                    POLL_INTERVAL_MS
+                };
+                std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
             }
 
             media_outputs.stop_all();
