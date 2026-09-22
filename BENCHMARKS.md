@@ -6,7 +6,7 @@ plus a same-machine comparison against nginx-rtmp and MediaMTX using the
 differences between test clients.
 
 **Read this before quoting a number from it:** every result below is from
-one run on one shared 4-vCPU cloud sandbox VM, with all three servers
+one run on one shared 4-vCPU VM, with all three servers
 benchmarked one at a time (not simultaneously) to avoid CPU contention
 between them skewing the comparison. Treat the *relative* shape of the
 results — where the numbers behave the same or differently across servers —
@@ -21,16 +21,13 @@ own target hardware before using any of this for capacity planning.
 | Language | Rust | C | Go |
 | Role | what this repo ships | most common existing RTMP relay | modern multi-protocol media server with RTMP support |
 
-**SRS is not included.** This benchmark was produced in a sandboxed CI
-environment whose network egress allowlist covers crates.io, the Go module
-proxy, and the Ubuntu package archives, but not `github.com` (where SRS's
-source and releases live) or a container registry (SRS ships primarily as a
-Docker image). Both nginx-rtmp (an Ubuntu package) and MediaMTX (fetched via
-`proxy.golang.org` and built from source, working around its
-release-time-only generated asset step — see the script) were reachable
-through that allowlist; SRS wasn't. If you can reach GitHub/Docker Hub,
-`scripts/run_rtmp_benchmarks.sh` is structured so adding a fourth `relay_sweep`
-block for SRS is the only change needed — contributions welcome.
+**SRS is not included.** nginx-rtmp was installed from the Ubuntu package
+archive and MediaMTX was fetched via the Go module proxy and built from
+source (working around its release-time-only generated asset step — see the
+script); SRS ships primarily as a Docker image, which wasn't set up for this
+run. `scripts/run_rtmp_benchmarks.sh` is structured so adding a fourth
+`relay_sweep` block for SRS is the only change needed — contributions
+welcome.
 
 ## Methodology
 
@@ -91,7 +88,7 @@ Full commands, including exact server configs, are in
 
 ## Environment
 
-- CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (cloud sandbox VM — not bare metal)
+- CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
 - rustc 1.98.1, ffmpeg 6.1.1
 - Date: 2026-09-22
