@@ -9,16 +9,29 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
+use crate::auth_worker::{self, AuthCompletion, AuthKind, AuthWorkerHandle};
 use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
 use crate::media_output::{MediaOutputConfig, MediaOutputManager};
 use crate::rtmp_bridge::{DbRtmpBridge, FrameInfo, FrameKind, RtmpEventHandler};
 use crate::state::StateCoordinator;
+use librtmp2::types::AuthorizationResult;
 
 /// RTMP publish/play callbacks are plain function pointers; the bridge is
 /// registered on the RTMP thread before the poll loop starts.
 pub(crate) static RTMP_BRIDGE: StdMutex<Option<Arc<DbRtmpBridge>>> = StdMutex::new(None);
+/// Submission handle for the dedicated publish/play authorization worker
+/// (see `auth_worker`). Set alongside `RTMP_BRIDGE` before the poll loop
+/// starts; the `publish`/`play` callbacks below use it to move SQLite/
+/// cluster authorization work off the RTMP thread.
+pub(crate) static AUTH_WORKER: StdMutex<Option<AuthWorkerHandle>> = StdMutex::new(None);
+/// Completions the auth worker has finished but the RTMP poll loop hasn't
+/// yet applied via `Server::complete_publish_authorization`/
+/// `complete_play_authorization`. Drained once per poll tick in
+/// [`drain_auth_completions`].
+pub(crate) static AUTH_COMPLETIONS_RX: StdMutex<Option<std::sync::mpsc::Receiver<AuthCompletion>>> =
+    StdMutex::new(None);
 static PUBLISH_GENERATIONS: LazyLock<StdMutex<HashMap<u64, u64>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -168,19 +181,62 @@ fn ensure_conn_registered_for_auth(conn_id: u64) {
     });
 }
 
-pub(crate) fn rtmp_publish_cb(conn_id: u64, app: &str, stream_key: &str) -> bool {
+/// Submits publish/play authorization work to the dedicated auth worker
+/// (see `auth_worker`) instead of running `DbRtmpBridge::authorize_publish`/
+/// `authorize_play` -- blocking SQLite, and cluster ownership acquisition
+/// for publish -- directly on the RTMP thread. Fails closed (`Deny`) if the
+/// worker is unavailable or its queue is full.
+fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> AuthorizationResult {
     ensure_conn_registered_for_auth(conn_id);
-    let allowed = with_rtmp_bridge(|b| b.authorize_publish(conn_id, app, stream_key).is_ok())
-        .unwrap_or(false);
-    if allowed {
-        bump_publish_generation(conn_id);
+    let submitted = AUTH_WORKER.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .map(|h| h.try_submit(kind, conn_id, app, stream_key))
+    });
+    match submitted {
+        Some(Ok(())) => AuthorizationResult::Pending,
+        _ => AuthorizationResult::Deny,
     }
-    allowed
 }
 
-pub(crate) fn rtmp_play_cb(conn_id: u64, app: &str, play_key: &str) -> bool {
-    ensure_conn_registered_for_auth(conn_id);
-    with_rtmp_bridge(|b| b.authorize_play(conn_id, app, play_key).is_ok()).unwrap_or(false)
+pub(crate) fn rtmp_publish_auth_cb(
+    conn_id: u64,
+    app: &str,
+    stream_key: &str,
+) -> AuthorizationResult {
+    submit_auth(AuthKind::Publish, conn_id, app, stream_key)
+}
+
+pub(crate) fn rtmp_play_auth_cb(conn_id: u64, app: &str, play_key: &str) -> AuthorizationResult {
+    submit_auth(AuthKind::Play, conn_id, app, play_key)
+}
+
+/// Applies every publish/play authorization the dedicated worker thread has
+/// finished since the last call. Called once at the start of every
+/// [`process_server_connections`] pass (production and test loops alike) so
+/// a `Pending` result the worker resolved between poll ticks turns into the
+/// connection's actual publish/play state -- and its `onStatus` reply -- as
+/// soon as possible, without ever blocking this thread on the worker.
+fn drain_auth_completions(server: &mut librtmp2::server::Server) {
+    let Ok(guard) = AUTH_COMPLETIONS_RX.lock() else {
+        return;
+    };
+    let Some(rx) = guard.as_ref() else {
+        return;
+    };
+    while let Ok(completion) = rx.try_recv() {
+        match completion.kind {
+            AuthKind::Publish => {
+                if completion.allow {
+                    bump_publish_generation(completion.conn_id);
+                }
+                let _ = server.complete_publish_authorization(completion.conn_id, completion.allow);
+            }
+            AuthKind::Play => {
+                let _ = server.complete_play_authorization(completion.conn_id, completion.allow);
+            }
+        }
+    }
 }
 
 pub(crate) fn rtmp_media_cb(
@@ -392,6 +448,8 @@ pub(crate) fn process_server_connections(
     revoked_now: &HashSet<String>,
     idle_timeout: Duration,
 ) -> HashSet<u64> {
+    drain_auth_completions(server);
+
     let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
 
@@ -1021,8 +1079,12 @@ impl ServerApp {
             server.resource_limits = rtmp_resource_limits;
             server.defer_media_relay = true;
             server.on_media_cb = Some(rtmp_media_cb);
-            server.on_publish_cb = Some(rtmp_publish_cb);
-            server.on_play_cb = Some(rtmp_play_cb);
+            // Pending-capable auth: publish/play requests dispatch to the
+            // dedicated auth worker (SQLite + cluster ownership) instead of
+            // running that work on this thread. Takes priority over
+            // on_publish_cb/on_play_cb, which stay unset here.
+            server.on_publish_auth_cb = Some(rtmp_publish_auth_cb);
+            server.on_play_auth_cb = Some(rtmp_play_auth_cb);
             if relay_export_bytes > 0 {
                 server.enable_relay_export(4096, relay_export_bytes.max(1024 * 1024));
             }
@@ -1047,6 +1109,14 @@ impl ServerApp {
             let _ = rtmp_ready_tx.send(Ok(()));
             if let Ok(mut guard) = RTMP_BRIDGE.lock() {
                 *guard = Some(Arc::clone(&rtmp_bridge));
+            }
+            let (auth_worker_handle, auth_completions_rx) =
+                auth_worker::spawn(Arc::clone(&rtmp_bridge));
+            if let Ok(mut guard) = AUTH_WORKER.lock() {
+                *guard = Some(auth_worker_handle);
+            }
+            if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+                *guard = Some(auth_completions_rx);
             }
 
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
