@@ -686,15 +686,22 @@ impl Db {
     }
 
     fn load_stream_row(row: &rusqlite::Row) -> rusqlite::Result<Stream> {
+        Self::load_stream_row_at(row, 0)
+    }
+
+    /// Like `load_stream_row`, but reads `STREAM_COLS` starting at column
+    /// `offset` instead of 0 -- for a joined query that selects other
+    /// columns first (see `viewer_and_stream_by_play_key`).
+    fn load_stream_row_at(row: &rusqlite::Row, offset: usize) -> rusqlite::Result<Stream> {
         Ok(Stream {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            app: row.get(2)?,
-            publish_key: row.get(3)?,
-            play_key: row.get(4)?,
-            stats_key: row.get(5)?,
-            enabled: row.get(6)?,
-            created_at: row.get(7)?,
+            id: row.get(offset)?,
+            name: row.get(offset + 1)?,
+            app: row.get(offset + 2)?,
+            publish_key: row.get(offset + 3)?,
+            play_key: row.get(offset + 4)?,
+            stats_key: row.get(offset + 5)?,
+            enabled: row.get(offset + 6)?,
+            created_at: row.get(offset + 7)?,
         })
     }
 
@@ -1047,6 +1054,43 @@ impl Db {
             ),
             params![key],
             Self::load_viewer_row,
+        ))
+    }
+
+    /// Combined viewer+stream lookup for the play-authorization hot path:
+    /// one query and one lock acquisition instead of
+    /// `viewer_find_by_play_key` followed by `stream_get`. Both lookups were
+    /// already indexed (`stream_viewers.play_key` is `UNIQUE`, `streams.id`
+    /// is the primary key), so this removes a round trip, not a missing
+    /// index. Semantics are unchanged: `Missing` for an invalid/unknown/
+    /// disabled play key, exactly as the two-query path returned.
+    pub fn viewer_and_stream_by_play_key(&self, key: &str) -> DbLookup<(StreamViewer, Stream)> {
+        if !crate::keygen::is_valid_access_key(key) {
+            return DbLookup::Missing;
+        }
+        let viewer_cols: Vec<String> = Self::VIEWER_COLS
+            .split(',')
+            .map(|c| format!("sv.{c}"))
+            .collect();
+        let stream_cols: Vec<String> = Self::STREAM_COLS
+            .split(',')
+            .map(|c| format!("s.{c}"))
+            .collect();
+        let conn = self.conn.lock();
+        map_optional(conn.query_row(
+            &format!(
+                "SELECT {},{} FROM stream_viewers sv \
+                 JOIN streams s ON s.id = sv.stream_id \
+                 WHERE sv.play_key=?1 AND sv.enabled=1",
+                viewer_cols.join(","),
+                stream_cols.join(","),
+            ),
+            params![key],
+            |row| {
+                let viewer = Self::load_viewer_row(row)?;
+                let stream = Self::load_stream_row_at(row, viewer_cols.len())?;
+                Ok((viewer, stream))
+            },
         ))
     }
 
@@ -2359,6 +2403,48 @@ mod tests {
         assert!(active_stream2[0].active);
 
         assert_eq!(db.publisher_list(Some("stream1")).len(), 0);
+    }
+
+    #[test]
+    fn viewer_and_stream_by_play_key_matches_two_query_lookup() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let viewer = StreamViewer {
+            id: "viewer1".to_string(),
+            stream_id: "stream1".to_string(),
+            name: "Viewer".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_play_key_0123456789ab"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        db.viewer_add(&viewer).unwrap();
+
+        let DbLookup::Ok((got_viewer, got_stream)) =
+            db.viewer_and_stream_by_play_key(&viewer.play_key)
+        else {
+            panic!("combined lookup failed");
+        };
+        assert_eq!(got_viewer, viewer);
+        assert_eq!(got_stream, s);
+
+        // Matches the semantics of the two-query path it replaces: unknown,
+        // malformed, and disabled play keys are all `Missing`.
+        assert!(matches!(
+            db.viewer_and_stream_by_play_key("no-such-key"),
+            DbLookup::Missing
+        ));
+
+        let mut disabled = viewer.clone();
+        disabled.id = "viewer2".to_string();
+        disabled.play_key =
+            crate::keygen::test_pad_access_key("viewer_play_key_disabled_0123456789");
+        disabled.enabled = false;
+        db.viewer_add(&disabled).unwrap();
+        assert!(matches!(
+            db.viewer_and_stream_by_play_key(&disabled.play_key),
+            DbLookup::Missing
+        ));
     }
 
     #[test]
