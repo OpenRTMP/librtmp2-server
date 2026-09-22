@@ -374,9 +374,17 @@ impl SqliteStateMachine {
         // Side effects collected here are emitted after commit so the RTMP
         // poll loop drains/revokes in-memory sessions that SQLite no longer
         // (or no longer fully) authorizes.
-        let (revoke_viewers, drain_streams) = self.db.with_conn(|conn| -> Result<(Vec<String>, Vec<String>), String> {
+        let (revoke_viewers, drain_streams, dropped_player_viewers) = self.db.with_conn(|conn| -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
             let mut revoke_viewers = Vec::new();
             let mut drain_streams = Vec::new();
+            // Active player rows whose parent stream or viewer didn't
+            // survive the snapshot are skipped below rather than
+            // reinserted (see the `local_players` loop) — permanently
+            // dropped from `players`, not just deactivated. Track them so
+            // `active_player_counts` (Db's in-memory viewer session
+            // counter) can be resynced after commit; otherwise it would
+            // keep counting a session whose row no longer exists.
+            let mut dropped_player_viewers = Vec::new();
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
             // Snapshot local session children before deleting `streams` — FK
@@ -600,6 +608,9 @@ impl SqliteStateMachine {
                     } else if !viewer_keep {
                         revoke_viewers.push(p.viewer_id.clone());
                     }
+                    if p.active {
+                        dropped_player_viewers.push(p.viewer_id.clone());
+                    }
                     continue;
                 }
                 let bytes_out = i64::try_from(p.bytes_out).unwrap_or(i64::MAX);
@@ -685,7 +696,7 @@ impl SqliteStateMachine {
                 .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
-            Ok((revoke_viewers, drain_streams))
+            Ok((revoke_viewers, drain_streams, dropped_player_viewers))
         })?;
 
         for stream_id in drain_streams {
@@ -693,6 +704,13 @@ impl SqliteStateMachine {
         }
         for viewer_id in revoke_viewers {
             self.emit_effect(StateEffect::RevokeViewer(viewer_id));
+        }
+        // Resync Db's in-memory active-viewer counter for every session
+        // dropped above instead of reinserted — `players_deactivate_for_viewer`
+        // zeroes it unconditionally, which is correct here even though the
+        // SQLite row is already gone (its UPDATE just matches zero rows).
+        for viewer_id in dropped_player_viewers {
+            self.db.players_deactivate_for_viewer(&viewer_id);
         }
         if let Some(token) = &snap.api_token {
             self.emit_effect(StateEffect::ApiToken(token.clone()));
