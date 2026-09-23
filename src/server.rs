@@ -102,6 +102,67 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 /// steady-state connections that no longer need it.
 pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 
+/// Block until a listener or tracked connection socket becomes readable, or
+/// `timeout_ms` elapses -- whichever comes first.
+///
+/// This replaces an unconditional `sleep(timeout_ms)` at the end of the poll
+/// loop. RTMP's handshake and command exchange (C0/C1/C2, connect,
+/// createStream, publish/play) is a long chain of small, sequential round
+/// trips, each of which waits for the next poll tick before the server's
+/// reply goes out -- a fixed sleep alone adds up to `timeout_ms` of pure
+/// waiting to *every one* of those steps, even when the peer's next byte is
+/// already sitting in the socket buffer. `poll(2)`'s timeout is still
+/// `timeout_ms`, so this can only shorten a tick, never lengthen it -- an
+/// async auth completion that arrives via the auth worker's channel with no
+/// matching socket activity is still picked up within the same
+/// `timeout_ms` bound as before, on the next tick that the timeout (rather
+/// than a socket) wakes.
+///
+/// Best-effort: a peer mid-TLS-handshake (tracked separately by librtmp2,
+/// not yet promoted to a `connections` entry) isn't included in the fd set,
+/// so a stalled TLS peer with no other socket activity still waits out the
+/// full timeout -- no worse than the sleep this replaces, just not sped up
+/// by it.
+fn wait_for_readiness_or_timeout(server: &librtmp2::server::Server, timeout_ms: u64) {
+    let mut fds: Vec<libc::pollfd> = server
+        .listener_fds()
+        .into_iter()
+        .chain(
+            server
+                .connections
+                .iter()
+                .map(|conn| conn.client_fd)
+                .filter(|&fd| fd >= 0),
+        )
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+
+    let timeout = timeout_ms.min(i32::MAX as u64) as i32;
+    loop {
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if rc >= 0 {
+            return;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            // Unexpected poll() failure -- e.g. a connection closed and its
+            // fd was reused between fd collection and this call. Fall back
+            // to the plain sleep this function replaces rather than
+            // spinning on a busy error.
+            std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
+            return;
+        }
+        // EINTR: a signal interrupted the wait. `poll`'s timeout is
+        // relative, so simply retrying restarts the full timeout rather
+        // than preserving a deadline -- acceptable for this loop's
+        // existing best-effort latency bound (worst case: one timeout
+        // window longer under signal pressure, which is rare).
+    }
+}
+
 /// Normalize a bind string so passing it to librtmp2 cannot fall back to the
 /// RTMP library default port. In particular, RTMPS host-only binds such as
 /// `0.0.0.0`, `::1`, or `[::1]` must be listened on 1936, not librtmp2's
@@ -1357,7 +1418,7 @@ impl ServerApp {
                 } else {
                     POLL_INTERVAL_MS
                 };
-                std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
+                wait_for_readiness_or_timeout(&server, poll_interval_ms);
             }
 
             media_outputs.stop_all();
