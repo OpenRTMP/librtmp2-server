@@ -360,6 +360,14 @@ impl Db {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
+        // rusqlite's per-connection prepared-statement cache defaults to 16
+        // entries (LRU). This connection serves every distinct query shape in
+        // this file on one shared `Mutex<Connection>`, so a small cache lets
+        // an admin/list query (stream_list, viewer_list, ...) evict the hot
+        // per-join query (`viewer_and_stream_by_play_key`) right before a
+        // burst of concurrent viewers hits it. Headroom avoids that without
+        // meaningfully growing memory use (each cached statement is small).
+        conn.set_prepared_statement_cache_capacity(64);
         conn.execute_batch(SCHEMA)?;
         // Migrate pre-existing databases created before `pending_delete` was
         // added to the `streams` table (CREATE TABLE IF NOT EXISTS above is a
@@ -1110,30 +1118,46 @@ impl Db {
         if !crate::keygen::is_valid_access_key(key) {
             return DbLookup::Missing;
         }
-        let viewer_cols: Vec<String> = Self::VIEWER_COLS
-            .split(',')
-            .map(|c| format!("sv.{c}"))
-            .collect();
-        let stream_cols: Vec<String> = Self::STREAM_COLS
-            .split(',')
-            .map(|c| format!("s.{c}"))
-            .collect();
-        let conn = self.conn.lock();
-        map_optional(conn.query_row(
-            &format!(
+        // `VIEWER_COLS`/`STREAM_COLS` are `const`, so this query text and the
+        // viewer/stream column split point are the same on every call. Every
+        // concurrent viewer join runs this lookup (it's the first DB hit in
+        // `try_authorize_play`), so build the SQL once instead of
+        // re-`format!`-ing and re-parsing it per join, and reuse the parsed
+        // statement via `prepare_cached` instead of `query_row`'s
+        // prepare-then-immediately-finalize.
+        static QUERY: std::sync::LazyLock<(String, usize)> = std::sync::LazyLock::new(|| {
+            let viewer_cols: Vec<String> = Db::VIEWER_COLS
+                .split(',')
+                .map(|c| format!("sv.{c}"))
+                .collect();
+            let stream_cols: Vec<String> = Db::STREAM_COLS
+                .split(',')
+                .map(|c| format!("s.{c}"))
+                .collect();
+            let viewer_col_count = viewer_cols.len();
+            let sql = format!(
                 "SELECT {},{} FROM stream_viewers sv \
                  JOIN streams s ON s.id = sv.stream_id \
                  WHERE sv.play_key=?1 AND sv.enabled=1",
                 viewer_cols.join(","),
                 stream_cols.join(","),
-            ),
-            params![key],
-            |row| {
-                let viewer = Self::load_viewer_row(row)?;
-                let stream = Self::load_stream_row_at(row, viewer_cols.len())?;
-                Ok((viewer, stream))
-            },
-        ))
+            );
+            (sql, viewer_col_count)
+        });
+        let (sql, viewer_col_count) = &*QUERY;
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare_cached(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("viewer_and_stream_by_play_key: prepare failed: {e}");
+                return DbLookup::Failed;
+            }
+        };
+        map_optional(stmt.query_row(params![key], |row| {
+            let viewer = Self::load_viewer_row(row)?;
+            let stream = Self::load_stream_row_at(row, *viewer_col_count)?;
+            Ok((viewer, stream))
+        }))
     }
 
     pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> DbLookup<StreamViewer> {
