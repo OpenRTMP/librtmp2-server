@@ -152,6 +152,15 @@ pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
 const SHARD_ID_SPACE: u64 = 1 << 48;
 const MAX_SHARDS: usize = 32;
 
+/// Bound on each shard's cross-shard relay inbox (see the broadcast/inject
+/// block in the shard loop below). A receiving shard that falls behind the
+/// incoming frame rate drops frames via `try_send` past this bound instead
+/// of growing the queue without limit, the same fail-fast-under-backpressure
+/// choice used for the auth worker's queue (`AUTH_QUEUE_CAPACITY`). Sized to
+/// match librtmp2's own per-route pending-relay cap
+/// (`MAX_PENDING_RELAY_FRAMES`).
+const CROSS_SHARD_RELAY_QUEUE_CAPACITY: usize = 1024;
+
 /// How many independent `librtmp2::server::Server` instances (each on its
 /// own OS thread, each with its own disjoint conn_id range, sharing one
 /// `SO_REUSEPORT` listener so the kernel load-balances new connections
@@ -1293,6 +1302,13 @@ impl ServerApp {
         let n_shards = resolve_shard_count(media_output_config.enabled(), cluster_enabled);
         #[cfg(not(feature = "cluster"))]
         let n_shards = resolve_shard_count(media_output_config.enabled(), false);
+        // Never shard past the configured connection cap: `rtmp_max_conn` is
+        // always >= 1 (see `parse_max_connections`), so this also guarantees
+        // `per_shard_max_conn` below floors to at least 1 without needing to
+        // bump it back up -- more shards than `rtmp_max_conn` would otherwise
+        // silently raise the effective global cap from `rtmp_max_conn` to
+        // `n_shards` (each shard's own floor-of-1 minimum summing past it).
+        let n_shards = n_shards.min(rtmp_max_conn as usize).max(1);
         if n_shards > 1 {
             crate::log_info!("RTMP sharding enabled: {n_shards} worker threads");
         }
@@ -1364,14 +1380,15 @@ impl ServerApp {
         // until after the `publish`/`play` command, long after accept).
         let mut relay_rxs: Vec<Option<std::sync::mpsc::Receiver<librtmp2::RelayFrame>>> =
             (0..n_shards).map(|_| None).collect();
-        let relay_txs: Option<Arc<Vec<std::sync::mpsc::Sender<librtmp2::RelayFrame>>>> =
+        let relay_txs: Option<Arc<Vec<std::sync::mpsc::SyncSender<librtmp2::RelayFrame>>>> =
             if n_shards > 1 {
                 let mut txs = Vec::with_capacity(n_shards);
-                for (i, slot) in relay_rxs.iter_mut().enumerate() {
-                    let (tx, rx) = std::sync::mpsc::channel::<librtmp2::RelayFrame>();
+                for slot in relay_rxs.iter_mut() {
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<librtmp2::RelayFrame>(
+                        CROSS_SHARD_RELAY_QUEUE_CAPACITY,
+                    );
                     txs.push(tx);
                     *slot = Some(rx);
-                    let _ = i;
                 }
                 Some(Arc::new(txs))
             } else {
@@ -1611,13 +1628,19 @@ impl ServerApp {
                         // another shard (unlike recording/HLS, which must not splice
                         // two publish sessions into one file/segment sequence), so
                         // there's no ambiguity to guard against.
+                        //
+                        // Each inbox is bounded (`CROSS_SHARD_RELAY_QUEUE_CAPACITY`)
+                        // and this is a non-blocking `try_send`: a receiving shard
+                        // that falls behind drops frames past that bound rather than
+                        // this shard's poll tick blocking on a slow/stuck peer, which
+                        // would stall every connection on *this* shard too.
                         if let Some(txs) = relay_txs.as_ref() {
                             for (i, tx) in txs.iter().enumerate() {
                                 if i == shard_index {
                                     continue;
                                 }
                                 for frame in &exported_frames {
-                                    let _ = tx.send(frame.clone());
+                                    let _ = tx.try_send(frame.clone());
                                 }
                             }
                         }
@@ -1796,10 +1819,33 @@ impl ServerApp {
             shard_threads.push(shard_thread);
         }
 
+        let mut startup_error: Option<String> = None;
         for ready_rx in ready_rxs {
-            ready_rx.await.map_err(|_| {
-                "RTMP startup thread exited before reporting readiness".to_string()
-            })??;
+            match ready_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    startup_error = Some(e);
+                    break;
+                }
+                Err(_) => {
+                    startup_error =
+                        Some("RTMP startup thread exited before reporting readiness".to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(e) = startup_error {
+            // A later shard failed to bind/init after earlier shards already
+            // started listening and polling. Stop and join every shard
+            // thread spawned so far -- each checks `rtmp_stop` at the top of
+            // its poll loop (see the `loop { if rtmp_stop_clone.load(...) `
+            // above) -- rather than returning this error with those shards'
+            // listeners, auth routing, and relay channels left running.
+            rtmp_stop.store(true, Ordering::Relaxed);
+            for shard_thread in shard_threads {
+                let _ = shard_thread.join();
+            }
+            return Err(e);
         }
 
         crate::log_info!(
