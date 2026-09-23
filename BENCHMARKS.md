@@ -17,7 +17,7 @@ own target hardware before using any of this for capacity planning.
 
 | | librtmp2-server | nginx-rtmp | MediaMTX |
 |---|---|---|---|
-| Version | 0.3.0 (this repo) | nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2 (Ubuntu package) | v1.21.1 |
+| Version | 0.4.0 (this repo) | nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2 (Ubuntu package) | v1.11.3 |
 | Language | Rust | C | Go |
 | Role | what this repo ships | most common existing RTMP relay | modern multi-protocol media server with RTMP support |
 
@@ -60,7 +60,7 @@ blindly repeating bytes) would reject.
 Full commands, including exact server configs, are in
 [`scripts/run_rtmp_benchmarks.sh`](scripts/run_rtmp_benchmarks.sh).
 
-### Two things this uncovered worth knowing regardless of the numbers
+### Three things this uncovered worth knowing regardless of the numbers
 
 - **nginx-rtmp's live relay state is per worker process.** With
   `worker_processes auto` (4, matching this box's core count — the normal
@@ -90,28 +90,39 @@ Full commands, including exact server configs, are in
   below actually provision (25 keys, ≤5 viewers each) — worth calling out
   explicitly in the README/docs for anyone building on this API, since it's
   not obvious from the "unique keys per stream" framing alone.
+- **The setup phase, not the timed benchmark, can hit the admin HTTP API's
+  default rate limit.** Provisioning 120 distinct handshake streams via
+  `POST /api/v1/streams` as fast as `curl` allows exceeds
+  `HTTP_RATE_LIMIT_DEFAULT` (60 requests/60s per IP) partway through, so a
+  reproduction may see `429` warnings in the server log while the script
+  provisions streams. `bench_handshake` still runs its full configured
+  `--count` by cycling the URLs it did get, so this doesn't affect the
+  reported numbers — it only means fewer distinct stream IDs back the run
+  than the setup loop requested.
 
 ## Environment
 
 - CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
-- rustc 1.98.1, ffmpeg 6.1.1
-- Date: 2026-09-22
+- rustc 1.95.0, ffmpeg 6.1.1
+- Date: 2026-09-23
 
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| librtmp2-server | 100% | 471.4/s | 61.3 ms | 59.5 ms | 73.9 ms | 78.0 ms | 80.2 ms |
-| nginx-rtmp | 100% | 325.9/s | 87.3 ms | 88.0 ms | 95.8 ms | 96.0 ms | 96.1 ms |
-| MediaMTX | 100% | 622.9/s | 42.0 ms | 47.0 ms | 48.9 ms | 49.4 ms | 49.5 ms |
+| librtmp2-server | 100% | 560.0/s | 49.9 ms | 49.2 ms | 59.8 ms | 62.2 ms | 62.3 ms |
+| nginx-rtmp | 100% | 336.3/s | 84.5 ms | 87.9 ms | 92.0 ms | 92.1 ms | 92.2 ms |
+| MediaMTX | 100% | 656.9/s | 37.5 ms | 44.1 ms | 49.5 ms | 50.5 ms | 50.6 ms |
 
-`librtmp2-server`'s RTMP poll loop polls every 5ms while any connection is
-still negotiating (handshake/connect/createStream/publish|play), backing off
-to a 50ms interval only once nothing is, and every publish/play
-authorization commits its SQLite write with `synchronous=NORMAL` rather than
-paying an fsync per commit — together these keep it clearly ahead of
-nginx-rtmp here, and second only to MediaMTX.
+`librtmp2-server`'s RTMP poll loop polls every 1ms while any connection is
+still negotiating (handshake/connect/createStream/publish|play) or an async
+publish/play authorization decision just resolved, backing off to 50ms only
+once nothing is; every publish/play authorization commits its SQLite write
+with `synchronous=NORMAL` rather than paying an fsync per commit, and
+publish/play authorization itself now runs on a dedicated worker thread
+(`src/auth_worker.rs`) instead of the RTMP poll thread. Together these keep
+it clearly ahead of nginx-rtmp here, and second only to MediaMTX.
 
 ## Concurrent-viewer relay throughput and join latency
 
@@ -121,15 +132,15 @@ viewer received the full stream with no drops.
 
 | Server | Players | Join latency avg / p95 / max | Steady throughput | Steady fps/player |
 |---|---|---|---|---|
-| librtmp2-server | 1 | 118.3 / 118.3 / 118.3 ms | 1.09 Mbps | 72.8 |
-| librtmp2-server | 25 | 122.7 / 133.7 / 133.9 ms | 27.42 Mbps | 73.1 |
-| librtmp2-server | 100 | 142.1 / 148.5 / 149.5 ms | 109.52 Mbps | 72.9 |
-| nginx-rtmp (1 worker) | 1 | 129.4 / 129.4 / 129.4 ms | 1.10 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 25 | 130.3 / 133.1 / 133.1 ms | 27.43 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 100 | 129.5 / 133.8 / 134.8 ms | 109.72 Mbps | 73.1 |
-| MediaMTX | 1 | 41.9 / 41.9 / 41.9 ms | 1.10 Mbps | 73.2 |
-| MediaMTX | 25 | 44.4 / 49.2 / 49.8 ms | 27.44 Mbps | 73.2 |
-| MediaMTX | 100 | 55.4 / 71.2 / 72.6 ms | 109.65 Mbps | 73.1 |
+| librtmp2-server | 1 | 96.8 / 96.8 / 96.8 ms | 1.09 Mbps | 72.8 |
+| librtmp2-server | 25 | 102.1 / 105.1 / 105.1 ms | 27.50 Mbps | 73.3 |
+| librtmp2-server | 100 | 134.5 / 145.1 / 146.9 ms | 109.71 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 1 | 130.8 / 130.8 / 130.8 ms | 1.10 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 25 | 132.6 / 135.5 / 135.7 ms | 27.41 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 100 | 130.5 / 136.6 / 140.4 ms | 109.61 Mbps | 73.1 |
+| MediaMTX | 1 | 45.1 / 45.1 / 45.1 ms | 1.10 Mbps | 73.2 |
+| MediaMTX | 25 | 38.4 / 49.6 / 50.1 ms | 27.37 Mbps | 73.0 |
+| MediaMTX | 100 | 53.1 / 61.0 / 61.6 ms | 109.70 Mbps | 73.1 |
 
 Takeaways:
 
@@ -137,18 +148,19 @@ Takeaways:
   100 concurrent viewers of one stream on this 4-vCPU box (steady fps/player
   ≈ 73 across the board) — none of the three is anywhere near saturated at
   this concurrency on this hardware.
-- **Join latency at 1 and 25 viewers**: `librtmp2-server` (118-123 ms) is at
-  or ahead of nginx-rtmp (129-130 ms); MediaMTX is fastest to join at this
-  concurrency (42-44 ms).
-- **Join latency at 100 viewers is `librtmp2-server`'s one remaining gap**:
-  142 ms vs. 129.5 ms (nginx-rtmp) and 55 ms (MediaMTX), and it's the one of
-  the three whose join latency increases most with viewer count (118 ms at 1
-  viewer → 142 ms at 100). The poll-loop interval and the SQLite commit path
-  are both already tuned for this (see the handshake section above); the
-  remaining cost is per-connection work inside publish/play authorization
-  itself (DB lookups, key generation, logging) running one connection after
-  another on the single RTMP thread — worth profiling further if this needs
-  to come down more.
+- **Join latency at 1 and 25 viewers**: `librtmp2-server` (97-102 ms) is
+  ahead of nginx-rtmp (131-133 ms); MediaMTX is fastest to join at this
+  concurrency (38-45 ms).
+- **Join latency at 100 viewers is now within 4 ms of nginx-rtmp**: 134.5 ms
+  vs. 130.5 ms (nginx-rtmp) and 53.1 ms (MediaMTX). Publish/play
+  authorization (SQLite lookups, the per-viewer connection-count check, key
+  generation) now runs on a dedicated worker thread
+  (`src/auth_worker.rs`) instead of blocking the single RTMP poll thread,
+  the per-viewer connection cap reads an in-memory counter instead of a
+  `SELECT COUNT(*)` per join, and the poll loop takes an immediate extra
+  tick right after each authorization decision resolves — together these
+  keep `librtmp2-server` at 1 and 25 viewers clearly ahead of nginx-rtmp and
+  narrow the 100-viewer gap to nginx-rtmp to about 4 ms.
 - Aggregate throughput scales linearly with viewer count for all three, as
   expected for a simple relay (no transcoding) — 100 viewers at ~1.1 Mbps
   each is ~110 Mbps served, consistent across all three implementations.

@@ -1,3 +1,4 @@
+pub mod auth_worker;
 pub mod config;
 pub mod db;
 pub mod http;

@@ -8,6 +8,7 @@
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Open flags for on-disk databases. `SQLITE_OPEN_NOFOLLOW` blocks a local
@@ -23,6 +24,18 @@ fn on_disk_db_open_flags() -> OpenFlags {
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// In-memory active-viewer-session counts, keyed by `stream_viewers.id`.
+    /// This is the authoritative source for the per-viewer connection cap
+    /// (`MAX_CONNECTIONS_PER_PLAY_KEY`) on this running node: it lets
+    /// `player_try_acquire`/`player_update` enforce the cap without a
+    /// `SELECT COUNT(*)` round trip on every play request. SQLite's
+    /// `players` table remains the durable, authoritative record of session
+    /// history; this map only mirrors *currently active* rows and is always
+    /// mutated in the same critical section (`conn.lock()`) as the matching
+    /// SQLite write, so the two never observably disagree. It starts empty
+    /// on every `Db::open`, which already resets all `active` rows to 0 for
+    /// the same reason (no session survives a process restart).
+    active_player_counts: Mutex<HashMap<String, usize>>,
 }
 
 /// Max simultaneous RTMP play connections per play key (not configurable).
@@ -384,7 +397,36 @@ impl Db {
         crate::log_info!("Database opened: {path}");
         Ok(Db {
             conn: Mutex::new(conn),
+            active_player_counts: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Increments the in-memory active-session count for `viewer_id`. Must
+    /// only be called while holding `self.conn`'s lock, in the same
+    /// critical section as the SQLite write that activated the row, so the
+    /// map never observes a state SQLite doesn't also have.
+    fn player_count_incr(&self, viewer_id: &str) {
+        *self
+            .active_player_counts
+            .lock()
+            .entry(viewer_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// Decrements the in-memory active-session count for `viewer_id`,
+    /// removing the entry once it reaches zero. Same locking requirement as
+    /// [`Self::player_count_incr`]. Safe to call for a viewer with no
+    /// tracked sessions (a no-op) so duplicate release/disconnect handling
+    /// can never underflow.
+    fn player_count_decr(&self, viewer_id: &str) {
+        let mut counts = self.active_player_counts.lock();
+        if let Some(count) = counts.get_mut(viewer_id) {
+            if *count <= 1 {
+                counts.remove(viewer_id);
+            } else {
+                *count -= 1;
+            }
+        }
     }
 
     /// Warns about access keys that were already shared across two or more
@@ -686,15 +728,22 @@ impl Db {
     }
 
     fn load_stream_row(row: &rusqlite::Row) -> rusqlite::Result<Stream> {
+        Self::load_stream_row_at(row, 0)
+    }
+
+    /// Like `load_stream_row`, but reads `STREAM_COLS` starting at column
+    /// `offset` instead of 0 -- for a joined query that selects other
+    /// columns first (see `viewer_and_stream_by_play_key`).
+    fn load_stream_row_at(row: &rusqlite::Row, offset: usize) -> rusqlite::Result<Stream> {
         Ok(Stream {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            app: row.get(2)?,
-            publish_key: row.get(3)?,
-            play_key: row.get(4)?,
-            stats_key: row.get(5)?,
-            enabled: row.get(6)?,
-            created_at: row.get(7)?,
+            id: row.get(offset)?,
+            name: row.get(offset + 1)?,
+            app: row.get(offset + 2)?,
+            publish_key: row.get(offset + 3)?,
+            play_key: row.get(offset + 4)?,
+            stats_key: row.get(offset + 5)?,
+            enabled: row.get(offset + 6)?,
+            created_at: row.get(offset + 7)?,
         })
     }
 
@@ -1050,6 +1099,43 @@ impl Db {
         ))
     }
 
+    /// Combined viewer+stream lookup for the play-authorization hot path:
+    /// one query and one lock acquisition instead of
+    /// `viewer_find_by_play_key` followed by `stream_get`. Both lookups were
+    /// already indexed (`stream_viewers.play_key` is `UNIQUE`, `streams.id`
+    /// is the primary key), so this removes a round trip, not a missing
+    /// index. Semantics are unchanged: `Missing` for an invalid/unknown/
+    /// disabled play key, exactly as the two-query path returned.
+    pub fn viewer_and_stream_by_play_key(&self, key: &str) -> DbLookup<(StreamViewer, Stream)> {
+        if !crate::keygen::is_valid_access_key(key) {
+            return DbLookup::Missing;
+        }
+        let viewer_cols: Vec<String> = Self::VIEWER_COLS
+            .split(',')
+            .map(|c| format!("sv.{c}"))
+            .collect();
+        let stream_cols: Vec<String> = Self::STREAM_COLS
+            .split(',')
+            .map(|c| format!("s.{c}"))
+            .collect();
+        let conn = self.conn.lock();
+        map_optional(conn.query_row(
+            &format!(
+                "SELECT {},{} FROM stream_viewers sv \
+                 JOIN streams s ON s.id = sv.stream_id \
+                 WHERE sv.play_key=?1 AND sv.enabled=1",
+                viewer_cols.join(","),
+                stream_cols.join(","),
+            ),
+            params![key],
+            |row| {
+                let viewer = Self::load_viewer_row(row)?;
+                let stream = Self::load_stream_row_at(row, viewer_cols.len())?;
+                Ok((viewer, stream))
+            },
+        ))
+    }
+
     pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> DbLookup<StreamViewer> {
         let conn = self.conn.lock();
         map_optional(conn.query_row(
@@ -1147,14 +1233,23 @@ impl Db {
         }
     }
 
-    /// Mark active player sessions for a revoked viewer slot inactive.
+    /// Mark active player sessions for a revoked viewer slot inactive, and
+    /// zero its in-memory active-session count to match — every session
+    /// this viewer had is gone after this call, however it got there
+    /// (including a row that was skipped rather than updated, e.g. a Raft
+    /// snapshot install that drops it entirely; see `install_app_snapshot`).
     pub fn players_deactivate_for_viewer(&self, viewer_id: &str) -> bool {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE players SET active=0 WHERE viewer_id=? AND active=1",
-            params![viewer_id],
-        )
-        .is_ok()
+        let ok = conn
+            .execute(
+                "UPDATE players SET active=0 WHERE viewer_id=? AND active=1",
+                params![viewer_id],
+            )
+            .is_ok();
+        if ok {
+            self.active_player_counts.lock().remove(viewer_id);
+        }
+        ok
     }
 
     /// List every viewer across all streams (used for cluster bootstrap seed).
@@ -1747,6 +1842,20 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        // In-memory cap check (see `active_player_counts`) instead of a
+        // `SELECT COUNT(*)`; held under the same `conn` lock as the insert
+        // below so check-then-insert stays atomic against a concurrent
+        // `player_try_acquire`/`player_update` on this connection.
+        if self
+            .active_player_counts
+            .lock()
+            .get(&p.viewer_id)
+            .copied()
+            .unwrap_or(0)
+            >= MAX_CONNECTIONS_PER_PLAY_KEY
+        {
+            return false;
+        }
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(e) => {
@@ -1754,16 +1863,6 @@ impl Db {
                 return false;
             }
         };
-        let active: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1",
-                params![p.viewer_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(MAX_CONNECTIONS_PER_PLAY_KEY as i64);
-        if active >= MAX_CONNECTIONS_PER_PLAY_KEY as i64 {
-            return false;
-        }
         if tx
             .execute(
                 "INSERT INTO players \
@@ -1785,7 +1884,11 @@ impl Db {
         {
             return false;
         }
-        tx.commit().is_ok()
+        if tx.commit().is_err() {
+            return false;
+        }
+        self.player_count_incr(&p.viewer_id);
+        true
     }
 
     #[allow(dead_code)]
@@ -1799,6 +1902,17 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        // Read the row's current (active, viewer_id) unconditionally — both
+        // the cap re-check below (only for a transition into active) and
+        // the in-memory counter sync after the write (for every active
+        // transition, in either direction) need it.
+        let current: Option<(bool, String)> = conn
+            .query_row(
+                "SELECT active, viewer_id FROM players WHERE id=?",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
         if p.active {
             if p.viewer_id.is_empty() {
                 crate::log_error!("player_update: missing viewer_id for {id}");
@@ -1806,38 +1920,29 @@ impl Db {
             }
             // Only re-verify the per-viewer connection cap on a real
             // transition into (or across) an active slot — see the matching
-            // comment in `publisher_update`.
-            let current: Option<(bool, String)> = conn
-                .query_row(
-                    "SELECT active, viewer_id FROM players WHERE id=?",
-                    params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .ok();
+            // comment in `publisher_update`. `is_transition` is false only
+            // when the row is already active under this same viewer_id, in
+            // which case it's already counted in `active_player_counts` and
+            // must not be double-checked against its own contribution.
             let is_transition =
                 !matches!(&current, Some((true, viewer_id)) if *viewer_id == p.viewer_id);
-            if is_transition {
-                let active: i64 = match conn.query_row(
-                    "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1 AND id!=?",
-                    params![p.viewer_id, id],
-                    |row| row.get(0),
-                ) {
-                    Ok(count) => count,
-                    Err(e) => {
-                        crate::log_error!("player_update: active-slot check failed for {id}: {e}");
-                        return false;
-                    }
-                };
-                if active >= MAX_CONNECTIONS_PER_PLAY_KEY as i64 {
-                    crate::log_warn!(
-                        "player_update: rejected reactivation of {id} — viewer '{}' is at the connection cap",
-                        p.viewer_id
-                    );
-                    return false;
-                }
+            if is_transition
+                && self
+                    .active_player_counts
+                    .lock()
+                    .get(&p.viewer_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= MAX_CONNECTIONS_PER_PLAY_KEY
+            {
+                crate::log_warn!(
+                    "player_update: rejected reactivation of {id} — viewer '{}' is at the connection cap",
+                    p.viewer_id
+                );
+                return false;
             }
         }
-        match conn.execute(
+        let updated = match conn.execute(
             "UPDATE players SET stream_id=?,viewer_id=?,app=?,stream_name=?,\
              bytes_out=?,bitrate_kbps=?,rtt_ms=?,active=? WHERE id=?",
             params![
@@ -1861,7 +1966,21 @@ impl Db {
                 crate::log_error!("player_update error for {id}: {e}");
                 false
             }
+        };
+        if updated {
+            let was_active_viewer =
+                current.and_then(|(active, viewer_id)| active.then_some(viewer_id));
+            match (was_active_viewer, p.active) {
+                (None, true) => self.player_count_incr(&p.viewer_id),
+                (Some(old_viewer_id), false) => self.player_count_decr(&old_viewer_id),
+                (Some(old_viewer_id), true) if old_viewer_id != p.viewer_id => {
+                    self.player_count_decr(&old_viewer_id);
+                    self.player_count_incr(&p.viewer_id);
+                }
+                _ => {}
+            }
         }
+        updated
     }
 
     /// Periodic stats/RTT flush for an already-active player.
@@ -1963,17 +2082,15 @@ impl Db {
         self.player_list(None)
     }
 
-    /// Active player sessions for a configured viewer (play-key row).
+    /// Active player sessions for a configured viewer (play-key row), from
+    /// the in-memory counter rather than a DB query — see
+    /// `active_player_counts`.
     pub fn player_active_count_for_viewer(&self, viewer_id: &str) -> u64 {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT COUNT(*) FROM players WHERE viewer_id=? AND active=1",
-            params![viewer_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .ok()
-        .and_then(|n| u64::try_from(n).ok())
-        .unwrap_or(0)
+        self.active_player_counts
+            .lock()
+            .get(viewer_id)
+            .copied()
+            .unwrap_or(0) as u64
     }
 
     // ==================== STATS SAMPLES ====================
@@ -2362,6 +2479,48 @@ mod tests {
     }
 
     #[test]
+    fn viewer_and_stream_by_play_key_matches_two_query_lookup() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let viewer = StreamViewer {
+            id: "viewer1".to_string(),
+            stream_id: "stream1".to_string(),
+            name: "Viewer".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_play_key_0123456789ab"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        db.viewer_add(&viewer).unwrap();
+
+        let DbLookup::Ok((got_viewer, got_stream)) =
+            db.viewer_and_stream_by_play_key(&viewer.play_key)
+        else {
+            panic!("combined lookup failed");
+        };
+        assert_eq!(got_viewer, viewer);
+        assert_eq!(got_stream, s);
+
+        // Matches the semantics of the two-query path it replaces: unknown,
+        // malformed, and disabled play keys are all `Missing`.
+        assert!(matches!(
+            db.viewer_and_stream_by_play_key("no-such-key"),
+            DbLookup::Missing
+        ));
+
+        let mut disabled = viewer.clone();
+        disabled.id = "viewer2".to_string();
+        disabled.play_key =
+            crate::keygen::test_pad_access_key("viewer_play_key_disabled_0123456789");
+        disabled.enabled = false;
+        db.viewer_add(&disabled).unwrap();
+        assert!(matches!(
+            db.viewer_and_stream_by_play_key(&disabled.play_key),
+            DbLookup::Missing
+        ));
+    }
+
+    #[test]
     fn player_try_acquire_enforces_per_key_connection_cap() {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
@@ -2391,6 +2550,114 @@ mod tests {
             ..Default::default()
         };
         assert!(!db.player_try_acquire(&overflow));
+    }
+
+    #[test]
+    fn player_active_count_for_viewer_tracks_acquire_and_release() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
+
+        let player = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&player));
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            1,
+            "a successful acquire must increment the in-memory counter"
+        );
+
+        let mut released = player;
+        released.active = false;
+        assert!(db.player_update("pl0", &released));
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            0,
+            "releasing (deactivating) must decrement the in-memory counter"
+        );
+
+        // Duplicate release (e.g. a retried disconnect) must not underflow.
+        assert!(db.player_update("pl0", &released));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
+    }
+
+    #[test]
+    fn player_active_count_for_viewer_unaffected_by_failed_acquire() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+
+        for i in 0..MAX_CONNECTIONS_PER_PLAY_KEY {
+            assert!(db.player_try_acquire(&Player {
+                id: format!("pl{i}"),
+                stream_id: "stream1".to_string(),
+                viewer_id: viewer.id.clone(),
+                connected_at: now_ts(),
+                active: true,
+                ..Default::default()
+            }));
+        }
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            MAX_CONNECTIONS_PER_PLAY_KEY as u64
+        );
+
+        assert!(!db.player_try_acquire(&Player {
+            id: "pl_overflow".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            MAX_CONNECTIONS_PER_PLAY_KEY as u64,
+            "a rejected (over-cap) acquire must not increment the counter"
+        );
+    }
+
+    #[test]
+    fn players_deactivate_for_viewer_zeroes_active_count() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+
+        for i in 0..3 {
+            assert!(db.player_try_acquire(&Player {
+                id: format!("pl{i}"),
+                stream_id: "stream1".to_string(),
+                viewer_id: viewer.id.clone(),
+                connected_at: now_ts(),
+                active: true,
+                ..Default::default()
+            }));
+        }
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 3);
+
+        assert!(db.players_deactivate_for_viewer(&viewer.id));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
+
+        // Idempotent: calling it again (e.g. a duplicate revoke) must not panic
+        // or underflow.
+        assert!(db.players_deactivate_for_viewer(&viewer.id));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
     }
 
     #[test]
@@ -2706,8 +2973,9 @@ mod tests {
         // Mirrors publisher_update_skips_active_slot_recheck_on_same_stream_flush:
         // a stats flush that keeps active=true for the same viewer_id is not
         // a reactivation and must not re-run the per-viewer connection-cap
-        // check. Prove it by manually pushing the viewer over the cap via a
-        // direct insert that bypasses player_try_acquire/update.
+        // check. Fill the viewer's slots for real (via player_try_acquire,
+        // which is what actually drives `active_player_counts`) so a broken
+        // skip would make this flush's own slot reject itself.
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
         db.stream_add(&s).unwrap();
@@ -2724,18 +2992,20 @@ mod tests {
             ..Default::default()
         };
         assert!(db.player_try_acquire(&first));
-
-        {
-            let conn = db.conn.lock();
-            for i in 0..MAX_CONNECTIONS_PER_PLAY_KEY {
-                conn.execute(
-                    "INSERT INTO players (id,stream_id,viewer_id,connected_at,active) \
-                     VALUES (?,?,?,0,1)",
-                    params![format!("phantom{i}"), "stream1", viewer.id],
-                )
-                .unwrap();
-            }
+        for i in 1..MAX_CONNECTIONS_PER_PLAY_KEY {
+            assert!(db.player_try_acquire(&Player {
+                id: format!("pl{i}"),
+                stream_id: "stream1".to_string(),
+                viewer_id: viewer.id.clone(),
+                connected_at: now_ts(),
+                active: true,
+                ..Default::default()
+            }));
         }
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            MAX_CONNECTIONS_PER_PLAY_KEY as u64
+        );
 
         let mut flushed = first;
         flushed.bitrate_kbps = 1500.0;

@@ -11,15 +11,16 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle as TokioJoinHandle;
 
+use crate::auth_worker;
 use crate::config::ServerConfig;
 use crate::db::Db;
 use crate::http::{self, AppState};
 use crate::logger;
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 use crate::server::{
-    POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn, clear_rtmp_poll_server,
-    live_stream_ids_for_deleted_markers, process_server_connections, rtmp_media_cb, rtmp_play_cb,
-    rtmp_publish_cb, set_rtmp_poll_server,
+    AUTH_COMPLETIONS_RX, AUTH_WORKER, POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn,
+    clear_rtmp_poll_server, live_stream_ids_for_deleted_markers, process_server_connections,
+    rtmp_media_cb, rtmp_play_auth_cb, rtmp_publish_auth_cb, set_rtmp_poll_server,
 };
 
 static TEST_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -133,8 +134,8 @@ impl TestServer {
             };
             server.defer_media_relay = true;
             server.on_media_cb = Some(rtmp_media_cb);
-            server.on_publish_cb = Some(rtmp_publish_cb);
-            server.on_play_cb = Some(rtmp_play_cb);
+            server.on_publish_auth_cb = Some(rtmp_publish_auth_cb);
+            server.on_play_auth_cb = Some(rtmp_play_auth_cb);
 
             if let Err(e) = server.listen(&rtmp_bind) {
                 let _ = rtmp_ready_tx.send(Err(format!("RTMP bind failed: {e}")));
@@ -144,6 +145,14 @@ impl TestServer {
             let _ = rtmp_ready_tx.send(Ok(()));
             if let Ok(mut guard) = RTMP_BRIDGE.lock() {
                 *guard = Some(Arc::clone(&rtmp_bridge));
+            }
+            let (auth_worker_handle, auth_completions_rx) =
+                auth_worker::spawn(Arc::clone(&rtmp_bridge));
+            if let Ok(mut guard) = AUTH_WORKER.lock() {
+                *guard = Some(auth_worker_handle);
+            }
+            if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+                *guard = Some(auth_completions_rx);
             }
 
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
@@ -166,7 +175,7 @@ impl TestServer {
                 let revoked_now: HashSet<String> =
                     revoked_for_rtmp.lock().iter().cloned().collect();
 
-                let current_ids = process_server_connections(
+                let (current_ids, _just_authorized) = process_server_connections(
                     &mut server,
                     &mut tracked,
                     &rtmp_bridge,
@@ -239,6 +248,14 @@ impl Drop for TestServer {
             let _ = handle.join();
         }
         if let Ok(mut guard) = RTMP_BRIDGE.lock() {
+            *guard = None;
+        }
+        // Dropping the last AuthWorkerHandle closes the worker's request
+        // channel, ending its thread's `for req in req_rx` loop on its own.
+        if let Ok(mut guard) = AUTH_WORKER.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
             *guard = None;
         }
         if let Some(tx) = self.http_shutdown.take() {

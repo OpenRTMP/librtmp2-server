@@ -1122,13 +1122,18 @@ impl DbRtmpBridge {
         let peer = self.peer_for(conn);
         crate::log_info!("RTMP: play request app='{app}' key=<redacted> from {peer}");
 
-        let DbLookup::Ok(viewer) = self.db.viewer_find_by_play_key(stream_key) else {
-            crate::log_warn!("RTMP: play rejected — invalid play_key for app='{app}' from {peer}");
-            return Err(AuthFailureKind::Credential);
-        };
-        let DbLookup::Ok(stream) = self.db.stream_get(&viewer.stream_id) else {
-            crate::log_warn!("RTMP: play rejected — stream missing for play_key from {peer}");
-            return Err(AuthFailureKind::Operational);
+        let (viewer, stream) = match self.db.viewer_and_stream_by_play_key(stream_key) {
+            DbLookup::Ok(pair) => pair,
+            DbLookup::Missing => {
+                crate::log_warn!(
+                    "RTMP: play rejected — invalid play_key for app='{app}' from {peer}"
+                );
+                return Err(AuthFailureKind::Credential);
+            }
+            DbLookup::Failed => {
+                crate::log_warn!("RTMP: play rejected — stream missing for play_key from {peer}");
+                return Err(AuthFailureKind::Operational);
+            }
         };
         if self.deleted_streams.lock().contains(&stream.id) {
             crate::log_warn!(
