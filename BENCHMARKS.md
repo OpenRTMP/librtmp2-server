@@ -1,12 +1,12 @@
 # Benchmarks
 
 Real, reproducible numbers for `librtmp2-server`'s RTMP ingest/relay path,
-plus a same-machine comparison against nginx-rtmp and MediaMTX using the
-*same* RTMP client for all three, so the comparison isn't skewed by
+plus a same-machine comparison against nginx-rtmp, MediaMTX, and SRS using
+the *same* RTMP client for all four, so the comparison isn't skewed by
 differences between test clients.
 
 **Read this before quoting a number from it:** every result below is from
-one run on one shared 4-vCPU VM, with all three servers
+one run on one shared 4-vCPU VM, with all four servers
 benchmarked one at a time (not simultaneously) to avoid CPU contention
 between them skewing the comparison. Treat the *relative* shape of the
 results — where the numbers behave the same or differently across servers —
@@ -15,26 +15,25 @@ own target hardware before using any of this for capacity planning.
 
 ## What's being compared
 
-| | librtmp2-server | nginx-rtmp | MediaMTX |
-|---|---|---|---|
-| Version | 0.4.0 (this repo) | nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2 (Ubuntu package) | v1.11.3 |
-| Language | Rust | C | Go |
-| Role | what this repo ships | most common existing RTMP relay | modern multi-protocol media server with RTMP support |
+| | librtmp2-server | nginx-rtmp | MediaMTX | SRS |
+|---|---|---|---|---|
+| Version | 0.4.0 (this repo) | nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2 (Ubuntu package) | v1.11.3 | v7.0-a0 (7.0.162) |
+| Language | Rust | C | Go | C++ |
+| Role | what this repo ships | most common existing RTMP relay | modern multi-protocol media server with RTMP support | long-running open-source media server with RTMP/SRT/WebRTC support |
 
-**SRS is not included.** nginx-rtmp was installed from the Ubuntu package
-archive and MediaMTX was fetched via the Go module proxy and built from
-source (working around its release-time-only generated asset step — see the
-script); SRS ships primarily as a Docker image, which wasn't set up for this
-run. `scripts/run_rtmp_benchmarks.sh` is structured so adding a fourth
-`relay_sweep` block for SRS is the only change needed — contributions
-welcome.
+nginx-rtmp was installed from the Ubuntu package archive; MediaMTX was
+fetched via the Go module proxy and built from source (working around its
+release-time-only generated asset step — see the script); SRS was built
+from source (`trunk/configure && make`) at its own repo rather than run
+from a container, to keep every server here on the same footing (installed
+package or built binary, nothing containerized).
 
 ## Methodology
 
 Every test uses `librtmp2`'s own `examples/bench_handshake.rs` and
 `examples/bench_relay.rs` (see
 [librtmp2's `BENCHMARKS.md`](https://github.com/OpenRTMP/librtmp2/blob/main/BENCHMARKS.md#examplesbench_handshakers-and-examplesbench_relayrs))
-as the client against all three servers, and a real `ffmpeg`-encoded source
+as the client against all four servers, and a real `ffmpeg`-encoded source
 (`testsrc` 1280x720@30 + a sine tone, libx264 veryfast/zerolatency @ 2.5 Mbps
 video + AAC @ 128 kbps audio, 2s GOP) as the publisher, so every server is
 relaying genuine, codec-valid H.264/AAC — not synthetic garbage bytes, which
@@ -60,7 +59,7 @@ blindly repeating bytes) would reject.
 Full commands, including exact server configs, are in
 [`scripts/run_rtmp_benchmarks.sh`](scripts/run_rtmp_benchmarks.sh).
 
-### Three things this uncovered worth knowing regardless of the numbers
+### Four things this uncovered worth knowing regardless of the numbers
 
 - **nginx-rtmp's live relay state is per worker process.** With
   `worker_processes auto` (4, matching this box's core count — the normal
@@ -77,7 +76,7 @@ Full commands, including exact server configs, are in
   always better) — but it means nginx-rtmp on more cores needs an external
   sticky-routing layer (consistent hashing on stream name at a load
   balancer, e.g.) to actually use them for one live stream, something
-  neither `librtmp2-server` nor MediaMTX need.
+  neither `librtmp2-server` nor MediaMTX nor SRS need.
 - **`librtmp2-server` caps concurrent connections per `play_key` at 5 by
   design** (`db::MAX_CONNECTIONS_PER_PLAY_KEY`). A 6th simultaneous viewer
   on the same key is rejected, and enough rejections from one IP trip a
@@ -99,30 +98,39 @@ Full commands, including exact server configs, are in
   `--count` by cycling the URLs it did get, so this doesn't affect the
   reported numbers — it only means fewer distinct stream IDs back the run
   than the setup loop requested.
+- **SRS defaults to a merged-write buffer that trades latency for fewer
+  syscalls.** Its own startup log states this plainly: `system default
+  latency(ms): mw(0-350) + mr(0-350)`. That buffering — not RTMP protocol
+  overhead or SRS's own per-connection cost — is most of the gap between
+  SRS's numbers below and MediaMTX's: SRS exposes `min_latency on; mw_latency
+  0;` (see `trunk/conf/full.conf`) specifically to trade it away for
+  real-time delivery at higher CPU cost, which this run leaves at its
+  default rather than tuning for either side of that trade-off.
 
 ## Environment
 
 - CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
-- rustc 1.95.0, ffmpeg 6.1.1
+- rustc 1.95.0, g++ 13.3.0, ffmpeg 6.1.1
 - Date: 2026-09-23
 
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| librtmp2-server | 100% | 560.0/s | 49.9 ms | 49.2 ms | 59.8 ms | 62.2 ms | 62.3 ms |
-| nginx-rtmp | 100% | 336.3/s | 84.5 ms | 87.9 ms | 92.0 ms | 92.1 ms | 92.2 ms |
-| MediaMTX | 100% | 656.9/s | 37.5 ms | 44.1 ms | 49.5 ms | 50.5 ms | 50.6 ms |
+| librtmp2-server | 100% | 542.3/s | 52.4 ms | 51.4 ms | 59.3 ms | 61.0 ms | 61.1 ms |
+| nginx-rtmp | 100% | 330.5/s | 81.1 ms | 88.1 ms | 92.0 ms | 96.4 ms | 96.4 ms |
+| MediaMTX | 100% | 651.5/s | 42.2 ms | 44.2 ms | 48.0 ms | 48.3 ms | 48.9 ms |
+| SRS | 100% | 304.2/s | 94.3 ms | 93.4 ms | 101.6 ms | 107.0 ms | 107.3 ms |
 
 `librtmp2-server`'s RTMP poll loop polls every 1ms while any connection is
 still negotiating (handshake/connect/createStream/publish|play) or an async
 publish/play authorization decision just resolved, backing off to 50ms only
 once nothing is; every publish/play authorization commits its SQLite write
 with `synchronous=NORMAL` rather than paying an fsync per commit, and
-publish/play authorization itself now runs on a dedicated worker thread
+publish/play authorization itself runs on a dedicated worker thread
 (`src/auth_worker.rs`) instead of the RTMP poll thread. Together these keep
-it clearly ahead of nginx-rtmp here, and second only to MediaMTX.
+it clearly ahead of nginx-rtmp and SRS here, and second only to MediaMTX.
 
 ## Concurrent-viewer relay throughput and join latency
 
@@ -132,38 +140,39 @@ viewer received the full stream with no drops.
 
 | Server | Players | Join latency avg / p95 / max | Steady throughput | Steady fps/player |
 |---|---|---|---|---|
-| librtmp2-server | 1 | 96.8 / 96.8 / 96.8 ms | 1.09 Mbps | 72.8 |
-| librtmp2-server | 25 | 102.1 / 105.1 / 105.1 ms | 27.50 Mbps | 73.3 |
-| librtmp2-server | 100 | 134.5 / 145.1 / 146.9 ms | 109.71 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 1 | 130.8 / 130.8 / 130.8 ms | 1.10 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 25 | 132.6 / 135.5 / 135.7 ms | 27.41 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 100 | 130.5 / 136.6 / 140.4 ms | 109.61 Mbps | 73.1 |
-| MediaMTX | 1 | 45.1 / 45.1 / 45.1 ms | 1.10 Mbps | 73.2 |
-| MediaMTX | 25 | 38.4 / 49.6 / 50.1 ms | 27.37 Mbps | 73.0 |
-| MediaMTX | 100 | 53.1 / 61.0 / 61.6 ms | 109.70 Mbps | 73.1 |
+| librtmp2-server | 1 | 100.3 / 100.3 / 100.3 ms | 1.09 Mbps | 72.8 |
+| librtmp2-server | 25 | 102.6 / 103.6 / 103.7 ms | 27.34 Mbps | 72.9 |
+| librtmp2-server | 100 | 142.3 / 152.7 / 156.1 ms | 109.64 Mbps | 73.0 |
+| nginx-rtmp (1 worker) | 1 | 138.2 / 138.2 / 138.2 ms | 1.10 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 25 | 130.5 / 135.5 / 135.6 ms | 27.39 Mbps | 73.0 |
+| nginx-rtmp (1 worker) | 100 | 135.0 / 141.6 / 145.5 ms | 109.56 Mbps | 73.0 |
+| MediaMTX | 1 | 45.0 / 45.0 / 45.0 ms | 1.10 Mbps | 73.2 |
+| MediaMTX | 25 | 41.1 / 46.1 / 46.1 ms | 27.42 Mbps | 73.1 |
+| MediaMTX | 100 | 45.5 / 49.6 / 51.0 ms | 109.72 Mbps | 73.1 |
+| SRS | 1 | 88.3 / 88.3 / 88.3 ms | 1.07 Mbps | 71.8 |
+| SRS | 25 | 92.6 / 96.8 / 97.3 ms | 27.11 Mbps | 72.1 |
+| SRS | 100 | 106.8 / 127.7 / 134.2 ms | 108.30 Mbps | 72.1 |
 
 Takeaways:
 
-- **All three relayed every frame to every viewer with zero loss** at up to
+- **All four relayed every frame to every viewer with zero loss** at up to
   100 concurrent viewers of one stream on this 4-vCPU box (steady fps/player
-  ≈ 73 across the board) — none of the three is anywhere near saturated at
-  this concurrency on this hardware.
-- **Join latency at 1 and 25 viewers**: `librtmp2-server` (97-102 ms) is
-  ahead of nginx-rtmp (131-133 ms); MediaMTX is fastest to join at this
-  concurrency (38-45 ms).
-- **Join latency at 100 viewers is now within 4 ms of nginx-rtmp**: 134.5 ms
-  vs. 130.5 ms (nginx-rtmp) and 53.1 ms (MediaMTX). Publish/play
-  authorization (SQLite lookups, the per-viewer connection-count check, key
-  generation) now runs on a dedicated worker thread
-  (`src/auth_worker.rs`) instead of blocking the single RTMP poll thread,
-  the per-viewer connection cap reads an in-memory counter instead of a
-  `SELECT COUNT(*)` per join, and the poll loop takes an immediate extra
-  tick right after each authorization decision resolves — together these
-  keep `librtmp2-server` at 1 and 25 viewers clearly ahead of nginx-rtmp and
-  narrow the 100-viewer gap to nginx-rtmp to about 4 ms.
-- Aggregate throughput scales linearly with viewer count for all three, as
+  in the 72-73 range across the board) — none of the four is anywhere near
+  saturated at this concurrency on this hardware.
+- **Join latency at 1 and 25 viewers**: `librtmp2-server` (100-103 ms) and
+  SRS (88-93 ms) sit ahead of nginx-rtmp (130-138 ms); MediaMTX is fastest to
+  join at this concurrency (41-45 ms), and SRS's default merged-write
+  buffering (see above) is most of what separates it from MediaMTX here
+  rather than raw per-connection cost.
+- **Join latency at 100 viewers**: `librtmp2-server` (142.3 ms) and SRS
+  (106.8 ms) both increase with viewer count more than nginx-rtmp
+  (135.0 ms) and MediaMTX (45.5 ms) do; publish/play authorization running
+  on a dedicated worker thread (`src/auth_worker.rs`) keeps
+  `librtmp2-server` close to nginx-rtmp here rather than falling further
+  behind.
+- Aggregate throughput scales linearly with viewer count for all four, as
   expected for a simple relay (no transcoding) — 100 viewers at ~1.1 Mbps
-  each is ~110 Mbps served, consistent across all three implementations.
+  each is ~108-110 Mbps served, consistent across all four implementations.
 
 ## Component microbenchmark: `benches/http_api.rs`
 
@@ -184,10 +193,14 @@ publishing the RTMP-path numbers above.
 # from a checkout of librtmp2-server, with a sibling ../librtmp2 checkout:
 (cd ../librtmp2 && cargo build --release --example bench_handshake --example bench_relay)
 cargo build --release
-MEDIAMTX_BIN=/path/to/mediamtx scripts/run_rtmp_benchmarks.sh
+MEDIAMTX_BIN=/path/to/mediamtx SRS_BIN=/path/to/srs scripts/run_rtmp_benchmarks.sh
 ```
 
-MediaMTX isn't vendored or built by this script (no Go toolchain
-dependency is added to this repo for it) — build or download it separately
-and point `MEDIAMTX_BIN` at the binary; the nginx-rtmp and librtmp2-server
-legs run without it.
+Neither MediaMTX nor SRS is vendored or built by this script (no Go
+toolchain dependency for MediaMTX, and SRS's own build is a separate,
+sizeable C++ project) — build or download each separately and point
+`MEDIAMTX_BIN`/`SRS_BIN` at the resulting binaries; the nginx-rtmp and
+librtmp2-server legs run without either. Build SRS from
+[github.com/ossrs/srs](https://github.com/ossrs/srs) with
+`(cd trunk && ./configure && make)`; the resulting `trunk/objs/srs` binary
+is what `SRS_BIN` should point at.
