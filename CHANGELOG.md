@@ -13,6 +13,14 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-23
+
+### Changed
+- Depends on `librtmp2` `0.9.2` (now a normal crates.io version requirement
+  again instead of the temporary git-commit pin used while the sharding
+  support it needs was still unreleased).
+- Package version `0.4.1` → `0.4.2`.
+
 ## [0.4.1] — 2026-09-23
 
 ### Security
