@@ -1,6 +1,6 @@
 [package]
 name = "librtmp2-server"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,10 +15,15 @@ name = "librtmp2-server"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned to the crates.io release. Local sibling override:
+# Temporarily pinned to the librtmp2 branch that adds AuthorizationResult /
+# Pending publish-play authorization (AuthorizationResult, on_publish_auth_cb,
+# on_play_auth_cb, complete_publish_authorization, complete_play_authorization
+# -- see https://github.com/OpenRTMP/librtmp2/pull/318). Revert to a
+# crates.io version pin once that PR merges and a release containing it is
+# published. Local sibling override:
 #   [patch.crates-io]
 #   librtmp2 = { path = "../librtmp2" }
-librtmp2 = { version = "0.8.1", features = ["tls"] }
+librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", branch = "claude/project-thread-3w9rjy", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }

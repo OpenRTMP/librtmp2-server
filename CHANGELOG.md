@@ -13,6 +13,24 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-23
+
+### Changed
+- Publish/play authorization now runs on a dedicated worker thread instead
+  of blocking the RTMP poll thread, using `librtmp2`'s
+  `AuthorizationResult::Pending` API; the poll loop denies a request
+  rather than blocking when the worker's request queue is full.
+- Play authorization resolves with a single JOIN query instead of two
+  separate lookups.
+- The per-viewer connection cap and cluster-heartbeat viewer count read an
+  in-memory counter kept in sync with SQLite under the same lock, instead
+  of a `SELECT COUNT(*)` per join.
+- The poll loop takes an immediate fast tick right after an asynchronous
+  authorization decision resolves, instead of waiting for the next
+  scheduled interval.
+- Depends on `librtmp2` `0.9.0`.
+- Package version `0.3.0` → `0.4.0`.
+
 ## [0.3.0] — 2026-09-18
 
 ### Added
