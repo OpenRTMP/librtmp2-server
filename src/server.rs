@@ -129,6 +129,8 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 /// fast-polling steady-state connections that no longer need it.
 pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 
+const FIRST_FRAME_GRACE_MS: u64 = 500;
+
 /// How often the poll loop re-derives `live_publishers`/`live_stream_ids`/
 /// `live_viewer_ids` and prunes `deleted_streams`/`revoked_viewers` against
 /// them. This bookkeeping is pure garbage collection -- it only reclaims
@@ -512,15 +514,15 @@ pub(crate) struct TrackedConn {
     video_codec: String,
     /// Last detected audio codec string from the protocol layer.
     audio_codec: String,
-    /// `Some(baseline)` from the moment this connection started playing
+    /// `Some((baseline, set_at))` from the moment this connection started playing
     /// (baseline = `Conn::media_bytes_sent` at that instant) until at least
     /// one media byte has been queued to it since -- i.e. until its first
     /// relayed frame. Kept alongside `publishing`/`playing` in the poll
     /// loop's fast-interval check: a player that has been accepted but has
     /// not yet received any media is still effectively "negotiating" from
     /// the viewer's perspective, even though its RTMP session already says
-    /// `playing`.
-    awaiting_first_frame: Option<u64>,
+    /// `playing`. Cleared after FIRST_FRAME_GRACE_MS even if no media arrives.
+    awaiting_first_frame: Option<(u64, Instant)>,
 }
 
 /// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
@@ -856,7 +858,7 @@ pub(crate) fn process_server_connections(
             );
             entry.playing = true;
             entry.stream_id = stream_id;
-            entry.awaiting_first_frame = Some(conn.media_bytes_sent);
+            entry.awaiting_first_frame = Some((conn.media_bytes_sent, Instant::now()));
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
         } else if is_playing && entry.playing {
@@ -920,10 +922,10 @@ pub(crate) fn process_server_connections(
         }
 
         if is_playing {
-            if entry
-                .awaiting_first_frame
-                .is_some_and(|baseline| conn.media_bytes_sent > baseline)
-            {
+            if entry.awaiting_first_frame.is_some_and(|(baseline, set_at)| {
+                conn.media_bytes_sent > baseline
+                    || set_at.elapsed() >= Duration::from_millis(FIRST_FRAME_GRACE_MS)
+            }) {
                 entry.awaiting_first_frame = None;
             }
             rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
@@ -2025,7 +2027,7 @@ mod tests {
                 connected: true,
                 publishing: true,
                 playing: true,
-                awaiting_first_frame: Some(0),
+                awaiting_first_frame: Some((0, Instant::now())),
                 ..Default::default()
             },
         );
