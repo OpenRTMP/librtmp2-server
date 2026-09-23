@@ -56,7 +56,10 @@ def main() -> int:
         bash,
     ]
     print("running docker cargo check...", flush=True)
-    r = subprocess.run(cmd)
+    try:
+        r = subprocess.run(cmd, shell=False, check=True)
+    except subprocess.CalledProcessError as exc:
+        r = exc
     src_log = os.path.join(DEST, LOG_NAME)
     out_log = os.path.join(SRC_ROOT, "librtmp2-server", LOG_NAME)
     if os.path.exists(src_log):
