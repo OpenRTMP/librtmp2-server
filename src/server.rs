@@ -1312,7 +1312,8 @@ impl ServerApp {
         if n_shards > 1 {
             crate::log_info!("RTMP sharding enabled: {n_shards} worker threads");
         }
-        let per_shard_max_conn = (rtmp_max_conn / n_shards as i32).max(1);
+        let base_per_shard_max_conn = rtmp_max_conn / n_shards as i32;
+        let max_conn_remainder = rtmp_max_conn as usize % n_shards;
         // At n_shards > 1 relay export must always be on (cross-shard relay
         // depends on it, regardless of media outputs/clustering), sized
         // generously since it's now also the sole path getting frames to
@@ -1345,6 +1346,7 @@ impl ServerApp {
         // legacy global `AUTH_COMPLETIONS_RX` -- no dispatcher needed.
         let mut shard_auth_rxs: Vec<Option<std::sync::mpsc::Receiver<AuthCompletion>>> =
             (0..n_shards).map(|_| None).collect();
+        let mut auth_dispatch_thread = None;
         if n_shards == 1 {
             if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
                 *guard = Some(auth_completions_rx);
@@ -1356,16 +1358,18 @@ impl ServerApp {
             for (i, rx) in shard_auth_rx_vec.into_iter().enumerate() {
                 shard_auth_rxs[i] = Some(rx);
             }
-            std::thread::Builder::new()
-                .name("rtmp-auth-dispatch".to_string())
-                .spawn(move || {
-                    for completion in auth_completions_rx {
-                        let shard =
-                            shard_for_conn_id(completion.conn_id).min(shard_auth_txs.len() - 1);
-                        let _ = shard_auth_txs[shard].send(completion);
-                    }
-                })
-                .expect("failed to spawn auth-completion dispatcher thread");
+            auth_dispatch_thread = Some(
+                std::thread::Builder::new()
+                    .name("rtmp-auth-dispatch".to_string())
+                    .spawn(move || {
+                        for completion in auth_completions_rx {
+                            let shard =
+                                shard_for_conn_id(completion.conn_id).min(shard_auth_txs.len() - 1);
+                            let _ = shard_auth_txs[shard].send(completion);
+                        }
+                    })
+                    .expect("failed to spawn auth-completion dispatcher thread"),
+            );
         }
 
         // Cross-shard media relay: each shard broadcasts the frames its own
@@ -1402,6 +1406,8 @@ impl ServerApp {
         for (shard_index, shard_auth_rx) in shard_auth_rxs.into_iter().enumerate() {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             ready_rxs.push(ready_rx);
+            let shard_max_connections =
+                base_per_shard_max_conn + i32::from(shard_index < max_conn_remainder);
             let relay_rx = relay_rxs[shard_index].take();
             let relay_txs = relay_txs.clone();
             let conn_id_base = (n_shards > 1).then(|| 1 + shard_index as u64 * SHARD_ID_SPACE);
@@ -1431,7 +1437,7 @@ impl ServerApp {
                     }
 
                     let cfg = RtmpConfig {
-                        max_connections: per_shard_max_conn,
+                        max_connections: shard_max_connections,
                         chunk_size: 4096,
                         tls_enabled: 0,
                         tls_cert_file: std::ptr::null(),
@@ -1842,8 +1848,26 @@ impl ServerApp {
             // above) -- rather than returning this error with those shards'
             // listeners, auth routing, and relay channels left running.
             rtmp_stop.store(true, Ordering::Relaxed);
-            for shard_thread in shard_threads {
+            for shard_thread in shard_threads.drain(..) {
                 let _ = shard_thread.join();
+            }
+
+            // Tear down the auth pipeline as part of failed startup too.
+            // Dropping the submission handle closes the worker request
+            // channel; once the worker exits, its completion channel closes
+            // and the dispatcher can be joined instead of being left
+            // detached after run returns an error.
+            if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+                guard.take();
+            }
+            if let Ok(mut guard) = AUTH_WORKER.lock() {
+                guard.take();
+            }
+            if let Some(dispatch_thread) = auth_dispatch_thread.take() {
+                let _ = dispatch_thread.join();
+            }
+            if let Ok(mut guard) = RTMP_BRIDGE.lock() {
+                guard.take();
             }
             return Err(e);
         }
