@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reproduces the cross-server numbers in BENCHMARKS.md: librtmp2-server vs
-# nginx-rtmp vs MediaMTX, using librtmp2's bench_handshake/bench_relay tools
-# (a real RTMP client, so all three servers are driven identically) plus a
+# nginx-rtmp vs MediaMTX vs SRS, using librtmp2's bench_handshake/bench_relay
+# tools (a real RTMP client, so all servers are driven identically) plus a
 # real ffmpeg-encoded source stream.
 #
 # Requirements (all optional pieces are skipped with a warning if missing):
@@ -11,12 +11,15 @@
 #   - ffmpeg
 #   - nginx with the nginx-rtmp module (Debian/Ubuntu: `libnginx-mod-rtmp`)
 #   - a MediaMTX binary (set MEDIAMTX_BIN to its path; skipped if unset)
+#   - an SRS binary (set SRS_BIN to its path; skipped if unset) — build from
+#     https://github.com/ossrs/srs (`trunk/configure && make`) or use a
+#     packaged binary; not vendored here for the same reason MediaMTX isn't
 #
 # Usage: scripts/run_rtmp_benchmarks.sh [work_dir]
 #
-# This starts and stops its own nginx/MediaMTX/librtmp2-server instances on
-# non-default ports (1935/1936/1937) so it doesn't collide with anything
-# already running; it does not touch system nginx config.
+# This starts and stops its own nginx/MediaMTX/SRS/librtmp2-server instances
+# on non-default ports (1935/1936/1937/1938) so it doesn't collide with
+# anything already running; it does not touch system nginx config.
 
 set -euo pipefail
 
@@ -24,11 +27,12 @@ WORK_DIR="${1:-$(mktemp -d)}"
 LIBRTMP2_DIR="${LIBRTMP2_DIR:-../librtmp2}"
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-}"
+SRS_BIN="${SRS_BIN:-}"
 
 BENCH_HANDSHAKE="$LIBRTMP2_DIR/target/release/examples/bench_handshake"
 BENCH_RELAY="$LIBRTMP2_DIR/target/release/examples/bench_relay"
 
-mkdir -p "$WORK_DIR"/{logs,lrtmp2-server,nginx,mediamtx}
+mkdir -p "$WORK_DIR"/{logs,lrtmp2-server,nginx,mediamtx,srs}
 echo "Work dir: $WORK_DIR"
 
 for bin in "$BENCH_HANDSHAKE" "$BENCH_RELAY"; do
@@ -187,6 +191,39 @@ EOF
   kill "$(cat "$WORK_DIR/mediamtx.pid")" >/dev/null 2>&1 || true
 else
   echo "skipping MediaMTX: set MEDIAMTX_BIN to a built binary to include it"
+fi
+
+### 4. SRS ###
+if [[ -n "$SRS_BIN" ]] && [[ -x "$SRS_BIN" ]]; then
+  echo "--- starting SRS on :1938 ---"
+  cat > "$WORK_DIR/srs/srs.conf" <<EOF
+max_connections     1000;
+daemon              off;
+pid                 $WORK_DIR/srs/srs.pid;
+srs_log_tank        file;
+srs_log_file        $WORK_DIR/logs/srs.log;
+rtmp {
+    listen          1938;
+}
+http_api {
+    enabled off;
+}
+http_server {
+    enabled off;
+}
+vhost __defaultVhost__ {
+}
+EOF
+  (cd "$WORK_DIR/srs" && "$SRS_BIN" -c ./srs.conf >"$WORK_DIR/logs/srs-stdout.log" 2>&1 &
+   echo $! > "$WORK_DIR/srs.pid")
+  PIDS+=("$(cat "$WORK_DIR/srs.pid")")
+  sleep 2
+  echo "=== SRS handshake (count=120, concurrency=30) ==="
+  "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1938/live/hsbench --count 120 --concurrency 30
+  relay_sweep "srs" "rtmp://127.0.0.1:1938/live/bench" prefix "rtmp://127.0.0.1:1938/live/bench"
+  kill "$(cat "$WORK_DIR/srs.pid")" >/dev/null 2>&1 || true
+else
+  echo "skipping SRS: set SRS_BIN to a built binary to include it"
 fi
 
 echo "Done. Logs in $WORK_DIR/logs"
