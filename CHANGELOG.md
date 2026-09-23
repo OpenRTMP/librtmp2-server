@@ -13,6 +13,17 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-23
+
+### Security
+- Update `librtmp2` to `0.9.1`, pulling in the upstream fix that requires
+  explicit publish/play authorization for shared-object-observer-only server
+  configurations instead of allowing publish/play and relay implicitly.
+
+### Changed
+- Depends on `librtmp2` `0.9.1`.
+- Package version `0.4.0` → `0.4.1`.
+
 ## [0.4.0] — 2026-09-23
 
 ### Changed
@@ -561,7 +572,9 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.0...v0.2.1
