@@ -120,7 +120,6 @@ pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 /// every joining connection at once, making the burst slower, not faster --
 /// running this at a fixed cadence instead keeps it off the hot path.
 pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
-
 /// Block until a listener or tracked connection socket becomes readable, or
 /// `timeout_ms` elapses -- whichever comes first.
 ///
