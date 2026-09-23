@@ -141,17 +141,35 @@ pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
 /// so a stalled TLS peer with no other socket activity still waits out the
 /// full timeout -- no worse than the sleep this replaces, just not sped up
 /// by it.
-fn wait_for_readiness_or_timeout(server: &librtmp2::server::Server, timeout_ms: u64) {
+///
+/// Returns the `conn_id`s whose fd came back readable (or errored/hung up --
+/// a dead connection must still get a `recv()` attempt to actually notice
+/// and close it), for the next call to `Server::poll_ready` to use. `None`
+/// means "assume everyone is readable" (the rare `poll(2)`-itself-failed
+/// fallback below) -- the caller must fall back to the unfiltered
+/// `Server::poll` in that case, never treat it as an empty ready set.
+///
+/// Beyond gating the sleep, `poll(2)` already tells us exactly which fds
+/// are readable; discarding that down to a single yes/no (as this function
+/// used to) meant every connection -- including idle players who send
+/// nothing after their initial `play` -- got a `recv()` syscall attempted
+/// every single tick regardless. At 100 concurrent viewers that is 100
+/// wasted syscalls per tick most of the time; returning the actual ready
+/// set lets the caller skip them.
+fn wait_for_readiness_or_timeout(
+    server: &librtmp2::server::Server,
+    timeout_ms: u64,
+) -> Option<HashSet<u64>> {
+    let conn_id_by_fd: HashMap<i32, u64> = server
+        .connections
+        .iter()
+        .filter(|conn| conn.client_fd >= 0)
+        .map(|conn| (conn.client_fd, conn.conn_id))
+        .collect();
     let mut fds: Vec<libc::pollfd> = server
         .listener_fds()
         .into_iter()
-        .chain(
-            server
-                .connections
-                .iter()
-                .map(|conn| conn.client_fd)
-                .filter(|&fd| fd >= 0),
-        )
+        .chain(conn_id_by_fd.keys().copied())
         .map(|fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -163,15 +181,22 @@ fn wait_for_readiness_or_timeout(server: &librtmp2::server::Server, timeout_ms: 
     loop {
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc >= 0 {
-            return;
+            const READY_MASK: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            return Some(
+                fds.iter()
+                    .filter(|pfd| pfd.revents & READY_MASK != 0)
+                    .filter_map(|pfd| conn_id_by_fd.get(&pfd.fd).copied())
+                    .collect(),
+            );
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             // Unexpected poll() failure -- e.g. a connection closed and its
             // fd was reused between fd collection and this call. Fall back
             // to the plain sleep this function replaces rather than
-            // spinning on a busy error.
+            // spinning on a busy error, and report "assume everyone ready"
+            // so the caller falls back to processing every connection.
             std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
-            return;
+            return None;
         }
         // EINTR: a signal interrupted the wait. `poll`'s timeout is
         // relative, so simply retrying restarts the full timeout rather
@@ -1235,6 +1260,12 @@ impl ServerApp {
             let mut media_outputs =
                 MediaOutputManager::new(media_output_thread_config, media_output_db);
             let mut last_prune = Instant::now();
+            // `None` until the first `wait_for_readiness_or_timeout` call
+            // below reports which connections are actually readable --
+            // until then (and whenever it falls back to "assume everyone
+            // ready"), `Server::poll` processes every connection, same as
+            // before this readiness-aware path existed.
+            let mut readable: Option<HashSet<u64>> = None;
 
             loop {
                 if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -1267,7 +1298,10 @@ impl ServerApp {
                 };
 
                 set_rtmp_poll_server(&mut server);
-                let poll_result = server.poll(0);
+                let poll_result = match &readable {
+                    Some(r) => server.poll_ready(0, r),
+                    None => server.poll(0),
+                };
                 clear_rtmp_poll_server();
                 if let Err(e) = poll_result {
                     crate::log_warn!("RTMP polling stopped: {e}");
@@ -1486,7 +1520,7 @@ impl ServerApp {
                 } else {
                     POLL_INTERVAL_MS
                 };
-                wait_for_readiness_or_timeout(&server, poll_interval_ms);
+                readable = wait_for_readiness_or_timeout(&server, poll_interval_ms);
             }
 
             media_outputs.stop_all();
