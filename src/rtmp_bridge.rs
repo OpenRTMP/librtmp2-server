@@ -494,6 +494,17 @@ impl DbRtmpBridge {
             .unwrap_or(false)
     }
 
+    /// `has_publisher(conn) || has_player(conn)` in one lock instead of two —
+    /// used on the per-tick poll path, where every tracked connection is
+    /// checked once per poll.
+    pub fn has_authorized_session(&self, conn: ConnId) -> bool {
+        self.conns
+            .lock()
+            .get(&conn)
+            .map(|s| s.publisher.is_some() || s.player.is_some())
+            .unwrap_or(false)
+    }
+
     /// Peer address (`IP:port`) recorded at `on_connect`, falling back to
     /// the bare IP or the literal `"unknown"`; empty only if the connection
     /// isn't tracked at all.

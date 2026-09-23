@@ -566,6 +566,11 @@ pub(crate) fn process_server_connections(
         }
         let conn_id = conn.conn_id;
         current_ids.insert(conn_id);
+        // Folded into this per-connection pass (was a separate full second
+        // scan below) so a poll tick locks `rtmp_bridge`'s shared connection
+        // map once per connection instead of twice; `update_rtt` debounces
+        // internally to at most once per second per connection regardless.
+        rtmp_bridge.update_rtt(conn_id, conn.rtt_ms);
         let entry = tracked.entry(conn_id).or_default();
         if !entry.connected {
             // A publish/play callback may have already run `on_connect` via
@@ -580,8 +585,7 @@ pub(crate) fn process_server_connections(
             entry.first_seen_at = Some(Instant::now());
         }
 
-        let has_authorized_session =
-            rtmp_bridge.has_publisher(conn_id) || rtmp_bridge.has_player(conn_id);
+        let has_authorized_session = rtmp_bridge.has_authorized_session(conn_id);
         if should_evict_idle_conn(entry, has_authorized_session, Instant::now(), idle_timeout) {
             crate::log_info!(
                 "RTMP: closing idle conn={conn_id} from {} (no publish/play within {}s)",
@@ -778,13 +782,6 @@ pub(crate) fn process_server_connections(
             }
             rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
         }
-    }
-
-    for conn in server.connections.iter() {
-        if conn.client_fd < 0 {
-            continue;
-        }
-        rtmp_bridge.update_rtt(conn.conn_id, conn.rtt_ms);
     }
 
     reject_indices.sort_unstable();
@@ -1250,12 +1247,24 @@ impl ServerApp {
                 // buffered in the same poll cannot be attributed safely to either
                 // generation because RelayFrame does not carry that boundary. Such a
                 // mixed batch is dropped for media outputs below rather than merging two
-                // logical publisher sessions.
-                let publish_generations_before_poll: HashMap<u64, u64> = tracked
-                    .iter()
-                    .filter(|(_, entry)| entry.publishing)
-                    .map(|(&conn_id, _)| (conn_id, publisher_generation(conn_id)))
-                    .collect();
+                // logical publisher sessions. Only media outputs and clustering consult
+                // this map, so skip building it (and the per-publisher global-mutex
+                // lock in `publisher_generation`) on every poll tick for a plain
+                // deployment that has neither configured.
+                #[cfg(feature = "cluster")]
+                let need_publish_generations = media_outputs.enabled() || cluster_enabled;
+                #[cfg(not(feature = "cluster"))]
+                let need_publish_generations = media_outputs.enabled();
+                let publish_generations_before_poll: HashMap<u64, u64> = if need_publish_generations
+                {
+                    tracked
+                        .iter()
+                        .filter(|(_, entry)| entry.publishing)
+                        .map(|(&conn_id, _)| (conn_id, publisher_generation(conn_id)))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
 
                 set_rtmp_poll_server(&mut server);
                 let poll_result = server.poll(0);
