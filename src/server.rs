@@ -107,6 +107,20 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 /// fast-polling steady-state connections that no longer need it.
 pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 
+/// How often the poll loop re-derives `live_publishers`/`live_stream_ids`/
+/// `live_viewer_ids` and prunes `deleted_streams`/`revoked_viewers` against
+/// them. This bookkeeping is pure garbage collection -- it only reclaims
+/// markers for connections that are already gone, so it tolerates the same
+/// staleness window as the slow poll interval. It is *not* tied to
+/// `poll_interval_ms`: that interval drops to `POLL_INTERVAL_FAST_MS` while
+/// any connection is negotiating (see above), and each of these derived
+/// sets locks `DbRtmpBridge`'s shared connection map once per tracked
+/// connection to build. Rebuilding them on every fast tick during a
+/// many-viewer join burst turned that lock into a bottleneck contended by
+/// every joining connection at once, making the burst slower, not faster --
+/// running this at a fixed cadence instead keeps it off the hot path.
+pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
+
 /// Block until a listener or tracked connection socket becomes readable, or
 /// `timeout_ms` elapses -- whichever comes first.
 ///
@@ -1224,6 +1238,7 @@ impl ServerApp {
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
             let mut media_outputs =
                 MediaOutputManager::new(media_output_thread_config, media_output_db);
+            let mut last_prune = Instant::now();
 
             loop {
                 if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -1416,32 +1431,46 @@ impl ServerApp {
                     clear_publish_generation(conn_id);
                 }
 
-                let live_publishers: HashSet<u64> = tracked
-                    .iter()
-                    .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
-                    .collect();
-                media_outputs.retain_publishers(&live_publishers);
+                // This bookkeeping only reclaims markers for connections that
+                // are already gone, so -- unlike the poll interval itself --
+                // it does not need to run on every fast tick. Each of these
+                // derived sets locks `rtmp_bridge`'s shared connection map
+                // once per tracked connection; rebuilding them at the full
+                // 1ms negotiating cadence during a many-viewer join burst
+                // turns that lock into a bottleneck the joining connections
+                // contend on, which is counterproductive. See
+                // `PRUNE_INTERVAL_MS`.
+                if last_prune.elapsed() >= Duration::from_millis(PRUNE_INTERVAL_MS) {
+                    last_prune = Instant::now();
 
-                // Prune transient drain markers (e.g. ownership force_unpublish)
-                // once no local session references them. Keep HTTP sticky
-                // markers until finalize/rollback clears them explicitly —
-                // otherwise Raft begin_delete timeouts lose rejection cover
-                // when the node has no live RTMP sessions for the stream.
-                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
-                let sticky = sticky_deleted_streams.lock().clone();
-                deleted_streams
-                    .lock()
-                    .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
+                    let live_publishers: HashSet<u64> = tracked
+                        .iter()
+                        .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
+                        .collect();
+                    media_outputs.retain_publishers(&live_publishers);
 
-                let live_viewer_ids: HashSet<String> = tracked
-                    .keys()
-                    .copied()
-                    .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
-                    .filter(|viewer_id| !viewer_id.is_empty())
-                    .collect();
-                revoked_viewers
-                    .lock()
-                    .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                    // Prune transient drain markers (e.g. ownership force_unpublish)
+                    // once no local session references them. Keep HTTP sticky
+                    // markers until finalize/rollback clears them explicitly —
+                    // otherwise Raft begin_delete timeouts lose rejection cover
+                    // when the node has no live RTMP sessions for the stream.
+                    let live_stream_ids =
+                        live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
+                    let sticky = sticky_deleted_streams.lock().clone();
+                    deleted_streams
+                        .lock()
+                        .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
+
+                    let live_viewer_ids: HashSet<String> = tracked
+                        .keys()
+                        .copied()
+                        .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
+                        .filter(|viewer_id| !viewer_id.is_empty())
+                        .collect();
+                    revoked_viewers
+                        .lock()
+                        .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                }
 
                 let negotiating = any_negotiating(&tracked);
                 let poll_interval_ms = if negotiating || just_authorized {
