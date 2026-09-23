@@ -109,10 +109,10 @@ OBS / FFmpeg / App
 
 ### Compile
 
-`librtmp2-server` uses the published `librtmp2` 0.4.1 release from crates.io:
+`librtmp2-server` uses the published `librtmp2` 0.9.1 release from crates.io:
 
 ```toml
-librtmp2 = { version = "0.4.1", features = ["tls"] }
+librtmp2 = { version = "0.9.1", features = ["tls"] }
 ```
 
 ```bash
