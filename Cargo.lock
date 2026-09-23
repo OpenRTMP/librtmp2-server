@@ -1256,12 +1256,13 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "librtmp2"
 version = "0.9.1"
-source = "git+https://github.com/OpenRTMP/librtmp2?rev=fe44805f551e1aa98848d55715fe3fd964565fba#fe44805f551e1aa98848d55715fe3fd964565fba"
+source = "git+https://github.com/OpenRTMP/librtmp2?rev=35b40c938df075b9b217e5291b3d179fc94ae1c0#35b40c938df075b9b217e5291b3d179fc94ae1c0"
 dependencies = [
  "cc",
  "libc",
  "openssl",
  "parking_lot",
+ "socket2",
  "thiserror 2.0.20",
 ]
 

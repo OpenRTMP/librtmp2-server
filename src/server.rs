@@ -67,6 +67,28 @@ thread_local! {
 }
 
 thread_local! {
+    /// Per-shard auth-completion receiver, set once by a sharded RTMP thread
+    /// (see [`resolve_shard_count`]) instead of the global
+    /// `AUTH_COMPLETIONS_RX`. There's still exactly one auth worker and one
+    /// underlying completion stream for the whole process; a small
+    /// dispatcher thread fans each completion out to the shard that owns its
+    /// `conn_id` (see `run`). `None` on the single-shard path, where
+    /// `drain_auth_completions` falls back to the legacy global receiver.
+    static SHARD_AUTH_COMPLETIONS_RX: RefCell<Option<std::sync::mpsc::Receiver<AuthCompletion>>> =
+        const { RefCell::new(None) };
+}
+
+pub(crate) fn set_shard_auth_completions_rx(rx: std::sync::mpsc::Receiver<AuthCompletion>) {
+    SHARD_AUTH_COMPLETIONS_RX.with(|cell| *cell.borrow_mut() = Some(rx));
+}
+
+/// Which shard owns `conn_id`, given `set_conn_id_base(1 + i * SHARD_ID_SPACE)`
+/// was used for shard `i` (see [`resolve_shard_count`]).
+pub(crate) fn shard_for_conn_id(conn_id: u64) -> usize {
+    (conn_id.saturating_sub(1) / SHARD_ID_SPACE) as usize
+}
+
+thread_local! {
     /// conn_ids whose callback ran during the current `server.poll()`. A
     /// connection that authorizes publish/play and is then reaped by the
     /// library in the same poll never enters `tracked`, so the poll loop uses
@@ -120,6 +142,66 @@ pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 /// every joining connection at once, making the burst slower, not faster --
 /// running this at a fixed cadence instead keeps it off the hot path.
 pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
+
+/// Size of the conn_id range reserved for each RTMP shard when sharding is
+/// active (see [`resolve_shard_count`]) -- shard `i` gets
+/// `set_conn_id_base(1 + i as u64 * SHARD_ID_SPACE)`. Comfortably larger
+/// than any realistic connection count per shard, and `MAX_SHARDS *
+/// SHARD_ID_SPACE` stays well under librtmp2's reserved external-publisher-id
+/// high bit (`1 << 63`).
+const SHARD_ID_SPACE: u64 = 1 << 48;
+const MAX_SHARDS: usize = 32;
+
+/// How many independent `librtmp2::server::Server` instances (each on its
+/// own OS thread, each with its own disjoint conn_id range, sharing one
+/// `SO_REUSEPORT` listener so the kernel load-balances new connections
+/// across them) to run the RTMP poll loop across.
+///
+/// A single dedicated poll thread processes every connection's `recv()`
+/// serially each tick -- fine at low concurrency, but it means the whole
+/// server runs on one CPU core no matter how many viewers connect.
+/// Sharding lets connections that don't need to interact (most of any
+/// tick's work) run in parallel across cores.
+///
+/// Cross-shard relay (a publisher on one shard, viewers on another) reuses
+/// librtmp2's existing `inject_relay_frame`/relay-export mechanism built for
+/// HA clustering -- broadcasting each shard's exported frames to every other
+/// shard in-process, no network involved. Media outputs (recording/HLS/push/
+/// exec) and HA clustering are not yet wired through that same cross-shard
+/// path -- both assume a single `Server`/`MediaOutputManager` instance -- so
+/// sharding is forced off (falls back to the single-thread path, unchanged)
+/// whenever either is enabled, rather than risk silently dropping frames or
+/// double-processing them.
+///
+/// Set with `LRTMP2_RTMP_SHARDS` (clamped to `[1, MAX_SHARDS]`); defaults to
+/// `1` (today's single-thread behavior, unchanged) rather than the core
+/// count. This is new code with a real, disclosed tradeoff --
+/// `max_connections_per_addr` is enforced per shard rather than truly
+/// globally, since a given IP's connections can land on different shards --
+/// so it stays opt-in rather than silently changing behavior (including the
+/// effective per-IP cap) for existing deployments the moment this ships.
+fn resolve_shard_count(media_outputs_enabled: bool, cluster_enabled: bool) -> usize {
+    let requested = std::env::var("LRTMP2_RTMP_SHARDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
+    if requested <= 1 {
+        return 1;
+    }
+    if media_outputs_enabled {
+        crate::log_warn!(
+            "LRTMP2_RTMP_SHARDS ignored: media outputs (recording/HLS/push/exec) aren't wired through cross-shard relay yet"
+        );
+        return 1;
+    }
+    if cluster_enabled {
+        crate::log_warn!(
+            "LRTMP2_RTMP_SHARDS ignored: HA clustering isn't wired through cross-shard relay yet"
+        );
+        return 1;
+    }
+    requested.clamp(1, MAX_SHARDS)
+}
 /// Block until a listener or tracked connection socket becomes readable, or
 /// `timeout_ms` elapses -- whichever comes first.
 ///
@@ -328,27 +410,48 @@ pub(crate) fn rtmp_play_auth_cb(conn_id: u64, app: &str, play_key: &str) -> Auth
 /// Returns whether at least one completion was applied, so the caller can
 /// poll again immediately (rather than take the full idle sleep) and pick
 /// up whatever the client sends right after receiving that `onStatus` reply.
+fn apply_auth_completion(server: &mut librtmp2::server::Server, completion: &AuthCompletion) {
+    match completion.kind {
+        AuthKind::Publish => {
+            if completion.allow {
+                bump_publish_generation(completion.conn_id);
+            }
+            let _ = server.complete_publish_authorization(completion.conn_id, completion.allow);
+        }
+        AuthKind::Play => {
+            let _ = server.complete_play_authorization(completion.conn_id, completion.allow);
+        }
+    }
+}
+
 fn drain_auth_completions(server: &mut librtmp2::server::Server) -> bool {
+    let mut any_completed = false;
+    // Sharded RTMP thread: drain this shard's own fan-out receiver instead
+    // of the single global one (see `SHARD_AUTH_COMPLETIONS_RX`).
+    let handled_locally = SHARD_AUTH_COMPLETIONS_RX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(rx) = slot.as_mut() else {
+            return false;
+        };
+        while let Ok(completion) = rx.try_recv() {
+            any_completed = true;
+            apply_auth_completion(server, &completion);
+        }
+        true
+    });
+    if handled_locally {
+        return any_completed;
+    }
+
     let Ok(guard) = AUTH_COMPLETIONS_RX.lock() else {
         return false;
     };
     let Some(rx) = guard.as_ref() else {
         return false;
     };
-    let mut any_completed = false;
     while let Ok(completion) = rx.try_recv() {
         any_completed = true;
-        match completion.kind {
-            AuthKind::Publish => {
-                if completion.allow {
-                    bump_publish_generation(completion.conn_id);
-                }
-                let _ = server.complete_publish_authorization(completion.conn_id, completion.allow);
-            }
-            AuthKind::Play => {
-                let _ = server.complete_play_authorization(completion.conn_id, completion.allow);
-            }
-        }
+        apply_auth_completion(server, &completion);
     }
     any_completed
 }
@@ -1163,7 +1266,6 @@ impl ServerApp {
         let sticky_deleted_streams = Arc::clone(&self.sticky_deleted_streams);
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
-        let rtmp_stop_clone = Arc::clone(&rtmp_stop);
         let media_export_bytes = if media_output_config.needs_relay_export() {
             media_output_config.export_buffer_bytes()
         } else {
@@ -1187,238 +1289,393 @@ impl ServerApp {
         #[cfg(not(feature = "cluster"))]
         let relay_export_bytes = media_export_bytes;
 
-        let (rtmp_ready_tx, rtmp_ready_rx) = tokio::sync::oneshot::channel();
-        let (rtmp_dead_tx, rtmp_dead_rx) = tokio::sync::oneshot::channel();
-        let rtmp_thread = std::thread::spawn(move || {
-            use librtmp2::server::Server as RtmpServer;
-            use librtmp2::types::ServerConfig as RtmpConfig;
+        #[cfg(feature = "cluster")]
+        let n_shards = resolve_shard_count(media_output_config.enabled(), cluster_enabled);
+        #[cfg(not(feature = "cluster"))]
+        let n_shards = resolve_shard_count(media_output_config.enabled(), false);
+        if n_shards > 1 {
+            crate::log_info!("RTMP sharding enabled: {n_shards} worker threads");
+        }
+        let per_shard_max_conn = (rtmp_max_conn / n_shards as i32).max(1);
+        // At n_shards > 1 relay export must always be on (cross-shard relay
+        // depends on it, regardless of media outputs/clustering), sized
+        // generously since it's now also the sole path getting frames to
+        // viewers on other shards.
+        let relay_export_bytes = if n_shards > 1 {
+            relay_export_bytes.max(4 * 1024 * 1024)
+        } else {
+            relay_export_bytes
+        };
 
-            let cfg = RtmpConfig {
-                max_connections: rtmp_max_conn,
-                chunk_size: 4096,
-                tls_enabled: 0,
-                tls_cert_file: std::ptr::null(),
-                tls_key_file: std::ptr::null(),
-                tls_ca_file: std::ptr::null(),
-                tls_insecure: 0,
-                max_pending_tls_per_addr: rtmp_max_pending_tls_per_addr,
-                max_connections_per_addr: rtmp_max_connections_per_addr,
-            };
-            let mut server = match RtmpServer::new(cfg) {
-                Ok(s) => s,
-                Err(e) => {
-                    let msg = format!("RTMP server init failed: {e}");
-                    crate::log_warn!("{msg}");
-                    let _ = rtmp_ready_tx.send(Err(msg));
-                    return;
-                }
-            };
-            server.resource_limits = rtmp_resource_limits;
-            server.defer_media_relay = true;
-            server.on_media_cb = Some(rtmp_media_cb);
-            // Pending-capable auth: publish/play requests dispatch to the
-            // dedicated auth worker (SQLite + cluster ownership) instead of
-            // running that work on this thread. Takes priority over
-            // on_publish_cb/on_play_cb, which stay unset here.
-            server.on_publish_auth_cb = Some(rtmp_publish_auth_cb);
-            server.on_play_auth_cb = Some(rtmp_play_auth_cb);
-            if relay_export_bytes > 0 {
-                server.enable_relay_export(4096, relay_export_bytes.max(1024 * 1024));
-            }
-            if let Err(e) = server.listen(&rtmp_bind) {
-                let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
-                crate::log_warn!("{msg}");
-                let _ = rtmp_ready_tx.send(Err(msg));
-                return;
-            }
-            crate::log_info!("RTMP listening on {rtmp_bind}");
-
-            if rtmp_tls_enabled {
-                if let Err(e) = server.listen_tls(&rtmps_bind, &rtmp_tls_cert, &rtmp_tls_key) {
-                    let msg = format!("RTMPS bind on {rtmps_bind} failed: {e}");
-                    crate::log_warn!("{msg}");
-                    let _ = rtmp_ready_tx.send(Err(msg));
-                    return;
-                }
-                crate::log_info!("RTMPS listening on {rtmps_bind}");
-            }
-
-            let _ = rtmp_ready_tx.send(Ok(()));
-            if let Ok(mut guard) = RTMP_BRIDGE.lock() {
-                *guard = Some(Arc::clone(&rtmp_bridge));
-            }
-            let (auth_worker_handle, auth_completions_rx) =
-                auth_worker::spawn(Arc::clone(&rtmp_bridge));
-            if let Ok(mut guard) = AUTH_WORKER.lock() {
-                *guard = Some(auth_worker_handle);
-            }
+        // The auth worker and the two globals its callbacks read
+        // (`RTMP_BRIDGE`, `AUTH_WORKER`) are set up once, before any shard
+        // thread starts -- there is exactly one auth worker for the whole
+        // process regardless of shard count, since it just does SQLite/
+        // cluster-ownership work keyed by conn_id, which is already unique
+        // across shards (see `SHARD_ID_SPACE`).
+        if let Ok(mut guard) = RTMP_BRIDGE.lock() {
+            *guard = Some(Arc::clone(&rtmp_bridge));
+        }
+        let (auth_worker_handle, auth_completions_rx) =
+            auth_worker::spawn(Arc::clone(&rtmp_bridge));
+        if let Ok(mut guard) = AUTH_WORKER.lock() {
+            *guard = Some(auth_worker_handle);
+        }
+        // Each shard may only apply a completion via its own `Server`, from
+        // its own thread (librtmp2's single-thread-per-`Conn` rule), so with
+        // more than one shard a small dispatcher thread fans the one
+        // completion stream out to each shard's own receiver by
+        // `shard_for_conn_id`. With exactly one shard this is just the
+        // legacy global `AUTH_COMPLETIONS_RX` -- no dispatcher needed.
+        let mut shard_auth_rxs: Vec<Option<std::sync::mpsc::Receiver<AuthCompletion>>> =
+            (0..n_shards).map(|_| None).collect();
+        if n_shards == 1 {
             if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
                 *guard = Some(auth_completions_rx);
             }
-
-            let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
-            let mut media_outputs =
-                MediaOutputManager::new(media_output_thread_config, media_output_db);
-            let mut last_prune = Instant::now();
-            // `None` until the first `wait_for_readiness_or_timeout` call
-            // below reports which connections are actually readable --
-            // until then (and whenever it falls back to "assume everyone
-            // ready"), `Server::poll` processes every connection, same as
-            // before this readiness-aware path existed.
-            let mut readable: Option<HashSet<u64>> = None;
-
-            loop {
-                if rtmp_stop_clone.load(Ordering::Relaxed) {
-                    server.stop();
-                    break;
-                }
-
-                // Capture the publish generation before entering librtmp2. If the
-                // callback accepts a republish during this poll, relay frames already
-                // buffered in the same poll cannot be attributed safely to either
-                // generation because RelayFrame does not carry that boundary. Such a
-                // mixed batch is dropped for media outputs below rather than merging two
-                // logical publisher sessions. Only media outputs and clustering consult
-                // this map, so skip building it (and the per-publisher global-mutex
-                // lock in `publisher_generation`) on every poll tick for a plain
-                // deployment that has neither configured.
-                #[cfg(feature = "cluster")]
-                let need_publish_generations = media_outputs.enabled() || cluster_enabled;
-                #[cfg(not(feature = "cluster"))]
-                let need_publish_generations = media_outputs.enabled();
-                let publish_generations_before_poll: HashMap<u64, u64> = if need_publish_generations
-                {
-                    tracked
-                        .iter()
-                        .filter(|(_, entry)| entry.publishing)
-                        .map(|(&conn_id, _)| (conn_id, publisher_generation(conn_id)))
-                        .collect()
-                } else {
-                    HashMap::new()
-                };
-
-                set_rtmp_poll_server(&mut server);
-                let poll_result = match &readable {
-                    Some(r) => server.poll_ready(0, r),
-                    None => server.poll(0),
-                };
-                clear_rtmp_poll_server();
-                if let Err(e) = poll_result {
-                    crate::log_warn!("RTMP polling stopped: {e}");
-                    break;
-                }
-
-                let deleted_now: HashSet<String> = deleted_streams.lock().iter().cloned().collect();
-                let revoked_now: HashSet<String> = revoked_viewers.lock().iter().cloned().collect();
-
-                let (current_ids, just_authorized) = process_server_connections(
-                    &mut server,
-                    &mut tracked,
-                    &rtmp_bridge,
-                    &deleted_now,
-                    &revoked_now,
-                    rtmp_idle_timeout,
-                );
-
-                #[cfg(feature = "cluster")]
-                if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
-                    mgr.poll_side_effects();
-                    rtmp_bridge.retry_pending_ownership_releases();
-                }
-
-                let exported_frames = if relay_export_bytes > 0 {
-                    server.drain_exported_relay_frames()
-                } else {
-                    Vec::new()
-                };
-
-                if media_outputs.enabled() {
-                    for frame in &exported_frames {
-                        if !tracked
-                            .get(&frame.publisher_conn_id)
-                            .is_some_and(|entry| entry.publishing)
-                        {
-                            continue;
-                        }
-                        let generation = publisher_generation(frame.publisher_conn_id);
-                        if publish_generations_before_poll
-                            .get(&frame.publisher_conn_id)
-                            .is_some_and(|before| *before != generation)
-                        {
-                            // A same-connection republish happened while this poll was
-                            // producing the export batch. RelayFrame has no per-frame
-                            // generation marker, so conservatively drop this ambiguous
-                            // boundary batch. The reconciliation below starts the new
-                            // generation before the next poll, preventing cross-session
-                            // recording/HLS/push corruption without guessing by timestamp.
-                            continue;
-                        }
-                        // RelayFrame carries the route active when the frame was
-                        // exported. Resolve publish keys before consulting the
-                        // connection's current stream so queued frames from stream A
-                        // cannot be written into a newly switched B.
-                        let frame_stream_id = rtmp_bridge
-                            .stream_id_for_publish_route(&frame.stream_name)
-                            .unwrap_or_else(|| frame.stream_name.clone());
-                        media_outputs.handle_frame(frame, &frame_stream_id, generation);
+        } else {
+            let (shard_auth_txs, shard_auth_rx_vec): (Vec<_>, Vec<_>) = (0..n_shards)
+                .map(|_| std::sync::mpsc::channel::<AuthCompletion>())
+                .unzip();
+            for (i, rx) in shard_auth_rx_vec.into_iter().enumerate() {
+                shard_auth_rxs[i] = Some(rx);
+            }
+            std::thread::Builder::new()
+                .name("rtmp-auth-dispatch".to_string())
+                .spawn(move || {
+                    for completion in auth_completions_rx {
+                        let shard =
+                            shard_for_conn_id(completion.conn_id).min(shard_auth_txs.len() - 1);
+                        let _ = shard_auth_txs[shard].send(completion);
                     }
-                }
+                })
+                .expect("failed to spawn auth-completion dispatcher thread");
+        }
 
-                // Reconcile the output session only after draining exported
-                // frames. This preserves the tail of an old publish session and
-                // still restarts hooks/outputs when the same TCP connection
-                // republishes the same stream with a new generation.
-                for (&conn_id, entry) in &tracked {
-                    if entry.publishing && !entry.stream_id.is_empty() {
-                        media_outputs.ensure_publisher(
-                            conn_id,
-                            &entry.stream_id,
-                            publisher_generation(conn_id),
-                        );
+        // Cross-shard media relay: each shard broadcasts the frames its own
+        // local publishers produced (the same relay-export buffer used for
+        // media outputs/clustering) to every other shard's inbox, which
+        // injects them into its own local relay/player fan-out via
+        // `inject_relay_frame` -- the same mechanism librtmp2 already uses
+        // to relay frames arriving from another HA-cluster node, just over
+        // an in-process channel instead of the network. A publisher and its
+        // viewers can land on different shards since SO_REUSEPORT
+        // load-balances by connection, not by route (the route isn't known
+        // until after the `publish`/`play` command, long after accept).
+        let mut relay_rxs: Vec<Option<std::sync::mpsc::Receiver<librtmp2::RelayFrame>>> =
+            (0..n_shards).map(|_| None).collect();
+        let relay_txs: Option<Arc<Vec<std::sync::mpsc::Sender<librtmp2::RelayFrame>>>> =
+            if n_shards > 1 {
+                let mut txs = Vec::with_capacity(n_shards);
+                for (i, slot) in relay_rxs.iter_mut().enumerate() {
+                    let (tx, rx) = std::sync::mpsc::channel::<librtmp2::RelayFrame>();
+                    txs.push(tx);
+                    *slot = Some(rx);
+                    let _ = i;
+                }
+                Some(Arc::new(txs))
+            } else {
+                None
+            };
+
+        let (rtmp_dead_tx, mut rtmp_dead_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut ready_rxs = Vec::with_capacity(n_shards);
+        let mut shard_threads = Vec::with_capacity(n_shards);
+
+        for (shard_index, shard_auth_rx) in shard_auth_rxs.into_iter().enumerate() {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            ready_rxs.push(ready_rx);
+            let relay_rx = relay_rxs[shard_index].take();
+            let relay_txs = relay_txs.clone();
+            let conn_id_base = (n_shards > 1).then(|| 1 + shard_index as u64 * SHARD_ID_SPACE);
+            let rtmp_bind = rtmp_bind.clone();
+            let rtmps_bind = rtmps_bind.clone();
+            let rtmp_tls_cert = rtmp_tls_cert.clone();
+            let rtmp_tls_key = rtmp_tls_key.clone();
+            let rtmp_bridge = Arc::clone(&rtmp_bridge);
+            let deleted_streams = Arc::clone(&deleted_streams);
+            let sticky_deleted_streams = Arc::clone(&sticky_deleted_streams);
+            let revoked_viewers = Arc::clone(&revoked_viewers);
+            let rtmp_stop_clone = Arc::clone(&rtmp_stop);
+            let media_output_thread_config = media_output_thread_config.clone();
+            let media_output_db = Arc::clone(&media_output_db);
+            let rtmp_dead_tx = rtmp_dead_tx.clone();
+            #[cfg(feature = "cluster")]
+            let cluster_enabled = cluster_enabled;
+
+            let shard_thread = std::thread::Builder::new()
+                .name(format!("rtmp-shard-{shard_index}"))
+                .spawn(move || {
+                    use librtmp2::server::Server as RtmpServer;
+                    use librtmp2::types::ServerConfig as RtmpConfig;
+
+                    if let Some(rx) = shard_auth_rx {
+                        set_shard_auth_completions_rx(rx);
                     }
-                }
 
-                #[cfg(feature = "cluster")]
-                if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
-                    for frame in exported_frames {
-                        let generation = publisher_generation(frame.publisher_conn_id);
-                        if publish_generations_before_poll
-                            .get(&frame.publisher_conn_id)
-                            .is_some_and(|before| *before != generation)
-                        {
-                            // A republish during this poll makes the buffered frame batch
-                            // ambiguous for cluster export as well. Do not stamp old frames
-                            // with the new stream/ownership epoch.
-                            continue;
+                    let cfg = RtmpConfig {
+                        max_connections: per_shard_max_conn,
+                        chunk_size: 4096,
+                        tls_enabled: 0,
+                        tls_cert_file: std::ptr::null(),
+                        tls_key_file: std::ptr::null(),
+                        tls_ca_file: std::ptr::null(),
+                        tls_insecure: 0,
+                        max_pending_tls_per_addr: rtmp_max_pending_tls_per_addr,
+                        max_connections_per_addr: rtmp_max_connections_per_addr,
+                    };
+                    let mut server = match RtmpServer::new(cfg) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let msg = format!("RTMP server init failed: {e}");
+                            crate::log_warn!("{msg}");
+                            let _ = ready_tx.send(Err(msg));
+                            return;
                         }
-                        let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
-                        let stream_id = if sid.is_empty() {
-                            rtmp_bridge
-                                .stream_id_for_publish_route(&frame.stream_name)
-                                .unwrap_or_else(|| frame.stream_name.clone())
+                    };
+                    if let Some(base) = conn_id_base {
+                        server.set_conn_id_base(base);
+                    }
+                    server.resource_limits = rtmp_resource_limits;
+                    server.defer_media_relay = true;
+                    server.on_media_cb = Some(rtmp_media_cb);
+                    // Pending-capable auth: publish/play requests dispatch to the
+                    // dedicated auth worker (SQLite + cluster ownership) instead of
+                    // running that work on this thread. Takes priority over
+                    // on_publish_cb/on_play_cb, which stay unset here.
+                    server.on_publish_auth_cb = Some(rtmp_publish_auth_cb);
+                    server.on_play_auth_cb = Some(rtmp_play_auth_cb);
+                    if relay_export_bytes > 0 {
+                        server.enable_relay_export(4096, relay_export_bytes.max(1024 * 1024));
+                    }
+                    let bind_result = if conn_id_base.is_some() {
+                        server.listen_reuseport(&rtmp_bind)
+                    } else {
+                        server.listen(&rtmp_bind)
+                    };
+                    if let Err(e) = bind_result {
+                        let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
+                        crate::log_warn!("{msg}");
+                        let _ = ready_tx.send(Err(msg));
+                        return;
+                    }
+                    crate::log_info!("RTMP listening on {rtmp_bind} (shard {shard_index})");
+
+                    if rtmp_tls_enabled {
+                        let tls_result = if conn_id_base.is_some() {
+                            server.listen_tls_reuseport(&rtmps_bind, &rtmp_tls_cert, &rtmp_tls_key)
                         } else {
-                            sid
+                            server.listen_tls(&rtmps_bind, &rtmp_tls_cert, &rtmp_tls_key)
                         };
-                        // Stamp only with this publisher socket's claimed
-                        // epoch — durable/current stream epoch can belong
-                        // to another node after a local release/failover.
-                        let Some(epoch) =
-                            rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
-                        else {
-                            continue;
-                        };
-                        use crate::cluster::media::protocol::MediaMessage;
-                        mgr.enqueue_export(crate::cluster::ExportedFrame {
-                            app: frame.app.clone(),
-                            stream: stream_id,
-                            epoch,
-                            frame_type: MediaMessage::frame_type_from_librtmp2(frame.frame_type),
-                            timestamp: frame.timestamp,
-                            payload: frame.payload,
-                        });
+                        if let Err(e) = tls_result {
+                            let msg = format!("RTMPS bind on {rtmps_bind} failed: {e}");
+                            crate::log_warn!("{msg}");
+                            let _ = ready_tx.send(Err(msg));
+                            return;
+                        }
+                        crate::log_info!("RTMPS listening on {rtmps_bind} (shard {shard_index})");
                     }
-                    for inj in mgr.drain_injects() {
-                        if let Some(ft) =
+
+                    let _ = ready_tx.send(Ok(()));
+
+                    let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+                    let mut media_outputs =
+                        MediaOutputManager::new(media_output_thread_config, media_output_db);
+                    let mut last_prune = Instant::now();
+                    // `None` until the first `wait_for_readiness_or_timeout` call
+                    // below reports which connections are actually readable --
+                    // until then (and whenever it falls back to "assume everyone
+                    // ready"), `Server::poll` processes every connection, same as
+                    // before this readiness-aware path existed.
+                    let mut readable: Option<HashSet<u64>> = None;
+
+                    loop {
+                        if rtmp_stop_clone.load(Ordering::Relaxed) {
+                            server.stop();
+                            break;
+                        }
+
+                        // Capture the publish generation before entering librtmp2. If the
+                        // callback accepts a republish during this poll, relay frames already
+                        // buffered in the same poll cannot be attributed safely to either
+                        // generation because RelayFrame does not carry that boundary. Such a
+                        // mixed batch is dropped for media outputs below rather than merging two
+                        // logical publisher sessions. Only media outputs and clustering consult
+                        // this map, so skip building it (and the per-publisher global-mutex
+                        // lock in `publisher_generation`) on every poll tick for a plain
+                        // deployment that has neither configured.
+                        #[cfg(feature = "cluster")]
+                        let need_publish_generations = media_outputs.enabled() || cluster_enabled;
+                        #[cfg(not(feature = "cluster"))]
+                        let need_publish_generations = media_outputs.enabled();
+                        let publish_generations_before_poll: HashMap<u64, u64> =
+                            if need_publish_generations {
+                                tracked
+                                    .iter()
+                                    .filter(|(_, entry)| entry.publishing)
+                                    .map(|(&conn_id, _)| (conn_id, publisher_generation(conn_id)))
+                                    .collect()
+                            } else {
+                                HashMap::new()
+                            };
+
+                        set_rtmp_poll_server(&mut server);
+                        let poll_result = match &readable {
+                            Some(r) => server.poll_ready(0, r),
+                            None => server.poll(0),
+                        };
+                        clear_rtmp_poll_server();
+                        if let Err(e) = poll_result {
+                            crate::log_warn!("RTMP polling stopped: {e}");
+                            break;
+                        }
+
+                        let deleted_now: HashSet<String> =
+                            deleted_streams.lock().iter().cloned().collect();
+                        let revoked_now: HashSet<String> =
+                            revoked_viewers.lock().iter().cloned().collect();
+
+                        let (current_ids, just_authorized) = process_server_connections(
+                            &mut server,
+                            &mut tracked,
+                            &rtmp_bridge,
+                            &deleted_now,
+                            &revoked_now,
+                            rtmp_idle_timeout,
+                        );
+
+                        #[cfg(feature = "cluster")]
+                        if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
+                            mgr.poll_side_effects();
+                            rtmp_bridge.retry_pending_ownership_releases();
+                        }
+
+                        let exported_frames = if relay_export_bytes > 0 {
+                            server.drain_exported_relay_frames()
+                        } else {
+                            Vec::new()
+                        };
+
+                        if media_outputs.enabled() {
+                            for frame in &exported_frames {
+                                if !tracked
+                                    .get(&frame.publisher_conn_id)
+                                    .is_some_and(|entry| entry.publishing)
+                                {
+                                    continue;
+                                }
+                                let generation = publisher_generation(frame.publisher_conn_id);
+                                if publish_generations_before_poll
+                                    .get(&frame.publisher_conn_id)
+                                    .is_some_and(|before| *before != generation)
+                                {
+                                    // A same-connection republish happened while this poll was
+                                    // producing the export batch. RelayFrame has no per-frame
+                                    // generation marker, so conservatively drop this ambiguous
+                                    // boundary batch. The reconciliation below starts the new
+                                    // generation before the next poll, preventing cross-session
+                                    // recording/HLS/push corruption without guessing by timestamp.
+                                    continue;
+                                }
+                                // RelayFrame carries the route active when the frame was
+                                // exported. Resolve publish keys before consulting the
+                                // connection's current stream so queued frames from stream A
+                                // cannot be written into a newly switched B.
+                                let frame_stream_id = rtmp_bridge
+                                    .stream_id_for_publish_route(&frame.stream_name)
+                                    .unwrap_or_else(|| frame.stream_name.clone());
+                                media_outputs.handle_frame(frame, &frame_stream_id, generation);
+                            }
+                        }
+
+                        // Reconcile the output session only after draining exported
+                        // frames. This preserves the tail of an old publish session and
+                        // still restarts hooks/outputs when the same TCP connection
+                        // republishes the same stream with a new generation.
+                        for (&conn_id, entry) in &tracked {
+                            if entry.publishing && !entry.stream_id.is_empty() {
+                                media_outputs.ensure_publisher(
+                                    conn_id,
+                                    &entry.stream_id,
+                                    publisher_generation(conn_id),
+                                );
+                            }
+                        }
+
+                        // Cross-shard relay: broadcast this shard's exported frames
+                        // to every other shard's inbox (`relay_txs` is only `Some`
+                        // when n_shards > 1 -- see its setup above `run`'s shard
+                        // loop). Frame generation isn't consulted here the way it is
+                        // for media outputs/clustering below: an unattributable
+                        // republish batch is still fine to relay to viewers on
+                        // another shard (unlike recording/HLS, which must not splice
+                        // two publish sessions into one file/segment sequence), so
+                        // there's no ambiguity to guard against.
+                        if let Some(txs) = relay_txs.as_ref() {
+                            for (i, tx) in txs.iter().enumerate() {
+                                if i == shard_index {
+                                    continue;
+                                }
+                                for frame in &exported_frames {
+                                    let _ = tx.send(frame.clone());
+                                }
+                            }
+                        }
+                        if let Some(rx) = relay_rx.as_ref() {
+                            while let Ok(frame) = rx.try_recv() {
+                                let _ = server.inject_relay_frame(
+                                    &frame.app,
+                                    &frame.stream_name,
+                                    frame.frame_type,
+                                    frame.timestamp,
+                                    &frame.payload,
+                                );
+                            }
+                        }
+
+                        #[cfg(feature = "cluster")]
+                        if cluster_enabled && let Some(mgr) = rtmp_bridge.cluster_manager() {
+                            for frame in exported_frames {
+                                let generation = publisher_generation(frame.publisher_conn_id);
+                                if publish_generations_before_poll
+                                    .get(&frame.publisher_conn_id)
+                                    .is_some_and(|before| *before != generation)
+                                {
+                                    // A republish during this poll makes the buffered frame batch
+                                    // ambiguous for cluster export as well. Do not stamp old frames
+                                    // with the new stream/ownership epoch.
+                                    continue;
+                                }
+                                let sid = rtmp_bridge.stream_id_for_conn(frame.publisher_conn_id);
+                                let stream_id = if sid.is_empty() {
+                                    rtmp_bridge
+                                        .stream_id_for_publish_route(&frame.stream_name)
+                                        .unwrap_or_else(|| frame.stream_name.clone())
+                                } else {
+                                    sid
+                                };
+                                // Stamp only with this publisher socket's claimed
+                                // epoch — durable/current stream epoch can belong
+                                // to another node after a local release/failover.
+                                let Some(epoch) =
+                                    rtmp_bridge.ownership_epoch_for_conn(frame.publisher_conn_id)
+                                else {
+                                    continue;
+                                };
+                                use crate::cluster::media::protocol::MediaMessage;
+                                mgr.enqueue_export(crate::cluster::ExportedFrame {
+                                    app: frame.app.clone(),
+                                    stream: stream_id,
+                                    epoch,
+                                    frame_type: MediaMessage::frame_type_from_librtmp2(
+                                        frame.frame_type,
+                                    ),
+                                    timestamp: frame.timestamp,
+                                    payload: frame.payload,
+                                });
+                            }
+                            for inj in mgr.drain_injects() {
+                                if let Some(ft) =
                             crate::cluster::media::protocol::MediaMessage::frame_type_to_librtmp2(
                                 inj.frame_type,
                             )
@@ -1433,112 +1690,117 @@ impl ServerApp {
                                 &inj.payload,
                             );
                         }
+                            }
+                        }
+
+                        // A conn_id still in `tracked` but absent this cycle was
+                        // closed by the peer (rather than rejected above) — notify
+                        // the bridge.
+                        let closed_ids: Vec<u64> = tracked
+                            .keys()
+                            .copied()
+                            .filter(|id| !current_ids.contains(id))
+                            .collect();
+                        for conn_id in closed_ids {
+                            tracked.remove(&conn_id);
+                            rtmp_bridge.on_close(conn_id);
+                            clear_publish_generation(conn_id);
+                        }
+
+                        // A connection whose publish/play/media callback ran during
+                        // this poll but whose socket the library reaped in the same
+                        // `poll(0)` never appears in `current_ids`, so it never entered
+                        // `tracked` and the `closed_ids` sweep above cannot see it. Its
+                        // bridge ConnState and any active publisher/player row were
+                        // created by the callback, so close them explicitly or the row
+                        // stays active (blocking future publishes) and conn/ownership
+                        // state leaks. Only ids absent from `current_ids` are touched,
+                        // so live connections are unaffected.
+                        let touched: Vec<u64> =
+                            RTMP_POLL_TOUCHED_CONNS.with(|set| set.borrow_mut().drain().collect());
+                        for conn_id in touched {
+                            if current_ids.contains(&conn_id)
+                                || (!rtmp_bridge.is_registered(conn_id)
+                                    && !rtmp_bridge.has_publisher(conn_id)
+                                    && !rtmp_bridge.has_player(conn_id))
+                            {
+                                continue;
+                            }
+                            rtmp_bridge.on_close(conn_id);
+                            clear_publish_generation(conn_id);
+                        }
+
+                        // This bookkeeping only reclaims markers for connections that
+                        // are already gone, so -- unlike the poll interval itself --
+                        // it does not need to run on every fast tick. Each of these
+                        // derived sets locks `rtmp_bridge`'s shared connection map
+                        // once per tracked connection; rebuilding them at the full
+                        // 1ms negotiating cadence during a many-viewer join burst
+                        // turns that lock into a bottleneck the joining connections
+                        // contend on, which is counterproductive. See
+                        // `PRUNE_INTERVAL_MS`.
+                        if last_prune.elapsed() >= Duration::from_millis(PRUNE_INTERVAL_MS) {
+                            last_prune = Instant::now();
+
+                            let live_publishers: HashSet<u64> = tracked
+                                .iter()
+                                .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
+                                .collect();
+                            media_outputs.retain_publishers(&live_publishers);
+
+                            // Prune transient drain markers (e.g. ownership force_unpublish)
+                            // once no local session references them. Keep HTTP sticky
+                            // markers until finalize/rollback clears them explicitly —
+                            // otherwise Raft begin_delete timeouts lose rejection cover
+                            // when the node has no live RTMP sessions for the stream.
+                            let live_stream_ids =
+                                live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
+                            let sticky = sticky_deleted_streams.lock().clone();
+                            deleted_streams
+                                .lock()
+                                .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
+
+                            let live_viewer_ids: HashSet<String> = tracked
+                                .keys()
+                                .copied()
+                                .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
+                                .filter(|viewer_id| !viewer_id.is_empty())
+                                .collect();
+                            revoked_viewers
+                                .lock()
+                                .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                        }
+
+                        let negotiating = any_negotiating(&tracked);
+                        let poll_interval_ms = if negotiating || just_authorized {
+                            POLL_INTERVAL_FAST_MS
+                        } else {
+                            POLL_INTERVAL_MS
+                        };
+                        readable = wait_for_readiness_or_timeout(&server, poll_interval_ms);
                     }
-                }
 
-                // A conn_id still in `tracked` but absent this cycle was
-                // closed by the peer (rather than rejected above) — notify
-                // the bridge.
-                let closed_ids: Vec<u64> = tracked
-                    .keys()
-                    .copied()
-                    .filter(|id| !current_ids.contains(id))
-                    .collect();
-                for conn_id in closed_ids {
-                    tracked.remove(&conn_id);
-                    rtmp_bridge.on_close(conn_id);
-                    clear_publish_generation(conn_id);
-                }
+                    media_outputs.stop_all();
 
-                // A connection whose publish/play/media callback ran during
-                // this poll but whose socket the library reaped in the same
-                // `poll(0)` never appears in `current_ids`, so it never entered
-                // `tracked` and the `closed_ids` sweep above cannot see it. Its
-                // bridge ConnState and any active publisher/player row were
-                // created by the callback, so close them explicitly or the row
-                // stays active (blocking future publishes) and conn/ownership
-                // state leaks. Only ids absent from `current_ids` are touched,
-                // so live connections are unaffected.
-                let touched: Vec<u64> =
-                    RTMP_POLL_TOUCHED_CONNS.with(|set| set.borrow_mut().drain().collect());
-                for conn_id in touched {
-                    if current_ids.contains(&conn_id)
-                        || (!rtmp_bridge.is_registered(conn_id)
-                            && !rtmp_bridge.has_publisher(conn_id)
-                            && !rtmp_bridge.has_player(conn_id))
-                    {
-                        continue;
+                    // Notify the bridge about connections that never got an explicit close event.
+                    for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
+                        rtmp_bridge.on_close(conn_id);
+                        clear_publish_generation(conn_id);
                     }
-                    rtmp_bridge.on_close(conn_id);
-                    clear_publish_generation(conn_id);
-                }
 
-                // This bookkeeping only reclaims markers for connections that
-                // are already gone, so -- unlike the poll interval itself --
-                // it does not need to run on every fast tick. Each of these
-                // derived sets locks `rtmp_bridge`'s shared connection map
-                // once per tracked connection; rebuilding them at the full
-                // 1ms negotiating cadence during a many-viewer join burst
-                // turns that lock into a bottleneck the joining connections
-                // contend on, which is counterproductive. See
-                // `PRUNE_INTERVAL_MS`.
-                if last_prune.elapsed() >= Duration::from_millis(PRUNE_INTERVAL_MS) {
-                    last_prune = Instant::now();
+                    if !rtmp_stop_clone.load(Ordering::Relaxed) {
+                        let _ = rtmp_dead_tx.send(());
+                    }
+                })
+                .expect("failed to spawn RTMP shard thread");
+            shard_threads.push(shard_thread);
+        }
 
-                    let live_publishers: HashSet<u64> = tracked
-                        .iter()
-                        .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
-                        .collect();
-                    media_outputs.retain_publishers(&live_publishers);
-
-                    // Prune transient drain markers (e.g. ownership force_unpublish)
-                    // once no local session references them. Keep HTTP sticky
-                    // markers until finalize/rollback clears them explicitly —
-                    // otherwise Raft begin_delete timeouts lose rejection cover
-                    // when the node has no live RTMP sessions for the stream.
-                    let live_stream_ids =
-                        live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
-                    let sticky = sticky_deleted_streams.lock().clone();
-                    deleted_streams
-                        .lock()
-                        .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
-
-                    let live_viewer_ids: HashSet<String> = tracked
-                        .keys()
-                        .copied()
-                        .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
-                        .filter(|viewer_id| !viewer_id.is_empty())
-                        .collect();
-                    revoked_viewers
-                        .lock()
-                        .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
-                }
-
-                let negotiating = any_negotiating(&tracked);
-                let poll_interval_ms = if negotiating || just_authorized {
-                    POLL_INTERVAL_FAST_MS
-                } else {
-                    POLL_INTERVAL_MS
-                };
-                readable = wait_for_readiness_or_timeout(&server, poll_interval_ms);
-            }
-
-            media_outputs.stop_all();
-
-            // Notify the bridge about connections that never got an explicit close event.
-            for conn_id in tracked.keys().copied().collect::<Vec<_>>() {
-                rtmp_bridge.on_close(conn_id);
-                clear_publish_generation(conn_id);
-            }
-
-            if !rtmp_stop_clone.load(Ordering::Relaxed) {
-                let _ = rtmp_dead_tx.send(());
-            }
-        });
-
-        rtmp_ready_rx
-            .await
-            .map_err(|_| "RTMP startup thread exited before reporting readiness".to_string())??;
+        for ready_rx in ready_rxs {
+            ready_rx.await.map_err(|_| {
+                "RTMP startup thread exited before reporting readiness".to_string()
+            })??;
+        }
 
         crate::log_info!(
             "Server ready — HTTP: {}, RTMP: {}{}",
@@ -1555,12 +1817,12 @@ impl ServerApp {
             http_listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             tokio::select! {
                 () = shutdown_signal() => {},
-                _ = rtmp_dead_rx => {
+                _ = rtmp_dead_rx.recv() => {
                     crate::log_error!(
-                        "RTMP thread exited unexpectedly; shutting down HTTP so the process does not keep serving a half-dead API"
+                        "An RTMP shard thread exited unexpectedly; shutting down HTTP so the process does not keep serving a half-dead API"
                     );
                 }
             }
@@ -1569,15 +1831,17 @@ impl ServerApp {
         .map_err(|e| format!("HTTP server error: {e}"));
 
         crate::log_info!("Shutting down...");
-        // Stop and join the RTMP thread before tearing down Raft: its
-        // on_close callbacks release publisher ownership through the
+        // Stop and join every RTMP shard thread before tearing down Raft:
+        // their on_close callbacks release publisher ownership through the
         // coordinator, and running them after `shutdown_blocking()` would
         // have those releases fail against an already-shut-down cluster
         // manager, leaving durable ownership rows behind that block
         // publishers routed to other nodes until the next failure sweep.
         rtmp_stop.store(true, Ordering::Relaxed);
-        let _ = rtmp_thread.join();
-        crate::log_info!("RTMP thread joined.");
+        for shard_thread in shard_threads {
+            let _ = shard_thread.join();
+        }
+        crate::log_info!("RTMP shard threads joined.");
         #[cfg(feature = "cluster")]
         if let Some(mgr) = coordinator.cluster_manager() {
             mgr.shutdown_blocking();

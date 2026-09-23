@@ -18,7 +18,7 @@ path = "src/main.rs"
 # RTMP protocol implementation. Local sibling override:
 #   [patch.crates-io]
 #   librtmp2 = { path = "../librtmp2" }
-librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", rev = "fe44805f551e1aa98848d55715fe3fd964565fba", features = ["tls"] }
+librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", rev = "35b40c938df075b9b217e5291b3d179fc94ae1c0", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }
