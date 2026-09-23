@@ -546,7 +546,7 @@ fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedC
 pub(crate) fn any_negotiating(tracked: &HashMap<u64, TrackedConn>) -> bool {
     tracked
         .values()
-        .any(|c| (!c.publishing && !c.playing) || c.awaiting_first_frame.is_some())
+        .any(|c| (!c.publishing && !c.playing) || (c.playing && c.awaiting_first_frame.is_some()))
 }
 
 pub(crate) fn live_stream_ids_for_deleted_markers(
@@ -634,6 +634,7 @@ fn drain_deleted_stream_roles(
         rtmp_bridge.release_player(conn_id);
         if !rtmp_bridge.has_player(conn_id) {
             entry.playing = false;
+            entry.awaiting_first_frame = None;
             if let Some(stream) = conn.current_stream.as_mut() {
                 stream.is_playing = false;
             }

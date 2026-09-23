@@ -967,6 +967,12 @@ impl MediaHub {
         if !self.subs.add(peer_id, app, stream) {
             return; // already subscribed (refcount)
         }
+        if media_addr.is_empty() {
+            // Owner address not learned yet (e.g. just after a restart). Keep
+            // the refcount so a later `connect_peer` resubscribes it, but do
+            // not spawn a peer that would dial an empty address forever.
+            return;
+        }
         let (peer, fresh) = self.ensure_peer_locked(peer_id, media_addr);
         // A fresh connection already resent every tracked subscription for
         // this peer, including the one just added above — sending it again

@@ -1787,13 +1787,6 @@ impl ClusterManager {
         let Some((_, media_addr)) = self.meta.get(owner.owner_node_id) else {
             return;
         };
-        if media_addr.is_empty() {
-            crate::log_warn!(
-                "Cluster: no media address for owner node {} of stream {stream_id}; skipping remote subscribe",
-                owner.owner_node_id
-            );
-            return;
-        }
         let media = Arc::clone(&self.media);
         let app = app.to_string();
         let stream = stream_id.to_string();
@@ -2465,12 +2458,6 @@ impl ClusterManager {
                 let Some((_, media_addr)) = self.meta.get(new_owner) else {
                     continue;
                 };
-                if media_addr.is_empty() {
-                    crate::log_warn!(
-                        "Cluster: no media address for owner node {new_owner} of stream {stream_id}; skipping replica subscribe"
-                    );
-                    continue;
-                }
                 let epoch = self
                     .db
                     .stream_owner_get(&stream_id)
