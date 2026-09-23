@@ -92,16 +92,34 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 /// tracked connection is still negotiating (handshake / connect /
 /// createStream / publish|play command, including a publish|play command
 /// still waiting on the async auth worker) rather than actively publishing
-/// or playing, and for one tick right after the async auth worker resolves
-/// a publish/play authorization (see `just_authorized` in the poll loop).
-/// Handshake and stream-join round trips each wait for the next poll tick
-/// before the server's reply goes out, so the fixed 50ms interval alone
-/// adds up to tens of milliseconds of avoidable latency per step; polling
-/// faster only during this comparatively brief, comparatively rare window
-/// keeps that cost low without paying the CPU cost of fast-polling
-/// steady-state connections that no longer need it.
+/// or playing; while a connection has started playing but has not yet
+/// relayed its first frame (see `TrackedConn::awaiting_first_frame` --
+/// otherwise the interval drops back to the slow 50ms the instant a play
+/// request is *accepted*, before the viewer has actually received
+/// anything, bounding their real join latency by the publisher's frame
+/// cadence instead); and for one tick right after the async auth worker
+/// resolves a publish/play authorization (see `just_authorized` in the
+/// poll loop). Handshake and stream-join round trips each wait for the
+/// next poll tick before the server's reply goes out, so the fixed 50ms
+/// interval alone adds up to tens of milliseconds of avoidable latency per
+/// step; polling faster only during this comparatively brief, comparatively
+/// rare window keeps that cost low without paying the CPU cost of
+/// fast-polling steady-state connections that no longer need it.
 pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 
+/// How often the poll loop re-derives `live_publishers`/`live_stream_ids`/
+/// `live_viewer_ids` and prunes `deleted_streams`/`revoked_viewers` against
+/// them. This bookkeeping is pure garbage collection -- it only reclaims
+/// markers for connections that are already gone, so it tolerates the same
+/// staleness window as the slow poll interval. It is *not* tied to
+/// `poll_interval_ms`: that interval drops to `POLL_INTERVAL_FAST_MS` while
+/// any connection is negotiating (see above), and each of these derived
+/// sets locks `DbRtmpBridge`'s shared connection map once per tracked
+/// connection to build. Rebuilding them on every fast tick during a
+/// many-viewer join burst turned that lock into a bottleneck contended by
+/// every joining connection at once, making the burst slower, not faster --
+/// running this at a fixed cadence instead keeps it off the hot path.
+pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
 /// Block until a listener or tracked connection socket becomes readable, or
 /// `timeout_ms` elapses -- whichever comes first.
 ///
@@ -348,6 +366,15 @@ pub(crate) struct TrackedConn {
     video_codec: String,
     /// Last detected audio codec string from the protocol layer.
     audio_codec: String,
+    /// `Some(baseline)` from the moment this connection started playing
+    /// (baseline = `Conn::media_bytes_sent` at that instant) until at least
+    /// one media byte has been queued to it since -- i.e. until its first
+    /// relayed frame. Kept alongside `publishing`/`playing` in the poll
+    /// loop's fast-interval check: a player that has been accepted but has
+    /// not yet received any media is still effectively "negotiating" from
+    /// the viewer's perspective, even though its RTMP session already says
+    /// `playing`.
+    awaiting_first_frame: Option<u64>,
 }
 
 /// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
@@ -360,6 +387,15 @@ fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedC
         return bridge_sid;
     }
     entry.stream_id.clone()
+}
+
+/// Whether any tracked connection still needs the fast poll interval: not
+/// yet publishing+playing, or playing but its first relayed frame hasn't
+/// reached it yet (see `TrackedConn::awaiting_first_frame`).
+pub(crate) fn any_negotiating(tracked: &HashMap<u64, TrackedConn>) -> bool {
+    tracked
+        .values()
+        .any(|c| (!c.publishing && !c.playing) || c.awaiting_first_frame.is_some())
 }
 
 pub(crate) fn live_stream_ids_for_deleted_markers(
@@ -608,6 +644,7 @@ pub(crate) fn process_server_connections(
             rtmp_bridge.release_player(conn_id);
             if !rtmp_bridge.has_player(conn_id) {
                 entry.playing = false;
+                entry.awaiting_first_frame = None;
                 if !is_publishing {
                     entry.stream_id.clear();
                     conn.relay_key.clear();
@@ -669,6 +706,7 @@ pub(crate) fn process_server_connections(
             );
             entry.playing = true;
             entry.stream_id = stream_id;
+            entry.awaiting_first_frame = Some(conn.media_bytes_sent);
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
         } else if is_playing && entry.playing {
@@ -732,6 +770,12 @@ pub(crate) fn process_server_connections(
         }
 
         if is_playing {
+            if entry
+                .awaiting_first_frame
+                .is_some_and(|baseline| conn.media_bytes_sent > baseline)
+            {
+                entry.awaiting_first_frame = None;
+            }
             rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
         }
     }
@@ -1193,6 +1237,7 @@ impl ServerApp {
             let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
             let mut media_outputs =
                 MediaOutputManager::new(media_output_thread_config, media_output_db);
+            let mut last_prune = Instant::now();
 
             loop {
                 if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -1385,34 +1430,48 @@ impl ServerApp {
                     clear_publish_generation(conn_id);
                 }
 
-                let live_publishers: HashSet<u64> = tracked
-                    .iter()
-                    .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
-                    .collect();
-                media_outputs.retain_publishers(&live_publishers);
+                // This bookkeeping only reclaims markers for connections that
+                // are already gone, so -- unlike the poll interval itself --
+                // it does not need to run on every fast tick. Each of these
+                // derived sets locks `rtmp_bridge`'s shared connection map
+                // once per tracked connection; rebuilding them at the full
+                // 1ms negotiating cadence during a many-viewer join burst
+                // turns that lock into a bottleneck the joining connections
+                // contend on, which is counterproductive. See
+                // `PRUNE_INTERVAL_MS`.
+                if last_prune.elapsed() >= Duration::from_millis(PRUNE_INTERVAL_MS) {
+                    last_prune = Instant::now();
 
-                // Prune transient drain markers (e.g. ownership force_unpublish)
-                // once no local session references them. Keep HTTP sticky
-                // markers until finalize/rollback clears them explicitly —
-                // otherwise Raft begin_delete timeouts lose rejection cover
-                // when the node has no live RTMP sessions for the stream.
-                let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
-                let sticky = sticky_deleted_streams.lock().clone();
-                deleted_streams
-                    .lock()
-                    .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
+                    let live_publishers: HashSet<u64> = tracked
+                        .iter()
+                        .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
+                        .collect();
+                    media_outputs.retain_publishers(&live_publishers);
 
-                let live_viewer_ids: HashSet<String> = tracked
-                    .keys()
-                    .copied()
-                    .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
-                    .filter(|viewer_id| !viewer_id.is_empty())
-                    .collect();
-                revoked_viewers
-                    .lock()
-                    .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                    // Prune transient drain markers (e.g. ownership force_unpublish)
+                    // once no local session references them. Keep HTTP sticky
+                    // markers until finalize/rollback clears them explicitly —
+                    // otherwise Raft begin_delete timeouts lose rejection cover
+                    // when the node has no live RTMP sessions for the stream.
+                    let live_stream_ids =
+                        live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
+                    let sticky = sticky_deleted_streams.lock().clone();
+                    deleted_streams
+                        .lock()
+                        .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
 
-                let negotiating = tracked.values().any(|c| !c.publishing && !c.playing);
+                    let live_viewer_ids: HashSet<String> = tracked
+                        .keys()
+                        .copied()
+                        .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
+                        .filter(|viewer_id| !viewer_id.is_empty())
+                        .collect();
+                    revoked_viewers
+                        .lock()
+                        .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                }
+
+                let negotiating = any_negotiating(&tracked);
                 let poll_interval_ms = if negotiating || just_authorized {
                     POLL_INTERVAL_FAST_MS
                 } else {
@@ -1512,7 +1571,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, bind_with_default_port,
+        AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, any_negotiating, bind_with_default_port,
         drain_auth_completions, drain_deleted_stream_roles, eviction_stream_id,
         live_stream_ids_for_deleted_markers, should_evict_idle_conn,
     };
@@ -1569,6 +1628,46 @@ mod tests {
             now,
             Duration::from_secs(30)
         ));
+    }
+
+    #[test]
+    fn negotiating_stays_true_while_playing_conn_awaits_its_first_frame() {
+        let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked.insert(
+            1,
+            TrackedConn {
+                connected: true,
+                publishing: true,
+                playing: true,
+                awaiting_first_frame: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(
+            any_negotiating(&tracked),
+            "a viewer that is playing but hasn't received its first relayed \
+             frame yet must still keep the poll loop on the fast interval"
+        );
+    }
+
+    #[test]
+    fn negotiating_clears_once_every_conn_is_settled() {
+        let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked.insert(
+            1,
+            TrackedConn {
+                connected: true,
+                publishing: true,
+                playing: true,
+                awaiting_first_frame: None,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !any_negotiating(&tracked),
+            "a fully settled publish+play connection with no pending first \
+             frame must let the poll loop fall back to the slow interval"
+        );
     }
 
     #[test]
