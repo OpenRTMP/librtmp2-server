@@ -447,6 +447,24 @@ impl ClusterManager {
                 // Existing voter restart — do not re-initialize OpenRaft storage.
                 if let Some(ref join_addr) = config.join {
                     mgr.refresh_topology_from_any(join_addr).await?;
+                } else {
+                    let peers = mgr.meta.all();
+                    let needs_media = peers
+                        .iter()
+                        .any(|(id, _, media)| *id != config.node_id && media.is_empty());
+                    if needs_media {
+                        let ctrl = peers
+                            .iter()
+                            .find(|(id, ctrl, _)| *id != config.node_id && !ctrl.is_empty())
+                            .map(|(_, ctrl, _)| ctrl.clone());
+                        if let Some(ctrl) = ctrl {
+                            if let Err(e) = mgr.refresh_topology_from_any(&ctrl).await {
+                                crate::log_warn!(
+                                    "Cluster: topology refresh after restart failed: {e}"
+                                );
+                            }
+                        }
+                    }
                 }
                 if db.setting_get(BOOTSTRAP_SEEDED_SETTING).is_none() {
                     // raft_has_state() only proves raft.initialize() ran; a
@@ -1539,17 +1557,27 @@ impl ClusterManager {
             if p.node_id == self.config.node_id {
                 continue;
             }
+            let media_addr = if p.media_addr.is_empty() {
+                self.meta
+                    .get(p.node_id)
+                    .map(|(_, m)| m)
+                    .unwrap_or_default()
+            } else {
+                p.media_addr.clone()
+            };
             self.network.upsert_node(p.node_id, p.control_addr.clone());
             self.meta
-                .set_addrs(p.node_id, p.control_addr.clone(), p.media_addr.clone());
-            let _ = self.media.connect_peer(p.node_id, &p.media_addr).await;
-            self.health.note_peer(
-                p.node_id,
-                NodeHealthState::Ready,
-                0.0,
-                Some(p.control_addr),
-                Some(p.media_addr),
-            );
+                .set_addrs(p.node_id, p.control_addr.clone(), media_addr.clone());
+            if !media_addr.is_empty() {
+                let _ = self.media.connect_peer(p.node_id, &media_addr).await;
+                self.health.note_peer(
+                    p.node_id,
+                    NodeHealthState::Ready,
+                    0.0,
+                    Some(p.control_addr),
+                    Some(media_addr),
+                );
+            }
         }
         Ok(())
     }
@@ -1759,6 +1787,13 @@ impl ClusterManager {
         let Some((_, media_addr)) = self.meta.get(owner.owner_node_id) else {
             return;
         };
+        if media_addr.is_empty() {
+            crate::log_warn!(
+                "Cluster: no media address for owner node {} of stream {stream_id}; skipping remote subscribe",
+                owner.owner_node_id
+            );
+            return;
+        }
         let media = Arc::clone(&self.media);
         let app = app.to_string();
         let stream = stream_id.to_string();
@@ -2430,6 +2465,12 @@ impl ClusterManager {
                 let Some((_, media_addr)) = self.meta.get(new_owner) else {
                     continue;
                 };
+                if media_addr.is_empty() {
+                    crate::log_warn!(
+                        "Cluster: no media address for owner node {new_owner} of stream {stream_id}; skipping replica subscribe"
+                    );
+                    continue;
+                }
                 let epoch = self
                     .db
                     .stream_owner_get(&stream_id)
