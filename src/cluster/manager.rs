@@ -140,7 +140,7 @@ pub struct ClusterManager {
 #[derive(Clone)]
 pub struct SessionHooks {
     pub deleted_streams: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-    pub revoked_viewers: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    pub revoked_viewers: Arc<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     pub api_token: Arc<parking_lot::RwLock<String>>,
     /// Force local RTMP publishers off a stream (stale epoch after partition).
     pub force_unpublish_stream: Arc<dyn Fn(&str) + Send + Sync>,
@@ -1423,7 +1423,7 @@ impl ClusterManager {
 
     fn mark_viewer_revoked(&self, viewer_id: &str) {
         if let Some(hooks) = self.session_hooks.lock().as_ref() {
-            hooks.revoked_viewers.lock().insert(viewer_id.to_string());
+            hooks.revoked_viewers.lock().insert(viewer_id.to_string(), std::time::Instant::now());
         }
     }
 

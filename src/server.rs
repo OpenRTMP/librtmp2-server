@@ -133,8 +133,9 @@ const FIRST_FRAME_GRACE_MS: u64 = 500;
 
 /// How often the poll loop re-derives `live_publishers`/`live_stream_ids`/
 /// `live_viewer_ids` and prunes `deleted_streams`/`revoked_viewers` against
-/// them. This bookkeeping is pure garbage collection -- it only reclaims
-/// markers for connections that are already gone, so it tolerates the same
+/// them (revocations after a cross-shard grace window). This bookkeeping is
+/// pure garbage collection -- it only reclaims markers for connections that
+/// are already gone, so it tolerates the same
 /// staleness window as the slow poll interval. It is *not* tied to
 /// `poll_interval_ms`: that interval drops to `POLL_INTERVAL_FAST_MS` while
 /// any connection is negotiating (see above), and each of these derived
@@ -144,6 +145,8 @@ const FIRST_FRAME_GRACE_MS: u64 = 500;
 /// every joining connection at once, making the burst slower, not faster --
 /// running this at a fixed cadence instead keeps it off the hot path.
 pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
+
+pub(crate) const REVOKED_VIEWER_GRACE_MS: u64 = 10_000;
 
 /// Size of the conn_id range reserved for each RTMP shard when sharding is
 /// active (see [`resolve_shard_count`]) -- shard `i` gets
@@ -1075,7 +1078,7 @@ pub struct ServerApp {
     /// [`crate::http::AppState::sticky_deleted_streams`]).
     sticky_deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Viewer slot IDs revoked via HTTP while player connections are live.
-    revoked_viewers: Arc<Mutex<HashSet<String>>>,
+    revoked_viewers: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl ServerApp {
@@ -1109,7 +1112,7 @@ impl ServerApp {
 
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let sticky_deleted_streams = Arc::new(Mutex::new(HashSet::new()));
-        let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
+        let revoked_viewers = Arc::new(Mutex::new(HashMap::new()));
 
         let coordinator = Arc::new(StateCoordinator::standalone(Arc::clone(&db)));
 
@@ -1567,7 +1570,7 @@ impl ServerApp {
                         let deleted_now: HashSet<String> =
                             deleted_streams.lock().iter().cloned().collect();
                         let revoked_now: HashSet<String> =
-                            revoked_viewers.lock().iter().cloned().collect();
+                            revoked_viewers.lock().keys().cloned().collect();
 
                         let (current_ids, just_authorized) = process_server_connections(
                             &mut server,
@@ -1806,9 +1809,11 @@ impl ServerApp {
                                 .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
                                 .filter(|viewer_id| !viewer_id.is_empty())
                                 .collect();
-                            revoked_viewers
-                                .lock()
-                                .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                            revoked_viewers.lock().retain(|viewer_id, inserted_at| {
+                                live_viewer_ids.contains(viewer_id)
+                                    || inserted_at.elapsed()
+                                        < Duration::from_millis(REVOKED_VIEWER_GRACE_MS)
+                            });
                         }
 
                         let negotiating = any_negotiating(&tracked);

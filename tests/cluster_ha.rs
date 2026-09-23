@@ -29,7 +29,7 @@ fn free_port() -> u16 {
 fn register_test_session_hooks(mgr: &ClusterManager) {
     mgr.register_session_hooks(SessionHooks {
         deleted_streams: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-        revoked_viewers: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+        revoked_viewers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         api_token: Arc::new(parking_lot::RwLock::new(TEST_API_TOKEN.to_string())),
         force_unpublish_stream: Arc::new(|_: &str| {}),
         local_stream_sessions: Arc::new(|_: &str| 0u64),

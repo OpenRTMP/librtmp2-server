@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ pub struct AppState {
     /// in `deleted_streams` and are pruned after local sessions drain.
     pub sticky_deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Viewer slot IDs revoked via HTTP while RTMP player sessions are active.
-    pub revoked_viewers: Arc<Mutex<HashSet<String>>>,
+    pub revoked_viewers: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// Build the Axum router, wiring all HTTP handlers to the shared application state.
@@ -1801,7 +1801,7 @@ async fn handle_stream_player_delete(
     }
     match state.coordinator.delete_viewer(&id, &player_id) {
         Ok(()) => {
-            state.revoked_viewers.lock().insert(player_id.clone());
+            state.revoked_viewers.lock().insert(player_id.clone(), Instant::now());
             state.db.players_deactivate_for_viewer(&player_id);
             #[cfg(feature = "cluster")]
             if let Some(mgr) = state.coordinator.cluster_manager() {
@@ -2246,7 +2246,7 @@ mod tests {
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
             sticky_deleted_streams: Arc::new(Mutex::new(HashSet::new())),
-            revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
+            revoked_viewers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2348,7 +2348,7 @@ mod tests {
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
             sticky_deleted_streams: Arc::new(Mutex::new(HashSet::new())),
-            revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
+            revoked_viewers: Arc::new(Mutex::new(HashMap::new())),
         });
         let app = router(state);
         let resp = app
