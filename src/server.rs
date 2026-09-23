@@ -257,9 +257,12 @@ fn wait_for_readiness_or_timeout(
         .filter(|conn| conn.client_fd >= 0)
         .map(|conn| (conn.client_fd, conn.conn_id))
         .collect();
+    let at_connection_cap = server.config.max_connections > 0
+        && server.connections.len() >= server.config.max_connections as usize;
     let mut fds: Vec<libc::pollfd> = server
         .listener_fds()
         .into_iter()
+        .filter(|_| !at_connection_cap)
         .chain(conn_id_by_fd.keys().copied())
         .map(|fd| libc::pollfd {
             fd,
@@ -273,12 +276,18 @@ fn wait_for_readiness_or_timeout(
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc >= 0 {
             const READY_MASK: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-            return Some(
-                fds.iter()
-                    .filter(|pfd| pfd.revents & READY_MASK != 0)
-                    .filter_map(|pfd| conn_id_by_fd.get(&pfd.fd).copied())
-                    .collect(),
-            );
+            let ready: HashSet<u64> = fds
+                .iter()
+                .filter(|pfd| pfd.revents & READY_MASK != 0)
+                .filter_map(|pfd| conn_id_by_fd.get(&pfd.fd).copied())
+                .collect();
+            let listener_ready = fds.iter().any(|pfd| {
+                pfd.revents & READY_MASK != 0 && !conn_id_by_fd.contains_key(&pfd.fd)
+            });
+            if ready.is_empty() && listener_ready {
+                std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(10)));
+            }
+            return Some(ready);
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             // Unexpected poll() failure -- e.g. a connection closed and its
