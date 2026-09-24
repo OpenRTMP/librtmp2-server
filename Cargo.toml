@@ -1,6 +1,6 @@
 [package]
 name = "librtmp2-server"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 # RTMP protocol implementation. Local sibling override:
 #   [patch.crates-io]
 #   librtmp2 = { path = "../librtmp2" }
-librtmp2 = { version = "0.9.2", features = ["tls"] }
+librtmp2 = { version = "0.9.3", features = ["tls"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }

@@ -13,11 +13,27 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-09-24
+
 ### Fixed
 - Wildcard RTMP/RTMPS binds (`0.0.0.0`) now serve IPv6 as well as IPv4 when
   IPv6 is available. The server probes the actual `IPV6_V6ONLY` socket mode,
   adds a separate IPv4 listener only when required, and falls back to IPv4
   cleanly on hosts or containers with IPv6 disabled.
+- Prevent the RTMP poll loop from busy-spinning when listener readiness cannot
+  be serviced at the configured connection cap, and bound the fast-poll
+  first-frame wait so a publisherless player cannot pin the 1 ms interval.
+- Preserve and actively recover cluster peer media addresses after restart;
+  subscriptions created before an owner media address is learned are retained
+  and replayed once the peer becomes reachable.
+- Keep viewer revocation markers long enough for cross-shard propagation so
+  active sessions are reliably revoked before garbage collection removes the
+  marker.
+
+### Changed
+- Depends on `librtmp2` `0.9.3`.
+- SonarCloud now imports Rust LCOV coverage before evaluating the quality gate.
+- Package version `0.4.2` → `0.4.3`.
 
 ## [0.4.2] — 2026-09-23
 
