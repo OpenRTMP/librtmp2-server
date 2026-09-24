@@ -14,11 +14,13 @@
 #   - an SRS binary (set SRS_BIN to its path; skipped if unset) — build from
 #     https://github.com/ossrs/srs (`trunk/configure && make`) or use a
 #     packaged binary; not vendored here for the same reason MediaMTX isn't
+#   - a LiveForge binary (set LIVEFORGE_BIN to its path; skipped if unset) —
+#     build from https://github.com/im-pingo/liveforge (`go build ./cmd/liveforge`)
 #
 # Usage: scripts/run_rtmp_benchmarks.sh [work_dir]
 #
-# This starts and stops its own nginx/MediaMTX/SRS/librtmp2-server instances
-# on non-default ports (1935/1936/1937/1938) so it doesn't collide with
+# This starts and stops its own nginx/MediaMTX/SRS/LiveForge/librtmp2-server
+# instances on non-default ports (1935-1939) so it doesn't collide with
 # anything already running; it does not touch system nginx config.
 
 set -euo pipefail
@@ -28,11 +30,12 @@ LIBRTMP2_DIR="${LIBRTMP2_DIR:-../librtmp2}"
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-}"
 SRS_BIN="${SRS_BIN:-}"
+LIVEFORGE_BIN="${LIVEFORGE_BIN:-}"
 
 BENCH_HANDSHAKE="$LIBRTMP2_DIR/target/release/examples/bench_handshake"
 BENCH_RELAY="$LIBRTMP2_DIR/target/release/examples/bench_relay"
 
-mkdir -p "$WORK_DIR"/{logs,lrtmp2-server,nginx,mediamtx,srs}
+mkdir -p "$WORK_DIR"/{logs,lrtmp2-server,nginx,mediamtx,srs,liveforge}
 echo "Work dir: $WORK_DIR"
 
 for bin in "$BENCH_HANDSHAKE" "$BENCH_RELAY"; do
@@ -225,6 +228,55 @@ EOF
   kill "$(cat "$WORK_DIR/srs.pid")" >/dev/null 2>&1 || true
 else
   echo "skipping SRS: set SRS_BIN to a built binary to include it"
+fi
+
+### 5. LiveForge ###
+if [[ -n "$LIVEFORGE_BIN" ]] && [[ -x "$LIVEFORGE_BIN" ]]; then
+  echo "--- starting LiveForge on :1939 ---"
+  # RTMP only, like the other servers here: every other protocol listener,
+  # the admin API and recording (on in LiveForge's sample config) are off.
+  # The stream block mirrors the sample config's defaults; LiveForge does
+  # not fill them in on its own, and without them it drops publishers.
+  cat > "$WORK_DIR/liveforge/liveforge.yaml" <<EOF
+server:
+  name: bench
+  log_level: warn
+rtmp:
+  enabled: true
+  listen: "127.0.0.1:1939"
+  chunk_size: 4096
+stream:
+  gop_cache: true
+  gop_cache_num: 1
+  gop_cache_max_frames: 300
+  gop_cache_max_duration: 10s
+  gop_cache_max_bytes: 33554432
+  ring_buffer_size: 1024
+  idle_timeout: 30s
+  no_publisher_timeout: 15s
+rtsp: {enabled: false}
+http_stream: {enabled: false}
+websocket: {enabled: false}
+webrtc: {enabled: false}
+srt: {enabled: false}
+sip: {enabled: false, gateway: {enabled: false}}
+gb28181: {enabled: false}
+auth: {enabled: false}
+record: {enabled: false}
+dvr: {enabled: false}
+metrics: {enabled: false}
+api: {enabled: false}
+EOF
+  (cd "$WORK_DIR/liveforge" && "$LIVEFORGE_BIN" -c ./liveforge.yaml >"$WORK_DIR/logs/liveforge.log" 2>&1 &
+   echo $! > "$WORK_DIR/liveforge.pid")
+  PIDS+=("$(cat "$WORK_DIR/liveforge.pid")")
+  sleep 2
+  echo "=== LiveForge handshake (count=120, concurrency=30) ==="
+  "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1939/live/hsbench --count 120 --concurrency 30
+  relay_sweep "liveforge" "rtmp://127.0.0.1:1939/live/bench" prefix "rtmp://127.0.0.1:1939/live/bench"
+  kill "$(cat "$WORK_DIR/liveforge.pid")" >/dev/null 2>&1 || true
+else
+  echo "skipping LiveForge: set LIVEFORGE_BIN to a built binary to include it"
 fi
 
 echo "Done. Logs in $WORK_DIR/logs"
