@@ -331,6 +331,34 @@ fn wait_for_readiness_or_timeout(
     }
 }
 
+/// Readiness source for the RTMP poll loop: a persistent epoll set on Linux
+/// (see `crate::readiness`), falling back to the per-tick `poll(2)` in
+/// [`wait_for_readiness_or_timeout`] elsewhere or if epoll is unavailable.
+enum ReadinessWaiter {
+    #[cfg(target_os = "linux")]
+    Epoll(crate::readiness::EpollReadiness),
+    Poll,
+}
+
+impl ReadinessWaiter {
+    fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        match crate::readiness::EpollReadiness::new() {
+            Ok(epoll) => return Self::Epoll(epoll),
+            Err(e) => crate::log_warn!("epoll unavailable ({e}); falling back to poll(2)"),
+        }
+        Self::Poll
+    }
+
+    fn wait(&mut self, server: &librtmp2::server::Server, timeout_ms: u64) -> Option<HashSet<u64>> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Epoll(epoll) => epoll.wait(server, timeout_ms),
+            Self::Poll => wait_for_readiness_or_timeout(server, timeout_ms),
+        }
+    }
+}
+
 /// Normalize a bind string so passing it to librtmp2 cannot fall back to the
 /// RTMP library default port. In particular, RTMPS host-only binds such as
 /// `0.0.0.0`, `::1`, or `[::1]` must be listened on 1936, not librtmp2's
@@ -1665,6 +1693,7 @@ impl ServerApp {
                     // ready"), `Server::poll` processes every connection, same as
                     // before this readiness-aware path existed.
                     let mut readable: Option<HashSet<u64>> = None;
+                    let mut readiness = ReadinessWaiter::new();
 
                     loop {
                         if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -1962,7 +1991,7 @@ impl ServerApp {
                         } else {
                             POLL_INTERVAL_MS
                         };
-                        readable = wait_for_readiness_or_timeout(&server, poll_interval_ms);
+                        readable = readiness.wait(&server, poll_interval_ms);
                     }
 
                     media_outputs.stop_all();
@@ -2104,10 +2133,10 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, any_negotiating, bind_rtmp_listener_set,
-        bind_with_default_port, drain_auth_completions, drain_deleted_stream_roles,
-        eviction_stream_id, ipv6_wildcard_for, live_stream_ids_for_deleted_markers,
-        should_evict_idle_conn, wait_for_readiness_or_timeout,
+        AUTH_COMPLETIONS_RX, ReadinessWaiter, ServerApp, TrackedConn, any_negotiating,
+        bind_rtmp_listener_set, bind_with_default_port, drain_auth_completions,
+        drain_deleted_stream_roles, eviction_stream_id, ipv6_wildcard_for,
+        live_stream_ids_for_deleted_markers, should_evict_idle_conn, wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -2281,6 +2310,123 @@ mod tests {
             start.elapsed() < Duration::from_millis(500),
             "a writable connection with queued bytes must not wait out the poll interval"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn epoll_waiter() -> ReadinessWaiter {
+        let waiter = ReadinessWaiter::new();
+        assert!(matches!(waiter, ReadinessWaiter::Epoll(_)));
+        waiter
+    }
+
+    fn accept_one(server: &mut librtmp2::server::Server) {
+        let before = server.connections.len();
+        for _ in 0..200 {
+            server.poll(0).unwrap();
+            if server.connections.len() > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("connection was not accepted");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_reports_readable_connections_and_honors_timeout() {
+        use std::io::Write;
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = epoll_waiter();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+        let conn_id = server.connections[0].conn_id;
+
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 100).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+
+        client.write_all(&[3u8]).unwrap();
+        let start = Instant::now();
+        let ready = waiter.wait(&server, 1000).unwrap();
+        assert!(ready.contains(&conn_id));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_wakes_on_writability_only_while_bytes_are_queued() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = epoll_waiter();
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+
+        server.connections[0]
+            .send_buffer
+            .write(b"queued media")
+            .unwrap();
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 1000).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() < Duration::from_millis(500));
+
+        // Drained again: EPOLLOUT interest must be dropped, or a writable
+        // idle socket would spin the loop.
+        let queued = server.connections[0].send_buffer.available();
+        server.connections[0].send_buffer.drain(queued);
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 100).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_tracks_connections_replaced_on_a_reused_fd() {
+        use std::io::Write;
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = epoll_waiter();
+        let first = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+        let old_fd = server.connections[0].client_fd;
+        assert_eq!(waiter.wait(&server, 20).map(|r| r.len()), Some(0));
+
+        // Close the first connection server-side, then accept a second one,
+        // which the kernel typically hands the same fd number.
+        drop(first);
+        for _ in 0..200 {
+            server.poll(0).unwrap();
+            if server.connections.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(server.connections.is_empty());
+        let mut second = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+        let new_conn = &server.connections[0];
+        let (new_fd, new_id) = (new_conn.client_fd, new_conn.conn_id);
+
+        second.write_all(&[3u8]).unwrap();
+        let ready = waiter.wait(&server, 1000).unwrap();
+        assert!(
+            ready.contains(&new_id),
+            "fd {new_fd} (previously {old_fd}) must report the new connection's id"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_listener_only_readiness_takes_the_bounded_sleep() {
+        let port = free_local_port();
+        let server = listening_rtmp_server(0, port);
+        let mut waiter = epoll_waiter();
+        let _pending = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 50).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(5));
     }
 
     #[test]

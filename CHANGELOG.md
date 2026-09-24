@@ -13,6 +13,19 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- The RTMP poll loop waits on a persistent `epoll(7)` set on Linux, updating
+  registrations only for connections that changed, instead of rebuilding and
+  passing every fd to `poll(2)` on each tick (`poll(2)` remains the fallback).
+- Connections with queued outbound bytes are also polled for writability, so
+  a player whose socket buffer filled mid-frame is flushed as soon as it can
+  take more data rather than on the next inbound packet or poll interval.
+
+### Fixed
+- `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
+  `LOG_LEVEL` variables the server does not read, and hit the admin API rate
+  limit while provisioning streams.
+
 ## [0.4.3] — 2026-09-24
 
 ### Fixed

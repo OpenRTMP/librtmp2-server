@@ -94,8 +94,9 @@ echo "--- starting librtmp2-server on :1935 (HTTP :8080) ---"
 (
   cd "$SERVER_DIR"
   LRTMP2_DB="$WORK_DIR/lrtmp2-server/server.db" \
-  RTMP_BIND=127.0.0.1:1935 HTTP_BIND=127.0.0.1:8080 \
-  LRTMP2_RTMP_MAX_CONNECTIONS=500 LOG_LEVEL=1 \
+  LRTMP2_RTMP_BIND=127.0.0.1:1935 LRTMP2_HTTP_BIND=127.0.0.1:8080 \
+  LRTMP2_RTMP_MAX_CONNECTIONS=500 LRTMP2_LOG_LEVEL=1 \
+  LRTMP2_HTTP_RATE_LIMIT_API=10000 LRTMP2_HTTP_RATE_LIMIT_DEFAULT=10000 \
   ./target/release/librtmp2-server >"$WORK_DIR/logs/lrtmp2-server.log" 2>&1 &
   echo $! > "$WORK_DIR/lrtmp2-server.pid"
 )

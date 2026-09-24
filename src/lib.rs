@@ -6,6 +6,8 @@ pub mod keygen;
 pub mod logger;
 pub mod media_output;
 pub mod rate_limit;
+#[cfg(target_os = "linux")]
+mod readiness;
 pub mod rtmp_bridge;
 pub mod server;
 pub mod state;
