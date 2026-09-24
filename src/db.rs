@@ -437,6 +437,12 @@ fn restrict_db_file_permissions(path: &str) {
 }
 
 impl Db {
+    #[cfg(test)]
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        let conn = self.conn.lock();
+        f(&conn)
+    }
+
     pub fn open(path: &str) -> rusqlite::Result<Db> {
         let conn = if path.is_empty() || path == ":memory:" {
             Connection::open(path)?
