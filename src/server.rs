@@ -2084,9 +2084,10 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, any_negotiating, bind_with_default_port,
-        drain_auth_completions, drain_deleted_stream_roles, eviction_stream_id,
-        live_stream_ids_for_deleted_markers, should_evict_idle_conn, wait_for_readiness_or_timeout,
+        AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, any_negotiating, bind_rtmp_listener_set,
+        bind_with_default_port, drain_auth_completions, drain_deleted_stream_roles,
+        eviction_stream_id, ipv6_wildcard_for, live_stream_ids_for_deleted_markers,
+        should_evict_idle_conn, wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -2188,7 +2189,7 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
-    fn listening_rtmp_server(max_connections: i32, port: u16) -> librtmp2::server::Server {
+    fn unbound_rtmp_server(max_connections: i32) -> librtmp2::server::Server {
         let cfg = librtmp2::types::ServerConfig {
             max_connections,
             chunk_size: 4096,
@@ -2200,7 +2201,11 @@ mod tests {
             max_pending_tls_per_addr: i32::MAX,
             max_connections_per_addr: i32::MAX,
         };
-        let mut server = librtmp2::server::Server::new(cfg).unwrap();
+        librtmp2::server::Server::new(cfg).unwrap()
+    }
+
+    fn listening_rtmp_server(max_connections: i32, port: u16) -> librtmp2::server::Server {
+        let mut server = unbound_rtmp_server(max_connections);
         server.listen(&format!("127.0.0.1:{port}")).unwrap();
         server
     }
@@ -2319,7 +2324,7 @@ mod tests {
     #[test]
     fn wildcard_listener_accepts_ipv4_and_ipv6_when_available() {
         let port = free_local_port();
-        let mut server = test_server();
+        let mut server = unbound_rtmp_server(8);
         let listeners = bind_rtmp_listener_set(
             &mut server,
             &format!("0.0.0.0:{port}"),
