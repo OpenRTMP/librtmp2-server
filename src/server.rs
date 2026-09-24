@@ -2323,7 +2323,12 @@ mod tests {
 
     #[test]
     fn wildcard_listener_accepts_ipv4_and_ipv6_when_available() {
-        let port = free_local_port();
+        let port_probe = std::net::TcpListener::bind("[::]:0")
+            .or_else(|_| std::net::TcpListener::bind("0.0.0.0:0"))
+            .expect("reserve wildcard test port");
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
         let mut server = unbound_rtmp_server(8);
         let listeners = bind_rtmp_listener_set(
             &mut server,
