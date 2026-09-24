@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 
+use crate::db::{Player, Publisher};
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 
 /// Bound on authorization requests queued but not yet picked up by the
@@ -180,6 +181,75 @@ fn run_jobs(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
     completions
 }
 
+/// Runs `jobs` in submission order, group-committing each run of
+/// consecutive authorizations. Closes run on their own, outside any group:
+/// they drop the connection's in-memory session before writing, so a
+/// deactivation rolled back with a failed group could never be retried.
+fn run_grouped(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
+    let mut completions = Vec::with_capacity(jobs.len());
+    let mut group: Vec<Job> = Vec::new();
+    for job in jobs {
+        if matches!(job, Job::Close(_)) {
+            completions.extend(run_authorization_group(bridge, std::mem::take(&mut group)));
+            completions.extend(run_jobs(bridge, vec![job]));
+        } else {
+            group.push(job);
+        }
+    }
+    completions.extend(run_authorization_group(bridge, group));
+    completions
+}
+
+/// Runs a group of authorizations in one transaction. If the commit fails,
+/// every write in it is rolled back, including deactivations of rows the
+/// connections held before (a publisher switching streams, a replaced
+/// player session). Those rows are active again in the DB while the bridge
+/// no longer tracks them, so they're deactivated again here, and every
+/// authorization the group allowed is turned into a denial.
+fn run_authorization_group(bridge: &DbRtmpBridge, group: Vec<Job>) -> Vec<AuthCompletion> {
+    if group.len() <= 1 {
+        return run_jobs(bridge, group);
+    }
+    let before: Vec<(u64, Option<Publisher>, Option<Player>)> = group
+        .iter()
+        .filter_map(|job| match job {
+            Job::Authorize(req) => {
+                let (publisher, player) = bridge.session_rows(req.conn_id);
+                Some((req.conn_id, publisher, player))
+            }
+            Job::Close(_) => None,
+        })
+        .collect();
+    let (mut completions, committed) = bridge.db().batch(|| run_jobs(bridge, group));
+    if committed {
+        return completions;
+    }
+    // Nothing the group allowed is backed by a row: deny it and drop the
+    // per-connection state it created.
+    for completion in &mut completions {
+        if completion.allow {
+            completion.allow = false;
+            bridge.on_close(completion.conn_id);
+        }
+    }
+    for (conn_id, publisher, player) in before {
+        let (publisher_now, player_now) = bridge.session_rows(conn_id);
+        if let Some(mut row) = publisher
+            && publisher_now.as_ref().is_none_or(|now| now.id != row.id)
+        {
+            row.active = false;
+            bridge.db().publisher_update(&row.id.clone(), &row);
+        }
+        if let Some(mut row) = player
+            && player_now.as_ref().is_none_or(|now| now.id != row.id)
+        {
+            row.active = false;
+            bridge.db().player_update(&row.id.clone(), &row);
+        }
+    }
+    completions
+}
+
 /// Spawns the dedicated auth worker thread. Returns a submission handle for
 /// the RTMP callbacks and the completion receiver the RTMP poll loop drains
 /// once per tick via [`drain_completions`]. The worker thread runs until
@@ -223,20 +293,7 @@ pub fn spawn_with_notify(
                     }
                 }
                 let completions = if jobs.len() > 1 && batching_allowed(&bridge) {
-                    let (mut completions, committed) =
-                        bridge.db().batch(|| run_jobs(&bridge, jobs));
-                    if !committed {
-                        // Everything in the group was rolled back: nothing
-                        // it allowed is backed by a row, so deny all of it
-                        // and drop the per-connection state it created.
-                        for completion in &mut completions {
-                            if completion.allow {
-                                completion.allow = false;
-                                bridge.on_close(completion.conn_id);
-                            }
-                        }
-                    }
-                    completions
+                    run_grouped(&bridge, jobs)
                 } else {
                     run_jobs(&bridge, jobs)
                 };
@@ -400,6 +457,62 @@ mod tests {
         assert_eq!(completion.conn_id, 2);
         assert!(completion.allow, "conn 1's slot must have been released");
         assert!(!bridge.is_registered(1));
+    }
+
+    #[test]
+    fn failed_group_commit_keeps_closes_and_releases_switched_rows() {
+        use crate::db::Stream;
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let mut keys = Vec::new();
+        for i in 1..=3 {
+            let s = Stream {
+                id: format!("s{i}"),
+                name: "S".to_string(),
+                app: "live".to_string(),
+                publish_key: crate::keygen::keygen_stream_key("pub_").unwrap(),
+                play_key: crate::keygen::keygen_stream_key("play_").unwrap(),
+                stats_key: crate::keygen::keygen_stream_key("stats_").unwrap(),
+                enabled: true,
+                ..Default::default()
+            };
+            db.stream_add(&s).unwrap();
+            keys.push(s.publish_key);
+        }
+        let deleted = Arc::new(Mutex::new(HashSet::new()));
+        let bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db), deleted));
+        bridge.set_coordinator(Arc::new(StateCoordinator::standalone(Arc::clone(&db))));
+        let publish = |conn_id: u64, key: &str| {
+            Job::Authorize(AuthRequest {
+                kind: AuthKind::Publish,
+                conn_id,
+                app: "live".to_string(),
+                stream_key: key.to_string(),
+            })
+        };
+        for conn_id in 1..=3 {
+            bridge.on_connect(conn_id, "127.0.0.1:1000");
+        }
+        // conn 1 publishes s1, conn 2 publishes s2.
+        run_jobs(&bridge, vec![publish(1, &keys[0]), publish(2, &keys[1])]);
+
+        // conn 1 closes; conn 2 switches to s3 and conn 3 takes s1, both in
+        // a group whose commit fails.
+        db.fail_next_batch_commit();
+        let completions = run_grouped(
+            &bridge,
+            vec![Job::Close(1), publish(2, &keys[2]), publish(3, &keys[0])],
+        );
+        assert_eq!(completions.len(), 2);
+        assert!(completions.iter().all(|c| !c.allow));
+        // The close ran outside the failed group, so conn 1's row stays
+        // released; conn 2's s2 row, whose deactivation the rollback undid,
+        // is released again; nothing from the failed group is active.
+        for stream in ["s1", "s2", "s3"] {
+            assert!(
+                db.publisher_list(Some(stream)).is_empty(),
+                "{stream} must have no active publisher"
+            );
+        }
     }
 
     #[test]

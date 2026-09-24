@@ -284,6 +284,14 @@ impl DbRtmpBridge {
             .is_some_and(|cs| !cs.remote_ip.is_empty())
     }
 
+    /// The publisher/player rows `conn` currently holds (copies).
+    pub(crate) fn session_rows(&self, conn: ConnId) -> (Option<Publisher>, Option<Player>) {
+        self.conns
+            .lock()
+            .get(&conn)
+            .map_or((None, None), |cs| (cs.publisher.clone(), cs.player.clone()))
+    }
+
     /// Auth-failure bucket key. The role is part of the key so a successful
     /// publish cannot clear a play-failure window (and vice versa) from the
     /// same IP, which would otherwise let one legitimate role defeat

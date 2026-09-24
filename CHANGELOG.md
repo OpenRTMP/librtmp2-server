@@ -124,6 +124,14 @@ begin at `1.0.0`.
   authorization queue is full. The old inline fallback could run `on_close`
   first, after which the late authorization recreated an active
   publisher/player row for a dead connection that nothing released.
+- A failed group commit no longer leaves rows active. Connection closes run
+  outside the authorization group (a deactivation rolled back with it was
+  never retried, blocking the stream's publisher slot or a play-key slot
+  until restart), and rows that the group's authorizations had replaced
+  (e.g. a publisher switching streams) are deactivated again after the
+  rollback.
+- `scripts/run_rtmp_benchmarks.sh` resolves relative `MEDIAMTX_BIN`/`SRS_BIN`/
+  `LIVEFORGE_BIN` paths before starting each server from its work directory.
 - With RTMPS enabled and several shards, the global `max_connections` cap is
   split into fixed per-shard shares instead of the per-tick budget, because
   librtmp2 counts TLS handshakes in progress against the cap and other shards

@@ -31,6 +31,13 @@ SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-}"
 SRS_BIN="${SRS_BIN:-}"
 LIVEFORGE_BIN="${LIVEFORGE_BIN:-}"
+# Each server is started from its own work directory, so resolve relative
+# binary paths against the caller's directory first.
+for var in MEDIAMTX_BIN SRS_BIN LIVEFORGE_BIN; do
+  if [[ -n "${!var}" && -e "${!var}" ]]; then
+    printf -v "$var" '%s' "$(realpath "${!var}")"
+  fi
+done
 
 BENCH_HANDSHAKE="$LIBRTMP2_DIR/target/release/examples/bench_handshake"
 BENCH_RELAY="$LIBRTMP2_DIR/target/release/examples/bench_relay"

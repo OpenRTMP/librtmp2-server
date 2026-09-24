@@ -268,5 +268,5 @@ the nginx-rtmp and librtmp2-server legs run without them. Build LiveForge
 from [github.com/im-pingo/liveforge](https://github.com/im-pingo/liveforge)
 with `go build -o liveforge ./cmd/liveforge` (needs Go 1.26+). Build SRS from
 [github.com/ossrs/srs](https://github.com/ossrs/srs) with
-`(cd trunk && ./configure && make)`; the resulting `trunk/objs/srs` binary
+`(cd trunk && ./configure --ffmpeg-fit=on --sys-ffmpeg=off --https=off --gb28181=off && make)`; the resulting `trunk/objs/srs` binary
 is what `SRS_BIN` should point at.

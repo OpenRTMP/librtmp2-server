@@ -115,6 +115,9 @@ pub struct Db {
     /// the RTMP poll threads and written in one transaction by
     /// [`Db::flush_pending_stats`]. Lock order: `conn` before this.
     pending_stats: Mutex<PendingStats>,
+    /// Test hook: make the next [`Db::batch`] commit fail.
+    #[cfg(test)]
+    fail_next_batch_commit: std::sync::atomic::AtomicBool,
 }
 
 /// Stats rows waiting for [`Db::flush_pending_stats`], keyed by row id; a
@@ -500,6 +503,8 @@ impl Db {
             conn: ReentrantMutex::new(conn),
             active_player_counts: Mutex::new(HashMap::new()),
             pending_stats: Mutex::new(PendingStats::default()),
+            #[cfg(test)]
+            fail_next_batch_commit: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1700,13 +1705,30 @@ impl Db {
             return (f(), true);
         }
         let result = f();
-        if let Err(e) = conn.execute_batch("COMMIT") {
+        #[cfg(test)]
+        let commit = if self
+            .fail_next_batch_commit
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(rusqlite::Error::ExecuteReturnedResults)
+        } else {
+            conn.execute_batch("COMMIT")
+        };
+        #[cfg(not(test))]
+        let commit = conn.execute_batch("COMMIT");
+        if let Err(e) = commit {
             crate::log_error!("DB batch commit failed, rolling back the whole group: {e}");
             let _ = conn.execute_batch("ROLLBACK");
             self.resync_active_player_counts(&conn);
             return (result, false);
         }
         (result, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_batch_commit(&self) {
+        self.fail_next_batch_commit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Rebuild `active_player_counts` from the `players` table.
