@@ -286,9 +286,9 @@ fn wait_for_readiness_or_timeout(
                 .filter(|pfd| pfd.revents & READY_MASK != 0)
                 .filter_map(|pfd| conn_id_by_fd.get(&pfd.fd).copied())
                 .collect();
-            let listener_ready = fds.iter().any(|pfd| {
-                pfd.revents & READY_MASK != 0 && !conn_id_by_fd.contains_key(&pfd.fd)
-            });
+            let listener_ready = fds
+                .iter()
+                .any(|pfd| pfd.revents & READY_MASK != 0 && !conn_id_by_fd.contains_key(&pfd.fd));
             if ready.is_empty() && listener_ready {
                 std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(10)));
             }
@@ -926,10 +926,13 @@ pub(crate) fn process_server_connections(
         }
 
         if is_playing {
-            if entry.awaiting_first_frame.is_some_and(|(baseline, set_at)| {
-                conn.media_bytes_sent > baseline
-                    || set_at.elapsed() >= Duration::from_millis(FIRST_FRAME_GRACE_MS)
-            }) {
+            if entry
+                .awaiting_first_frame
+                .is_some_and(|(baseline, set_at)| {
+                    conn.media_bytes_sent > baseline
+                        || set_at.elapsed() >= Duration::from_millis(FIRST_FRAME_GRACE_MS)
+                })
+            {
                 entry.awaiting_first_frame = None;
             }
             rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);

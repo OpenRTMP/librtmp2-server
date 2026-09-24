@@ -1801,7 +1801,10 @@ async fn handle_stream_player_delete(
     }
     match state.coordinator.delete_viewer(&id, &player_id) {
         Ok(()) => {
-            state.revoked_viewers.lock().insert(player_id.clone(), Instant::now());
+            state
+                .revoked_viewers
+                .lock()
+                .insert(player_id.clone(), Instant::now());
             state.db.players_deactivate_for_viewer(&player_id);
             #[cfg(feature = "cluster")]
             if let Some(mgr) = state.coordinator.cluster_manager() {

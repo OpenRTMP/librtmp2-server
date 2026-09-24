@@ -20,8 +20,8 @@ use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 use crate::server::{
     AUTH_COMPLETIONS_RX, AUTH_WORKER, POLL_INTERVAL_MS, REVOKED_VIEWER_GRACE_MS, RTMP_BRIDGE,
     TrackedConn, clear_rtmp_poll_server, live_stream_ids_for_deleted_markers,
-    process_server_connections,
-    rtmp_media_cb, rtmp_play_auth_cb, rtmp_publish_auth_cb, set_rtmp_poll_server,
+    process_server_connections, rtmp_media_cb, rtmp_play_auth_cb, rtmp_publish_auth_cb,
+    set_rtmp_poll_server,
 };
 
 static TEST_RUNTIME: OnceLock<Runtime> = OnceLock::new();
