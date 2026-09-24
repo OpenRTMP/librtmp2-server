@@ -20,9 +20,7 @@ begin at `1.0.0`.
   CPUs by default, see below).
 - The benchmark numbers in `BENCHMARKS.md` were measured against librtmp2
   0.10.0 (per-player flow control, frames chunked once per fan-out, compact
-  chunk headers). This release still builds against librtmp2 `0.9.3`; raise
-  the requirement to `0.10` once that version is on crates.io to pick those
-  relay changes up.
+  chunk headers).
 - The RTMP poll loop waits on a persistent `epoll(7)` set on Linux, updating
   registrations only for connections that changed, instead of rebuilding and
   passing every fd to `poll(2)` on each tick (`poll(2)` remains the fallback).
