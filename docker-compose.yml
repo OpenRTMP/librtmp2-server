@@ -13,6 +13,7 @@ services:
     restart: unless-stopped
     environment:
       - LRTMP2_HTTP_BIND=0.0.0.0:8080
+      # RTMP wildcard binds are dual-stack inside the container when IPv6 is available.
       - LRTMP2_RTMP_BIND=0.0.0.0:1935
       - LRTMP2_LOG_LEVEL=2
       - LRTMP2_DB=/data/server.db
@@ -38,6 +39,7 @@ services:
       - server-data:/data
       # - ./certs:/certs:ro
     ports:
+      # Host-IP omitted: Docker publishes on the host wildcard addresses (IPv4 + IPv6 by default).
       - "1935:1935"
       # - "1936:1936"
       - "8080:8080"
