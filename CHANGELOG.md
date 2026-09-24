@@ -66,6 +66,13 @@ begin at `1.0.0`.
   connection id instead of the connection count, which stayed flat (and
   triggered a needless 10 ms sleep) when accepts and closes cancelled out.
 
+- After applying a publish/play authorization the poll loop re-polls
+  immediately instead of sleeping a 1 ms tick first: the new player's cached
+  codec headers and keyframe are only sent inside the next `server.poll`, and
+  with Play.Start already flushed nothing woke the wait early. Single-viewer
+  join latency dropped from ~2.3 ms to ~1.2 ms (p50 over 20 joins), ahead of
+  LiveForge (~1.3 ms) and MediaMTX (~1.3 ms) on the same box.
+
 ### Fixed
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate

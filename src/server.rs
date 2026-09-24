@@ -125,9 +125,9 @@ const STATS_FLUSH_INTERVAL_TICKS: u32 = 10;
 /// otherwise the interval drops back to the slow 50ms the instant a play
 /// request is *accepted*, before the viewer has actually received
 /// anything, bounding their real join latency by the publisher's frame
-/// cadence instead); and for one tick right after the async auth worker
-/// resolves a publish/play authorization (see `just_authorized` in the
-/// poll loop). Handshake and stream-join round trips each wait for the
+/// cadence instead). Right after the async auth worker resolves a
+/// publish/play authorization the loop doesn't wait at all (see
+/// `just_authorized` in the poll loop). Handshake and stream-join round trips each wait for the
 /// next poll tick before the server's reply goes out, so the fixed 50ms
 /// interval alone adds up to tens of milliseconds of avoidable latency per
 /// step; polling faster only during this comparatively brief, comparatively
@@ -2149,7 +2149,16 @@ impl ServerApp {
                         }
 
                         let negotiating = any_negotiating(&tracked);
-                        let poll_interval_ms = if negotiating || just_authorized {
+                        // An authorization applied this tick (e.g. a play just
+                        // got Play.Start) has follow-up work that only runs
+                        // inside the next `server.poll`: replaying the cached
+                        // codec headers and keyframe to the new player. Its
+                        // reply is usually flushed already, so nothing would
+                        // wake the wait early -- re-poll immediately instead of
+                        // sleeping a tick before the viewer's first frame.
+                        let poll_interval_ms = if just_authorized {
+                            0
+                        } else if negotiating {
                             POLL_INTERVAL_FAST_MS
                         } else {
                             POLL_INTERVAL_MS
