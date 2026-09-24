@@ -214,20 +214,28 @@ out the VM's run-to-run noise that a single sweep can't:
 |---|---|---|---|
 | connect+publish, sequential (`bench_handshake --concurrency 1`, 100 × 2 runs), avg / p50 | **0.55 / 0.52 ms** | 0.67 / 0.61 ms | 0.77 / 0.68 ms |
 | single-viewer join (20 sequential `bench_relay --players 1` joins), avg / p50 | **1.19 / 1.19 ms** | 1.23 / 1.19 ms | 1.36 / 1.30 ms |
-| 100-viewer join (4 rounds), avg / p50 / p95 | 19.9 / 17.9 / 30.4 ms | 23.3 / 24.2 / 44.9 ms | **16.3 / 15.5 / 27.5 ms** |
-| connect+publish, 30 concurrent (4 rounds × 120), avg / p50 / p95 | 8.0 / 6.1 / 17.2 ms | **5.4 / 4.8 / 10.3 ms** | 6.0 / 5.5 / 10.8 ms |
+| 100-viewer join (3 rounds), avg / p50 / p95 | **11.9 / 7.7 / 23.2 ms** | 24.8 / 23.8 / 43.4 ms | 14.5 / 12.2 / 26.1 ms |
+| connect+publish, 30 concurrent (3 rounds × 120), avg / p50 / p95 | **4.6 / 3.9 / 9.2 ms** | 5.2 / 4.9 / 10.6 ms | 6.6 / 6.3 / 12.6 ms |
 | steady fps per viewer at 100 viewers | 73.0-73.2 | 73.1-73.2 | 73.1-73.3 |
 
 `librtmp2-server` is the only one of the three that authenticates every
 publish and play here (per-stream keys looked up and session rows written in
-SQLite); the other two accept any stream name. Even so it has the lowest
-fixed per-connection cost: fastest sequential connect+publish and
-single-viewer join. It is second at 100 simultaneous joins (ahead of
-LiveForge, a few ms behind MediaMTX) and third at 30 concurrent publishes,
-where MediaMTX and LiveForge spread connection handling over all cores while
-`librtmp2-server` runs each shard's connections (one shard by default) on a
-single thread and serializes session writes through one SQLite connection.
-`LRTMP2_RTMP_SHARDS=4` did not measurably change these numbers on this box.
+SQLite); the other two accept any stream name. Even so it now leads every
+row: the lowest fixed per-connection cost (sequential connect+publish and
+single-viewer join) and, since RTMP connections are spread over one
+`SO_REUSEPORT` poll shard per CPU by default (up to 4; see CHANGELOG), also
+the fastest 30-concurrent connect+publish and 100-viewer join. The
+concurrent rows were re-measured after that change (3 interleaved rounds);
+the sequential rows are from before it and are unaffected by it (a single
+connection only ever touches one shard).
+
+Sharding on its own, 1 vs 4 shards of the same build (4 interleaved rounds):
+30 concurrent connect+publish 4.95 -> 3.63 ms avg (p95 6.8 -> 5.9 ms),
+100-viewer join 16.5 -> 10.3 ms avg (p95 28.6 -> 22.5 ms), single-viewer
+join unchanged (~1.5 ms), full frame rate for every viewer in both. Earlier
+sharding runs showed no gain because a shard only noticed relayed frames on
+its next poll tick; the receiving shard is now woken through its `eventfd`.
+Set `LRTMP2_RTMP_SHARDS=1` to get the single-thread loop back.
 
 ## Component microbenchmark: `benches/http_api.rs`
 
