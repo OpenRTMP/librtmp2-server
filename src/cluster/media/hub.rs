@@ -1135,10 +1135,14 @@ fn parse_subscribe_denied(message: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn subscribe_remote_with_unlearned_owner_addr_keeps_refcount_without_dialing() {
-        let hub = MediaHub::new(
-            1,
+    fn free_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn test_hub(local_id: NodeId) -> Arc<MediaHub> {
+        MediaHub::new(
+            local_id,
             "test-cluster-secret-32-chars-min--".to_string(),
             8,
             1,
@@ -1147,20 +1151,53 @@ mod tests {
             None,
             None,
             Arc::new(|_: NodeId| true),
-        );
+        )
+    }
 
-        hub.subscribe_remote("", 2, "live", "s1", 0).await;
+    #[tokio::test]
+    async fn unlearned_owner_addr_keeps_refcount_and_replays_on_connect() {
+        let hub1 = test_hub(1);
 
+        // The subscription is registered while the owner's address is unknown:
+        // the refcount is kept and no dialing peer is spawned.
+        hub1.subscribe_remote("", 2, "live", "s1", 0).await;
         assert_eq!(
-            hub.subscribed_nodes_for("live", "s1"),
+            hub1.subscribed_nodes_for("live", "s1"),
             vec![2],
             "a subscription registered before the owner address is learned must \
              survive so a later connect_peer resubscribes it"
         );
         assert_eq!(
-            hub.peer_count(),
+            hub1.peer_count(),
             0,
             "no media peer may be spawned for an empty owner address"
         );
+
+        // A later topology refresh learns the address and dials the owner.
+        let hub2 = test_hub(2);
+        let port = free_local_port();
+        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        hub2.start(bind).await.expect("media plane must bind");
+        hub1.connect_peer(2, &format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect_peer must accept the learned address");
+
+        let replayed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if hub2.subscribed_nodes_for("live", "s1").contains(&1) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            replayed,
+            "connect_peer must replay a subscription registered before the \
+             owner address was learned"
+        );
+        assert_eq!(hub1.peer_count(), 1);
     }
 }

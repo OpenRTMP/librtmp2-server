@@ -452,7 +452,12 @@ impl ClusterManager {
                 if let Some(ref join_addr) = config.join {
                     mgr.refresh_topology_from_any(join_addr).await?;
                 } else {
-                    mgr.recover_missing_media_addrs().await;
+                    // Best-effort recovery runs off the startup path: an
+                    // unreachable peer must not delay the HTTP/RTMP listeners.
+                    let recovery_mgr = Arc::clone(&mgr);
+                    tokio::spawn(async move {
+                        recovery_mgr.recover_missing_media_addrs().await;
+                    });
                 }
                 if db.setting_get(BOOTSTRAP_SEEDED_SETTING).is_none() {
                     // raft_has_state() only proves raft.initialize() ran; a
