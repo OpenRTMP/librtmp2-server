@@ -5,7 +5,7 @@
 //! at a time anyway, so this matches the C version's locking model without
 //! needing a connection pool.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, ReentrantMutex};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -22,8 +22,83 @@ fn on_disk_db_open_flags() -> OpenFlags {
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
 }
 
+/// A transaction on the shared connection -- or, when a [`Db::batch`]
+/// transaction is already open on it, a savepoint nested inside that one,
+/// so the operation can still be rolled back on its own without aborting
+/// the rest of the batch. Rolls back on drop unless committed. Derefs to the
+/// connection for running statements.
+pub(crate) struct DbTx<'c> {
+    conn: &'c Connection,
+    savepoint: bool,
+    finished: bool,
+}
+
+impl<'c> DbTx<'c> {
+    pub(crate) fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
+        let savepoint = !conn.is_autocommit();
+        conn.execute_batch(if savepoint {
+            "SAVEPOINT db_tx"
+        } else {
+            "BEGIN DEFERRED"
+        })?;
+        Ok(Self {
+            conn,
+            savepoint,
+            finished: false,
+        })
+    }
+
+    /// On failure the transaction (or savepoint) is still rolled back when
+    /// `self` drops, so a failed `COMMIT`/`RELEASE` can't leave the shared
+    /// connection inside an abandoned transaction, and a failed operation
+    /// inside a batch can't be persisted by the batch's outer commit.
+    pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(if self.savepoint {
+            "RELEASE db_tx"
+        } else {
+            "COMMIT"
+        })?;
+        self.finished = true;
+        Ok(())
+    }
+
+    pub(crate) fn rollback(mut self) -> rusqlite::Result<()> {
+        self.finished = true;
+        self.conn.execute_batch(Self::rollback_sql(self.savepoint))
+    }
+
+    fn rollback_sql(savepoint: bool) -> &'static str {
+        if savepoint {
+            "ROLLBACK TO db_tx; RELEASE db_tx"
+        } else {
+            "ROLLBACK"
+        }
+    }
+}
+
+impl std::ops::Deref for DbTx<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Drop for DbTx<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // After a failed COMMIT SQLite may already have rolled back, in
+            // which case this errors harmlessly.
+            let _ = self.conn.execute_batch(Self::rollback_sql(self.savepoint));
+        }
+    }
+}
+
 pub struct Db {
-    conn: Mutex<Connection>,
+    /// Re-entrant so that [`Db::batch`] can hold the connection for a whole
+    /// group of operations while each operation still locks it as usual on
+    /// the same thread. Every other thread still gets exclusive access.
+    conn: ReentrantMutex<Connection>,
     /// In-memory active-viewer-session counts, keyed by `stream_viewers.id`.
     /// This is the authoritative source for the per-viewer connection cap
     /// (`MAX_CONNECTIONS_PER_PLAY_KEY`) on this running node: it lets
@@ -36,6 +111,27 @@ pub struct Db {
     /// on every `Db::open`, which already resets all `active` rows to 0 for
     /// the same reason (no session survives a process restart).
     active_player_counts: Mutex<HashMap<String, usize>>,
+    /// Latest not-yet-persisted stats per publisher/player row, queued by
+    /// the RTMP poll threads and written in one transaction by
+    /// [`Db::flush_pending_stats`]. Lock order: `conn` before this.
+    pending_stats: Mutex<PendingStats>,
+    /// Test hook: make the next [`Db::batch`] commit fail.
+    #[cfg(test)]
+    fail_next_batch_commit: std::sync::atomic::AtomicBool,
+}
+
+/// Stats rows waiting for [`Db::flush_pending_stats`], keyed by row id; a
+/// newer queue for the same id replaces the older one.
+#[derive(Default)]
+struct PendingStats {
+    publishers: HashMap<String, Publisher>,
+    players: HashMap<String, Player>,
+}
+
+impl PendingStats {
+    fn is_empty(&self) -> bool {
+        self.publishers.is_empty() && self.players.is_empty()
+    }
 }
 
 /// Max simultaneous RTMP play connections per play key (not configurable).
@@ -404,8 +500,11 @@ impl Db {
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
-            conn: Mutex::new(conn),
+            conn: ReentrantMutex::new(conn),
             active_player_counts: Mutex::new(HashMap::new()),
+            pending_stats: Mutex::new(PendingStats::default()),
+            #[cfg(test)]
+            fail_next_batch_commit: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -626,7 +725,7 @@ impl Db {
                 return Err(StreamAddError::Duplicate);
             }
         }
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("stream_add_with_viewer: begin tx failed: {e}");
@@ -812,14 +911,15 @@ impl Db {
             return DbLookup::Missing;
         }
         let conn = self.conn.lock();
-        map_optional(conn.query_row(
-            &format!(
+        // Hot path: every publish attempt. Cached so the statement isn't
+        // re-parsed and re-planned per request.
+        map_optional(
+            conn.prepare_cached(&format!(
                 "SELECT {} FROM streams WHERE publish_key=?",
                 Self::STREAM_COLS
-            ),
-            params![key],
-            Self::load_stream_row,
-        ))
+            ))
+            .and_then(|mut stmt| stmt.query_row(params![key], Self::load_stream_row)),
+        )
     }
 
     pub fn stream_find_by_stats_key(&self, key: &str) -> DbLookup<Stream> {
@@ -912,7 +1012,7 @@ impl Db {
     /// finalize must be a no-op).
     pub fn stream_delete_if_pending(&self, id: &str) -> Option<bool> {
         let conn = self.conn.lock();
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("DB error starting pending-delete transaction: {e}");
@@ -945,7 +1045,7 @@ impl Db {
     /// Returns `Some(true)` = deleted, `Some(false)` = not found, `None` = DB error.
     pub fn stream_delete(&self, id: &str) -> Option<bool> {
         let conn = self.conn.lock();
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("DB error starting cascade delete transaction: {e}");
@@ -1359,9 +1459,7 @@ impl Db {
         String,
     > {
         let conn = self.conn.lock();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("snapshot tx begin: {e}"))?;
+        let tx = DbTx::begin(&conn).map_err(|e| format!("snapshot tx begin: {e}"))?;
 
         let mut stmt = tx
             .prepare(&format!(
@@ -1474,7 +1572,7 @@ impl Db {
         acquired_at: i64,
     ) -> Result<u64, OwnerError> {
         let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction().map_err(|_| OwnerError::Db)?;
+        let tx = DbTx::begin(&conn).map_err(|_| OwnerError::Db)?;
         let stream_ok: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT enabled, pending_delete FROM streams WHERE id=?",
@@ -1587,6 +1685,71 @@ impl Db {
         f(&conn)
     }
 
+    /// Group commit: run `f` -- typically several independent operations,
+    /// each using its own [`DbTx`] as usual -- inside one SQLite transaction
+    /// on this thread, holding the connection for the duration so no other
+    /// thread's statements interleave. Each operation's `DbTx` becomes a
+    /// savepoint, so it still commits or rolls back on its own, but the WAL
+    /// commit is paid once for the whole group instead of once per
+    /// operation (~4x less per-operation cost at a batch of 30).
+    ///
+    /// Returns `f`'s result and whether the outer commit succeeded. On
+    /// failure everything in the group is rolled back and the in-memory
+    /// active-viewer counts are resynced from the table; the caller must
+    /// then treat each operation's outcome as failed. If the outer
+    /// transaction can't even be opened, `f` runs unbatched (each operation
+    /// commits itself) and the result counts as committed.
+    pub fn batch<R>(&self, f: impl FnOnce() -> R) -> (R, bool) {
+        let conn = self.conn.lock();
+        if !conn.is_autocommit() || conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+            return (f(), true);
+        }
+        let result = f();
+        #[cfg(test)]
+        let commit = if self
+            .fail_next_batch_commit
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(rusqlite::Error::ExecuteReturnedResults)
+        } else {
+            conn.execute_batch("COMMIT")
+        };
+        #[cfg(not(test))]
+        let commit = conn.execute_batch("COMMIT");
+        if let Err(e) = commit {
+            crate::log_error!("DB batch commit failed, rolling back the whole group: {e}");
+            let _ = conn.execute_batch("ROLLBACK");
+            self.resync_active_player_counts(&conn);
+            return (result, false);
+        }
+        (result, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_batch_commit(&self) {
+        self.fail_next_batch_commit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Rebuild `active_player_counts` from the `players` table.
+    fn resync_active_player_counts(&self, conn: &Connection) {
+        let mut counts = self.active_player_counts.lock();
+        counts.clear();
+        let Ok(mut stmt) = conn
+            .prepare("SELECT viewer_id, COUNT(*) FROM players WHERE active=1 GROUP BY viewer_id")
+        else {
+            return;
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for (viewer_id, n) in rows.flatten() {
+                counts.insert(viewer_id, n.max(0) as usize);
+            }
+        }
+    }
+
     /// Atomically insert an active publisher only when the stream has none.
     pub fn publisher_try_acquire(&self, p: &Publisher) -> bool {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
@@ -1597,18 +1760,17 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("publisher_try_acquire: begin tx failed: {e}");
                 return false;
             }
         };
-        let active: i64 = match tx.query_row(
-            "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1",
-            params![p.stream_id],
-            |row| row.get(0),
-        ) {
+        let active: i64 = match tx
+            .prepare_cached("SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1")
+            .and_then(|mut stmt| stmt.query_row(params![p.stream_id], |row| row.get(0)))
+        {
             Ok(count) => count,
             Err(e) => {
                 crate::log_error!("publisher_try_acquire: count query failed: {e}");
@@ -1619,11 +1781,12 @@ impl Db {
             return false;
         }
         if tx
-            .execute(
+            .prepare_cached(
                 "INSERT INTO publishers \
                  (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
-                params![
+            )
+            .and_then(|mut stmt| stmt.execute(params![
                     p.id,
                     p.stream_id,
                     p.app,
@@ -1639,8 +1802,7 @@ impl Db {
                     p.bitrate_kbps,
                     p.rtt_ms,
                     p.connected_at
-                ],
-            )
+                ]))
             .is_err()
         {
             return false;
@@ -1654,6 +1816,8 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        // This full-row write supersedes any queued stats for the row.
+        self.pending_stats.lock().publishers.remove(id);
         if p.active {
             // Only re-verify the single-active-publisher invariant on a real
             // transition into (or across) an active slot. A row that is
@@ -1738,6 +1902,11 @@ impl Db {
     /// from the stale clone would resurrect a ghost active slot; restricting
     /// the UPDATE to `WHERE id=? AND active=1` makes the late flush a no-op.
     pub fn publisher_update_stats(&self, id: &str, p: &Publisher) -> bool {
+        let conn = self.conn.lock();
+        Self::write_publisher_stats(&conn, id, p)
+    }
+
+    fn write_publisher_stats(conn: &Connection, id: &str, p: &Publisher) -> bool {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
             crate::log_error!(
                 "publisher_update_stats: bytes_in {} overflows i64",
@@ -1745,26 +1914,28 @@ impl Db {
             );
             return false;
         };
-        let conn = self.conn.lock();
-        match conn.execute(
-            "UPDATE publishers SET \
+        match conn
+            .prepare_cached(
+                "UPDATE publishers SET \
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
              audio_sample_rate=?,audio_channels=?,\
              bytes_in=?,bitrate_kbps=?,rtt_ms=? WHERE id=? AND active=1",
-            params![
-                p.video_codec,
-                p.audio_codec,
-                p.video_width,
-                p.video_height,
-                p.fps,
-                p.audio_sample_rate,
-                p.audio_channels,
-                bytes_in,
-                p.bitrate_kbps,
-                p.rtt_ms,
-                id
-            ],
-        ) {
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
+                    p.video_codec,
+                    p.audio_codec,
+                    p.video_width,
+                    p.video_height,
+                    p.fps,
+                    p.audio_sample_rate,
+                    p.audio_channels,
+                    bytes_in,
+                    p.bitrate_kbps,
+                    p.rtt_ms,
+                    id
+                ])
+            }) {
             Ok(rows) if rows > 0 => true,
             Ok(_) => false,
             Err(e) => {
@@ -1772,6 +1943,59 @@ impl Db {
                 false
             }
         }
+    }
+
+    /// Queue a stats-only update for publisher `id` (same semantics as
+    /// [`Self::publisher_update_stats`]) to be written by the next
+    /// [`Self::flush_pending_stats`], without touching SQLite or the
+    /// connection lock. For the RTMP poll threads, which must not block on
+    /// a per-connection SQLite transaction every second.
+    pub fn queue_publisher_stats(&self, id: &str, p: &Publisher) {
+        self.pending_stats
+            .lock()
+            .publishers
+            .insert(id.to_string(), p.clone());
+    }
+
+    /// Player counterpart of [`Self::queue_publisher_stats`].
+    pub fn queue_player_stats(&self, id: &str, p: &Player) {
+        self.pending_stats
+            .lock()
+            .players
+            .insert(id.to_string(), p.clone());
+    }
+
+    /// Write every queued stats update in a single transaction. Each row
+    /// keeps the `WHERE id=? AND active=1` guard, and a full-row
+    /// `publisher_update`/`player_update` drops any queued stats for its row
+    /// under the same `conn` lock, so a late flush can neither resurrect a
+    /// released row nor carry a previous session's numbers into a
+    /// reactivated one. Returns the number of queued rows processed.
+    pub fn flush_pending_stats(&self) -> usize {
+        let conn = self.conn.lock();
+        let pending = std::mem::take(&mut *self.pending_stats.lock());
+        if pending.is_empty() {
+            return 0;
+        }
+        let count = pending.publishers.len() + pending.players.len();
+        let tx = match DbTx::begin(&conn) {
+            Ok(tx) => tx,
+            Err(e) => {
+                crate::log_error!("flush_pending_stats: begin failed: {e}");
+                return 0;
+            }
+        };
+        for (id, p) in &pending.publishers {
+            Self::write_publisher_stats(&tx, id, p);
+        }
+        for (id, p) in &pending.players {
+            Self::write_player_stats(&tx, id, p);
+        }
+        if let Err(e) = tx.commit() {
+            crate::log_error!("flush_pending_stats: commit failed: {e}");
+            return 0;
+        }
+        count
     }
 
     #[allow(dead_code)]
@@ -1880,7 +2104,7 @@ impl Db {
         {
             return false;
         }
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("player_try_acquire: begin tx failed: {e}");
@@ -1888,11 +2112,13 @@ impl Db {
             }
         };
         if tx
-            .execute(
+            .prepare_cached(
                 "INSERT INTO players \
                  (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
                  VALUES (?,?,?,?,?,?,?,?,?,1)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     p.id,
                     p.stream_id,
                     p.viewer_id,
@@ -1902,8 +2128,8 @@ impl Db {
                     p.bitrate_kbps,
                     p.rtt_ms,
                     p.connected_at
-                ],
-            )
+                ])
+            })
             .is_err()
         {
             return false;
@@ -1926,6 +2152,8 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        // This full-row write supersedes any queued stats for the row.
+        self.pending_stats.lock().players.remove(id);
         // Read the row's current (active, viewer_id) unconditionally — both
         // the cap re-check below (only for a transition into active) and
         // the in-memory counter sync after the write (for every active
@@ -2013,6 +2241,11 @@ impl Db {
     /// touches rows that are still `active=1`, so a stale ConnState clone
     /// cannot resurrect a deactivated player after `release_player`.
     pub fn player_update_stats(&self, id: &str, p: &Player) -> bool {
+        let conn = self.conn.lock();
+        Self::write_player_stats(&conn, id, p)
+    }
+
+    fn write_player_stats(conn: &Connection, id: &str, p: &Player) -> bool {
         let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
             crate::log_error!(
                 "player_update_stats: bytes_out {} overflows i64",
@@ -2020,12 +2253,13 @@ impl Db {
             );
             return false;
         };
-        let conn = self.conn.lock();
-        match conn.execute(
-            "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
+        match conn
+            .prepare_cached(
+                "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
              WHERE id=? AND active=1",
-            params![bytes_out, p.bitrate_kbps, p.rtt_ms, id],
-        ) {
+            )
+            .and_then(|mut stmt| stmt.execute(params![bytes_out, p.bitrate_kbps, p.rtt_ms, id]))
+        {
             Ok(rows) if rows > 0 => true,
             Ok(_) => false,
             Err(e) => {
@@ -2266,6 +2500,97 @@ mod tests {
         };
         assert!(db.publisher_try_acquire(&first));
         assert!(!db.publisher_try_acquire(&second));
+        assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
+    }
+
+    #[test]
+    fn batch_isolates_each_operation_and_commits_once() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "live_key_123",
+            "play_key_456",
+            "sts_key_789",
+        ))
+        .unwrap();
+        db.stream_add(&sample_stream(
+            "stream2",
+            "live_key_abc",
+            "play_key_def",
+            "sts_key_ghi",
+        ))
+        .unwrap();
+        let publisher = |id: &str, stream: &str| Publisher {
+            id: id.to_string(),
+            stream_id: stream.to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+
+        let (results, committed) = db.batch(|| {
+            vec![
+                db.publisher_try_acquire(&publisher("p1", "stream1")),
+                // Sees p1 from earlier in the same batch: rejected, and its
+                // savepoint rolls back without touching p1.
+                db.publisher_try_acquire(&publisher("p2", "stream1")),
+                db.publisher_try_acquire(&publisher("p3", "stream2")),
+            ]
+        });
+        assert!(committed);
+        assert_eq!(results, vec![true, false, true]);
+        assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
+        assert_eq!(db.publisher_list(Some("stream1"))[0].id, "p1");
+        assert_eq!(db.publisher_list(Some("stream2")).len(), 1);
+        // Back to autocommit afterwards: plain operations commit on their own.
+        assert!(db.with_conn(|conn| conn.is_autocommit()));
+    }
+
+    #[test]
+    fn db_tx_rolls_back_when_commit_fails() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,
+                 parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .unwrap();
+        let tx = DbTx::begin(&conn).unwrap();
+        // Deferred FK violation: only reported by COMMIT, which then fails
+        // and leaves the transaction open.
+        tx.execute("INSERT INTO child(id, parent_id) VALUES (1, 42)", [])
+            .unwrap();
+        assert!(tx.commit().is_err());
+        // Rolled back on drop instead of staying inside the failed
+        // transaction for whoever uses the connection next.
+        assert!(conn.is_autocommit());
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM child", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn nested_batch_runs_inside_the_outer_transaction() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "live_key_123",
+            "play_key_456",
+            "sts_key_789",
+        ))
+        .unwrap();
+        let p = Publisher {
+            id: "p1".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        let ((inner, inner_committed), committed) =
+            db.batch(|| db.batch(|| db.publisher_try_acquire(&p)));
+        assert!(inner && inner_committed && committed);
         assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
     }
 
@@ -3107,6 +3432,92 @@ mod tests {
         assert_eq!(listed[0].bitrate_kbps, 1500.0);
         assert_eq!(listed[0].rtt_ms, 8.0);
         assert!(listed[0].active);
+    }
+
+    #[test]
+    fn queued_player_stats_are_written_by_flush_in_one_batch() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        let row = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&row));
+
+        let mut older = row.clone();
+        older.bytes_out = 100;
+        let mut newer = row.clone();
+        newer.bytes_out = 200;
+        newer.rtt_ms = 5.0;
+        db.queue_player_stats("pl0", &older);
+        db.queue_player_stats("pl0", &newer);
+        assert_eq!(
+            db.player_list(Some("stream1"))[0].bytes_out,
+            0,
+            "queueing must not touch SQLite"
+        );
+        assert_eq!(db.flush_pending_stats(), 1, "latest queue per row wins");
+        let listed = db.player_list(Some("stream1"));
+        assert_eq!(listed[0].bytes_out, 200);
+        assert_eq!(listed[0].rtt_ms, 5.0);
+        assert_eq!(db.flush_pending_stats(), 0);
+    }
+
+    #[test]
+    fn queued_stats_never_leak_across_release_or_reactivation() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        let row = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&row));
+
+        // Stats queued, then the session is released before the flush.
+        let mut stale = row.clone();
+        stale.bytes_out = 9999;
+        db.queue_player_stats("pl0", &stale);
+        let mut released = row.clone();
+        released.active = false;
+        assert!(db.player_update("pl0", &released));
+        // Reactivated (same row id) for a new session.
+        assert!(db.player_update("pl0", &row));
+
+        db.flush_pending_stats();
+        let listed = db.player_list(Some("stream1"));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].bytes_out, 0,
+            "the previous session's queued stats must not reach the new one"
+        );
+
+        // A queue that races a release (flushed after it) is a no-op.
+        db.queue_player_stats("pl0", &stale);
+        let conn = db.conn.lock();
+        conn.execute("UPDATE players SET active=0 WHERE id='pl0'", [])
+            .unwrap();
+        drop(conn);
+        db.flush_pending_stats();
+        assert!(
+            db.player_list(Some("stream1")).is_empty(),
+            "a late flush must not resurrect a released row"
+        );
     }
 
     #[test]

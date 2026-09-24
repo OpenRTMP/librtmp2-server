@@ -13,6 +13,134 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-25
+
+### Changed
+- Package version `0.4.3` → `0.5.0` (RTMP connections are now sharded across
+  CPUs by default, see below).
+- The benchmark numbers in `BENCHMARKS.md` were measured against librtmp2
+  0.10.0 (per-player flow control, frames chunked once per fan-out, compact
+  chunk headers).
+- The RTMP poll loop waits on a persistent `epoll(7)` set on Linux, updating
+  registrations only for connections that changed, instead of rebuilding and
+  passing every fd to `poll(2)` on each tick (`poll(2)` remains the fallback).
+- Connections with queued outbound bytes are also polled for writability, so
+  a player whose socket buffer filled mid-frame is flushed as soon as it can
+  take more data rather than on the next inbound packet or poll interval.
+
+- Periodic publisher/player stats (bytes, bitrate, RTT) are no longer written
+  to SQLite from the RTMP poll threads, one transaction per connection per
+  second. The poll threads now only queue the latest row in memory and a
+  `db-stats-flush` thread writes all queued rows in a single transaction once
+  a second (and once more on shutdown). This removed the main per-viewer
+  stall on the relay loop: on the benchmark box, join latency for 100
+  concurrent viewers dropped from ~40 ms to ~27 ms on average (p95 ~58 ms to
+  ~32 ms). The `WHERE active=1` guard is unchanged, and full-row updates drop
+  any queued stats for their row, so a late flush cannot revive a released
+  session or leak into a reactivated one.
+
+- When only a listener is ready, the poll loop now returns immediately so
+  the new connection is accepted at once. It used to sleep up to 10 ms first
+  on every such wake (a guard against spinning on a listener the server
+  can't service, e.g. under per-IP caps), which added that delay to nearly
+  every new connection. The sleep now only happens when the previous wake
+  was also listener-only and no connection was accepted in between. Single
+  viewer join latency on the benchmark box dropped from ~15 ms to ~4 ms,
+  100-viewer join from ~35 ms to ~17 ms on average.
+
+- Publish/play authorization results now wake the RTMP poll loop through
+  an `eventfd` registered in its epoll set, instead of waiting for the next
+  poll tick (up to 1 ms while connections are negotiating, one per auth).
+  The hot authorization and stats statements (`publish_key` lookup,
+  publisher/player inserts and the active-publisher count, stats updates)
+  now use cached prepared statements instead of being re-parsed per call.
+  Sequential connect+publish latency dropped from ~1.8 ms to ~0.6 ms on the
+  benchmark box, on par with MediaMTX (~0.8 ms) and LiveForge (~0.7 ms)
+  even though this server also authenticates every publish against SQLite.
+
+- Closing a connection no longer writes to SQLite on the RTMP poll thread.
+  `on_close` (deactivating the connection's publisher/player rows) now runs
+  on the auth worker, through the same FIFO queue as publish/play
+  authorization, so a release is still applied before any later
+  authorization on the same stream. Each close used to stall the poll loop
+  for every connection on the shard while it waited for the shared SQLite
+  connection, which showed up whenever many clients disconnected at once.
+  Falls back to the inline call when the queue is full, and stays inline
+  with HA clustering active (Raft ownership releases must finish before
+  shutdown). Concurrent connect+publish (30 parallel) improved from ~9.5 ms
+  to ~8.2 ms on average (p50 7.4 -> 6.1 ms).
+- The listener backoff added above now detects accept progress by the newest
+  connection id instead of the connection count, which stayed flat (and
+  triggered a needless 10 ms sleep) when accepts and closes cancelled out.
+
+- After applying a publish/play authorization the poll loop re-polls
+  immediately instead of sleeping a 1 ms tick first: the new player's cached
+  codec headers and keyframe are only sent inside the next `server.poll`, and
+  with Play.Start already flushed nothing woke the wait early. Single-viewer
+  join latency dropped from ~2.3 ms to ~1.2 ms (p50 over 20 joins), ahead of
+  LiveForge (~1.3 ms) and MediaMTX (~1.3 ms) on the same box.
+
+- Group commit for session writes. The auth worker now takes every job
+  already queued (up to 32 publish/play authorizations and connection
+  closes) and runs them in one SQLite transaction, each job in its own
+  savepoint so it still succeeds or rolls back on its own. Replies go out
+  only after the shared commit. The DB connection lock is re-entrant so the
+  worker can hold it across the group, and every inner transaction goes
+  through `DbTx`, which becomes a savepoint inside an open batch. With HA
+  clustering active jobs still run one at a time (publish authorization may
+  wait on Raft, whose apply path needs the same connection). 30 concurrent
+  connect+publish: ~7.9 ms -> ~5.6 ms on average, p95 ~16 ms -> ~7 ms.
+
+- RTMP connections are now spread over several poll threads by default.
+  When `LRTMP2_RTMP_SHARDS` is unset the server runs one `SO_REUSEPORT`
+  shard per available CPU, up to 4, wherever that can't change behaviour:
+  media outputs (recording/HLS/push/exec), HA clustering and a configured
+  per-address connection cap still force a single shard, and
+  `LRTMP2_RTMP_SHARDS=1` restores the single-thread loop. The global
+  `max_connections` cap stays exact across shards: each shard's cap is set
+  before every poll to what the other shards leave free, and any overshoot
+  from simultaneous accepts is trimmed (newest unauthorized connections
+  first).
+- Cross-shard relay no longer waits for the receiving shard's next poll
+  tick. The sending shard signals the target shard's `eventfd` after
+  queueing a frame, and a shard that injected relayed frames re-polls
+  immediately so they are flushed to its players at once. Before this,
+  sharding added up to 50 ms of latency to every relayed frame on idle
+  shards, which is why `LRTMP2_RTMP_SHARDS=4` showed no gain before.
+  On the 4-vCPU benchmark box (4 interleaved rounds, 1 vs 4 shards):
+  30 concurrent connect+publish ~4.9 -> ~3.6 ms on average, 100-viewer join
+  ~16.5 -> ~10.3 ms on average (p95 ~28.6 -> ~22.5 ms), with every viewer
+  still receiving the full frame rate.
+
+### Fixed
+- A failed `COMMIT`/`RELEASE` in a DB transaction now rolls the transaction
+  (or savepoint) back instead of leaving the shared SQLite connection inside
+  an abandoned transaction, where a failed operation inside a group commit
+  could still be persisted by the outer commit.
+- Connection closes are always queued on the auth worker behind any
+  authorization still queued for the same connection, even when the
+  authorization queue is full. The old inline fallback could run `on_close`
+  first, after which the late authorization recreated an active
+  publisher/player row for a dead connection that nothing released.
+- A failed group commit no longer leaves rows active. Connection closes run
+  outside the authorization group (a deactivation rolled back with it was
+  never retried, blocking the stream's publisher slot or a play-key slot
+  until restart), and rows that the group's authorizations had replaced
+  (e.g. a publisher switching streams) are deactivated again after the
+  rollback.
+- `scripts/run_rtmp_benchmarks.sh` resolves relative `MEDIAMTX_BIN`/`SRS_BIN`/
+  `LIVEFORGE_BIN` paths before starting each server from its work directory.
+- With RTMPS enabled and several shards, the global `max_connections` cap is
+  split into fixed per-shard shares instead of the per-tick budget, because
+  librtmp2 counts TLS handshakes in progress against the cap and other shards
+  can't see them.
+- When a publisher stops, the other shards release its relayed route right
+  away instead of holding the inject claim (and the old codec headers) until
+  the 120 s stale-route timeout.
+- `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
+  `LOG_LEVEL` variables the server does not read, and hit the admin API rate
+  limit while provisioning streams.
+
 ## [0.4.3] — 2026-09-24
 
 ### Fixed
@@ -602,7 +730,10 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.2...v0.3.0

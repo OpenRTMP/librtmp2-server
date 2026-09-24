@@ -233,6 +233,10 @@ impl DbRtmpBridge {
         }
     }
 
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
     pub fn set_coordinator(&self, coordinator: Arc<StateCoordinator>) {
         *self.coordinator.lock() = Some(coordinator);
     }
@@ -278,6 +282,14 @@ impl DbRtmpBridge {
             .lock()
             .get(&conn)
             .is_some_and(|cs| !cs.remote_ip.is_empty())
+    }
+
+    /// The publisher/player rows `conn` currently holds (copies).
+    pub(crate) fn session_rows(&self, conn: ConnId) -> (Option<Publisher>, Option<Player>) {
+        self.conns
+            .lock()
+            .get(&conn)
+            .map_or((None, None), |cs| (cs.publisher.clone(), cs.player.clone()))
     }
 
     /// Auth-failure bucket key. The role is part of the key so a successful
@@ -792,7 +804,7 @@ impl DbRtmpBridge {
             let pub_row_clone = pub_row.clone();
             drop(guard);
             // Stats-only write: must not touch `active` (TOCTOU vs release_publisher).
-            self.db.publisher_update_stats(&pub_id, &pub_row_clone);
+            self.db.queue_publisher_stats(&pub_id, &pub_row_clone);
             return;
         }
 
@@ -828,7 +840,7 @@ impl DbRtmpBridge {
         drop(guard);
 
         // Stats-only write: must not touch `active` (TOCTOU vs release_publisher).
-        self.db.publisher_update_stats(&pub_id, &pub_row_clone);
+        self.db.queue_publisher_stats(&pub_id, &pub_row_clone);
     }
 
     /// Update player stats (media bytes_out, bitrate) in the DB.
@@ -855,7 +867,7 @@ impl DbRtmpBridge {
             let row = player_row.clone();
             drop(guard);
             // Stats-only write: must not touch `active` (TOCTOU vs release_player).
-            self.db.player_update_stats(&player_id, &row);
+            self.db.queue_player_stats(&player_id, &row);
             return;
         }
 
@@ -886,7 +898,7 @@ impl DbRtmpBridge {
         drop(guard);
 
         // Stats-only write: must not touch `active` (TOCTOU vs release_player).
-        self.db.player_update_stats(&player_id, &row);
+        self.db.queue_player_stats(&player_id, &row);
     }
 
     /// Persist the latest measured client↔server RTT for this connection.
@@ -931,10 +943,10 @@ impl DbRtmpBridge {
 
         // Stats-only write: must not touch `active` (TOCTOU vs release_*).
         if let Some((pub_id, row)) = pub_update {
-            self.db.publisher_update_stats(&pub_id, &row);
+            self.db.queue_publisher_stats(&pub_id, &row);
         }
         if let Some((player_id, row)) = player_update {
-            self.db.player_update_stats(&player_id, &row);
+            self.db.queue_player_stats(&player_id, &row);
         }
     }
 
@@ -2082,6 +2094,7 @@ mod tests {
         }
 
         bridge.update_player_stats(1, 2_500);
+        db.flush_pending_stats();
         let players = db.player_list(Some("s2"));
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].bytes_out, 0);
@@ -2096,6 +2109,9 @@ mod tests {
         bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
         bridge.update_player_stats(1, 4096);
+        // Queued off the poll thread; persisted by the next flush.
+        assert_eq!(db.player_list(Some("s1"))[0].bytes_out, 0);
+        db.flush_pending_stats();
 
         let players = db.player_list(Some("s1"));
         assert_eq!(players.len(), 1);

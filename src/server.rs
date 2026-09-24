@@ -4,7 +4,7 @@
 use parking_lot::Mutex;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -110,6 +110,12 @@ pub(crate) fn clear_rtmp_poll_server() {
 /// once every tracked connection has reached a steady publish/play state.
 pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 
+/// Queued publisher/player stats are written to SQLite once per
+/// `STATS_FLUSH_TICK * STATS_FLUSH_INTERVAL_TICKS` (1 s, matching the
+/// per-connection stats debounce), checking for shutdown every tick.
+const STATS_FLUSH_TICK: Duration = Duration::from_millis(100);
+const STATS_FLUSH_INTERVAL_TICKS: u32 = 10;
+
 /// Poll interval used instead of `POLL_INTERVAL_MS` while at least one
 /// tracked connection is still negotiating (handshake / connect /
 /// createStream / publish|play command, including a publish|play command
@@ -119,9 +125,9 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 /// otherwise the interval drops back to the slow 50ms the instant a play
 /// request is *accepted*, before the viewer has actually received
 /// anything, bounding their real join latency by the publisher's frame
-/// cadence instead); and for one tick right after the async auth worker
-/// resolves a publish/play authorization (see `just_authorized` in the
-/// poll loop). Handshake and stream-join round trips each wait for the
+/// cadence instead). Right after the async auth worker resolves a
+/// publish/play authorization the loop doesn't wait at all (see
+/// `just_authorized` in the poll loop). Handshake and stream-join round trips each wait for the
 /// next poll tick before the server's reply goes out, so the fixed 50ms
 /// interval alone adds up to tens of milliseconds of avoidable latency per
 /// step; polling faster only during this comparatively brief, comparatively
@@ -187,35 +193,214 @@ const CROSS_SHARD_RELAY_QUEUE_CAPACITY: usize = 1024;
 /// whenever either is enabled, rather than risk silently dropping frames or
 /// double-processing them.
 ///
-/// Set with `LRTMP2_RTMP_SHARDS` (clamped to `[1, MAX_SHARDS]`); defaults to
-/// `1` (today's single-thread behavior, unchanged) rather than the core
-/// count. This is new code with a real, disclosed tradeoff --
-/// `max_connections_per_addr` is enforced per shard rather than truly
-/// globally, since a given IP's connections can land on different shards --
-/// so it stays opt-in rather than silently changing behavior (including the
-/// effective per-IP cap) for existing deployments the moment this ships.
-fn resolve_shard_count(media_outputs_enabled: bool, cluster_enabled: bool) -> usize {
-    let requested = std::env::var("LRTMP2_RTMP_SHARDS")
+/// Set with `LRTMP2_RTMP_SHARDS` (clamped to `[1, MAX_SHARDS]`). When unset
+/// it defaults to the number of available CPUs, capped at
+/// [`AUTO_SHARDS_MAX`] -- but only where sharding can't change behaviour:
+/// media outputs and HA clustering (above) force a single shard, and so
+/// does a configured per-address connection cap, since that cap is
+/// enforced per shard (a given IP's connections can land on different
+/// shards). The global `max_connections` cap stays exact across shards
+/// (see [`ShardConnBudget`]). Setting `LRTMP2_RTMP_SHARDS=1` restores the
+/// single-thread loop.
+fn resolve_shard_count(
+    media_outputs_enabled: bool,
+    cluster_enabled: bool,
+    per_addr_caps_configured: bool,
+) -> usize {
+    let explicit = std::env::var("LRTMP2_RTMP_SHARDS")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
+    shard_count_for(
+        explicit,
+        cpus,
+        media_outputs_enabled,
+        cluster_enabled,
+        per_addr_caps_configured,
+    )
+}
+
+/// [`resolve_shard_count`] without the environment lookups.
+fn shard_count_for(
+    explicit: Option<usize>,
+    cpus: usize,
+    media_outputs_enabled: bool,
+    cluster_enabled: bool,
+    per_addr_caps_configured: bool,
+) -> usize {
+    let requested = match explicit {
+        Some(n) => n,
+        None if per_addr_caps_configured => return 1,
+        None => cpus.min(AUTO_SHARDS_MAX),
+    };
     if requested <= 1 {
         return 1;
     }
     if media_outputs_enabled {
-        crate::log_warn!(
-            "LRTMP2_RTMP_SHARDS ignored: media outputs (recording/HLS/push/exec) aren't wired through cross-shard relay yet"
-        );
+        if explicit.is_some() {
+            crate::log_warn!(
+                "LRTMP2_RTMP_SHARDS ignored: media outputs (recording/HLS/push/exec) aren't wired through cross-shard relay yet"
+            );
+        }
         return 1;
     }
     if cluster_enabled {
-        crate::log_warn!(
-            "LRTMP2_RTMP_SHARDS ignored: HA clustering isn't wired through cross-shard relay yet"
-        );
+        if explicit.is_some() {
+            crate::log_warn!(
+                "LRTMP2_RTMP_SHARDS ignored: HA clustering isn't wired through cross-shard relay yet"
+            );
+        }
         return 1;
     }
     requested.clamp(1, MAX_SHARDS)
 }
+
+/// Default shard count ceiling when `LRTMP2_RTMP_SHARDS` is unset. Every
+/// shard receives every other shard's relayed frames, so returns diminish
+/// past a handful of shards for a single hot stream.
+const AUTO_SHARDS_MAX: usize = 4;
+
+/// One message on a shard's cross-shard relay inbox.
+enum ShardRelayMsg {
+    /// A frame from a publisher on another shard, to inject for local viewers.
+    Frame(librtmp2::RelayFrame),
+    /// That publisher is gone: release the inject claim on its route right
+    /// away. Without it the receiving shard kept the route claimed for its
+    /// external feed until the stale-route timeout (120 s), rejecting a
+    /// publisher that reconnected and happened to land on that shard.
+    RouteEnded { app: String, stream_name: String },
+}
+
+/// Routes (`app`, `stream_name`) this shard's own publishers have relayed to
+/// the other shards, with the publishing connection, so the other shards can
+/// be told when a route ends.
+#[derive(Default)]
+struct ExportedRoutes {
+    routes: HashMap<(String, String), u64>,
+}
+
+impl ExportedRoutes {
+    fn record(&mut self, frames: &[librtmp2::RelayFrame]) {
+        for frame in frames {
+            // Frames injected from elsewhere are never re-broadcast.
+            if librtmp2::server::is_external_publisher_id(frame.publisher_conn_id) {
+                continue;
+            }
+            let key = (frame.app.clone(), frame.stream_name.clone());
+            if self.routes.get(&key) != Some(&frame.publisher_conn_id) {
+                self.routes.insert(key, frame.publisher_conn_id);
+            }
+        }
+    }
+
+    /// Removes and returns the routes whose publisher is no longer among
+    /// `publishing` (the ids of this shard's connections still publishing).
+    fn take_ended(&mut self, publishing: &HashSet<u64>) -> Vec<(String, String)> {
+        let mut ended = Vec::new();
+        self.routes.retain(|route, conn_id| {
+            let live = publishing.contains(conn_id);
+            if !live {
+                ended.push(route.clone());
+            }
+            live
+        });
+        ended
+    }
+}
+
+/// librtmp2 `max_connections` for one shard, and whether [`ShardConnBudget`]
+/// should adjust it every tick.
+///
+/// Plaintext only: each shard starts with the full global cap and the
+/// budget narrows it to what the other shards leave free. With RTMPS
+/// enabled librtmp2 also counts TLS handshakes in progress against
+/// `max_connections`, and those aren't visible to the other shards (nor in
+/// `Server::connections`), so a per-tick budget could let every shard fill
+/// up with stalled handshakes on its own. The cap is then split statically
+/// instead (`global / n_shards`, remainder to the first shards): librtmp2
+/// enforces each share including pending handshakes, so the shares can't
+/// add up past the global cap. `n_shards <= global` is guaranteed by the
+/// caller, so no share is 0 (which librtmp2 would read as "unlimited").
+fn shard_connection_cap(
+    global: i32,
+    n_shards: usize,
+    shard_index: usize,
+    tls_enabled: bool,
+) -> (i32, bool) {
+    if n_shards <= 1 {
+        return (global, false);
+    }
+    if !tls_enabled {
+        return (global, true);
+    }
+    let n = n_shards as i32;
+    let share = global / n + i32::from((shard_index as i32) < global % n);
+    (share.max(1), false)
+}
+
+/// Keeps the configured global `max_connections` exact when connections are
+/// spread over several shards. Each shard publishes its connection count;
+/// before each poll a shard's own librtmp2 cap is set to what the others
+/// leave free (so it stops accepting once the process-wide total is
+/// reached, instead of at a fixed per-shard share that uneven kernel load
+/// balancing could fill early), and after the poll any overshoot from two
+/// shards accepting in the same instant is trimmed by closing the newest
+/// not-yet-authorized connections.
+struct ShardConnBudget {
+    counts: Arc<Vec<AtomicUsize>>,
+    index: usize,
+    global: usize,
+}
+
+impl ShardConnBudget {
+    fn others(&self) -> usize {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.index)
+            .map(|(_, c)| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn before_poll(&self, server: &mut librtmp2::server::Server) {
+        self.counts[self.index].store(server.connections.len(), Ordering::Relaxed);
+        // librtmp2 treats 0 as "unlimited", so never go below 1; the
+        // overshoot that can allow is trimmed in `after_poll`.
+        let free = self.global.saturating_sub(self.others()).max(1);
+        server.config.max_connections = free.min(i32::MAX as usize) as i32;
+    }
+
+    fn after_poll(&self, server: &mut librtmp2::server::Server, rtmp_bridge: &DbRtmpBridge) {
+        let own = server.connections.len();
+        let total = own + self.others();
+        let mut trimmed = 0;
+        if total > self.global {
+            let excess = total - self.global;
+            let mut newest: Vec<(u64, usize)> = server
+                .connections
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.client_fd >= 0 && !rtmp_bridge.has_authorized_session(c.conn_id))
+                .map(|(i, c)| (c.conn_id, i))
+                .collect();
+            newest.sort_unstable_by_key(|&(conn_id, _)| std::cmp::Reverse(conn_id));
+            for (_, idx) in newest.into_iter().take(excess) {
+                server.connections[idx].disconnect_transport();
+                trimmed += 1;
+            }
+            if trimmed > 0 {
+                crate::log_warn!(
+                    "RTMP: connection cap {} reached across shards; closed {trimmed} new connection(s)",
+                    self.global
+                );
+            }
+        }
+        self.counts[self.index].store(own - trimmed, Ordering::Relaxed);
+    }
+}
+
 /// Block until a listener or tracked connection socket becomes readable, or
 /// `timeout_ms` elapses -- whichever comes first.
 ///
@@ -252,10 +437,7 @@ fn resolve_shard_count(media_outputs_enabled: bool, cluster_enabled: bool) -> us
 /// every single tick regardless. At 100 concurrent viewers that is 100
 /// wasted syscalls per tick most of the time; returning the actual ready
 /// set lets the caller skip them.
-fn wait_for_readiness_or_timeout(
-    server: &librtmp2::server::Server,
-    timeout_ms: u64,
-) -> Option<HashSet<u64>> {
+fn poll_readiness(server: &librtmp2::server::Server, timeout_ms: u64) -> Option<Wake> {
     let conn_id_by_fd: HashMap<i32, u64> = server
         .connections
         .iter()
@@ -264,14 +446,34 @@ fn wait_for_readiness_or_timeout(
         .collect();
     let at_connection_cap = server.config.max_connections > 0
         && server.connections.len() >= server.config.max_connections as usize;
+    // A connection with outbound bytes still queued (a player whose socket
+    // send buffer filled mid-keyframe, say) also waits for POLLOUT, so the
+    // loop wakes to flush the rest as soon as the peer's window opens instead
+    // of stalling that viewer's stream for up to a full poll interval. Only
+    // requested while bytes are pending, so a drained or idle connection
+    // can't turn this into a busy loop.
     let mut fds: Vec<libc::pollfd> = server
         .listener_fds()
         .into_iter()
         .filter(|_| !at_connection_cap)
-        .chain(conn_id_by_fd.keys().copied())
-        .map(|fd| libc::pollfd {
+        .map(|fd| (fd, libc::POLLIN))
+        .chain(
+            server
+                .connections
+                .iter()
+                .filter(|conn| conn.client_fd >= 0)
+                .map(|conn| {
+                    let events = if conn.send_buffer.available() > 0 {
+                        libc::POLLIN | libc::POLLOUT
+                    } else {
+                        libc::POLLIN
+                    };
+                    (conn.client_fd, events)
+                }),
+        )
+        .map(|(fd, events)| libc::pollfd {
             fd,
-            events: libc::POLLIN,
+            events,
             revents: 0,
         })
         .collect();
@@ -289,10 +491,10 @@ fn wait_for_readiness_or_timeout(
             let listener_ready = fds
                 .iter()
                 .any(|pfd| pfd.revents & READY_MASK != 0 && !conn_id_by_fd.contains_key(&pfd.fd));
-            if ready.is_empty() && listener_ready {
-                std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(10)));
-            }
-            return Some(ready);
+            return Some(Wake {
+                ready,
+                listener_ready,
+            });
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             // Unexpected poll() failure -- e.g. a connection closed and its
@@ -309,6 +511,121 @@ fn wait_for_readiness_or_timeout(
         // existing best-effort latency bound (worst case: one timeout
         // window longer under signal pressure, which is rare).
     }
+}
+
+/// Readiness source for the RTMP poll loop: a persistent epoll set on Linux
+/// (see `crate::readiness`), falling back to the per-tick `poll(2)` in
+/// [`poll_readiness`] elsewhere or if epoll is unavailable.
+#[cfg(target_os = "linux")]
+use crate::readiness::WakeFd;
+
+/// Stand-in where `eventfd` isn't available: completions are then picked up
+/// on the poll loop's next tick, as before wake fds existed.
+#[cfg(not(target_os = "linux"))]
+struct WakeFd;
+
+#[cfg(not(target_os = "linux"))]
+impl WakeFd {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn signal(&self) {}
+}
+
+struct ReadinessWaiter {
+    source: ReadinessSource,
+    /// Newest `conn_id` among `server.connections` when the previous wait
+    /// returned with only a listener ready, or `None` if it didn't.
+    /// Connection ids are allocated in increasing order, so a newer id
+    /// means an accept happened in between -- unlike the connection count,
+    /// which stays flat when accepts and closes cancel out under churn.
+    listener_only_at: Option<u64>,
+}
+
+enum ReadinessSource {
+    #[cfg(target_os = "linux")]
+    Epoll(crate::readiness::EpollReadiness),
+    Poll,
+}
+
+/// What one readiness wait reported.
+pub(crate) struct Wake {
+    /// Connections that are readable (or errored/hung up).
+    pub(crate) ready: HashSet<u64>,
+    /// A listener had a pending connection.
+    pub(crate) listener_ready: bool,
+}
+
+impl ReadinessWaiter {
+    fn new(wake: Option<Arc<WakeFd>>) -> Self {
+        #[cfg(target_os = "linux")]
+        match crate::readiness::EpollReadiness::new(wake) {
+            Ok(epoll) => return Self::with_source(ReadinessSource::Epoll(epoll)),
+            Err(e) => crate::log_warn!("epoll unavailable ({e}); falling back to poll(2)"),
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = wake;
+        Self::with_source(ReadinessSource::Poll)
+    }
+
+    fn with_source(source: ReadinessSource) -> Self {
+        Self {
+            source,
+            listener_only_at: None,
+        }
+    }
+
+    /// Returns the `conn_id`s that are ready, or `None` for "assume
+    /// everyone is ready" (the wait itself failed).
+    ///
+    /// When only a listener is ready, return at once so the new connection
+    /// is accepted without delay. Only if that happens again with no new
+    /// connection accepted in between (the server can't service the
+    /// listener right now, e.g. per-IP caps, so it stays readable) take a
+    /// short bounded sleep, so an unserviceable listener can't spin the
+    /// loop. The unconditional sleep this replaces added up to 10 ms to
+    /// every single accept.
+    fn wait(&mut self, server: &librtmp2::server::Server, timeout_ms: u64) -> Option<HashSet<u64>> {
+        let wake = match &mut self.source {
+            #[cfg(target_os = "linux")]
+            ReadinessSource::Epoll(epoll) => epoll.wait(server, timeout_ms),
+            ReadinessSource::Poll => poll_readiness(server, timeout_ms),
+        };
+        let Some(wake) = wake else {
+            self.listener_only_at = None;
+            return None;
+        };
+        if wake.ready.is_empty() && wake.listener_ready {
+            let newest = newest_conn_id(server);
+            if self.listener_only_at == Some(newest) {
+                std::thread::sleep(Duration::from_millis(timeout_ms.min(10)));
+            }
+            self.listener_only_at = Some(newest);
+        } else {
+            self.listener_only_at = None;
+        }
+        Some(wake.ready)
+    }
+}
+
+/// Highest `conn_id` currently in `server.connections` (0 when empty).
+fn newest_conn_id(server: &librtmp2::server::Server) -> u64 {
+    server
+        .connections
+        .iter()
+        .map(|conn| conn.conn_id)
+        .max()
+        .unwrap_or(0)
+}
+
+/// `poll(2)` readiness without the waiter's listener backoff (tests).
+#[cfg(test)]
+fn wait_for_readiness_or_timeout(
+    server: &librtmp2::server::Server,
+    timeout_ms: u64,
+) -> Option<HashSet<u64>> {
+    poll_readiness(server, timeout_ms).map(|wake| wake.ready)
 }
 
 /// Normalize a bind string so passing it to librtmp2 cannot fall back to the
@@ -507,6 +824,27 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
     match submitted {
         Some(Ok(())) => AuthorizationResult::Pending,
         _ => AuthorizationResult::Deny,
+    }
+}
+
+/// Runs `on_close` for a closed connection on the auth worker thread (see
+/// `AuthWorkerHandle::try_submit_close`) instead of inline, in order after
+/// any authorization still queued for the same connection; inline only
+/// when the worker isn't running. With HA clustering
+/// active it stays inline: ownership releases then go through Raft, and
+/// shutdown relies on them finishing before the cluster manager stops.
+fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
+    #[cfg(feature = "cluster")]
+    if rtmp_bridge.cluster_manager().is_some() {
+        rtmp_bridge.on_close(conn_id);
+        return;
+    }
+    let submitted = AUTH_WORKER
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|h| h.try_submit_close(conn_id)));
+    if !matches!(submitted, Some(Ok(()))) {
+        rtmp_bridge.on_close(conn_id);
     }
 }
 
@@ -1049,7 +1387,7 @@ pub(crate) fn process_server_connections(
             conn.relay_key.clear();
             conn.pending_relay.clear();
             tracked.remove(&conn_id);
-            rtmp_bridge.on_close(conn_id);
+            close_conn_off_poll_thread(rtmp_bridge, conn_id);
             clear_publish_generation(conn_id);
         }
         server.connections.remove(idx);
@@ -1392,6 +1730,28 @@ impl ServerApp {
         let sticky_deleted_streams = Arc::clone(&self.sticky_deleted_streams);
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
+        // Periodic publisher/player stats are queued in memory by the RTMP
+        // poll threads and written here in one transaction per interval,
+        // instead of one SQLite transaction per connection per second on
+        // the poll threads themselves (which blocked relay for every
+        // connection on the shard while it ran).
+        let stats_flush_db = Arc::clone(&self.db);
+        let stats_flush_stop = Arc::clone(&rtmp_stop);
+        let stats_flush_thread = std::thread::Builder::new()
+            .name("db-stats-flush".to_string())
+            .spawn(move || {
+                while !stats_flush_stop.load(Ordering::Relaxed) {
+                    for _ in 0..STATS_FLUSH_INTERVAL_TICKS {
+                        if stats_flush_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(STATS_FLUSH_TICK);
+                    }
+                    stats_flush_db.flush_pending_stats();
+                }
+            })
+            .map_err(|e| format!("failed to spawn stats flush thread: {e}"))?;
+        let final_stats_flush_db = Arc::clone(&self.db);
         let media_export_bytes = if media_output_config.needs_relay_export() {
             media_output_config.export_buffer_bytes()
         } else {
@@ -1415,10 +1775,20 @@ impl ServerApp {
         #[cfg(not(feature = "cluster"))]
         let relay_export_bytes = media_export_bytes;
 
+        let per_addr_caps_configured = rtmp_max_connections_per_addr != i32::MAX
+            || self.config.rtmp_max_pending_tls_per_addr != i32::MAX;
         #[cfg(feature = "cluster")]
-        let n_shards = resolve_shard_count(media_output_config.enabled(), cluster_enabled);
+        let n_shards = resolve_shard_count(
+            media_output_config.enabled(),
+            cluster_enabled,
+            per_addr_caps_configured,
+        );
         #[cfg(not(feature = "cluster"))]
-        let n_shards = resolve_shard_count(media_output_config.enabled(), false);
+        let n_shards = resolve_shard_count(
+            media_output_config.enabled(),
+            false,
+            per_addr_caps_configured,
+        );
         // Never shard past the configured connection cap: `rtmp_max_conn` is
         // always >= 1 (see `parse_max_connections`), so this also guarantees
         // `per_shard_max_conn` below floors to at least 1 without needing to
@@ -1429,8 +1799,8 @@ impl ServerApp {
         if n_shards > 1 {
             crate::log_info!("RTMP sharding enabled: {n_shards} worker threads");
         }
-        let base_per_shard_max_conn = rtmp_max_conn / n_shards as i32;
-        let max_conn_remainder = rtmp_max_conn as usize % n_shards;
+        let shard_conn_counts: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..n_shards).map(|_| AtomicUsize::new(0)).collect());
         // At n_shards > 1 relay export must always be on (cross-shard relay
         // depends on it, regardless of media outputs/clustering), sized
         // generously since it's now also the sole path getting frames to
@@ -1450,8 +1820,29 @@ impl ServerApp {
         if let Ok(mut guard) = RTMP_BRIDGE.lock() {
             *guard = Some(Arc::clone(&rtmp_bridge));
         }
+        // One wake fd per shard: whoever delivers that shard's auth
+        // completions signals it, so the shard's poll loop picks a
+        // publish/play decision up at once instead of on its next tick.
+        let shard_wakes: Vec<Option<Arc<WakeFd>>> = (0..n_shards)
+            .map(|_| match WakeFd::new() {
+                Ok(wake) => Some(Arc::new(wake)),
+                Err(e) => {
+                    crate::log_warn!("RTMP: auth wake fd unavailable ({e}); using poll ticks");
+                    None
+                }
+            })
+            .collect();
+        let worker_wake = if n_shards == 1 {
+            shard_wakes[0].clone()
+        } else {
+            None
+        };
         let (auth_worker_handle, auth_completions_rx) =
-            auth_worker::spawn(Arc::clone(&rtmp_bridge));
+            auth_worker::spawn_with_notify(Arc::clone(&rtmp_bridge), move || {
+                if let Some(wake) = &worker_wake {
+                    wake.signal();
+                }
+            });
         if let Ok(mut guard) = AUTH_WORKER.lock() {
             *guard = Some(auth_worker_handle);
         }
@@ -1475,6 +1866,7 @@ impl ServerApp {
             for (i, rx) in shard_auth_rx_vec.into_iter().enumerate() {
                 shard_auth_rxs[i] = Some(rx);
             }
+            let dispatch_wakes = shard_wakes.clone();
             auth_dispatch_thread = Some(
                 std::thread::Builder::new()
                     .name("rtmp-auth-dispatch".to_string())
@@ -1482,7 +1874,11 @@ impl ServerApp {
                         for completion in auth_completions_rx {
                             let shard =
                                 shard_for_conn_id(completion.conn_id).min(shard_auth_txs.len() - 1);
-                            let _ = shard_auth_txs[shard].send(completion);
+                            if shard_auth_txs[shard].send(completion).is_ok()
+                                && let Some(wake) = &dispatch_wakes[shard]
+                            {
+                                wake.signal();
+                            }
                         }
                     })
                     .expect("failed to spawn auth-completion dispatcher thread"),
@@ -1499,13 +1895,13 @@ impl ServerApp {
         // viewers can land on different shards since SO_REUSEPORT
         // load-balances by connection, not by route (the route isn't known
         // until after the `publish`/`play` command, long after accept).
-        let mut relay_rxs: Vec<Option<std::sync::mpsc::Receiver<librtmp2::RelayFrame>>> =
+        let mut relay_rxs: Vec<Option<std::sync::mpsc::Receiver<ShardRelayMsg>>> =
             (0..n_shards).map(|_| None).collect();
-        let relay_txs: Option<Arc<Vec<std::sync::mpsc::SyncSender<librtmp2::RelayFrame>>>> =
+        let relay_txs: Option<Arc<Vec<std::sync::mpsc::SyncSender<ShardRelayMsg>>>> =
             if n_shards > 1 {
                 let mut txs = Vec::with_capacity(n_shards);
                 for slot in relay_rxs.iter_mut() {
-                    let (tx, rx) = std::sync::mpsc::sync_channel::<librtmp2::RelayFrame>(
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<ShardRelayMsg>(
                         CROSS_SHARD_RELAY_QUEUE_CAPACITY,
                     );
                     txs.push(tx);
@@ -1520,13 +1916,25 @@ impl ServerApp {
         let mut ready_rxs = Vec::with_capacity(n_shards);
         let mut shard_threads = Vec::with_capacity(n_shards);
 
-        for (shard_index, shard_auth_rx) in shard_auth_rxs.into_iter().enumerate() {
+        // Every shard can wake every other one: cross-shard relay frames
+        // land in the receiving shard's inbox and must be fanned out to its
+        // viewers right away, not on that shard's next poll timeout.
+        let all_shard_wakes: Arc<Vec<Option<Arc<WakeFd>>>> = Arc::new(shard_wakes.clone());
+        for (shard_index, (shard_auth_rx, shard_wake)) in
+            shard_auth_rxs.into_iter().zip(shard_wakes).enumerate()
+        {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             ready_rxs.push(ready_rx);
-            let shard_max_connections =
-                base_per_shard_max_conn + i32::from(shard_index < max_conn_remainder);
+            let (shard_max_connections, dynamic_budget) =
+                shard_connection_cap(rtmp_max_conn, n_shards, shard_index, rtmp_tls_enabled);
+            let conn_budget = dynamic_budget.then(|| ShardConnBudget {
+                counts: Arc::clone(&shard_conn_counts),
+                index: shard_index,
+                global: rtmp_max_conn.max(1) as usize,
+            });
             let relay_rx = relay_rxs[shard_index].take();
             let relay_txs = relay_txs.clone();
+            let all_shard_wakes = Arc::clone(&all_shard_wakes);
             let conn_id_base = (n_shards > 1).then(|| 1 + shard_index as u64 * SHARD_ID_SPACE);
             let rtmp_bind = rtmp_bind.clone();
             let rtmps_bind = rtmps_bind.clone();
@@ -1645,6 +2053,12 @@ impl ServerApp {
                     // ready"), `Server::poll` processes every connection, same as
                     // before this readiness-aware path existed.
                     let mut readable: Option<HashSet<u64>> = None;
+                    let mut readiness = ReadinessWaiter::new(shard_wake);
+                    let mut exported_routes = ExportedRoutes::default();
+                    // Route-end notices that didn't fit a full inbox yet:
+                    // (target shard, app, stream_name). Unlike frames these
+                    // must not be dropped, so they're retried every tick.
+                    let mut pending_route_ends: Vec<(usize, String, String)> = Vec::new();
 
                     loop {
                         if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -1676,6 +2090,9 @@ impl ServerApp {
                                 HashMap::new()
                             };
 
+                        if let Some(budget) = &conn_budget {
+                            budget.before_poll(&mut server);
+                        }
                         set_rtmp_poll_server(&mut server);
                         let poll_result = match &readable {
                             Some(r) => server.poll_ready(0, r),
@@ -1685,6 +2102,9 @@ impl ServerApp {
                         if let Err(e) = poll_result {
                             crate::log_warn!("RTMP polling stopped: {e}");
                             break;
+                        }
+                        if let Some(budget) = &conn_budget {
+                            budget.after_poll(&mut server, &rtmp_bridge);
                         }
 
                         let deleted_now: HashSet<String> =
@@ -1775,24 +2195,68 @@ impl ServerApp {
                         // this shard's poll tick blocking on a slow/stuck peer, which
                         // would stall every connection on *this* shard too.
                         if let Some(txs) = relay_txs.as_ref() {
+                            exported_routes.record(&exported_frames);
+                            let publishing: HashSet<u64> = server
+                                .connections
+                                .iter()
+                                .filter(|c| c.state == librtmp2::types::ConnState::Publishing)
+                                .map(|c| c.conn_id)
+                                .collect();
+                            for (app, stream_name) in exported_routes.take_ended(&publishing) {
+                                for i in (0..txs.len()).filter(|&i| i != shard_index) {
+                                    pending_route_ends.push((i, app.clone(), stream_name.clone()));
+                                }
+                            }
                             for (i, tx) in txs.iter().enumerate() {
                                 if i == shard_index {
                                     continue;
                                 }
+                                let mut sent = false;
                                 for frame in &exported_frames {
-                                    let _ = tx.try_send(frame.clone());
+                                    sent |=
+                                        tx.try_send(ShardRelayMsg::Frame(frame.clone())).is_ok();
+                                }
+                                // After this tick's frames, so the route is
+                                // released only once its last frames are in.
+                                pending_route_ends.retain(|(target, app, stream_name)| {
+                                    if *target != i {
+                                        return true;
+                                    }
+                                    let msg = ShardRelayMsg::RouteEnded {
+                                        app: app.clone(),
+                                        stream_name: stream_name.clone(),
+                                    };
+                                    let queued = tx.try_send(msg).is_ok();
+                                    sent |= queued;
+                                    !queued
+                                });
+                                if sent && let Some(wake) = &all_shard_wakes[i] {
+                                    wake.signal();
                                 }
                             }
                         }
+                        // Frames injected here are only fanned out to this
+                        // shard's viewers inside the next `server.poll`, so
+                        // re-poll immediately (below) rather than holding them
+                        // for a tick.
+                        let mut injected_relay = false;
                         if let Some(rx) = relay_rx.as_ref() {
-                            while let Ok(frame) = rx.try_recv() {
-                                let _ = server.inject_relay_frame(
-                                    &frame.app,
-                                    &frame.stream_name,
-                                    frame.frame_type,
-                                    frame.timestamp,
-                                    &frame.payload,
-                                );
+                            while let Ok(msg) = rx.try_recv() {
+                                injected_relay = true;
+                                match msg {
+                                    ShardRelayMsg::Frame(frame) => {
+                                        let _ = server.inject_relay_frame(
+                                            &frame.app,
+                                            &frame.stream_name,
+                                            frame.frame_type,
+                                            frame.timestamp,
+                                            &frame.payload,
+                                        );
+                                    }
+                                    ShardRelayMsg::RouteEnded { app, stream_name } => {
+                                        server.release_injected_route(&app, &stream_name);
+                                    }
+                                }
                             }
                         }
 
@@ -1864,9 +2328,9 @@ impl ServerApp {
                             .copied()
                             .filter(|id| !current_ids.contains(id))
                             .collect();
-                        for conn_id in closed_ids {
+                        for &conn_id in &closed_ids {
                             tracked.remove(&conn_id);
-                            rtmp_bridge.on_close(conn_id);
+                            close_conn_off_poll_thread(&rtmp_bridge, conn_id);
                             clear_publish_generation(conn_id);
                         }
 
@@ -1882,14 +2346,17 @@ impl ServerApp {
                         let touched: Vec<u64> =
                             RTMP_POLL_TOUCHED_CONNS.with(|set| set.borrow_mut().drain().collect());
                         for conn_id in touched {
-                            if current_ids.contains(&conn_id)
+                            // Closed just above: its (possibly still queued)
+                            // on_close is already on the way.
+                            if closed_ids.contains(&conn_id)
+                                || current_ids.contains(&conn_id)
                                 || (!rtmp_bridge.is_registered(conn_id)
                                     && !rtmp_bridge.has_publisher(conn_id)
                                     && !rtmp_bridge.has_player(conn_id))
                             {
                                 continue;
                             }
-                            rtmp_bridge.on_close(conn_id);
+                            close_conn_off_poll_thread(&rtmp_bridge, conn_id);
                             clear_publish_generation(conn_id);
                         }
 
@@ -1937,12 +2404,21 @@ impl ServerApp {
                         }
 
                         let negotiating = any_negotiating(&tracked);
-                        let poll_interval_ms = if negotiating || just_authorized {
+                        // An authorization applied this tick (e.g. a play just
+                        // got Play.Start) has follow-up work that only runs
+                        // inside the next `server.poll`: replaying the cached
+                        // codec headers and keyframe to the new player. Its
+                        // reply is usually flushed already, so nothing would
+                        // wake the wait early -- re-poll immediately instead of
+                        // sleeping a tick before the viewer's first frame.
+                        let poll_interval_ms = if just_authorized || injected_relay {
+                            0
+                        } else if negotiating {
                             POLL_INTERVAL_FAST_MS
                         } else {
                             POLL_INTERVAL_MS
                         };
-                        readable = wait_for_readiness_or_timeout(&server, poll_interval_ms);
+                        readable = readiness.wait(&server, poll_interval_ms);
                     }
 
                     media_outputs.stop_all();
@@ -2048,6 +2524,9 @@ impl ServerApp {
             let _ = shard_thread.join();
         }
         crate::log_info!("RTMP shard threads joined.");
+        let _ = stats_flush_thread.join();
+        // Stats the shards queued while shutting down.
+        final_stats_flush_db.flush_pending_stats();
         #[cfg(feature = "cluster")]
         if let Some(mgr) = coordinator.cluster_manager() {
             mgr.shutdown_blocking();
@@ -2084,10 +2563,11 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, any_negotiating, bind_rtmp_listener_set,
-        bind_with_default_port, drain_auth_completions, drain_deleted_stream_roles,
-        eviction_stream_id, ipv6_wildcard_for, live_stream_ids_for_deleted_markers,
-        should_evict_idle_conn, wait_for_readiness_or_timeout,
+        AUTH_COMPLETIONS_RX, ReadinessSource, ReadinessWaiter, ServerApp, TrackedConn,
+        any_negotiating, bind_rtmp_listener_set, bind_with_default_port, drain_auth_completions,
+        drain_deleted_stream_roles, eviction_stream_id, ipv6_wildcard_for,
+        live_stream_ids_for_deleted_markers, newest_conn_id, should_evict_idle_conn,
+        wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -2210,21 +2690,357 @@ mod tests {
         server
     }
 
-    #[test]
-    fn listener_only_readiness_takes_the_bounded_sleep() {
+    /// A listener-only wake returns at once (so the connection is accepted
+    /// without delay); a repeat with no accept in between backs off.
+    fn assert_listener_backoff(mut waiter: ReadinessWaiter) {
         let port = free_local_port();
         let server = listening_rtmp_server(0, port);
         let _pending = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
         let start = Instant::now();
-        let ready = wait_for_readiness_or_timeout(&server, 50);
+        assert_eq!(waiter.wait(&server, 50).map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "a new connection must not wait out a backoff before accept"
+        );
 
-        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        // Not accepted (nothing polled the server): still readable.
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 50).map(|ids| ids.len()), Some(0));
         assert!(
             start.elapsed() >= Duration::from_millis(5),
             "an unserviceable listener must not turn the wait into a busy loop"
         );
+    }
+
+    #[test]
+    fn shard_count_defaults_to_cpus_only_where_behaviour_is_unchanged() {
+        use super::shard_count_for;
+        // Unset: CPUs, capped.
+        assert_eq!(shard_count_for(None, 2, false, false, false), 2);
+        assert_eq!(shard_count_for(None, 16, false, false, false), 4);
+        assert_eq!(shard_count_for(None, 1, false, false, false), 1);
+        // Features that aren't shard-aware, or per-address caps, keep one.
+        assert_eq!(shard_count_for(None, 8, true, false, false), 1);
+        assert_eq!(shard_count_for(None, 8, false, true, false), 1);
+        assert_eq!(shard_count_for(None, 8, false, false, true), 1);
+        // Explicit setting wins (clamped), except where sharding can't work.
+        assert_eq!(shard_count_for(Some(1), 8, false, false, false), 1);
+        assert_eq!(shard_count_for(Some(6), 2, false, false, true), 6);
+        assert_eq!(shard_count_for(Some(1000), 2, false, false, false), 32);
+        assert_eq!(shard_count_for(Some(4), 8, true, false, false), 1);
+    }
+
+    #[test]
+    fn exported_routes_end_when_their_publisher_stops() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        routes.record(&[
+            frame(1, "a"),
+            frame(2, "b"),
+            // Injected from another shard: never announced back.
+            frame(1 << 63 | 5, "c"),
+        ]);
+        assert!(routes.take_ended(&HashSet::from([1, 2])).is_empty());
+        // Publisher 2 disconnected: only its route ends, and only once.
+        assert_eq!(
+            routes.take_ended(&HashSet::from([1])),
+            vec![("live".to_string(), "b".to_string())]
+        );
+        assert!(routes.take_ended(&HashSet::from([1])).is_empty());
+        let mut ended = routes.take_ended(&HashSet::new());
+        ended.sort();
+        assert_eq!(ended, vec![("live".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn tls_shards_split_the_connection_cap_statically() {
+        use super::shard_connection_cap;
+        // Single shard: the cap as configured, no budget.
+        assert_eq!(shard_connection_cap(10, 1, 0, true), (10, false));
+        assert_eq!(shard_connection_cap(10, 1, 0, false), (10, false));
+        // Plaintext: full cap per shard, narrowed by the per-tick budget.
+        assert_eq!(shard_connection_cap(10, 4, 3, false), (10, true));
+        // RTMPS: fixed shares that add up to exactly the global cap, since
+        // pending TLS handshakes are invisible to the other shards.
+        let shares: Vec<i32> = (0..4)
+            .map(|i| shard_connection_cap(10, 4, i, true).0)
+            .collect();
+        assert_eq!(shares, vec![3, 3, 2, 2]);
+        assert_eq!(shares.iter().sum::<i32>(), 10);
+        assert!((0..4).all(|i| !shard_connection_cap(10, 4, i, true).1));
+        let shares: Vec<i32> = (0..4)
+            .map(|i| shard_connection_cap(4, 4, i, true).0)
+            .collect();
+        assert_eq!(shares, vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn shard_conn_budget_keeps_the_global_cap_exact() {
+        use super::ShardConnBudget;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counts: Arc<Vec<AtomicUsize>> = Arc::new((0..2).map(|_| AtomicUsize::new(0)).collect());
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
+        let budget = ShardConnBudget {
+            counts: Arc::clone(&counts),
+            index: 0,
+            global: 3,
+        };
+        let mut server = unbound_rtmp_server(3);
+
+        // The other shard holds 2: this one may take only 1 more.
+        counts[1].store(2, Ordering::Relaxed);
+        budget.before_poll(&mut server);
+        assert_eq!(server.config.max_connections, 1);
+
+        // Both shards accepted at once and overshot: this shard now has 3
+        // new connections, 5 in total. The 2 newest are closed.
+        for id in 1..=3u64 {
+            let mut conn = librtmp2::session::conn::Conn::new();
+            conn.conn_id = id;
+            conn.client_fd = 1000 + id as i32;
+            server.connections.push(conn);
+        }
+        budget.after_poll(&mut server, &bridge);
+        let open: Vec<u64> = server
+            .connections
+            .iter()
+            .filter(|c| c.client_fd >= 0)
+            .map(|c| c.conn_id)
+            .collect();
+        assert_eq!(open, vec![1]);
+        assert_eq!(counts[0].load(Ordering::Relaxed), 1);
+
+        // Everything else full: librtmp2's 0 means unlimited, so the cap
+        // floors at 1 and relies on the trim above.
+        counts[1].store(3, Ordering::Relaxed);
+        budget.before_poll(&mut server);
+        assert_eq!(server.config.max_connections, 1);
+    }
+
+    #[test]
+    fn listener_backoff_counts_accepts_even_when_closes_keep_the_count_flat() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = ReadinessWaiter::with_source(ReadinessSource::Poll);
+        let first = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+
+        let _second = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(waiter.wait(&server, 50).map(|r| r.len()), Some(0));
+
+        // Accept the second connection and reap the first, so the count is
+        // back to 1 even though an accept happened.
+        drop(first);
+        for _ in 0..200 {
+            server.poll(0).unwrap();
+            if server.connections.len() == 1 && newest_conn_id(&server) > 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server.connections.len(), 1);
+
+        let _third = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 50).map(|r| r.len()), Some(0));
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "an accept since the last listener-only wake must not trigger the backoff"
+        );
+    }
+
+    #[test]
+    fn listener_only_readiness_backs_off_only_without_accept_progress() {
+        assert_listener_backoff(ReadinessWaiter::with_source(ReadinessSource::Poll));
+    }
+
+    #[test]
+    fn pending_outbound_bytes_wake_the_wait_on_writability() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        for _ in 0..50 {
+            server.poll(0).unwrap();
+            if !server.connections.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server.connections.len(), 1);
+
+        // Nothing queued and nothing to read: the wait honors its timeout.
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 100);
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+
+        // Queued outbound bytes on a writable socket must end the wait
+        // right away so they get flushed, without marking the connection
+        // recv-ready (it sent nothing).
+        server.connections[0]
+            .send_buffer
+            .write(b"queued media")
+            .unwrap();
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 1000);
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a writable connection with queued bytes must not wait out the poll interval"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn epoll_waiter() -> ReadinessWaiter {
+        let waiter = ReadinessWaiter::new(None);
+        assert!(matches!(waiter.source, ReadinessSource::Epoll(_)));
+        waiter
+    }
+
+    fn accept_one(server: &mut librtmp2::server::Server) {
+        let before = server.connections.len();
+        for _ in 0..200 {
+            server.poll(0).unwrap();
+            if server.connections.len() > before {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("connection was not accepted");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_reports_readable_connections_and_honors_timeout() {
+        use std::io::Write;
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = epoll_waiter();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+        let conn_id = server.connections[0].conn_id;
+
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 100).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+
+        client.write_all(&[3u8]).unwrap();
+        let start = Instant::now();
+        let ready = waiter.wait(&server, 1000).unwrap();
+        assert!(ready.contains(&conn_id));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_wakes_on_writability_only_while_bytes_are_queued() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = epoll_waiter();
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+
+        server.connections[0]
+            .send_buffer
+            .write(b"queued media")
+            .unwrap();
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 1000).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() < Duration::from_millis(500));
+
+        // Drained again: EPOLLOUT interest must be dropped, or a writable
+        // idle socket would spin the loop.
+        let queued = server.connections[0].send_buffer.available();
+        server.connections[0].send_buffer.drain(queued);
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 100).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_tracks_connections_replaced_on_a_reused_fd() {
+        use std::io::Write;
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = epoll_waiter();
+        let first = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+        let old_fd = server.connections[0].client_fd;
+        assert_eq!(waiter.wait(&server, 20).map(|r| r.len()), Some(0));
+
+        // Close the first connection server-side, then accept a second one,
+        // which the kernel typically hands the same fd number.
+        drop(first);
+        for _ in 0..200 {
+            server.poll(0).unwrap();
+            if server.connections.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(server.connections.is_empty());
+        let mut second = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+        let new_conn = &server.connections[0];
+        let (new_fd, new_id) = (new_conn.client_fd, new_conn.conn_id);
+
+        second.write_all(&[3u8]).unwrap();
+        let ready = waiter.wait(&server, 1000).unwrap();
+        assert!(
+            ready.contains(&new_id),
+            "fd {new_fd} (previously {old_fd}) must report the new connection's id"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_listener_only_readiness_backs_off_only_without_accept_progress() {
+        assert_listener_backoff(epoll_waiter());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wake_fd_cuts_the_wait_short_and_rearms() {
+        let port = free_local_port();
+        let server = listening_rtmp_server(0, port);
+        let wake = Arc::new(super::WakeFd::new().unwrap());
+        let mut waiter = ReadinessWaiter::new(Some(Arc::clone(&wake)));
+        assert!(matches!(waiter.source, ReadinessSource::Epoll(_)));
+
+        let signaller = Arc::clone(&wake);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            signaller.signal();
+        });
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 2000).map(|r| r.len()), Some(0));
+        let woke_after = start.elapsed();
+        t.join().unwrap();
+        assert!(
+            woke_after < Duration::from_millis(1000),
+            "a signal must end the wait early, took {woke_after:?}"
+        );
+
+        // Drained: with no new signal the next wait honors its timeout.
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 100).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]
