@@ -51,6 +51,21 @@ begin at `1.0.0`.
   benchmark box, on par with MediaMTX (~0.8 ms) and LiveForge (~0.7 ms)
   even though this server also authenticates every publish against SQLite.
 
+- Closing a connection no longer writes to SQLite on the RTMP poll thread.
+  `on_close` (deactivating the connection's publisher/player rows) now runs
+  on the auth worker, through the same FIFO queue as publish/play
+  authorization, so a release is still applied before any later
+  authorization on the same stream. Each close used to stall the poll loop
+  for every connection on the shard while it waited for the shared SQLite
+  connection, which showed up whenever many clients disconnected at once.
+  Falls back to the inline call when the queue is full, and stays inline
+  with HA clustering active (Raft ownership releases must finish before
+  shutdown). Concurrent connect+publish (30 parallel) improved from ~9.5 ms
+  to ~8.2 ms on average (p50 7.4 -> 6.1 ms).
+- The listener backoff added above now detects accept progress by the newest
+  connection id instead of the connection count, which stayed flat (and
+  triggered a needless 10 ms sleep) when accepts and closes cancelled out.
+
 ### Fixed
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate

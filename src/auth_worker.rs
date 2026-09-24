@@ -48,6 +48,14 @@ struct AuthRequest {
     stream_key: String,
 }
 
+/// Work items for the worker thread, processed strictly in submission order.
+enum Job {
+    Authorize(AuthRequest),
+    /// Run `on_close` (deactivating the connection's publisher/player rows)
+    /// for a connection the RTMP poll loop saw close.
+    Close(u64),
+}
+
 /// Result of a completed authorization request. Produced by the worker
 /// thread, drained by the RTMP poll loop once per tick (see
 /// [`drain_completions`]) and applied via `Server::complete_publish_authorization`/
@@ -63,7 +71,7 @@ pub struct AuthCompletion {
 /// queue and worker thread.
 #[derive(Clone)]
 pub struct AuthWorkerHandle {
-    tx: SyncSender<AuthRequest>,
+    tx: SyncSender<Job>,
 }
 
 impl AuthWorkerHandle {
@@ -81,12 +89,12 @@ impl AuthWorkerHandle {
         stream_key: &str,
     ) -> Result<(), ()> {
         self.tx
-            .try_send(AuthRequest {
+            .try_send(Job::Authorize(AuthRequest {
                 kind,
                 conn_id,
                 app: app.to_string(),
                 stream_key: stream_key.to_string(),
-            })
+            }))
             .map_err(|e| {
                 match e {
                     TrySendError::Full(_) => crate::log_warn!(
@@ -97,6 +105,23 @@ impl AuthWorkerHandle {
                     ),
                 }
             })
+    }
+}
+
+impl AuthWorkerHandle {
+    /// Queues `on_close` for a closed connection on the worker thread, so its
+    /// SQLite deactivation writes neither run on nor block the RTMP poll
+    /// thread (they used to, stalling every other connection on the shard
+    /// once per close -- noticeable whenever many viewers leave at once).
+    ///
+    /// Because it shares the authorization queue, the release is always
+    /// applied before any publish/play authorization submitted after it --
+    /// the same ordering the old inline call gave. Returns `Err(())` when
+    /// the queue is full or the worker is gone; the caller must then run
+    /// `on_close` itself so a release is never lost.
+    #[allow(clippy::result_unit_err)]
+    pub fn try_submit_close(&self, conn_id: u64) -> Result<(), ()> {
+        self.tx.try_send(Job::Close(conn_id)).map_err(|_| ())
     }
 }
 
@@ -115,7 +140,7 @@ pub fn spawn_with_notify(
     bridge: Arc<DbRtmpBridge>,
     notify: impl Fn() + Send + 'static,
 ) -> (AuthWorkerHandle, Receiver<AuthCompletion>) {
-    let (req_tx, req_rx) = sync_channel::<AuthRequest>(AUTH_QUEUE_CAPACITY);
+    let (req_tx, req_rx) = sync_channel::<Job>(AUTH_QUEUE_CAPACITY);
     let (completion_tx, completion_rx) = sync_channel::<AuthCompletion>(AUTH_QUEUE_CAPACITY);
 
     std::thread::Builder::new()
@@ -123,7 +148,14 @@ pub fn spawn_with_notify(
         .spawn(move || {
             // Blocks between requests -- no busy loop -- and exits cleanly
             // once every `AuthWorkerHandle` (and `req_tx`) is dropped.
-            for req in req_rx {
+            for job in req_rx {
+                let req = match job {
+                    Job::Authorize(req) => req,
+                    Job::Close(conn_id) => {
+                        bridge.on_close(conn_id);
+                        continue;
+                    }
+                };
                 let allow = match req.kind {
                     AuthKind::Publish => bridge
                         .authorize_publish(req.conn_id, &req.app, &req.stream_key)
@@ -185,6 +217,50 @@ mod tests {
         assert_eq!(completion.conn_id, 1);
         assert_eq!(completion.kind, AuthKind::Publish);
         assert!(!completion.allow);
+    }
+
+    #[test]
+    fn queued_close_is_applied_before_a_later_authorization() {
+        use crate::db::Stream;
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = Stream {
+            id: "s1".to_string(),
+            name: "S".to_string(),
+            app: "live".to_string(),
+            publish_key: crate::keygen::keygen_stream_key("pub_").unwrap(),
+            play_key: crate::keygen::keygen_stream_key("play_").unwrap(),
+            stats_key: crate::keygen::keygen_stream_key("stats_").unwrap(),
+            enabled: true,
+            ..Default::default()
+        };
+        db.stream_add(&s).unwrap();
+        let deleted = Arc::new(Mutex::new(HashSet::new()));
+        let bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db), deleted));
+        bridge.set_coordinator(Arc::new(StateCoordinator::standalone(Arc::clone(&db))));
+        let (handle, rx) = spawn(Arc::clone(&bridge));
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        handle
+            .try_submit(AuthKind::Publish, 1, "live", &s.publish_key)
+            .unwrap();
+        assert!(recv_within(&rx, Duration::from_secs(2)).unwrap().allow);
+        assert_eq!(db.publisher_list(Some("s1")).len(), 1);
+
+        // The first publisher's connection closes and a new one publishes
+        // the same stream right away: the queued close must release the
+        // single-publisher slot before the new authorization runs.
+        handle.try_submit_close(1).unwrap();
+        bridge.on_connect(2, "127.0.0.1:1001");
+        handle
+            .try_submit(AuthKind::Publish, 2, "live", &s.publish_key)
+            .unwrap();
+        let completion = recv_within(&rx, Duration::from_secs(2)).unwrap();
+        assert_eq!(completion.conn_id, 2);
+        assert!(
+            completion.allow,
+            "release must be ordered before the re-publish"
+        );
+        assert!(!bridge.is_registered(1));
     }
 
     #[test]

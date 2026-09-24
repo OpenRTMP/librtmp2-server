@@ -356,9 +356,12 @@ impl WakeFd {
 
 struct ReadinessWaiter {
     source: ReadinessSource,
-    /// `server.connections.len()` when the previous wait returned with only
-    /// a listener ready, or `None` if it didn't.
-    listener_only_at: Option<usize>,
+    /// Newest `conn_id` among `server.connections` when the previous wait
+    /// returned with only a listener ready, or `None` if it didn't.
+    /// Connection ids are allocated in increasing order, so a newer id
+    /// means an accept happened in between -- unlike the connection count,
+    /// which stays flat when accepts and closes cancel out under churn.
+    listener_only_at: Option<u64>,
 }
 
 enum ReadinessSource {
@@ -415,16 +418,26 @@ impl ReadinessWaiter {
             return None;
         };
         if wake.ready.is_empty() && wake.listener_ready {
-            let conns = server.connections.len();
-            if self.listener_only_at == Some(conns) {
+            let newest = newest_conn_id(server);
+            if self.listener_only_at == Some(newest) {
                 std::thread::sleep(Duration::from_millis(timeout_ms.min(10)));
             }
-            self.listener_only_at = Some(conns);
+            self.listener_only_at = Some(newest);
         } else {
             self.listener_only_at = None;
         }
         Some(wake.ready)
     }
+}
+
+/// Highest `conn_id` currently in `server.connections` (0 when empty).
+fn newest_conn_id(server: &librtmp2::server::Server) -> u64 {
+    server
+        .connections
+        .iter()
+        .map(|conn| conn.conn_id)
+        .max()
+        .unwrap_or(0)
 }
 
 /// `poll(2)` readiness without the waiter's listener backoff (tests).
@@ -632,6 +645,26 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
     match submitted {
         Some(Ok(())) => AuthorizationResult::Pending,
         _ => AuthorizationResult::Deny,
+    }
+}
+
+/// Runs `on_close` for a closed connection on the auth worker thread (see
+/// `AuthWorkerHandle::try_submit_close`) instead of inline, falling back to
+/// inline when the worker queue is full or unavailable. With HA clustering
+/// active it stays inline: ownership releases then go through Raft, and
+/// shutdown relies on them finishing before the cluster manager stops.
+fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
+    #[cfg(feature = "cluster")]
+    if rtmp_bridge.cluster_manager().is_some() {
+        rtmp_bridge.on_close(conn_id);
+        return;
+    }
+    let submitted = AUTH_WORKER
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|h| h.try_submit_close(conn_id)));
+    if !matches!(submitted, Some(Ok(()))) {
+        rtmp_bridge.on_close(conn_id);
     }
 }
 
@@ -1174,7 +1207,7 @@ pub(crate) fn process_server_connections(
             conn.relay_key.clear();
             conn.pending_relay.clear();
             tracked.remove(&conn_id);
-            rtmp_bridge.on_close(conn_id);
+            close_conn_off_poll_thread(rtmp_bridge, conn_id);
             clear_publish_generation(conn_id);
         }
         server.connections.remove(idx);
@@ -2040,9 +2073,9 @@ impl ServerApp {
                             .copied()
                             .filter(|id| !current_ids.contains(id))
                             .collect();
-                        for conn_id in closed_ids {
+                        for &conn_id in &closed_ids {
                             tracked.remove(&conn_id);
-                            rtmp_bridge.on_close(conn_id);
+                            close_conn_off_poll_thread(&rtmp_bridge, conn_id);
                             clear_publish_generation(conn_id);
                         }
 
@@ -2058,14 +2091,17 @@ impl ServerApp {
                         let touched: Vec<u64> =
                             RTMP_POLL_TOUCHED_CONNS.with(|set| set.borrow_mut().drain().collect());
                         for conn_id in touched {
-                            if current_ids.contains(&conn_id)
+                            // Closed just above: its (possibly still queued)
+                            // on_close is already on the way.
+                            if closed_ids.contains(&conn_id)
+                                || current_ids.contains(&conn_id)
                                 || (!rtmp_bridge.is_registered(conn_id)
                                     && !rtmp_bridge.has_publisher(conn_id)
                                     && !rtmp_bridge.has_player(conn_id))
                             {
                                 continue;
                             }
-                            rtmp_bridge.on_close(conn_id);
+                            close_conn_off_poll_thread(&rtmp_bridge, conn_id);
                             clear_publish_generation(conn_id);
                         }
 
@@ -2266,7 +2302,8 @@ mod tests {
         AUTH_COMPLETIONS_RX, ReadinessSource, ReadinessWaiter, ServerApp, TrackedConn,
         any_negotiating, bind_rtmp_listener_set, bind_with_default_port, drain_auth_completions,
         drain_deleted_stream_roles, eviction_stream_id, ipv6_wildcard_for,
-        live_stream_ids_for_deleted_markers, should_evict_idle_conn, wait_for_readiness_or_timeout,
+        live_stream_ids_for_deleted_markers, newest_conn_id, should_evict_idle_conn,
+        wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -2410,6 +2447,40 @@ mod tests {
         assert!(
             start.elapsed() >= Duration::from_millis(5),
             "an unserviceable listener must not turn the wait into a busy loop"
+        );
+    }
+
+    #[test]
+    fn listener_backoff_counts_accepts_even_when_closes_keep_the_count_flat() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let mut waiter = ReadinessWaiter::with_source(ReadinessSource::Poll);
+        let first = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+
+        let _second = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(waiter.wait(&server, 50).map(|r| r.len()), Some(0));
+
+        // Accept the second connection and reap the first, so the count is
+        // back to 1 even though an accept happened.
+        drop(first);
+        for _ in 0..200 {
+            server.poll(0).unwrap();
+            if server.connections.len() == 1 && newest_conn_id(&server) > 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server.connections.len(), 1);
+
+        let _third = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 50).map(|r| r.len()), Some(0));
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "an accept since the last listener-only wake must not trigger the backoff"
         );
     }
 
