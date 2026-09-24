@@ -13,7 +13,7 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
-## [0.5.0] — 2026-09-24
+## [0.5.0] — 2026-09-25
 
 ### Changed
 - Package version `0.4.3` → `0.5.0` (RTMP connections are now sharded across

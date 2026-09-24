@@ -122,7 +122,7 @@ Full commands, including exact server configs, are in
 - CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
 - rustc 1.95.0, g++ 13.3.0, ffmpeg 6.1.1
-- Date: 2026-09-24
+- Date: 2026-09-25
 
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
