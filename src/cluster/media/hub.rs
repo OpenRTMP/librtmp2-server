@@ -1130,3 +1130,37 @@ fn parse_subscribe_denied(message: &str) -> Option<(String, String)> {
     }
     Some((app.to_string(), stream.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn subscribe_remote_with_unlearned_owner_addr_keeps_refcount_without_dialing() {
+        let hub = MediaHub::new(
+            1,
+            "test-cluster-secret-32-chars-min--".to_string(),
+            8,
+            1,
+            Arc::new(OwnershipTracker::new()),
+            InjectQueue::new(8),
+            None,
+            None,
+            Arc::new(|_: NodeId| true),
+        );
+
+        hub.subscribe_remote("", 2, "live", "s1", 0).await;
+
+        assert_eq!(
+            hub.subscribed_nodes_for("live", "s1"),
+            vec![2],
+            "a subscription registered before the owner address is learned must \
+             survive so a later connect_peer resubscribes it"
+        );
+        assert_eq!(
+            hub.peer_count(),
+            0,
+            "no media peer may be spawned for an empty owner address"
+        );
+    }
+}

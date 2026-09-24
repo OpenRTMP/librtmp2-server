@@ -2557,6 +2557,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_player_with_another_remaining_inserts_a_revocation_marker() {
+        let state = test_state("a-strong-random-secret-value");
+        let app = router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"id":"revoketest"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let mut player_ids = Vec::new();
+        for name in ["Guest A", "Guest B"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/streams/revoketest/players")
+                        .header("Authorization", "Bearer a-strong-random-secret-value")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(r#"{{"name":"{name}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            player_ids.push(json["id"].as_str().unwrap().to_string());
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/v1/streams/revoketest/players/{}",
+                        player_ids[0]
+                    ))
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state.revoked_viewers.lock().contains_key(&player_ids[0]),
+            "a successful revocation must leave a marker so live RTMP sessions \
+             are kicked"
+        );
+    }
+
+    #[tokio::test]
     async fn create_and_list_stream_with_valid_token() {
         let state = test_state("a-strong-random-secret-value");
         let app = router(state.clone());

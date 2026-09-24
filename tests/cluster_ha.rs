@@ -97,6 +97,48 @@ async fn start_joiner(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_style_recovery_relearns_peer_media_addrs() {
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let join = n1.config.advertise_control();
+    let (n2, _d2) = start_joiner(&n1, 2, join).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let media2 = n2
+        .config
+        .media_advertise_addr
+        .clone()
+        .expect("joiner advertises a media address");
+    assert_eq!(
+        n1.meta().get(2).map(|(_, media)| media).unwrap_or_default(),
+        media2,
+        "bootstrap node must know the joiner's media address while both are live"
+    );
+
+    // Simulate a plaintext restart: topology is restored from Raft membership
+    // with control addresses only, so peer media addresses are missing.
+    n1.meta()
+        .set_addrs(2, n2.config.advertise_control(), String::new());
+    assert!(
+        n1.meta()
+            .get(2)
+            .map(|(_, media)| media)
+            .unwrap_or_default()
+            .is_empty()
+    );
+
+    n1.recover_missing_media_addrs_for_test().await;
+
+    assert_eq!(
+        n1.meta().get(2).map(|(_, media)| media).unwrap_or_default(),
+        media2,
+        "recovery must relearn the peer media address from a topology refresh"
+    );
+    let _ = n2;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_bootstrap_and_leader() {
     let (n1, _d1) = start_node(1, true, None, String::new()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;

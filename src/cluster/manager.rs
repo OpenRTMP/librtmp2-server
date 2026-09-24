@@ -1651,6 +1651,12 @@ impl ClusterManager {
         }
     }
 
+    /// Test-only entry point for the restart media-address recovery path.
+    #[cfg(feature = "test-support")]
+    pub async fn recover_missing_media_addrs_for_test(&self) {
+        self.recover_missing_media_addrs().await;
+    }
+
     /// Sum active play sessions for `viewer_id` across peers (excludes local).
     pub fn remote_viewer_session_count_cached(&self, viewer_id: &str) -> u64 {
         let counts = self.peer_viewer_players.lock();

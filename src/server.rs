@@ -1970,7 +1970,7 @@ mod tests {
     use super::{
         AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, any_negotiating, bind_with_default_port,
         drain_auth_completions, drain_deleted_stream_roles, eviction_stream_id,
-        live_stream_ids_for_deleted_markers, should_evict_idle_conn,
+        live_stream_ids_for_deleted_markers, should_evict_idle_conn, wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -2064,6 +2064,70 @@ mod tests {
             !any_negotiating(&tracked),
             "a fully settled publish+play connection with no pending first \
              frame must let the poll loop fall back to the slow interval"
+        );
+    }
+
+    fn free_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn listening_rtmp_server(max_connections: i32, port: u16) -> librtmp2::server::Server {
+        let cfg = librtmp2::types::ServerConfig {
+            max_connections,
+            chunk_size: 4096,
+            tls_enabled: 0,
+            tls_cert_file: std::ptr::null(),
+            tls_key_file: std::ptr::null(),
+            tls_ca_file: std::ptr::null(),
+            tls_insecure: 0,
+            max_pending_tls_per_addr: i32::MAX,
+            max_connections_per_addr: i32::MAX,
+        };
+        let mut server = librtmp2::server::Server::new(cfg).unwrap();
+        server.listen(&format!("127.0.0.1:{port}")).unwrap();
+        server
+    }
+
+    #[test]
+    fn listener_only_readiness_takes_the_bounded_sleep() {
+        let port = free_local_port();
+        let server = listening_rtmp_server(0, port);
+        let _pending = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 50);
+
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() >= Duration::from_millis(5),
+            "an unserviceable listener must not turn the wait into a busy loop"
+        );
+    }
+
+    #[test]
+    fn connection_cap_drops_listeners_from_the_poll_set() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(1, port);
+        let _active = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        server.poll(0).unwrap();
+        assert_eq!(
+            server.connections.len(),
+            1,
+            "the first client must be accepted so the cap is reached"
+        );
+        let _queued = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 50);
+
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() >= Duration::from_millis(25),
+            "at the connection cap the listener must be excluded so the wait \
+             honors its timeout instead of spinning"
         );
     }
 
@@ -2275,6 +2339,7 @@ mod tests {
             publishing: true,
             playing: true,
             stream_id: "s1".into(),
+            awaiting_first_frame: Some((0, Instant::now())),
             ..Default::default()
         };
 
@@ -2284,6 +2349,11 @@ mod tests {
         assert!(!bridge.has_player(1));
         assert!(entry.publishing);
         assert!(!entry.playing);
+        assert!(
+            entry.awaiting_first_frame.is_none(),
+            "losing the playing role must clear the pending first-frame flag so \
+             the poll loop can fall back to the slow interval"
+        );
         assert_eq!(entry.stream_id, "s1");
         assert!(!conn.current_stream.as_ref().unwrap().is_playing);
         assert!(
