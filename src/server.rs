@@ -211,7 +211,7 @@ fn resolve_shard_count(
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
     let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
     shard_count_for(
         explicit,
