@@ -2317,6 +2317,38 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_listener_accepts_ipv4_and_ipv6_when_available() {
+        let port = free_local_port();
+        let mut server = test_server();
+        let listeners = bind_rtmp_listener_set(
+            &mut server,
+            &format!("0.0.0.0:{port}"),
+            port,
+            false,
+            None,
+            "RTMP",
+            false,
+        )
+        .expect("bind wildcard listener set");
+
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "IPv4 loopback must reach a wildcard RTMP listener"
+        );
+
+        if std::net::TcpListener::bind("[::1]:0").is_ok() {
+            assert!(
+                listeners.iter().any(|bind| bind.starts_with("[::]")),
+                "IPv6-capable hosts must create an IPv6 wildcard listener"
+            );
+            assert!(
+                std::net::TcpStream::connect(("::1", port)).is_ok(),
+                "IPv6 loopback must reach the same wildcard RTMP endpoint"
+            );
+        }
+    }
+
+    #[test]
     fn bind_with_default_port_normalizes_host_only_binds() {
         assert_eq!(bind_with_default_port("0.0.0.0", 1936), "0.0.0.0:1936");
         assert_eq!(bind_with_default_port("::1", 1936), "[::1]:1936");
