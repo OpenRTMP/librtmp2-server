@@ -342,6 +342,105 @@ fn bind_with_default_port(bind: &str, default_port: u16) -> String {
     }
 }
 
+/// For the IPv4 wildcard bind, derive the matching IPv6 wildcard on the same
+/// port. Specific IPv4 addresses stay IPv4-only so an operator binding to
+/// loopback or one interface does not unexpectedly expose another address
+/// family.
+fn ipv6_wildcard_for(bind: &str, default_port: u16) -> Option<String> {
+    let normalized = bind_with_default_port(bind, default_port);
+    let port = normalized.strip_prefix("0.0.0.0:")?;
+    Some(format!("[::]:{port}"))
+}
+
+/// Whether the most recently added IPv6 listener also accepts IPv4-mapped
+/// connections. Linux commonly defaults IPV6_V6ONLY to 0, while other hosts
+/// may default it to 1. Inspect the actual socket instead of assuming either
+/// behavior so wildcard RTMP/RTMPS binds stay portable.
+fn last_listener_is_ipv6_dual_stack(server: &librtmp2::server::Server) -> Result<bool, String> {
+    let fd = *server
+        .listener_fds()
+        .last()
+        .ok_or_else(|| "listener fd missing after successful IPv6 bind".to_string())?;
+    let mut only_v6: libc::c_int = 1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &mut only_v6 as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "getsockopt(IPV6_V6ONLY) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(only_v6 == 0)
+}
+
+fn bind_one_rtmp_listener(
+    server: &mut librtmp2::server::Server,
+    bind: &str,
+    reuseport: bool,
+    tls: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let result = match (reuseport, tls) {
+        (true, Some((cert, key))) => server.listen_tls_reuseport(bind, cert, key),
+        (false, Some((cert, key))) => server.listen_tls(bind, cert, key),
+        (true, None) => server.listen_reuseport(bind),
+        (false, None) => server.listen(bind),
+    };
+    result.map_err(|e| e.to_string())
+}
+
+/// Bind a wildcard RTMP/RTMPS endpoint on IPv6 first. If that socket is
+/// dual-stack it already covers IPv4; if the OS marks it v6-only, bind the
+/// configured IPv4 wildcard too. Hosts/containers with IPv6 disabled fall
+/// back to the original IPv4 listener instead of failing startup.
+fn bind_rtmp_listener_set(
+    server: &mut librtmp2::server::Server,
+    bind: &str,
+    default_port: u16,
+    reuseport: bool,
+    tls: Option<(&str, &str)>,
+    label: &str,
+    log_fallback: bool,
+) -> Result<Vec<String>, String> {
+    let primary = bind_with_default_port(bind, default_port);
+    let Some(ipv6) = ipv6_wildcard_for(&primary, default_port) else {
+        bind_one_rtmp_listener(server, &primary, reuseport, tls)
+            .map_err(|e| format!("{label} bind on {primary} failed: {e}"))?;
+        return Ok(vec![primary]);
+    };
+
+    match bind_one_rtmp_listener(server, &ipv6, reuseport, tls) {
+        Ok(()) => {
+            let dual_stack = last_listener_is_ipv6_dual_stack(server)
+                .map_err(|e| format!("{label} IPv6 listener inspection failed: {e}"))?;
+            if dual_stack {
+                return Ok(vec![ipv6]);
+            }
+
+            bind_one_rtmp_listener(server, &primary, reuseport, tls)
+                .map_err(|e| format!("{label} IPv4 bind on {primary} failed: {e}"))?;
+            Ok(vec![ipv6, primary])
+        }
+        Err(ipv6_err) => {
+            if log_fallback {
+                crate::log_warn!(
+                    "{label} IPv6 wildcard bind on {ipv6} unavailable ({ipv6_err}); falling back to IPv4 {primary}"
+                );
+            }
+            bind_one_rtmp_listener(server, &primary, reuseport, tls)
+                .map_err(|e| format!("{label} IPv4 fallback bind on {primary} failed: {e}"))?;
+            Ok(vec![primary])
+        }
+    }
+}
+
 fn with_rtmp_bridge<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&DbRtmpBridge) -> R,
@@ -1489,32 +1588,49 @@ impl ServerApp {
                     if relay_export_bytes > 0 {
                         server.enable_relay_export(4096, relay_export_bytes.max(1024 * 1024));
                     }
-                    let bind_result = if conn_id_base.is_some() {
-                        server.listen_reuseport(&rtmp_bind)
-                    } else {
-                        server.listen(&rtmp_bind)
-                    };
-                    if let Err(e) = bind_result {
-                        let msg = format!("RTMP bind on {rtmp_bind} failed: {e}");
-                        crate::log_warn!("{msg}");
-                        let _ = ready_tx.send(Err(msg));
-                        return;
-                    }
-                    crate::log_info!("RTMP listening on {rtmp_bind} (shard {shard_index})");
-
-                    if rtmp_tls_enabled {
-                        let tls_result = if conn_id_base.is_some() {
-                            server.listen_tls_reuseport(&rtmps_bind, &rtmp_tls_cert, &rtmp_tls_key)
-                        } else {
-                            server.listen_tls(&rtmps_bind, &rtmp_tls_cert, &rtmp_tls_key)
-                        };
-                        if let Err(e) = tls_result {
-                            let msg = format!("RTMPS bind on {rtmps_bind} failed: {e}");
+                    let reuseport = conn_id_base.is_some();
+                    let rtmp_listeners = match bind_rtmp_listener_set(
+                        &mut server,
+                        &rtmp_bind,
+                        1935,
+                        reuseport,
+                        None,
+                        "RTMP",
+                        shard_index == 0,
+                    ) {
+                        Ok(listeners) => listeners,
+                        Err(msg) => {
                             crate::log_warn!("{msg}");
                             let _ = ready_tx.send(Err(msg));
                             return;
                         }
-                        crate::log_info!("RTMPS listening on {rtmps_bind} (shard {shard_index})");
+                    };
+                    crate::log_info!(
+                        "RTMP listening on {} (shard {shard_index})",
+                        rtmp_listeners.join(", ")
+                    );
+
+                    if rtmp_tls_enabled {
+                        let rtmps_listeners = match bind_rtmp_listener_set(
+                            &mut server,
+                            &rtmps_bind,
+                            1936,
+                            reuseport,
+                            Some((&rtmp_tls_cert, &rtmp_tls_key)),
+                            "RTMPS",
+                            shard_index == 0,
+                        ) {
+                            Ok(listeners) => listeners,
+                            Err(msg) => {
+                                crate::log_warn!("{msg}");
+                                let _ = ready_tx.send(Err(msg));
+                                return;
+                            }
+                        };
+                        crate::log_info!(
+                            "RTMPS listening on {} (shard {shard_index})",
+                            rtmps_listeners.join(", ")
+                        );
                     }
 
                     let _ = ready_tx.send(Ok(()));
@@ -2184,6 +2300,20 @@ mod tests {
     fn bind_with_default_port_leaves_explicit_ports() {
         assert_eq!(bind_with_default_port("0.0.0.0:1936", 1936), "0.0.0.0:1936");
         assert_eq!(bind_with_default_port("[::1]:1936", 1936), "[::1]:1936");
+    }
+
+    #[test]
+    fn ipv6_wildcard_is_added_only_for_ipv4_wildcard_binds() {
+        assert_eq!(
+            ipv6_wildcard_for("0.0.0.0:1935", 1935),
+            Some("[::]:1935".to_string())
+        );
+        assert_eq!(
+            ipv6_wildcard_for("0.0.0.0", 1936),
+            Some("[::]:1936".to_string())
+        );
+        assert_eq!(ipv6_wildcard_for("127.0.0.1:1935", 1935), None);
+        assert_eq!(ipv6_wildcard_for("[::1]:1935", 1935), None);
     }
 
     #[test]
