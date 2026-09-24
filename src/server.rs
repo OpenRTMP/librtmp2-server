@@ -258,10 +258,7 @@ fn resolve_shard_count(media_outputs_enabled: bool, cluster_enabled: bool) -> us
 /// every single tick regardless. At 100 concurrent viewers that is 100
 /// wasted syscalls per tick most of the time; returning the actual ready
 /// set lets the caller skip them.
-fn wait_for_readiness_or_timeout(
-    server: &librtmp2::server::Server,
-    timeout_ms: u64,
-) -> Option<HashSet<u64>> {
+fn poll_readiness(server: &librtmp2::server::Server, timeout_ms: u64) -> Option<Wake> {
     let conn_id_by_fd: HashMap<i32, u64> = server
         .connections
         .iter()
@@ -315,10 +312,10 @@ fn wait_for_readiness_or_timeout(
             let listener_ready = fds
                 .iter()
                 .any(|pfd| pfd.revents & READY_MASK != 0 && !conn_id_by_fd.contains_key(&pfd.fd));
-            if ready.is_empty() && listener_ready {
-                std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(10)));
-            }
-            return Some(ready);
+            return Some(Wake {
+                ready,
+                listener_ready,
+            });
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             // Unexpected poll() failure -- e.g. a connection closed and its
@@ -339,30 +336,85 @@ fn wait_for_readiness_or_timeout(
 
 /// Readiness source for the RTMP poll loop: a persistent epoll set on Linux
 /// (see `crate::readiness`), falling back to the per-tick `poll(2)` in
-/// [`wait_for_readiness_or_timeout`] elsewhere or if epoll is unavailable.
-enum ReadinessWaiter {
+/// [`poll_readiness`] elsewhere or if epoll is unavailable.
+struct ReadinessWaiter {
+    source: ReadinessSource,
+    /// `server.connections.len()` when the previous wait returned with only
+    /// a listener ready, or `None` if it didn't.
+    listener_only_at: Option<usize>,
+}
+
+enum ReadinessSource {
     #[cfg(target_os = "linux")]
     Epoll(crate::readiness::EpollReadiness),
     Poll,
+}
+
+/// What one readiness wait reported.
+pub(crate) struct Wake {
+    /// Connections that are readable (or errored/hung up).
+    pub(crate) ready: HashSet<u64>,
+    /// A listener had a pending connection.
+    pub(crate) listener_ready: bool,
 }
 
 impl ReadinessWaiter {
     fn new() -> Self {
         #[cfg(target_os = "linux")]
         match crate::readiness::EpollReadiness::new() {
-            Ok(epoll) => return Self::Epoll(epoll),
+            Ok(epoll) => return Self::with_source(ReadinessSource::Epoll(epoll)),
             Err(e) => crate::log_warn!("epoll unavailable ({e}); falling back to poll(2)"),
         }
-        Self::Poll
+        Self::with_source(ReadinessSource::Poll)
     }
 
-    fn wait(&mut self, server: &librtmp2::server::Server, timeout_ms: u64) -> Option<HashSet<u64>> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Epoll(epoll) => epoll.wait(server, timeout_ms),
-            Self::Poll => wait_for_readiness_or_timeout(server, timeout_ms),
+    fn with_source(source: ReadinessSource) -> Self {
+        Self {
+            source,
+            listener_only_at: None,
         }
     }
+
+    /// Returns the `conn_id`s that are ready, or `None` for "assume
+    /// everyone is ready" (the wait itself failed).
+    ///
+    /// When only a listener is ready, return at once so the new connection
+    /// is accepted without delay. Only if that happens again with no new
+    /// connection accepted in between (the server can't service the
+    /// listener right now, e.g. per-IP caps, so it stays readable) take a
+    /// short bounded sleep, so an unserviceable listener can't spin the
+    /// loop. The unconditional sleep this replaces added up to 10 ms to
+    /// every single accept.
+    fn wait(&mut self, server: &librtmp2::server::Server, timeout_ms: u64) -> Option<HashSet<u64>> {
+        let wake = match &mut self.source {
+            #[cfg(target_os = "linux")]
+            ReadinessSource::Epoll(epoll) => epoll.wait(server, timeout_ms),
+            ReadinessSource::Poll => poll_readiness(server, timeout_ms),
+        };
+        let Some(wake) = wake else {
+            self.listener_only_at = None;
+            return None;
+        };
+        if wake.ready.is_empty() && wake.listener_ready {
+            let conns = server.connections.len();
+            if self.listener_only_at == Some(conns) {
+                std::thread::sleep(Duration::from_millis(timeout_ms.min(10)));
+            }
+            self.listener_only_at = Some(conns);
+        } else {
+            self.listener_only_at = None;
+        }
+        Some(wake.ready)
+    }
+}
+
+/// `poll(2)` readiness without the waiter's listener backoff (tests).
+#[cfg(test)]
+fn wait_for_readiness_or_timeout(
+    server: &librtmp2::server::Server,
+    timeout_ms: u64,
+) -> Option<HashSet<u64>> {
+    poll_readiness(server, timeout_ms).map(|wake| wake.ready)
 }
 
 /// Normalize a bind string so passing it to librtmp2 cannot fall back to the
@@ -2164,8 +2216,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COMPLETIONS_RX, ReadinessWaiter, ServerApp, TrackedConn, any_negotiating,
-        bind_rtmp_listener_set, bind_with_default_port, drain_auth_completions,
+        AUTH_COMPLETIONS_RX, ReadinessSource, ReadinessWaiter, ServerApp, TrackedConn,
+        any_negotiating, bind_rtmp_listener_set, bind_with_default_port, drain_auth_completions,
         drain_deleted_stream_roles, eviction_stream_id, ipv6_wildcard_for,
         live_stream_ids_for_deleted_markers, should_evict_idle_conn, wait_for_readiness_or_timeout,
     };
@@ -2290,21 +2342,33 @@ mod tests {
         server
     }
 
-    #[test]
-    fn listener_only_readiness_takes_the_bounded_sleep() {
+    /// A listener-only wake returns at once (so the connection is accepted
+    /// without delay); a repeat with no accept in between backs off.
+    fn assert_listener_backoff(mut waiter: ReadinessWaiter) {
         let port = free_local_port();
         let server = listening_rtmp_server(0, port);
         let _pending = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
         let start = Instant::now();
-        let ready = wait_for_readiness_or_timeout(&server, 50);
+        assert_eq!(waiter.wait(&server, 50).map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "a new connection must not wait out a backoff before accept"
+        );
 
-        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        // Not accepted (nothing polled the server): still readable.
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 50).map(|ids| ids.len()), Some(0));
         assert!(
             start.elapsed() >= Duration::from_millis(5),
             "an unserviceable listener must not turn the wait into a busy loop"
         );
+    }
+
+    #[test]
+    fn listener_only_readiness_backs_off_only_without_accept_progress() {
+        assert_listener_backoff(ReadinessWaiter::with_source(ReadinessSource::Poll));
     }
 
     #[test]
@@ -2346,7 +2410,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn epoll_waiter() -> ReadinessWaiter {
         let waiter = ReadinessWaiter::new();
-        assert!(matches!(waiter, ReadinessWaiter::Epoll(_)));
+        assert!(matches!(waiter.source, ReadinessSource::Epoll(_)));
         waiter
     }
 
@@ -2447,17 +2511,10 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn epoll_listener_only_readiness_takes_the_bounded_sleep() {
-        let port = free_local_port();
-        let server = listening_rtmp_server(0, port);
-        let mut waiter = epoll_waiter();
-        let _pending = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-
-        let start = Instant::now();
-        assert_eq!(waiter.wait(&server, 50).map(|r| r.len()), Some(0));
-        assert!(start.elapsed() >= Duration::from_millis(5));
+    fn epoll_listener_only_readiness_backs_off_only_without_accept_progress() {
+        assert_listener_backoff(epoll_waiter());
     }
 
     #[test]

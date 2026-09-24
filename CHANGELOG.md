@@ -32,6 +32,15 @@ begin at `1.0.0`.
   any queued stats for their row, so a late flush cannot revive a released
   session or leak into a reactivated one.
 
+- When only a listener is ready, the poll loop now returns immediately so
+  the new connection is accepted at once. It used to sleep up to 10 ms first
+  on every such wake (a guard against spinning on a listener the server
+  can't service, e.g. under per-IP caps), which added that delay to nearly
+  every new connection. The sleep now only happens when the previous wake
+  was also listener-only and no connection was accepted in between. Single
+  viewer join latency on the benchmark box dropped from ~15 ms to ~4 ms,
+  100-viewer join from ~35 ms to ~17 ms on average.
+
 ### Fixed
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate

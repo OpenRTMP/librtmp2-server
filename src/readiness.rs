@@ -41,14 +41,15 @@ impl EpollReadiness {
     }
 
     /// Wait until a registered fd is ready or `timeout_ms` elapses. Same
-    /// contract as `server::wait_for_readiness_or_timeout`: returns the
-    /// `conn_id`s that are readable (or errored/hung up), and `None` only
-    /// when the wait itself failed, meaning "assume everyone is readable".
+    /// contract as `server::poll_readiness`: reports the `conn_id`s that
+    /// are readable (or errored/hung up) and whether a listener is, and
+    /// `None` only when the wait itself failed ("assume everyone is
+    /// readable").
     pub(crate) fn wait(
         &mut self,
         server: &librtmp2::server::Server,
         timeout_ms: u64,
-    ) -> Option<HashSet<u64>> {
+    ) -> Option<crate::server::Wake> {
         if self.sync(server).is_err() {
             std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
             return None;
@@ -97,13 +98,10 @@ impl EpollReadiness {
                 None => listener_ready = true,
             }
         }
-        if ready.is_empty() && listener_ready {
-            // Same guard as the poll(2) path: a listener the server can't
-            // service right now (e.g. per-IP caps) stays readable, so don't
-            // let it turn the loop into a busy spin.
-            std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(10)));
-        }
-        Some(ready)
+        Some(crate::server::Wake {
+            ready,
+            listener_ready,
+        })
     }
 
     /// Bring the epoll registrations in line with the server's current
