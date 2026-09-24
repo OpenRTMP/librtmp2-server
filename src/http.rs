@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ pub struct AppState {
     /// in `deleted_streams` and are pruned after local sessions drain.
     pub sticky_deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Viewer slot IDs revoked via HTTP while RTMP player sessions are active.
-    pub revoked_viewers: Arc<Mutex<HashSet<String>>>,
+    pub revoked_viewers: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// Build the Axum router, wiring all HTTP handlers to the shared application state.
@@ -1801,7 +1801,10 @@ async fn handle_stream_player_delete(
     }
     match state.coordinator.delete_viewer(&id, &player_id) {
         Ok(()) => {
-            state.revoked_viewers.lock().insert(player_id.clone());
+            state
+                .revoked_viewers
+                .lock()
+                .insert(player_id.clone(), Instant::now());
             state.db.players_deactivate_for_viewer(&player_id);
             #[cfg(feature = "cluster")]
             if let Some(mgr) = state.coordinator.cluster_manager() {
@@ -2246,7 +2249,7 @@ mod tests {
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
             sticky_deleted_streams: Arc::new(Mutex::new(HashSet::new())),
-            revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
+            revoked_viewers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2348,7 +2351,7 @@ mod tests {
             coordinator: Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db))),
             deleted_streams,
             sticky_deleted_streams: Arc::new(Mutex::new(HashSet::new())),
-            revoked_viewers: Arc::new(Mutex::new(HashSet::new())),
+            revoked_viewers: Arc::new(Mutex::new(HashMap::new())),
         });
         let app = router(state);
         let resp = app
@@ -2551,6 +2554,71 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["play_key"], "guest_play_key_with_sufficient_len01");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_player_with_another_remaining_inserts_a_revocation_marker() {
+        let state = test_state("a-strong-random-secret-value");
+        let app = router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/streams")
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"id":"revoketest"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let mut player_ids = Vec::new();
+        for name in ["Guest A", "Guest B"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/streams/revoketest/players")
+                        .header("Authorization", "Bearer a-strong-random-secret-value")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(r#"{{"name":"{name}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            player_ids.push(json["id"].as_str().unwrap().to_string());
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/v1/streams/revoketest/players/{}",
+                        player_ids[0]
+                    ))
+                    .header("Authorization", "Bearer a-strong-random-secret-value")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state.revoked_viewers.lock().contains_key(&player_ids[0]),
+            "a successful revocation must leave a marker so live RTMP sessions \
+             are kicked"
+        );
     }
 
     #[tokio::test]

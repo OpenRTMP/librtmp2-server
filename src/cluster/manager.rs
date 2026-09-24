@@ -48,6 +48,9 @@ const BOOTSTRAP_SEEDED_SETTING: &str = "bootstrap_seeded";
 const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
 /// Reject re-sent `admin_proof` values captured from the control plane.
 const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
+/// Bounded retry budget for re-learning peer media addresses after a restart.
+const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
+const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -140,7 +143,8 @@ pub struct ClusterManager {
 #[derive(Clone)]
 pub struct SessionHooks {
     pub deleted_streams: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-    pub revoked_viewers: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    pub revoked_viewers:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     pub api_token: Arc<parking_lot::RwLock<String>>,
     /// Force local RTMP publishers off a stream (stale epoch after partition).
     pub force_unpublish_stream: Arc<dyn Fn(&str) + Send + Sync>,
@@ -447,6 +451,13 @@ impl ClusterManager {
                 // Existing voter restart — do not re-initialize OpenRaft storage.
                 if let Some(ref join_addr) = config.join {
                     mgr.refresh_topology_from_any(join_addr).await?;
+                } else {
+                    // Best-effort recovery runs off the startup path: an
+                    // unreachable peer must not delay the HTTP/RTMP listeners.
+                    let recovery_mgr = Arc::clone(&mgr);
+                    tokio::spawn(async move {
+                        recovery_mgr.recover_missing_media_addrs().await;
+                    });
                 }
                 if db.setting_get(BOOTSTRAP_SEEDED_SETTING).is_none() {
                     // raft_has_state() only proves raft.initialize() ran; a
@@ -1405,7 +1416,10 @@ impl ClusterManager {
 
     fn mark_viewer_revoked(&self, viewer_id: &str) {
         if let Some(hooks) = self.session_hooks.lock().as_ref() {
-            hooks.revoked_viewers.lock().insert(viewer_id.to_string());
+            hooks
+                .revoked_viewers
+                .lock()
+                .insert(viewer_id.to_string(), std::time::Instant::now());
         }
     }
 
@@ -1539,17 +1553,24 @@ impl ClusterManager {
             if p.node_id == self.config.node_id {
                 continue;
             }
+            let media_addr = if p.media_addr.is_empty() {
+                self.meta.get(p.node_id).map(|(_, m)| m).unwrap_or_default()
+            } else {
+                p.media_addr.clone()
+            };
             self.network.upsert_node(p.node_id, p.control_addr.clone());
             self.meta
-                .set_addrs(p.node_id, p.control_addr.clone(), p.media_addr.clone());
-            let _ = self.media.connect_peer(p.node_id, &p.media_addr).await;
-            self.health.note_peer(
-                p.node_id,
-                NodeHealthState::Ready,
-                0.0,
-                Some(p.control_addr),
-                Some(p.media_addr),
-            );
+                .set_addrs(p.node_id, p.control_addr.clone(), media_addr.clone());
+            if !media_addr.is_empty() {
+                let _ = self.media.connect_peer(p.node_id, &media_addr).await;
+                self.health.note_peer(
+                    p.node_id,
+                    NodeHealthState::Ready,
+                    0.0,
+                    Some(p.control_addr),
+                    Some(media_addr),
+                );
+            }
         }
         Ok(())
     }
@@ -1580,6 +1601,65 @@ impl ClusterManager {
             }
         }
         Err(primary_err)
+    }
+
+    /// True while any non-self member still has no known media address.
+    fn missing_member_media_addrs(&self) -> bool {
+        self.meta
+            .all()
+            .iter()
+            .any(|(id, _, media)| *id != self.config.node_id && media.is_empty())
+    }
+
+    /// Re-query every known peer control address until every member's media
+    /// address is known or a bounded deadline expires. A single successful
+    /// refresh can still return an incomplete topology — a freshly restarted
+    /// responder may not know every member's media address yet — so retrying
+    /// instead of stopping at the first response is required for recovery.
+    async fn recover_missing_media_addrs(&self) {
+        let ctrls: Vec<String> = self
+            .meta
+            .all()
+            .into_iter()
+            .filter(|(id, ctrl, _)| *id != self.config.node_id && !ctrl.is_empty())
+            .map(|(_, ctrl, _)| ctrl)
+            .collect();
+        if ctrls.is_empty() || !self.missing_member_media_addrs() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(TOPOLOGY_RECOVERY_TIMEOUT_SECS);
+        loop {
+            let mut responded = false;
+            for ctrl in &ctrls {
+                if self.refresh_topology_from(ctrl).await.is_ok() {
+                    responded = true;
+                    if !self.missing_member_media_addrs() {
+                        return;
+                    }
+                }
+            }
+            if !self.missing_member_media_addrs() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                crate::log_warn!(
+                    "Cluster: peer media addresses still unknown after {TOPOLOGY_RECOVERY_TIMEOUT_SECS}s; media routing may stay degraded until peers recover"
+                );
+                return;
+            }
+            if !responded {
+                crate::log_warn!(
+                    "Cluster: topology refresh after restart failed for all peers; retrying"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(TOPOLOGY_RECOVERY_RETRY_MS)).await;
+        }
+    }
+
+    /// Test-only entry point for the restart media-address recovery path.
+    #[cfg(feature = "test-support")]
+    pub async fn recover_missing_media_addrs_for_test(&self) {
+        self.recover_missing_media_addrs().await;
     }
 
     /// Sum active play sessions for `viewer_id` across peers (excludes local).

@@ -18,9 +18,10 @@ use crate::http::{self, AppState};
 use crate::logger;
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 use crate::server::{
-    AUTH_COMPLETIONS_RX, AUTH_WORKER, POLL_INTERVAL_MS, RTMP_BRIDGE, TrackedConn,
-    clear_rtmp_poll_server, live_stream_ids_for_deleted_markers, process_server_connections,
-    rtmp_media_cb, rtmp_play_auth_cb, rtmp_publish_auth_cb, set_rtmp_poll_server,
+    AUTH_COMPLETIONS_RX, AUTH_WORKER, POLL_INTERVAL_MS, REVOKED_VIEWER_GRACE_MS, RTMP_BRIDGE,
+    TrackedConn, clear_rtmp_poll_server, live_stream_ids_for_deleted_markers,
+    process_server_connections, rtmp_media_cb, rtmp_play_auth_cb, rtmp_publish_auth_cb,
+    set_rtmp_poll_server,
 };
 
 static TEST_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -50,7 +51,7 @@ impl TestServer {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let sticky_deleted_streams = Arc::new(Mutex::new(HashSet::new()));
-        let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
+        let revoked_viewers = Arc::new(Mutex::new(HashMap::new()));
         let rtmp_bridge = Arc::new(DbRtmpBridge::new(
             Arc::clone(&db),
             Arc::clone(&deleted_streams),
@@ -173,7 +174,7 @@ impl TestServer {
                 let deleted_now: HashSet<String> =
                     deleted_for_rtmp.lock().iter().cloned().collect();
                 let revoked_now: HashSet<String> =
-                    revoked_for_rtmp.lock().iter().cloned().collect();
+                    revoked_for_rtmp.lock().keys().cloned().collect();
 
                 let (current_ids, _just_authorized) = process_server_connections(
                     &mut server,
@@ -208,9 +209,11 @@ impl TestServer {
                     .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
                     .filter(|viewer_id| !viewer_id.is_empty())
                     .collect();
-                revoked_for_rtmp
-                    .lock()
-                    .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                revoked_for_rtmp.lock().retain(|viewer_id, inserted_at| {
+                    live_viewer_ids.contains(viewer_id)
+                        || inserted_at.elapsed()
+                            < std::time::Duration::from_millis(REVOKED_VIEWER_GRACE_MS)
+                });
 
                 thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             }

@@ -129,10 +129,13 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 /// fast-polling steady-state connections that no longer need it.
 pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 
+const FIRST_FRAME_GRACE_MS: u64 = 500;
+
 /// How often the poll loop re-derives `live_publishers`/`live_stream_ids`/
 /// `live_viewer_ids` and prunes `deleted_streams`/`revoked_viewers` against
-/// them. This bookkeeping is pure garbage collection -- it only reclaims
-/// markers for connections that are already gone, so it tolerates the same
+/// them (revocations after a cross-shard grace window). This bookkeeping is
+/// pure garbage collection -- it only reclaims markers for connections that
+/// are already gone, so it tolerates the same
 /// staleness window as the slow poll interval. It is *not* tied to
 /// `poll_interval_ms`: that interval drops to `POLL_INTERVAL_FAST_MS` while
 /// any connection is negotiating (see above), and each of these derived
@@ -142,6 +145,8 @@ pub(crate) const POLL_INTERVAL_FAST_MS: u64 = 1;
 /// every joining connection at once, making the burst slower, not faster --
 /// running this at a fixed cadence instead keeps it off the hot path.
 pub(crate) const PRUNE_INTERVAL_MS: u64 = POLL_INTERVAL_MS;
+
+pub(crate) const REVOKED_VIEWER_GRACE_MS: u64 = 10_000;
 
 /// Size of the conn_id range reserved for each RTMP shard when sharding is
 /// active (see [`resolve_shard_count`]) -- shard `i` gets
@@ -257,9 +262,12 @@ fn wait_for_readiness_or_timeout(
         .filter(|conn| conn.client_fd >= 0)
         .map(|conn| (conn.client_fd, conn.conn_id))
         .collect();
+    let at_connection_cap = server.config.max_connections > 0
+        && server.connections.len() >= server.config.max_connections as usize;
     let mut fds: Vec<libc::pollfd> = server
         .listener_fds()
         .into_iter()
+        .filter(|_| !at_connection_cap)
         .chain(conn_id_by_fd.keys().copied())
         .map(|fd| libc::pollfd {
             fd,
@@ -273,12 +281,18 @@ fn wait_for_readiness_or_timeout(
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc >= 0 {
             const READY_MASK: i16 = libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-            return Some(
-                fds.iter()
-                    .filter(|pfd| pfd.revents & READY_MASK != 0)
-                    .filter_map(|pfd| conn_id_by_fd.get(&pfd.fd).copied())
-                    .collect(),
-            );
+            let ready: HashSet<u64> = fds
+                .iter()
+                .filter(|pfd| pfd.revents & READY_MASK != 0)
+                .filter_map(|pfd| conn_id_by_fd.get(&pfd.fd).copied())
+                .collect();
+            let listener_ready = fds
+                .iter()
+                .any(|pfd| pfd.revents & READY_MASK != 0 && !conn_id_by_fd.contains_key(&pfd.fd));
+            if ready.is_empty() && listener_ready {
+                std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(10)));
+            }
+            return Some(ready);
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             // Unexpected poll() failure -- e.g. a connection closed and its
@@ -503,15 +517,15 @@ pub(crate) struct TrackedConn {
     video_codec: String,
     /// Last detected audio codec string from the protocol layer.
     audio_codec: String,
-    /// `Some(baseline)` from the moment this connection started playing
+    /// `Some((baseline, set_at))` from the moment this connection started playing
     /// (baseline = `Conn::media_bytes_sent` at that instant) until at least
     /// one media byte has been queued to it since -- i.e. until its first
     /// relayed frame. Kept alongside `publishing`/`playing` in the poll
     /// loop's fast-interval check: a player that has been accepted but has
     /// not yet received any media is still effectively "negotiating" from
     /// the viewer's perspective, even though its RTMP session already says
-    /// `playing`.
-    awaiting_first_frame: Option<u64>,
+    /// `playing`. Cleared after FIRST_FRAME_GRACE_MS even if no media arrives.
+    awaiting_first_frame: Option<(u64, Instant)>,
 }
 
 /// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
@@ -532,7 +546,7 @@ fn eviction_stream_id(rtmp_bridge: &DbRtmpBridge, conn_id: u64, entry: &TrackedC
 pub(crate) fn any_negotiating(tracked: &HashMap<u64, TrackedConn>) -> bool {
     tracked
         .values()
-        .any(|c| (!c.publishing && !c.playing) || c.awaiting_first_frame.is_some())
+        .any(|c| (!c.publishing && !c.playing) || (c.playing && c.awaiting_first_frame.is_some()))
 }
 
 pub(crate) fn live_stream_ids_for_deleted_markers(
@@ -620,6 +634,7 @@ fn drain_deleted_stream_roles(
         rtmp_bridge.release_player(conn_id);
         if !rtmp_bridge.has_player(conn_id) {
             entry.playing = false;
+            entry.awaiting_first_frame = None;
             if let Some(stream) = conn.current_stream.as_mut() {
                 stream.is_playing = false;
             }
@@ -847,7 +862,7 @@ pub(crate) fn process_server_connections(
             );
             entry.playing = true;
             entry.stream_id = stream_id;
-            entry.awaiting_first_frame = Some(conn.media_bytes_sent);
+            entry.awaiting_first_frame = Some((conn.media_bytes_sent, Instant::now()));
             conn.relay_key = entry.stream_id.clone();
             conn.relay_enabled = true;
         } else if is_playing && entry.playing {
@@ -913,7 +928,10 @@ pub(crate) fn process_server_connections(
         if is_playing {
             if entry
                 .awaiting_first_frame
-                .is_some_and(|baseline| conn.media_bytes_sent > baseline)
+                .is_some_and(|(baseline, set_at)| {
+                    conn.media_bytes_sent > baseline
+                        || set_at.elapsed() >= Duration::from_millis(FIRST_FRAME_GRACE_MS)
+                })
             {
                 entry.awaiting_first_frame = None;
             }
@@ -1064,7 +1082,7 @@ pub struct ServerApp {
     /// [`crate::http::AppState::sticky_deleted_streams`]).
     sticky_deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Viewer slot IDs revoked via HTTP while player connections are live.
-    revoked_viewers: Arc<Mutex<HashSet<String>>>,
+    revoked_viewers: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl ServerApp {
@@ -1098,7 +1116,7 @@ impl ServerApp {
 
         let deleted_streams = Arc::new(Mutex::new(HashSet::new()));
         let sticky_deleted_streams = Arc::new(Mutex::new(HashSet::new()));
-        let revoked_viewers = Arc::new(Mutex::new(HashSet::new()));
+        let revoked_viewers = Arc::new(Mutex::new(HashMap::new()));
 
         let coordinator = Arc::new(StateCoordinator::standalone(Arc::clone(&db)));
 
@@ -1556,7 +1574,7 @@ impl ServerApp {
                         let deleted_now: HashSet<String> =
                             deleted_streams.lock().iter().cloned().collect();
                         let revoked_now: HashSet<String> =
-                            revoked_viewers.lock().iter().cloned().collect();
+                            revoked_viewers.lock().keys().cloned().collect();
 
                         let (current_ids, just_authorized) = process_server_connections(
                             &mut server,
@@ -1795,9 +1813,11 @@ impl ServerApp {
                                 .map(|conn_id| rtmp_bridge.viewer_id_for_conn(conn_id))
                                 .filter(|viewer_id| !viewer_id.is_empty())
                                 .collect();
-                            revoked_viewers
-                                .lock()
-                                .retain(|viewer_id| live_viewer_ids.contains(viewer_id));
+                            revoked_viewers.lock().retain(|viewer_id, inserted_at| {
+                                live_viewer_ids.contains(viewer_id)
+                                    || inserted_at.elapsed()
+                                        < Duration::from_millis(REVOKED_VIEWER_GRACE_MS)
+                            });
                         }
 
                         let negotiating = any_negotiating(&tracked);
@@ -1950,7 +1970,7 @@ mod tests {
     use super::{
         AUTH_COMPLETIONS_RX, ServerApp, TrackedConn, any_negotiating, bind_with_default_port,
         drain_auth_completions, drain_deleted_stream_roles, eviction_stream_id,
-        live_stream_ids_for_deleted_markers, should_evict_idle_conn,
+        live_stream_ids_for_deleted_markers, should_evict_idle_conn, wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -2016,7 +2036,7 @@ mod tests {
                 connected: true,
                 publishing: true,
                 playing: true,
-                awaiting_first_frame: Some(0),
+                awaiting_first_frame: Some((0, Instant::now())),
                 ..Default::default()
             },
         );
@@ -2044,6 +2064,70 @@ mod tests {
             !any_negotiating(&tracked),
             "a fully settled publish+play connection with no pending first \
              frame must let the poll loop fall back to the slow interval"
+        );
+    }
+
+    fn free_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn listening_rtmp_server(max_connections: i32, port: u16) -> librtmp2::server::Server {
+        let cfg = librtmp2::types::ServerConfig {
+            max_connections,
+            chunk_size: 4096,
+            tls_enabled: 0,
+            tls_cert_file: std::ptr::null(),
+            tls_key_file: std::ptr::null(),
+            tls_ca_file: std::ptr::null(),
+            tls_insecure: 0,
+            max_pending_tls_per_addr: i32::MAX,
+            max_connections_per_addr: i32::MAX,
+        };
+        let mut server = librtmp2::server::Server::new(cfg).unwrap();
+        server.listen(&format!("127.0.0.1:{port}")).unwrap();
+        server
+    }
+
+    #[test]
+    fn listener_only_readiness_takes_the_bounded_sleep() {
+        let port = free_local_port();
+        let server = listening_rtmp_server(0, port);
+        let _pending = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 50);
+
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() >= Duration::from_millis(5),
+            "an unserviceable listener must not turn the wait into a busy loop"
+        );
+    }
+
+    #[test]
+    fn connection_cap_drops_listeners_from_the_poll_set() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(1, port);
+        let _active = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        server.poll(0).unwrap();
+        assert_eq!(
+            server.connections.len(),
+            1,
+            "the first client must be accepted so the cap is reached"
+        );
+        let _queued = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 50);
+
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() >= Duration::from_millis(25),
+            "at the connection cap the listener must be excluded so the wait \
+             honors its timeout instead of spinning"
         );
     }
 
@@ -2255,6 +2339,7 @@ mod tests {
             publishing: true,
             playing: true,
             stream_id: "s1".into(),
+            awaiting_first_frame: Some((0, Instant::now())),
             ..Default::default()
         };
 
@@ -2264,6 +2349,11 @@ mod tests {
         assert!(!bridge.has_player(1));
         assert!(entry.publishing);
         assert!(!entry.playing);
+        assert!(
+            entry.awaiting_first_frame.is_none(),
+            "losing the playing role must clear the pending first-frame flag so \
+             the poll loop can fall back to the slow interval"
+        );
         assert_eq!(entry.stream_id, "s1");
         assert!(!conn.current_stream.as_ref().unwrap().is_playing);
         assert!(

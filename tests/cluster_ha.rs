@@ -18,7 +18,7 @@ use tempfile::TempDir;
 const TEST_API_TOKEN: &str = "cluster-ha-test-api-token";
 
 fn secret() -> String {
-    "test-cluster-secret-32-chars-min!!".to_string()
+    "test-cluster-secret-32-chars-min--".to_string()
 }
 
 fn free_port() -> u16 {
@@ -29,7 +29,7 @@ fn free_port() -> u16 {
 fn register_test_session_hooks(mgr: &ClusterManager) {
     mgr.register_session_hooks(SessionHooks {
         deleted_streams: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-        revoked_viewers: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+        revoked_viewers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         api_token: Arc::new(parking_lot::RwLock::new(TEST_API_TOKEN.to_string())),
         force_unpublish_stream: Arc::new(|_: &str| {}),
         local_stream_sessions: Arc::new(|_: &str| 0u64),
@@ -94,6 +94,48 @@ async fn start_joiner(
         .expect("start cluster node");
     register_test_session_hooks(&mgr);
     (mgr, dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_style_recovery_relearns_peer_media_addrs() {
+    let (n1, _d1) = start_node(1, true, None, String::new()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let join = n1.config.advertise_control();
+    let (n2, _d2) = start_joiner(&n1, 2, join).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let media2 = n2
+        .config
+        .media_advertise_addr
+        .clone()
+        .expect("joiner advertises a media address");
+    assert_eq!(
+        n1.meta().get(2).map(|(_, media)| media).unwrap_or_default(),
+        media2,
+        "bootstrap node must know the joiner's media address while both are live"
+    );
+
+    // Simulate a plaintext restart: topology is restored from Raft membership
+    // with control addresses only, so peer media addresses are missing.
+    n1.meta()
+        .set_addrs(2, n2.config.advertise_control(), String::new());
+    assert!(
+        n1.meta()
+            .get(2)
+            .map(|(_, media)| media)
+            .unwrap_or_default()
+            .is_empty()
+    );
+
+    n1.recover_missing_media_addrs_for_test().await;
+
+    assert_eq!(
+        n1.meta().get(2).map(|(_, media)| media).unwrap_or_default(),
+        media2,
+        "recovery must relearn the peer media address from a topology refresh"
+    );
+    let _ = n2;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
