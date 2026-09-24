@@ -5,7 +5,7 @@
 //! at a time anyway, so this matches the C version's locking model without
 //! needing a connection pool.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, ReentrantMutex};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -22,8 +22,76 @@ fn on_disk_db_open_flags() -> OpenFlags {
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
 }
 
+/// A transaction on the shared connection -- or, when a [`Db::batch`]
+/// transaction is already open on it, a savepoint nested inside that one,
+/// so the operation can still be rolled back on its own without aborting
+/// the rest of the batch. Rolls back on drop unless committed. Derefs to the
+/// connection for running statements.
+pub(crate) struct DbTx<'c> {
+    conn: &'c Connection,
+    savepoint: bool,
+    finished: bool,
+}
+
+impl<'c> DbTx<'c> {
+    pub(crate) fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
+        let savepoint = !conn.is_autocommit();
+        conn.execute_batch(if savepoint {
+            "SAVEPOINT db_tx"
+        } else {
+            "BEGIN DEFERRED"
+        })?;
+        Ok(Self {
+            conn,
+            savepoint,
+            finished: false,
+        })
+    }
+
+    pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
+        self.finished = true;
+        self.conn.execute_batch(if self.savepoint {
+            "RELEASE db_tx"
+        } else {
+            "COMMIT"
+        })
+    }
+
+    pub(crate) fn rollback(mut self) -> rusqlite::Result<()> {
+        self.finished = true;
+        self.conn.execute_batch(if self.savepoint {
+            "ROLLBACK TO db_tx; RELEASE db_tx"
+        } else {
+            "ROLLBACK"
+        })
+    }
+}
+
+impl std::ops::Deref for DbTx<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Drop for DbTx<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.conn.execute_batch(if self.savepoint {
+                "ROLLBACK TO db_tx; RELEASE db_tx"
+            } else {
+                "ROLLBACK"
+            });
+        }
+    }
+}
+
 pub struct Db {
-    conn: Mutex<Connection>,
+    /// Re-entrant so that [`Db::batch`] can hold the connection for a whole
+    /// group of operations while each operation still locks it as usual on
+    /// the same thread. Every other thread still gets exclusive access.
+    conn: ReentrantMutex<Connection>,
     /// In-memory active-viewer-session counts, keyed by `stream_viewers.id`.
     /// This is the authoritative source for the per-viewer connection cap
     /// (`MAX_CONNECTIONS_PER_PLAY_KEY`) on this running node: it lets
@@ -422,7 +490,7 @@ impl Db {
         restrict_db_file_permissions(path);
         crate::log_info!("Database opened: {path}");
         Ok(Db {
-            conn: Mutex::new(conn),
+            conn: ReentrantMutex::new(conn),
             active_player_counts: Mutex::new(HashMap::new()),
             pending_stats: Mutex::new(PendingStats::default()),
         })
@@ -645,7 +713,7 @@ impl Db {
                 return Err(StreamAddError::Duplicate);
             }
         }
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("stream_add_with_viewer: begin tx failed: {e}");
@@ -932,7 +1000,7 @@ impl Db {
     /// finalize must be a no-op).
     pub fn stream_delete_if_pending(&self, id: &str) -> Option<bool> {
         let conn = self.conn.lock();
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("DB error starting pending-delete transaction: {e}");
@@ -965,7 +1033,7 @@ impl Db {
     /// Returns `Some(true)` = deleted, `Some(false)` = not found, `None` = DB error.
     pub fn stream_delete(&self, id: &str) -> Option<bool> {
         let conn = self.conn.lock();
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("DB error starting cascade delete transaction: {e}");
@@ -1379,9 +1447,7 @@ impl Db {
         String,
     > {
         let conn = self.conn.lock();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("snapshot tx begin: {e}"))?;
+        let tx = DbTx::begin(&conn).map_err(|e| format!("snapshot tx begin: {e}"))?;
 
         let mut stmt = tx
             .prepare(&format!(
@@ -1494,7 +1560,7 @@ impl Db {
         acquired_at: i64,
     ) -> Result<u64, OwnerError> {
         let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction().map_err(|_| OwnerError::Db)?;
+        let tx = DbTx::begin(&conn).map_err(|_| OwnerError::Db)?;
         let stream_ok: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT enabled, pending_delete FROM streams WHERE id=?",
@@ -1607,6 +1673,54 @@ impl Db {
         f(&conn)
     }
 
+    /// Group commit: run `f` -- typically several independent operations,
+    /// each using its own [`DbTx`] as usual -- inside one SQLite transaction
+    /// on this thread, holding the connection for the duration so no other
+    /// thread's statements interleave. Each operation's `DbTx` becomes a
+    /// savepoint, so it still commits or rolls back on its own, but the WAL
+    /// commit is paid once for the whole group instead of once per
+    /// operation (~4x less per-operation cost at a batch of 30).
+    ///
+    /// Returns `f`'s result and whether the outer commit succeeded. On
+    /// failure everything in the group is rolled back and the in-memory
+    /// active-viewer counts are resynced from the table; the caller must
+    /// then treat each operation's outcome as failed. If the outer
+    /// transaction can't even be opened, `f` runs unbatched (each operation
+    /// commits itself) and the result counts as committed.
+    pub fn batch<R>(&self, f: impl FnOnce() -> R) -> (R, bool) {
+        let conn = self.conn.lock();
+        if !conn.is_autocommit() || conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+            return (f(), true);
+        }
+        let result = f();
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            crate::log_error!("DB batch commit failed, rolling back the whole group: {e}");
+            let _ = conn.execute_batch("ROLLBACK");
+            self.resync_active_player_counts(&conn);
+            return (result, false);
+        }
+        (result, true)
+    }
+
+    /// Rebuild `active_player_counts` from the `players` table.
+    fn resync_active_player_counts(&self, conn: &Connection) {
+        let mut counts = self.active_player_counts.lock();
+        counts.clear();
+        let Ok(mut stmt) = conn
+            .prepare("SELECT viewer_id, COUNT(*) FROM players WHERE active=1 GROUP BY viewer_id")
+        else {
+            return;
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for (viewer_id, n) in rows.flatten() {
+                counts.insert(viewer_id, n.max(0) as usize);
+            }
+        }
+    }
+
     /// Atomically insert an active publisher only when the stream has none.
     pub fn publisher_try_acquire(&self, p: &Publisher) -> bool {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
@@ -1617,7 +1731,7 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("publisher_try_acquire: begin tx failed: {e}");
@@ -1835,7 +1949,7 @@ impl Db {
             return 0;
         }
         let count = pending.publishers.len() + pending.players.len();
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("flush_pending_stats: begin failed: {e}");
@@ -1961,7 +2075,7 @@ impl Db {
         {
             return false;
         }
-        let tx = match conn.unchecked_transaction() {
+        let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
                 crate::log_error!("player_try_acquire: begin tx failed: {e}");
@@ -2357,6 +2471,72 @@ mod tests {
         };
         assert!(db.publisher_try_acquire(&first));
         assert!(!db.publisher_try_acquire(&second));
+        assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
+    }
+
+    #[test]
+    fn batch_isolates_each_operation_and_commits_once() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "live_key_123",
+            "play_key_456",
+            "sts_key_789",
+        ))
+        .unwrap();
+        db.stream_add(&sample_stream(
+            "stream2",
+            "live_key_abc",
+            "play_key_def",
+            "sts_key_ghi",
+        ))
+        .unwrap();
+        let publisher = |id: &str, stream: &str| Publisher {
+            id: id.to_string(),
+            stream_id: stream.to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+
+        let (results, committed) = db.batch(|| {
+            vec![
+                db.publisher_try_acquire(&publisher("p1", "stream1")),
+                // Sees p1 from earlier in the same batch: rejected, and its
+                // savepoint rolls back without touching p1.
+                db.publisher_try_acquire(&publisher("p2", "stream1")),
+                db.publisher_try_acquire(&publisher("p3", "stream2")),
+            ]
+        });
+        assert!(committed);
+        assert_eq!(results, vec![true, false, true]);
+        assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
+        assert_eq!(db.publisher_list(Some("stream1"))[0].id, "p1");
+        assert_eq!(db.publisher_list(Some("stream2")).len(), 1);
+        // Back to autocommit afterwards: plain operations commit on their own.
+        assert!(db.with_conn(|conn| conn.is_autocommit()));
+    }
+
+    #[test]
+    fn nested_batch_runs_inside_the_outer_transaction() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "live_key_123",
+            "play_key_456",
+            "sts_key_789",
+        ))
+        .unwrap();
+        let p = Publisher {
+            id: "p1".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        let ((inner, inner_committed), committed) =
+            db.batch(|| db.batch(|| db.publisher_try_acquire(&p)));
+        assert!(inner && inner_committed && committed);
         assert_eq!(db.publisher_list(Some("stream1")).len(), 1);
     }
 

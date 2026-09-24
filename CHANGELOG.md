@@ -73,6 +73,17 @@ begin at `1.0.0`.
   join latency dropped from ~2.3 ms to ~1.2 ms (p50 over 20 joins), ahead of
   LiveForge (~1.3 ms) and MediaMTX (~1.3 ms) on the same box.
 
+- Group commit for session writes. The auth worker now takes every job
+  already queued (up to 32 publish/play authorizations and connection
+  closes) and runs them in one SQLite transaction, each job in its own
+  savepoint so it still succeeds or rolls back on its own. Replies go out
+  only after the shared commit. The DB connection lock is re-entrant so the
+  worker can hold it across the group, and every inner transaction goes
+  through `DbTx`, which becomes a savepoint inside an open batch. With HA
+  clustering active jobs still run one at a time (publish authorization may
+  wait on Raft, whose apply path needs the same connection). 30 concurrent
+  connect+publish: ~7.9 ms -> ~5.6 ms on average, p95 ~16 ms -> ~7 ms.
+
 ### Fixed
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate

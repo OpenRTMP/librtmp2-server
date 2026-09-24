@@ -233,6 +233,10 @@ impl DbRtmpBridge {
         }
     }
 
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
     pub fn set_coordinator(&self, coordinator: Arc<StateCoordinator>) {
         *self.coordinator.lock() = Some(coordinator);
     }

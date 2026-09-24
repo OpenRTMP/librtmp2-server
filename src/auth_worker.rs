@@ -125,6 +125,50 @@ impl AuthWorkerHandle {
     }
 }
 
+/// Most jobs folded into one group-commit transaction. Bounds how long the
+/// first job in a burst waits for its reply (each job is ~15-30 us of SQLite
+/// work inside a batch) and how long other threads wait for the connection.
+const MAX_BATCH_JOBS: usize = 32;
+
+/// Group commit holds the SQLite connection across several jobs. With HA
+/// clustering active, publish authorization can wait on a Raft round trip
+/// whose apply path needs that same connection on another thread, so jobs
+/// then run one by one as before.
+fn batching_allowed(bridge: &DbRtmpBridge) -> bool {
+    #[cfg(feature = "cluster")]
+    if bridge.cluster_manager().is_some() {
+        return false;
+    }
+    let _ = bridge;
+    true
+}
+
+/// Runs `jobs` in order, returning the completion for each authorization.
+fn run_jobs(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
+    let mut completions = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        match job {
+            Job::Close(conn_id) => bridge.on_close(conn_id),
+            Job::Authorize(req) => {
+                let allow = match req.kind {
+                    AuthKind::Publish => bridge
+                        .authorize_publish(req.conn_id, &req.app, &req.stream_key)
+                        .is_ok(),
+                    AuthKind::Play => bridge
+                        .authorize_play(req.conn_id, &req.app, &req.stream_key)
+                        .is_ok(),
+                };
+                completions.push(AuthCompletion {
+                    kind: req.kind,
+                    conn_id: req.conn_id,
+                    allow,
+                });
+            }
+        }
+    }
+    completions
+}
+
 /// Spawns the dedicated auth worker thread. Returns a submission handle for
 /// the RTMP callbacks and the completion receiver the RTMP poll loop drains
 /// once per tick via [`drain_completions`]. The worker thread runs until
@@ -148,32 +192,44 @@ pub fn spawn_with_notify(
         .spawn(move || {
             // Blocks between requests -- no busy loop -- and exits cleanly
             // once every `AuthWorkerHandle` (and `req_tx`) is dropped.
-            for job in req_rx {
-                let req = match job {
-                    Job::Authorize(req) => req,
-                    Job::Close(conn_id) => {
-                        bridge.on_close(conn_id);
-                        continue;
+            while let Ok(first) = req_rx.recv() {
+                // Group commit: take whatever else is already queued (a
+                // burst of joins, publishes or closes) and run it in one
+                // SQLite transaction instead of one commit per job.
+                let mut jobs = vec![first];
+                while jobs.len() < MAX_BATCH_JOBS {
+                    match req_rx.try_recv() {
+                        Ok(job) => jobs.push(job),
+                        Err(_) => break,
                     }
+                }
+                let completions = if jobs.len() > 1 && batching_allowed(&bridge) {
+                    let (mut completions, committed) =
+                        bridge.db().batch(|| run_jobs(&bridge, jobs));
+                    if !committed {
+                        // Everything in the group was rolled back: nothing
+                        // it allowed is backed by a row, so deny all of it
+                        // and drop the per-connection state it created.
+                        for completion in &mut completions {
+                            if completion.allow {
+                                completion.allow = false;
+                                bridge.on_close(completion.conn_id);
+                            }
+                        }
+                    }
+                    completions
+                } else {
+                    run_jobs(&bridge, jobs)
                 };
-                let allow = match req.kind {
-                    AuthKind::Publish => bridge
-                        .authorize_publish(req.conn_id, &req.app, &req.stream_key)
-                        .is_ok(),
-                    AuthKind::Play => bridge
-                        .authorize_play(req.conn_id, &req.app, &req.stream_key)
-                        .is_ok(),
-                };
-                // If the RTMP thread already shut down, there's no receiver
-                // left to deliver this completion to; drop it silently.
-                if completion_tx
-                    .send(AuthCompletion {
-                        kind: req.kind,
-                        conn_id: req.conn_id,
-                        allow,
-                    })
-                    .is_ok()
-                {
+                // Completions go out only after the commit, so a client is
+                // never told "allowed" for a row that isn't durable yet. If
+                // the RTMP thread already shut down, there's no receiver
+                // left to deliver them to; drop them silently.
+                let mut delivered = false;
+                for completion in completions {
+                    delivered |= completion_tx.send(completion).is_ok();
+                }
+                if delivered {
                     notify();
                 }
             }
@@ -261,6 +317,52 @@ mod tests {
             "release must be ordered before the re-publish"
         );
         assert!(!bridge.is_registered(1));
+    }
+
+    #[test]
+    fn burst_of_publishes_allows_exactly_one_per_stream() {
+        use crate::db::Stream;
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let mut keys = Vec::new();
+        for i in 0..10 {
+            let s = Stream {
+                id: format!("s{i}"),
+                name: "S".to_string(),
+                app: "live".to_string(),
+                publish_key: crate::keygen::keygen_stream_key("pub_").unwrap(),
+                play_key: crate::keygen::keygen_stream_key("play_").unwrap(),
+                stats_key: crate::keygen::keygen_stream_key("stats_").unwrap(),
+                enabled: true,
+                ..Default::default()
+            };
+            db.stream_add(&s).unwrap();
+            keys.push(s.publish_key);
+        }
+        let deleted = Arc::new(Mutex::new(HashSet::new()));
+        let bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db), deleted));
+        bridge.set_coordinator(Arc::new(StateCoordinator::standalone(Arc::clone(&db))));
+        let (handle, rx) = spawn(Arc::clone(&bridge));
+
+        // Two publishers per stream, submitted back to back so the worker
+        // finds them queued together and group-commits them.
+        let mut conn_id = 0u64;
+        for key in keys.iter().chain(keys.iter()) {
+            conn_id += 1;
+            bridge.on_connect(conn_id, "127.0.0.1:1000");
+            handle
+                .try_submit(AuthKind::Publish, conn_id, "live", key)
+                .unwrap();
+        }
+        let mut allowed = 0;
+        for _ in 0..conn_id {
+            if recv_within(&rx, Duration::from_secs(2)).unwrap().allow {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 10, "exactly one publisher per stream");
+        for i in 0..10 {
+            assert_eq!(db.publisher_list(Some(&format!("s{i}"))).len(), 1);
+        }
     }
 
     #[test]
