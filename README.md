@@ -20,8 +20,8 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 
 ### Implemented in this repository
 
-- **RTMP listener** on `RTMP_BIND` via `librtmp2`
-- **RTMPS listener** on `RTMPS_BIND` when `TLS_ENABLED=true` (alongside plaintext RTMP)
+- **RTMP listener** on `RTMP_BIND` via `librtmp2`; wildcard `0.0.0.0` binds are dual-stack when IPv6 is available
+- **RTMPS listener** on `RTMPS_BIND` when `TLS_ENABLED=true` (alongside plaintext RTMP), with the same dual-stack wildcard behavior
 - **OBS / FFmpeg publish path** with DB-backed `publish_key` validation
 - **Play authentication** via `play_key`
 - **Publisher → player relay** (same `(app, stream)` route)
@@ -145,7 +145,7 @@ restores, volume migration, token behavior, and rollback procedures.
 
 ## Configuration
 
-`LRTMP2_DB` or `LRTMP2_DB_PATH` must point to the SQLite database file. Listener and logging settings live in `.env` (loaded by default, or pass `-c <path>`):
+`LRTMP2_DB` or `LRTMP2_DB_PATH` must point to the SQLite database file. Listener and logging settings live in `.env` (loaded by default, or pass `-c <path>`). For RTMP/RTMPS, a wildcard IPv4 bind (`0.0.0.0`) automatically enables the matching IPv6 wildcard listener when IPv6 is available; specific addresses such as `127.0.0.1` remain single-family:
 
 ```env
 # RTMP listener address (always active, regardless of TLS_ENABLED)
@@ -219,6 +219,12 @@ RTMPS_BIND=0.0.0.0:1936
 ports the RTMP/RTMPS listeners are bound to (`rtmp_port`, `rtmps_enabled`,
 `rtmps_port`), so integrations like `librtmp2-server-panel` can show RTMPS
 URLs only when they'll actually work.
+
+Wildcard `RTMP_BIND=0.0.0.0:1935` and `RTMPS_BIND=0.0.0.0:1936` are treated
+as dual-stack endpoints. The server first attempts `[::]:port`; when that
+socket also accepts IPv4-mapped connections it is used alone, otherwise the
+IPv4 wildcard is bound as a second listener. If IPv6 is unavailable in the
+host or container, startup falls back to IPv4 instead of failing.
 
 RTMPS support should still be considered experimental while the protocol layer
 and server integration are being hardened.
@@ -477,6 +483,11 @@ To build from source instead:
 ```bash
 docker compose up -d
 ```
+
+Published Docker ports without a host IP are normally exposed on all host
+IPv4 and IPv6 addresses. The server's wildcard RTMP/RTMPS listeners mirror
+that behavior inside the container; if the Docker daemon or host firewall is
+configured IPv4-only, IPv6 must also be enabled there.
 
 For named-volume and bind-mount backup, restore, and host-migration procedures,
 see [Operations: SQLite data and API token](docs/operations.md).
