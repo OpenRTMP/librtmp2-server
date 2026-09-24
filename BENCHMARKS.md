@@ -17,14 +17,16 @@ own target hardware before using any of this for capacity planning.
 
 | | librtmp2-server | nginx-rtmp | MediaMTX | SRS |
 |---|---|---|---|---|
-| Version | 0.4.1 (this repo) | nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2 (Ubuntu package) | v1.11.3 | v7.0-a0 (7.0.162) |
+| Version | 0.4.3 + unreleased changes on this branch, built against librtmp2 0.9.3 + its matching unreleased relay changes | nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2 (Ubuntu package) | v1.11.3 | v8.0.44 (`develop`, bundled FFmpeg) |
 | Language | Rust | C | Go | C++ |
 | Role | what this repo ships | most common existing RTMP relay | modern multi-protocol media server with RTMP support | long-running open-source media server with RTMP/SRT/WebRTC support |
 
 nginx-rtmp was installed from the Ubuntu package archive; MediaMTX was
 fetched via the Go module proxy and built from source (working around its
 release-time-only generated asset step — see the script); SRS was built
-from source (`trunk/configure && make`) at its own repo rather than run
+from source (`trunk/configure --ffmpeg-fit=on --sys-ffmpeg=off --https=off
+--gb28181=off && make`; SRS 8 no longer builds against the system FFmpeg
+6.1 headers) at its own repo rather than run
 from a container, to keep every server here on the same footing (installed
 package or built binary, nothing containerized).
 
@@ -112,28 +114,30 @@ Full commands, including exact server configs, are in
 - CPU: Intel Xeon @ 2.80GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
 - rustc 1.95.0, g++ 13.3.0, ffmpeg 6.1.1
-- Date: 2026-09-23
+- Date: 2026-09-24
 
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| librtmp2-server | 100% | 2441.2/s | 9.11 ms | 7.86 ms | 20.24 ms | 20.55 ms | 20.58 ms |
-| nginx-rtmp | 100% | 630.1/s | 46.50 ms | 47.30 ms | 48.14 ms | 48.64 ms | 50.66 ms |
-| MediaMTX | 100% | 2604.5/s | 9.67 ms | 9.40 ms | 18.12 ms | 20.46 ms | 29.74 ms |
-| SRS | 100% | 436.2/s | 63.27 ms | 64.17 ms | 74.76 ms | 75.49 ms | 75.49 ms |
+| librtmp2-server | 100% | 2393.2/s | 11.09 ms | 8.06 ms | 21.64 ms | 21.80 ms | 21.84 ms |
+| nginx-rtmp | 100% | 628.1/s | 45.98 ms | 45.34 ms | 51.39 ms | 52.78 ms | 53.46 ms |
+| MediaMTX | 100% | 3072.2/s | 7.65 ms | 7.77 ms | 14.32 ms | 15.38 ms | 18.58 ms |
+| SRS | 100% | 473.2/s | 56.75 ms | 58.77 ms | 67.03 ms | 68.92 ms | 69.04 ms |
 
-`librtmp2-server`'s RTMP poll loop waits on `poll(2)` socket readiness
-instead of a fixed sleep, so a handshake step that has data already
-sitting in the socket buffer doesn't wait out a poll tick to get it; it
-also sets `TCP_NODELAY` on every accepted socket, since RTMP's handshake
-and command exchange is many small round trips that Nagle's algorithm
-combined with a peer's delayed ACK can otherwise stall by tens of ms each.
-Every publish/play authorization commits its SQLite write with
-`synchronous=NORMAL` rather than paying an fsync per commit, and runs on a
-dedicated worker thread (`src/auth_worker.rs`) instead of the RTMP poll
-thread. Together these put it on par with MediaMTX here (each server wins
-on a different percentile) and clearly ahead of nginx-rtmp and SRS.
+`librtmp2-server`'s RTMP poll loop waits on socket readiness (a persistent
+`epoll(7)` set on Linux) instead of a fixed sleep, so a handshake step that
+has data already sitting in the socket buffer doesn't wait out a poll tick
+to get it, and a newly queued connection is accepted as soon as the
+listener reports it; it also sets `TCP_NODELAY` on every accepted socket,
+since RTMP's handshake and command exchange is many small round trips that
+Nagle's algorithm combined with a peer's delayed ACK can otherwise stall by
+tens of ms each. Every publish/play authorization commits its SQLite write
+with `synchronous=NORMAL` rather than paying an fsync per commit, and runs
+on a dedicated worker thread (`src/auth_worker.rs`) instead of the RTMP
+poll thread; periodic per-connection stats are batched into one SQLite
+transaction per second on a separate thread for the same reason. That puts
+it in MediaMTX's tier here and clearly ahead of nginx-rtmp and SRS.
 
 ## Concurrent-viewer relay throughput and join latency
 
@@ -143,18 +147,18 @@ viewer received the full stream with no drops.
 
 | Server | Players | Join latency avg / p95 / max | Steady throughput | Steady fps/player |
 |---|---|---|---|---|
-| librtmp2-server | 1 | 3.63 / 3.63 / 3.63 ms | 1.10 Mbps | 73.2 |
-| librtmp2-server | 25 | 14.96 / 18.03 / 18.20 ms | 27.37 Mbps | 73.0 |
-| librtmp2-server | 100 | 47.14 / 58.81 / 61.19 ms | 109.72 Mbps | 73.2 |
-| nginx-rtmp (1 worker) | 1 | 87.76 / 87.76 / 87.76 ms | 1.10 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 25 | 88.31 / 92.33 / 93.47 ms | 27.40 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 100 | 90.45 / 96.50 / 100.17 ms | 109.64 Mbps | 73.1 |
-| MediaMTX | 1 | 1.28 / 1.28 / 1.28 ms | 1.09 Mbps | 73.0 |
-| MediaMTX | 25 | 4.04 / 6.31 / 6.52 ms | 27.41 Mbps | 73.1 |
-| MediaMTX | 100 | 16.91 / 24.68 / 28.03 ms | 109.70 Mbps | 73.1 |
-| SRS | 1 | 42.84 / 42.84 / 42.84 ms | 1.08 Mbps | 72.1 |
-| SRS | 25 | 50.54 / 53.20 / 53.54 ms | 26.81 Mbps | 71.8 |
-| SRS | 100 | 79.38 / 90.82 / 95.50 ms | 108.21 Mbps | 72.1 |
+| librtmp2-server | 1 | 3.22 / 3.22 / 3.22 ms | 1.09 Mbps | 73.0 |
+| librtmp2-server | 25 | 7.51 / 10.46 / 10.67 ms | 27.49 Mbps | 73.3 |
+| librtmp2-server | 100 | 27.88 / 41.83 / 42.34 ms | 109.68 Mbps | 73.2 |
+| nginx-rtmp (1 worker) | 1 | 86.42 / 86.42 / 86.42 ms | 1.10 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 25 | 91.74 / 93.39 / 93.48 ms | 27.39 Mbps | 73.0 |
+| nginx-rtmp (1 worker) | 100 | 90.72 / 94.37 / 98.41 ms | 109.65 Mbps | 73.1 |
+| MediaMTX | 1 | 2.58 / 2.58 / 2.58 ms | 1.10 Mbps | 73.3 |
+| MediaMTX | 25 | 7.04 / 9.08 / 9.13 ms | 27.39 Mbps | 73.0 |
+| MediaMTX | 100 | 22.66 / 39.02 / 41.34 ms | 109.62 Mbps | 73.1 |
+| SRS | 1 | 42.40 / 42.40 / 42.40 ms | 1.07 Mbps | 71.8 |
+| SRS | 25 | 54.02 / 58.77 / 59.68 ms | 26.93 Mbps | 72.2 |
+| SRS | 100 | 71.33 / 89.02 / 89.76 ms | 108.00 Mbps | 72.0 |
 
 Takeaways:
 
@@ -162,18 +166,18 @@ Takeaways:
   100 concurrent viewers of one stream on this 4-vCPU box (steady fps/player
   in the 72-73 range across the board) — none of the four is anywhere near
   saturated at this concurrency on this hardware.
-- **Join latency at 1 and 25 viewers**: `librtmp2-server` (3.6-15.0 ms) sits
-  well ahead of SRS (42.8-50.5 ms) and nginx-rtmp (87.8-88.3 ms), and close
-  behind MediaMTX (1.3-4.0 ms) — `TCP_NODELAY` and the `poll(2)`-driven poll
-  loop (see above) put it in the same tier as MediaMTX at this concurrency.
-  SRS's default merged-write buffering (see above) is most of what separates
-  it from MediaMTX and `librtmp2-server` here rather than raw per-connection
-  cost.
-- **Join latency at 100 viewers**: `librtmp2-server` (47.1 ms) stays well
-  ahead of SRS (79.4 ms) and nginx-rtmp (90.5 ms), though the gap to
-  MediaMTX (16.9 ms) widens with concurrency more than the 1/25-viewer
-  numbers suggest — MediaMTX's mature epoll-based async I/O scales flatter
-  under this poll-based design's per-tick connection bookkeeping.
+- **Join latency at 1 and 25 viewers**: `librtmp2-server` (3.2-7.5 ms) is
+  on par with MediaMTX (2.6-7.0 ms) and well ahead of SRS (42.4-54.0 ms) and
+  nginx-rtmp (86.4-91.7 ms). SRS's default merged-write buffering (see
+  above) is most of what separates it from the other two here rather than
+  raw per-connection cost.
+- **Join latency at 100 viewers**: `librtmp2-server` (27.9 ms avg, 41.8 ms
+  p95) is close to MediaMTX (22.7 ms avg, 39.0 ms p95) and well ahead of SRS
+  (71.3 ms) and nginx-rtmp (90.7 ms). Single runs on this shared VM vary by
+  roughly ±7 ms at this concurrency, so compare the tier, not the decimals.
+  Before the stats batching and accept-latency fixes in this release,
+  `librtmp2-server` measured ~15 ms (1 viewer) and ~40-47 ms (100 viewers)
+  on the same box.
 - Aggregate throughput scales linearly with viewer count for all four, as
   expected for a simple relay (no transcoding) — 100 viewers at ~1.1 Mbps
   each is ~108-110 Mbps served, consistent across all four implementations.
