@@ -84,6 +84,27 @@ begin at `1.0.0`.
   wait on Raft, whose apply path needs the same connection). 30 concurrent
   connect+publish: ~7.9 ms -> ~5.6 ms on average, p95 ~16 ms -> ~7 ms.
 
+- RTMP connections are now spread over several poll threads by default.
+  When `LRTMP2_RTMP_SHARDS` is unset the server runs one `SO_REUSEPORT`
+  shard per available CPU, up to 4, wherever that can't change behaviour:
+  media outputs (recording/HLS/push/exec), HA clustering and a configured
+  per-address connection cap still force a single shard, and
+  `LRTMP2_RTMP_SHARDS=1` restores the single-thread loop. The global
+  `max_connections` cap stays exact across shards: each shard's cap is set
+  before every poll to what the other shards leave free, and any overshoot
+  from simultaneous accepts is trimmed (newest unauthorized connections
+  first).
+- Cross-shard relay no longer waits for the receiving shard's next poll
+  tick. The sending shard signals the target shard's `eventfd` after
+  queueing a frame, and a shard that injected relayed frames re-polls
+  immediately so they are flushed to its players at once. Before this,
+  sharding added up to 50 ms of latency to every relayed frame on idle
+  shards, which is why `LRTMP2_RTMP_SHARDS=4` showed no gain before.
+  On the 4-vCPU benchmark box (4 interleaved rounds, 1 vs 4 shards):
+  30 concurrent connect+publish ~4.9 -> ~3.6 ms on average, 100-viewer join
+  ~16.5 -> ~10.3 ms on average (p95 ~28.6 -> ~22.5 ms), with every viewer
+  still receiving the full frame rate.
+
 ### Fixed
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate

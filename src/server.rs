@@ -4,7 +4,7 @@
 use parking_lot::Mutex;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -193,35 +193,136 @@ const CROSS_SHARD_RELAY_QUEUE_CAPACITY: usize = 1024;
 /// whenever either is enabled, rather than risk silently dropping frames or
 /// double-processing them.
 ///
-/// Set with `LRTMP2_RTMP_SHARDS` (clamped to `[1, MAX_SHARDS]`); defaults to
-/// `1` (today's single-thread behavior, unchanged) rather than the core
-/// count. This is new code with a real, disclosed tradeoff --
-/// `max_connections_per_addr` is enforced per shard rather than truly
-/// globally, since a given IP's connections can land on different shards --
-/// so it stays opt-in rather than silently changing behavior (including the
-/// effective per-IP cap) for existing deployments the moment this ships.
-fn resolve_shard_count(media_outputs_enabled: bool, cluster_enabled: bool) -> usize {
-    let requested = std::env::var("LRTMP2_RTMP_SHARDS")
+/// Set with `LRTMP2_RTMP_SHARDS` (clamped to `[1, MAX_SHARDS]`). When unset
+/// it defaults to the number of available CPUs, capped at
+/// [`AUTO_SHARDS_MAX`] -- but only where sharding can't change behaviour:
+/// media outputs and HA clustering (above) force a single shard, and so
+/// does a configured per-address connection cap, since that cap is
+/// enforced per shard (a given IP's connections can land on different
+/// shards). The global `max_connections` cap stays exact across shards
+/// (see [`ShardConnBudget`]). Setting `LRTMP2_RTMP_SHARDS=1` restores the
+/// single-thread loop.
+fn resolve_shard_count(
+    media_outputs_enabled: bool,
+    cluster_enabled: bool,
+    per_addr_caps_configured: bool,
+) -> usize {
+    let explicit = std::env::var("LRTMP2_RTMP_SHARDS")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
         .unwrap_or(1);
+    shard_count_for(
+        explicit,
+        cpus,
+        media_outputs_enabled,
+        cluster_enabled,
+        per_addr_caps_configured,
+    )
+}
+
+/// [`resolve_shard_count`] without the environment lookups.
+fn shard_count_for(
+    explicit: Option<usize>,
+    cpus: usize,
+    media_outputs_enabled: bool,
+    cluster_enabled: bool,
+    per_addr_caps_configured: bool,
+) -> usize {
+    let requested = match explicit {
+        Some(n) => n,
+        None if per_addr_caps_configured => return 1,
+        None => cpus.min(AUTO_SHARDS_MAX),
+    };
     if requested <= 1 {
         return 1;
     }
     if media_outputs_enabled {
-        crate::log_warn!(
-            "LRTMP2_RTMP_SHARDS ignored: media outputs (recording/HLS/push/exec) aren't wired through cross-shard relay yet"
-        );
+        if explicit.is_some() {
+            crate::log_warn!(
+                "LRTMP2_RTMP_SHARDS ignored: media outputs (recording/HLS/push/exec) aren't wired through cross-shard relay yet"
+            );
+        }
         return 1;
     }
     if cluster_enabled {
-        crate::log_warn!(
-            "LRTMP2_RTMP_SHARDS ignored: HA clustering isn't wired through cross-shard relay yet"
-        );
+        if explicit.is_some() {
+            crate::log_warn!(
+                "LRTMP2_RTMP_SHARDS ignored: HA clustering isn't wired through cross-shard relay yet"
+            );
+        }
         return 1;
     }
     requested.clamp(1, MAX_SHARDS)
 }
+
+/// Default shard count ceiling when `LRTMP2_RTMP_SHARDS` is unset. Every
+/// shard receives every other shard's relayed frames, so returns diminish
+/// past a handful of shards for a single hot stream.
+const AUTO_SHARDS_MAX: usize = 4;
+
+/// Keeps the configured global `max_connections` exact when connections are
+/// spread over several shards. Each shard publishes its connection count;
+/// before each poll a shard's own librtmp2 cap is set to what the others
+/// leave free (so it stops accepting once the process-wide total is
+/// reached, instead of at a fixed per-shard share that uneven kernel load
+/// balancing could fill early), and after the poll any overshoot from two
+/// shards accepting in the same instant is trimmed by closing the newest
+/// not-yet-authorized connections.
+struct ShardConnBudget {
+    counts: Arc<Vec<AtomicUsize>>,
+    index: usize,
+    global: usize,
+}
+
+impl ShardConnBudget {
+    fn others(&self) -> usize {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.index)
+            .map(|(_, c)| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn before_poll(&self, server: &mut librtmp2::server::Server) {
+        self.counts[self.index].store(server.connections.len(), Ordering::Relaxed);
+        // librtmp2 treats 0 as "unlimited", so never go below 1; the
+        // overshoot that can allow is trimmed in `after_poll`.
+        let free = self.global.saturating_sub(self.others()).max(1);
+        server.config.max_connections = free.min(i32::MAX as usize) as i32;
+    }
+
+    fn after_poll(&self, server: &mut librtmp2::server::Server, rtmp_bridge: &DbRtmpBridge) {
+        let own = server.connections.len();
+        let total = own + self.others();
+        let mut trimmed = 0;
+        if total > self.global {
+            let excess = total - self.global;
+            let mut newest: Vec<(u64, usize)> = server
+                .connections
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.client_fd >= 0 && !rtmp_bridge.has_authorized_session(c.conn_id))
+                .map(|(i, c)| (c.conn_id, i))
+                .collect();
+            newest.sort_unstable_by_key(|&(conn_id, _)| std::cmp::Reverse(conn_id));
+            for (_, idx) in newest.into_iter().take(excess) {
+                server.connections[idx].disconnect_transport();
+                trimmed += 1;
+            }
+            if trimmed > 0 {
+                crate::log_warn!(
+                    "RTMP: connection cap {} reached across shards; closed {trimmed} new connection(s)",
+                    self.global
+                );
+            }
+        }
+        self.counts[self.index].store(own - trimmed, Ordering::Relaxed);
+    }
+}
+
 /// Block until a listener or tracked connection socket becomes readable, or
 /// `timeout_ms` elapses -- whichever comes first.
 ///
@@ -1595,10 +1696,20 @@ impl ServerApp {
         #[cfg(not(feature = "cluster"))]
         let relay_export_bytes = media_export_bytes;
 
+        let per_addr_caps_configured = rtmp_max_connections_per_addr != i32::MAX
+            || self.config.rtmp_max_pending_tls_per_addr != i32::MAX;
         #[cfg(feature = "cluster")]
-        let n_shards = resolve_shard_count(media_output_config.enabled(), cluster_enabled);
+        let n_shards = resolve_shard_count(
+            media_output_config.enabled(),
+            cluster_enabled,
+            per_addr_caps_configured,
+        );
         #[cfg(not(feature = "cluster"))]
-        let n_shards = resolve_shard_count(media_output_config.enabled(), false);
+        let n_shards = resolve_shard_count(
+            media_output_config.enabled(),
+            false,
+            per_addr_caps_configured,
+        );
         // Never shard past the configured connection cap: `rtmp_max_conn` is
         // always >= 1 (see `parse_max_connections`), so this also guarantees
         // `per_shard_max_conn` below floors to at least 1 without needing to
@@ -1609,8 +1720,8 @@ impl ServerApp {
         if n_shards > 1 {
             crate::log_info!("RTMP sharding enabled: {n_shards} worker threads");
         }
-        let base_per_shard_max_conn = rtmp_max_conn / n_shards as i32;
-        let max_conn_remainder = rtmp_max_conn as usize % n_shards;
+        let shard_conn_counts: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..n_shards).map(|_| AtomicUsize::new(0)).collect());
         // At n_shards > 1 relay export must always be on (cross-shard relay
         // depends on it, regardless of media outputs/clustering), sized
         // generously since it's now also the sole path getting frames to
@@ -1726,15 +1837,26 @@ impl ServerApp {
         let mut ready_rxs = Vec::with_capacity(n_shards);
         let mut shard_threads = Vec::with_capacity(n_shards);
 
+        // Every shard can wake every other one: cross-shard relay frames
+        // land in the receiving shard's inbox and must be fanned out to its
+        // viewers right away, not on that shard's next poll timeout.
+        let all_shard_wakes: Arc<Vec<Option<Arc<WakeFd>>>> = Arc::new(shard_wakes.clone());
         for (shard_index, (shard_auth_rx, shard_wake)) in
             shard_auth_rxs.into_iter().zip(shard_wakes).enumerate()
         {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             ready_rxs.push(ready_rx);
-            let shard_max_connections =
-                base_per_shard_max_conn + i32::from(shard_index < max_conn_remainder);
+            // Each shard starts with the full global cap; `ShardConnBudget`
+            // narrows it every tick to what the other shards leave free.
+            let shard_max_connections = rtmp_max_conn;
+            let conn_budget = (n_shards > 1).then(|| ShardConnBudget {
+                counts: Arc::clone(&shard_conn_counts),
+                index: shard_index,
+                global: rtmp_max_conn.max(1) as usize,
+            });
             let relay_rx = relay_rxs[shard_index].take();
             let relay_txs = relay_txs.clone();
+            let all_shard_wakes = Arc::clone(&all_shard_wakes);
             let conn_id_base = (n_shards > 1).then(|| 1 + shard_index as u64 * SHARD_ID_SPACE);
             let rtmp_bind = rtmp_bind.clone();
             let rtmps_bind = rtmps_bind.clone();
@@ -1885,6 +2007,9 @@ impl ServerApp {
                                 HashMap::new()
                             };
 
+                        if let Some(budget) = &conn_budget {
+                            budget.before_poll(&mut server);
+                        }
                         set_rtmp_poll_server(&mut server);
                         let poll_result = match &readable {
                             Some(r) => server.poll_ready(0, r),
@@ -1894,6 +2019,9 @@ impl ServerApp {
                         if let Err(e) = poll_result {
                             crate::log_warn!("RTMP polling stopped: {e}");
                             break;
+                        }
+                        if let Some(budget) = &conn_budget {
+                            budget.after_poll(&mut server, &rtmp_bridge);
                         }
 
                         let deleted_now: HashSet<String> =
@@ -1983,18 +2111,30 @@ impl ServerApp {
                         // that falls behind drops frames past that bound rather than
                         // this shard's poll tick blocking on a slow/stuck peer, which
                         // would stall every connection on *this* shard too.
-                        if let Some(txs) = relay_txs.as_ref() {
+                        if let Some(txs) = relay_txs.as_ref()
+                            && !exported_frames.is_empty()
+                        {
                             for (i, tx) in txs.iter().enumerate() {
                                 if i == shard_index {
                                     continue;
                                 }
+                                let mut sent = false;
                                 for frame in &exported_frames {
-                                    let _ = tx.try_send(frame.clone());
+                                    sent |= tx.try_send(frame.clone()).is_ok();
+                                }
+                                if sent && let Some(wake) = &all_shard_wakes[i] {
+                                    wake.signal();
                                 }
                             }
                         }
+                        // Frames injected here are only fanned out to this
+                        // shard's viewers inside the next `server.poll`, so
+                        // re-poll immediately (below) rather than holding them
+                        // for a tick.
+                        let mut injected_relay = false;
                         if let Some(rx) = relay_rx.as_ref() {
                             while let Ok(frame) = rx.try_recv() {
+                                injected_relay = true;
                                 let _ = server.inject_relay_frame(
                                     &frame.app,
                                     &frame.stream_name,
@@ -2156,7 +2296,7 @@ impl ServerApp {
                         // reply is usually flushed already, so nothing would
                         // wake the wait early -- re-poll immediately instead of
                         // sleeping a tick before the viewer's first frame.
-                        let poll_interval_ms = if just_authorized {
+                        let poll_interval_ms = if just_authorized || injected_relay {
                             0
                         } else if negotiating {
                             POLL_INTERVAL_FAST_MS
@@ -2457,6 +2597,68 @@ mod tests {
             start.elapsed() >= Duration::from_millis(5),
             "an unserviceable listener must not turn the wait into a busy loop"
         );
+    }
+
+    #[test]
+    fn shard_count_defaults_to_cpus_only_where_behaviour_is_unchanged() {
+        use super::shard_count_for;
+        // Unset: CPUs, capped.
+        assert_eq!(shard_count_for(None, 2, false, false, false), 2);
+        assert_eq!(shard_count_for(None, 16, false, false, false), 4);
+        assert_eq!(shard_count_for(None, 1, false, false, false), 1);
+        // Features that aren't shard-aware, or per-address caps, keep one.
+        assert_eq!(shard_count_for(None, 8, true, false, false), 1);
+        assert_eq!(shard_count_for(None, 8, false, true, false), 1);
+        assert_eq!(shard_count_for(None, 8, false, false, true), 1);
+        // Explicit setting wins (clamped), except where sharding can't work.
+        assert_eq!(shard_count_for(Some(1), 8, false, false, false), 1);
+        assert_eq!(shard_count_for(Some(6), 2, false, false, true), 6);
+        assert_eq!(shard_count_for(Some(1000), 2, false, false, false), 32);
+        assert_eq!(shard_count_for(Some(4), 8, true, false, false), 1);
+    }
+
+    #[test]
+    fn shard_conn_budget_keeps_the_global_cap_exact() {
+        use super::ShardConnBudget;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counts: Arc<Vec<AtomicUsize>> = Arc::new((0..2).map(|_| AtomicUsize::new(0)).collect());
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
+        let budget = ShardConnBudget {
+            counts: Arc::clone(&counts),
+            index: 0,
+            global: 3,
+        };
+        let mut server = unbound_rtmp_server(3);
+
+        // The other shard holds 2: this one may take only 1 more.
+        counts[1].store(2, Ordering::Relaxed);
+        budget.before_poll(&mut server);
+        assert_eq!(server.config.max_connections, 1);
+
+        // Both shards accepted at once and overshot: this shard now has 3
+        // new connections, 5 in total. The 2 newest are closed.
+        for id in 1..=3u64 {
+            let mut conn = librtmp2::session::conn::Conn::new();
+            conn.conn_id = id;
+            conn.client_fd = 1000 + id as i32;
+            server.connections.push(conn);
+        }
+        budget.after_poll(&mut server, &bridge);
+        let open: Vec<u64> = server
+            .connections
+            .iter()
+            .filter(|c| c.client_fd >= 0)
+            .map(|c| c.conn_id)
+            .collect();
+        assert_eq!(open, vec![1]);
+        assert_eq!(counts[0].load(Ordering::Relaxed), 1);
+
+        // Everything else full: librtmp2's 0 means unlimited, so the cap
+        // floors at 1 and relies on the trim above.
+        counts[1].store(3, Ordering::Relaxed);
+        budget.before_poll(&mut server);
+        assert_eq!(server.config.max_connections, 1);
     }
 
     #[test]
