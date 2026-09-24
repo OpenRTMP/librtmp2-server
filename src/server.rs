@@ -264,14 +264,34 @@ fn wait_for_readiness_or_timeout(
         .collect();
     let at_connection_cap = server.config.max_connections > 0
         && server.connections.len() >= server.config.max_connections as usize;
+    // A connection with outbound bytes still queued (a player whose socket
+    // send buffer filled mid-keyframe, say) also waits for POLLOUT, so the
+    // loop wakes to flush the rest as soon as the peer's window opens instead
+    // of stalling that viewer's stream for up to a full poll interval. Only
+    // requested while bytes are pending, so a drained or idle connection
+    // can't turn this into a busy loop.
     let mut fds: Vec<libc::pollfd> = server
         .listener_fds()
         .into_iter()
         .filter(|_| !at_connection_cap)
-        .chain(conn_id_by_fd.keys().copied())
-        .map(|fd| libc::pollfd {
+        .map(|fd| (fd, libc::POLLIN))
+        .chain(
+            server
+                .connections
+                .iter()
+                .filter(|conn| conn.client_fd >= 0)
+                .map(|conn| {
+                    let events = if conn.send_buffer.available() > 0 {
+                        libc::POLLIN | libc::POLLOUT
+                    } else {
+                        libc::POLLIN
+                    };
+                    (conn.client_fd, events)
+                }),
+        )
+        .map(|(fd, events)| libc::pollfd {
             fd,
-            events: libc::POLLIN,
+            events,
             revents: 0,
         })
         .collect();
@@ -2224,6 +2244,42 @@ mod tests {
         assert!(
             start.elapsed() >= Duration::from_millis(5),
             "an unserviceable listener must not turn the wait into a busy loop"
+        );
+    }
+
+    #[test]
+    fn pending_outbound_bytes_wake_the_wait_on_writability() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(0, port);
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        for _ in 0..50 {
+            server.poll(0).unwrap();
+            if !server.connections.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server.connections.len(), 1);
+
+        // Nothing queued and nothing to read: the wait honors its timeout.
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 100);
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+
+        // Queued outbound bytes on a writable socket must end the wait
+        // right away so they get flushed, without marking the connection
+        // recv-ready (it sent nothing).
+        server.connections[0]
+            .send_buffer
+            .write(b"queued media")
+            .unwrap();
+        let start = Instant::now();
+        let ready = wait_for_readiness_or_timeout(&server, 1000);
+        assert_eq!(ready.map(|ids| ids.len()), Some(0));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a writable connection with queued bytes must not wait out the poll interval"
         );
     }
 
