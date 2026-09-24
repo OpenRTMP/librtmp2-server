@@ -41,6 +41,16 @@ begin at `1.0.0`.
   viewer join latency on the benchmark box dropped from ~15 ms to ~4 ms,
   100-viewer join from ~35 ms to ~17 ms on average.
 
+- Publish/play authorization results now wake the RTMP poll loop through
+  an `eventfd` registered in its epoll set, instead of waiting for the next
+  poll tick (up to 1 ms while connections are negotiating, one per auth).
+  The hot authorization and stats statements (`publish_key` lookup,
+  publisher/player inserts and the active-publisher count, stats updates)
+  now use cached prepared statements instead of being re-parsed per call.
+  Sequential connect+publish latency dropped from ~1.8 ms to ~0.6 ms on the
+  benchmark box, on par with MediaMTX (~0.8 ms) and LiveForge (~0.7 ms)
+  even though this server also authenticates every publish against SQLite.
+
 ### Fixed
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate

@@ -337,6 +337,23 @@ fn poll_readiness(server: &librtmp2::server::Server, timeout_ms: u64) -> Option<
 /// Readiness source for the RTMP poll loop: a persistent epoll set on Linux
 /// (see `crate::readiness`), falling back to the per-tick `poll(2)` in
 /// [`poll_readiness`] elsewhere or if epoll is unavailable.
+#[cfg(target_os = "linux")]
+use crate::readiness::WakeFd;
+
+/// Stand-in where `eventfd` isn't available: completions are then picked up
+/// on the poll loop's next tick, as before wake fds existed.
+#[cfg(not(target_os = "linux"))]
+struct WakeFd;
+
+#[cfg(not(target_os = "linux"))]
+impl WakeFd {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn signal(&self) {}
+}
+
 struct ReadinessWaiter {
     source: ReadinessSource,
     /// `server.connections.len()` when the previous wait returned with only
@@ -359,12 +376,14 @@ pub(crate) struct Wake {
 }
 
 impl ReadinessWaiter {
-    fn new() -> Self {
+    fn new(wake: Option<Arc<WakeFd>>) -> Self {
         #[cfg(target_os = "linux")]
-        match crate::readiness::EpollReadiness::new() {
+        match crate::readiness::EpollReadiness::new(wake) {
             Ok(epoll) => return Self::with_source(ReadinessSource::Epoll(epoll)),
             Err(e) => crate::log_warn!("epoll unavailable ({e}); falling back to poll(2)"),
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = wake;
         Self::with_source(ReadinessSource::Poll)
     }
 
@@ -1578,8 +1597,29 @@ impl ServerApp {
         if let Ok(mut guard) = RTMP_BRIDGE.lock() {
             *guard = Some(Arc::clone(&rtmp_bridge));
         }
+        // One wake fd per shard: whoever delivers that shard's auth
+        // completions signals it, so the shard's poll loop picks a
+        // publish/play decision up at once instead of on its next tick.
+        let shard_wakes: Vec<Option<Arc<WakeFd>>> = (0..n_shards)
+            .map(|_| match WakeFd::new() {
+                Ok(wake) => Some(Arc::new(wake)),
+                Err(e) => {
+                    crate::log_warn!("RTMP: auth wake fd unavailable ({e}); using poll ticks");
+                    None
+                }
+            })
+            .collect();
+        let worker_wake = if n_shards == 1 {
+            shard_wakes[0].clone()
+        } else {
+            None
+        };
         let (auth_worker_handle, auth_completions_rx) =
-            auth_worker::spawn(Arc::clone(&rtmp_bridge));
+            auth_worker::spawn_with_notify(Arc::clone(&rtmp_bridge), move || {
+                if let Some(wake) = &worker_wake {
+                    wake.signal();
+                }
+            });
         if let Ok(mut guard) = AUTH_WORKER.lock() {
             *guard = Some(auth_worker_handle);
         }
@@ -1603,6 +1643,7 @@ impl ServerApp {
             for (i, rx) in shard_auth_rx_vec.into_iter().enumerate() {
                 shard_auth_rxs[i] = Some(rx);
             }
+            let dispatch_wakes = shard_wakes.clone();
             auth_dispatch_thread = Some(
                 std::thread::Builder::new()
                     .name("rtmp-auth-dispatch".to_string())
@@ -1610,7 +1651,11 @@ impl ServerApp {
                         for completion in auth_completions_rx {
                             let shard =
                                 shard_for_conn_id(completion.conn_id).min(shard_auth_txs.len() - 1);
-                            let _ = shard_auth_txs[shard].send(completion);
+                            if shard_auth_txs[shard].send(completion).is_ok()
+                                && let Some(wake) = &dispatch_wakes[shard]
+                            {
+                                wake.signal();
+                            }
                         }
                     })
                     .expect("failed to spawn auth-completion dispatcher thread"),
@@ -1648,7 +1693,9 @@ impl ServerApp {
         let mut ready_rxs = Vec::with_capacity(n_shards);
         let mut shard_threads = Vec::with_capacity(n_shards);
 
-        for (shard_index, shard_auth_rx) in shard_auth_rxs.into_iter().enumerate() {
+        for (shard_index, (shard_auth_rx, shard_wake)) in
+            shard_auth_rxs.into_iter().zip(shard_wakes).enumerate()
+        {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             ready_rxs.push(ready_rx);
             let shard_max_connections =
@@ -1773,7 +1820,7 @@ impl ServerApp {
                     // ready"), `Server::poll` processes every connection, same as
                     // before this readiness-aware path existed.
                     let mut readable: Option<HashSet<u64>> = None;
-                    let mut readiness = ReadinessWaiter::new();
+                    let mut readiness = ReadinessWaiter::new(shard_wake);
 
                     loop {
                         if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -2409,7 +2456,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn epoll_waiter() -> ReadinessWaiter {
-        let waiter = ReadinessWaiter::new();
+        let waiter = ReadinessWaiter::new(None);
         assert!(matches!(waiter.source, ReadinessSource::Epoll(_)));
         waiter
     }
@@ -2515,6 +2562,35 @@ mod tests {
     #[test]
     fn epoll_listener_only_readiness_backs_off_only_without_accept_progress() {
         assert_listener_backoff(epoll_waiter());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wake_fd_cuts_the_wait_short_and_rearms() {
+        let port = free_local_port();
+        let server = listening_rtmp_server(0, port);
+        let wake = Arc::new(super::WakeFd::new().unwrap());
+        let mut waiter = ReadinessWaiter::new(Some(Arc::clone(&wake)));
+        assert!(matches!(waiter.source, ReadinessSource::Epoll(_)));
+
+        let signaller = Arc::clone(&wake);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            signaller.signal();
+        });
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 2000).map(|r| r.len()), Some(0));
+        let woke_after = start.elapsed();
+        t.join().unwrap();
+        assert!(
+            woke_after < Duration::from_millis(1000),
+            "a signal must end the wait early, took {woke_after:?}"
+        );
+
+        // Drained: with no new signal the next wait honors its timeout.
+        let start = Instant::now();
+        assert_eq!(waiter.wait(&server, 100).map(|r| r.len()), Some(0));
+        assert!(start.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]

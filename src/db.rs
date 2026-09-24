@@ -831,14 +831,15 @@ impl Db {
             return DbLookup::Missing;
         }
         let conn = self.conn.lock();
-        map_optional(conn.query_row(
-            &format!(
+        // Hot path: every publish attempt. Cached so the statement isn't
+        // re-parsed and re-planned per request.
+        map_optional(
+            conn.prepare_cached(&format!(
                 "SELECT {} FROM streams WHERE publish_key=?",
                 Self::STREAM_COLS
-            ),
-            params![key],
-            Self::load_stream_row,
-        ))
+            ))
+            .and_then(|mut stmt| stmt.query_row(params![key], Self::load_stream_row)),
+        )
     }
 
     pub fn stream_find_by_stats_key(&self, key: &str) -> DbLookup<Stream> {
@@ -1623,11 +1624,10 @@ impl Db {
                 return false;
             }
         };
-        let active: i64 = match tx.query_row(
-            "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1",
-            params![p.stream_id],
-            |row| row.get(0),
-        ) {
+        let active: i64 = match tx
+            .prepare_cached("SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1")
+            .and_then(|mut stmt| stmt.query_row(params![p.stream_id], |row| row.get(0)))
+        {
             Ok(count) => count,
             Err(e) => {
                 crate::log_error!("publisher_try_acquire: count query failed: {e}");
@@ -1638,11 +1638,12 @@ impl Db {
             return false;
         }
         if tx
-            .execute(
+            .prepare_cached(
                 "INSERT INTO publishers \
                  (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
-                params![
+            )
+            .and_then(|mut stmt| stmt.execute(params![
                     p.id,
                     p.stream_id,
                     p.app,
@@ -1658,8 +1659,7 @@ impl Db {
                     p.bitrate_kbps,
                     p.rtt_ms,
                     p.connected_at
-                ],
-            )
+                ]))
             .is_err()
         {
             return false;
@@ -1771,25 +1771,28 @@ impl Db {
             );
             return false;
         };
-        match conn.execute(
-            "UPDATE publishers SET \
+        match conn
+            .prepare_cached(
+                "UPDATE publishers SET \
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
              audio_sample_rate=?,audio_channels=?,\
              bytes_in=?,bitrate_kbps=?,rtt_ms=? WHERE id=? AND active=1",
-            params![
-                p.video_codec,
-                p.audio_codec,
-                p.video_width,
-                p.video_height,
-                p.fps,
-                p.audio_sample_rate,
-                p.audio_channels,
-                bytes_in,
-                p.bitrate_kbps,
-                p.rtt_ms,
-                id
-            ],
-        ) {
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
+                    p.video_codec,
+                    p.audio_codec,
+                    p.video_width,
+                    p.video_height,
+                    p.fps,
+                    p.audio_sample_rate,
+                    p.audio_channels,
+                    bytes_in,
+                    p.bitrate_kbps,
+                    p.rtt_ms,
+                    id
+                ])
+            }) {
             Ok(rows) if rows > 0 => true,
             Ok(_) => false,
             Err(e) => {
@@ -1966,11 +1969,13 @@ impl Db {
             }
         };
         if tx
-            .execute(
+            .prepare_cached(
                 "INSERT INTO players \
                  (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
                  VALUES (?,?,?,?,?,?,?,?,?,1)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     p.id,
                     p.stream_id,
                     p.viewer_id,
@@ -1980,8 +1985,8 @@ impl Db {
                     p.bitrate_kbps,
                     p.rtt_ms,
                     p.connected_at
-                ],
-            )
+                ])
+            })
             .is_err()
         {
             return false;
@@ -2105,11 +2110,13 @@ impl Db {
             );
             return false;
         };
-        match conn.execute(
-            "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
+        match conn
+            .prepare_cached(
+                "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
              WHERE id=? AND active=1",
-            params![bytes_out, p.bitrate_kbps, p.rtt_ms, id],
-        ) {
+            )
+            .and_then(|mut stmt| stmt.execute(params![bytes_out, p.bitrate_kbps, p.rtt_ms, id]))
+        {
             Ok(rows) if rows > 0 => true,
             Ok(_) => false,
             Err(e) => {

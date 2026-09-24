@@ -12,6 +12,52 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+
+/// `epoll_event.u64` for the [`WakeFd`] registration. Every other
+/// registration uses its (non-negative) fd, so this can't collide.
+const WAKE_TOKEN: u64 = u64::MAX;
+
+/// An `eventfd(2)` other threads signal to cut an [`EpollReadiness::wait`]
+/// short, e.g. when the auth worker has a publish/play decision ready.
+/// Without it the poll loop only noticed completions on its next timeout
+/// tick, adding up to a tick of latency to every publish and play.
+pub(crate) struct WakeFd(OwnedFd);
+
+impl WakeFd {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Wake the waiter. Signals coalesce until it drains them.
+    pub(crate) fn signal(&self) {
+        let one: u64 = 1;
+        // EAGAIN only if the counter would overflow, i.e. it is already
+        // signalled; nothing to do in that case.
+        let _ = unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                (&one as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+
+    fn drain(&self) {
+        let mut buf: u64 = 0;
+        let _ = unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                (&mut buf as *mut u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+}
 
 /// What one fd is registered for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,19 +71,41 @@ pub(crate) struct EpollReadiness {
     epfd: OwnedFd,
     registered: HashMap<i32, Interest>,
     events: Vec<libc::epoll_event>,
+    /// Registered once at construction (under [`WAKE_TOKEN`]) and never
+    /// part of `registered`, so `sync` leaves it alone.
+    wake: Option<Arc<WakeFd>>,
 }
 
 impl EpollReadiness {
-    pub(crate) fn new() -> std::io::Result<Self> {
+    pub(crate) fn new(wake: Option<Arc<WakeFd>>) -> std::io::Result<Self> {
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Self {
+        let epoll = Self {
             epfd: unsafe { OwnedFd::from_raw_fd(fd) },
             registered: HashMap::new(),
             events: Vec::new(),
-        })
+            wake,
+        };
+        if let Some(wake) = &epoll.wake {
+            let mut ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: WAKE_TOKEN,
+            };
+            let rc = unsafe {
+                libc::epoll_ctl(
+                    epoll.epfd.as_raw_fd(),
+                    libc::EPOLL_CTL_ADD,
+                    wake.0.as_raw_fd(),
+                    &mut ev,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(epoll)
     }
 
     /// Wait until a registered fd is ready or `timeout_ms` elapses. Same
@@ -54,7 +122,7 @@ impl EpollReadiness {
             std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
             return None;
         }
-        let capacity = self.registered.len().max(1);
+        let capacity = self.registered.len() + 1;
         self.events.clear();
         self.events
             .resize(capacity, libc::epoll_event { events: 0, u64: 0 });
@@ -82,6 +150,14 @@ impl EpollReadiness {
         let mut ready = HashSet::new();
         let mut listener_ready = false;
         for ev in &self.events[..n] {
+            if ev.u64 == WAKE_TOKEN {
+                // Only the early return matters; the caller processes
+                // whatever the signaller queued (e.g. auth completions).
+                if let Some(wake) = &self.wake {
+                    wake.drain();
+                }
+                continue;
+            }
             let fd = ev.u64 as i32;
             let Some(interest) = self.registered.get(&fd) else {
                 continue;

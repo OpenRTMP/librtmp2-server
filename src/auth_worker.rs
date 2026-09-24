@@ -106,6 +106,15 @@ impl AuthWorkerHandle {
 /// `handle` and every clone of it are dropped, at which point the request
 /// channel closes and the thread's loop ends on its own.
 pub fn spawn(bridge: Arc<DbRtmpBridge>) -> (AuthWorkerHandle, Receiver<AuthCompletion>) {
+    spawn_with_notify(bridge, || {})
+}
+
+/// [`spawn`], calling `notify` after each completion is queued so the
+/// receiving poll loop can be woken instead of finding it on its next tick.
+pub fn spawn_with_notify(
+    bridge: Arc<DbRtmpBridge>,
+    notify: impl Fn() + Send + 'static,
+) -> (AuthWorkerHandle, Receiver<AuthCompletion>) {
     let (req_tx, req_rx) = sync_channel::<AuthRequest>(AUTH_QUEUE_CAPACITY);
     let (completion_tx, completion_rx) = sync_channel::<AuthCompletion>(AUTH_QUEUE_CAPACITY);
 
@@ -125,11 +134,16 @@ pub fn spawn(bridge: Arc<DbRtmpBridge>) -> (AuthWorkerHandle, Receiver<AuthCompl
                 };
                 // If the RTMP thread already shut down, there's no receiver
                 // left to deliver this completion to; drop it silently.
-                let _ = completion_tx.send(AuthCompletion {
-                    kind: req.kind,
-                    conn_id: req.conn_id,
-                    allow,
-                });
+                if completion_tx
+                    .send(AuthCompletion {
+                        kind: req.kind,
+                        conn_id: req.conn_id,
+                        allow,
+                    })
+                    .is_ok()
+                {
+                    notify();
+                }
             }
         })
         .expect("failed to spawn RTMP auth worker thread");
