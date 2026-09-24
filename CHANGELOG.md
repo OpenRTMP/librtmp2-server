@@ -13,7 +13,16 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-24
+
 ### Changed
+- Package version `0.4.3` → `0.5.0` (RTMP connections are now sharded across
+  CPUs by default, see below).
+- The benchmark numbers in `BENCHMARKS.md` were measured against librtmp2
+  0.10.0 (per-player flow control, frames chunked once per fan-out, compact
+  chunk headers). This release still builds against librtmp2 `0.9.3`; raise
+  the requirement to `0.10` once that version is on crates.io to pick those
+  relay changes up.
 - The RTMP poll loop waits on a persistent `epoll(7)` set on Linux, updating
   registrations only for connections that changed, instead of rebuilding and
   passing every fd to `poll(2)` on each tick (`poll(2)` remains the fallback).
@@ -699,7 +708,10 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.2.2...v0.3.0
