@@ -48,22 +48,31 @@ impl<'c> DbTx<'c> {
         })
     }
 
+    /// On failure the transaction (or savepoint) is still rolled back when
+    /// `self` drops, so a failed `COMMIT`/`RELEASE` can't leave the shared
+    /// connection inside an abandoned transaction, and a failed operation
+    /// inside a batch can't be persisted by the batch's outer commit.
     pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
-        self.finished = true;
         self.conn.execute_batch(if self.savepoint {
             "RELEASE db_tx"
         } else {
             "COMMIT"
-        })
+        })?;
+        self.finished = true;
+        Ok(())
     }
 
     pub(crate) fn rollback(mut self) -> rusqlite::Result<()> {
         self.finished = true;
-        self.conn.execute_batch(if self.savepoint {
+        self.conn.execute_batch(Self::rollback_sql(self.savepoint))
+    }
+
+    fn rollback_sql(savepoint: bool) -> &'static str {
+        if savepoint {
             "ROLLBACK TO db_tx; RELEASE db_tx"
         } else {
             "ROLLBACK"
-        })
+        }
     }
 }
 
@@ -78,11 +87,9 @@ impl std::ops::Deref for DbTx<'_> {
 impl Drop for DbTx<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.conn.execute_batch(if self.savepoint {
-                "ROLLBACK TO db_tx; RELEASE db_tx"
-            } else {
-                "ROLLBACK"
-            });
+            // After a failed COMMIT SQLite may already have rolled back, in
+            // which case this errors harmlessly.
+            let _ = self.conn.execute_batch(Self::rollback_sql(self.savepoint));
         }
     }
 }
@@ -2515,6 +2522,31 @@ mod tests {
         assert_eq!(db.publisher_list(Some("stream2")).len(), 1);
         // Back to autocommit afterwards: plain operations commit on their own.
         assert!(db.with_conn(|conn| conn.is_autocommit()));
+    }
+
+    #[test]
+    fn db_tx_rolls_back_when_commit_fails() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,
+                 parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .unwrap();
+        let tx = DbTx::begin(&conn).unwrap();
+        // Deferred FK violation: only reported by COMMIT, which then fails
+        // and leaves the transaction open.
+        tx.execute("INSERT INTO child(id, parent_id) VALUES (1, 42)", [])
+            .unwrap();
+        assert!(tx.commit().is_err());
+        // Rolled back on drop instead of staying inside the failed
+        // transaction for whoever uses the connection next.
+        assert!(conn.is_autocommit());
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM child", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

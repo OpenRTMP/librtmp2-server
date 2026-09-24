@@ -115,6 +115,22 @@ begin at `1.0.0`.
   still receiving the full frame rate.
 
 ### Fixed
+- A failed `COMMIT`/`RELEASE` in a DB transaction now rolls the transaction
+  (or savepoint) back instead of leaving the shared SQLite connection inside
+  an abandoned transaction, where a failed operation inside a group commit
+  could still be persisted by the outer commit.
+- Connection closes are always queued on the auth worker behind any
+  authorization still queued for the same connection, even when the
+  authorization queue is full. The old inline fallback could run `on_close`
+  first, after which the late authorization recreated an active
+  publisher/player row for a dead connection that nothing released.
+- With RTMPS enabled and several shards, the global `max_connections` cap is
+  split into fixed per-shard shares instead of the per-tick budget, because
+  librtmp2 counts TLS handshakes in progress against the cap and other shards
+  can't see them.
+- When a publisher stops, the other shards release its relayed route right
+  away instead of holding the inject claim (and the old codec headers) until
+  the 120 s stale-route timeout.
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate
   limit while provisioning streams.

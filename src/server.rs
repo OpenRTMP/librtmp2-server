@@ -262,6 +262,84 @@ fn shard_count_for(
 /// past a handful of shards for a single hot stream.
 const AUTO_SHARDS_MAX: usize = 4;
 
+/// One message on a shard's cross-shard relay inbox.
+enum ShardRelayMsg {
+    /// A frame from a publisher on another shard, to inject for local viewers.
+    Frame(librtmp2::RelayFrame),
+    /// That publisher is gone: release the inject claim on its route right
+    /// away. Without it the receiving shard kept the route claimed for its
+    /// external feed until the stale-route timeout (120 s), rejecting a
+    /// publisher that reconnected and happened to land on that shard.
+    RouteEnded { app: String, stream_name: String },
+}
+
+/// Routes (`app`, `stream_name`) this shard's own publishers have relayed to
+/// the other shards, with the publishing connection, so the other shards can
+/// be told when a route ends.
+#[derive(Default)]
+struct ExportedRoutes {
+    routes: HashMap<(String, String), u64>,
+}
+
+impl ExportedRoutes {
+    fn record(&mut self, frames: &[librtmp2::RelayFrame]) {
+        for frame in frames {
+            // Frames injected from elsewhere are never re-broadcast.
+            if librtmp2::server::is_external_publisher_id(frame.publisher_conn_id) {
+                continue;
+            }
+            let key = (frame.app.clone(), frame.stream_name.clone());
+            if self.routes.get(&key) != Some(&frame.publisher_conn_id) {
+                self.routes.insert(key, frame.publisher_conn_id);
+            }
+        }
+    }
+
+    /// Removes and returns the routes whose publisher is no longer among
+    /// `publishing` (the ids of this shard's connections still publishing).
+    fn take_ended(&mut self, publishing: &HashSet<u64>) -> Vec<(String, String)> {
+        let mut ended = Vec::new();
+        self.routes.retain(|route, conn_id| {
+            let live = publishing.contains(conn_id);
+            if !live {
+                ended.push(route.clone());
+            }
+            live
+        });
+        ended
+    }
+}
+
+/// librtmp2 `max_connections` for one shard, and whether [`ShardConnBudget`]
+/// should adjust it every tick.
+///
+/// Plaintext only: each shard starts with the full global cap and the
+/// budget narrows it to what the other shards leave free. With RTMPS
+/// enabled librtmp2 also counts TLS handshakes in progress against
+/// `max_connections`, and those aren't visible to the other shards (nor in
+/// `Server::connections`), so a per-tick budget could let every shard fill
+/// up with stalled handshakes on its own. The cap is then split statically
+/// instead (`global / n_shards`, remainder to the first shards): librtmp2
+/// enforces each share including pending handshakes, so the shares can't
+/// add up past the global cap. `n_shards <= global` is guaranteed by the
+/// caller, so no share is 0 (which librtmp2 would read as "unlimited").
+fn shard_connection_cap(
+    global: i32,
+    n_shards: usize,
+    shard_index: usize,
+    tls_enabled: bool,
+) -> (i32, bool) {
+    if n_shards <= 1 {
+        return (global, false);
+    }
+    if !tls_enabled {
+        return (global, true);
+    }
+    let n = n_shards as i32;
+    let share = global / n + i32::from((shard_index as i32) < global % n);
+    (share.max(1), false)
+}
+
 /// Keeps the configured global `max_connections` exact when connections are
 /// spread over several shards. Each shard publishes its connection count;
 /// before each poll a shard's own librtmp2 cap is set to what the others
@@ -750,8 +828,9 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
 }
 
 /// Runs `on_close` for a closed connection on the auth worker thread (see
-/// `AuthWorkerHandle::try_submit_close`) instead of inline, falling back to
-/// inline when the worker queue is full or unavailable. With HA clustering
+/// `AuthWorkerHandle::try_submit_close`) instead of inline, in order after
+/// any authorization still queued for the same connection; inline only
+/// when the worker isn't running. With HA clustering
 /// active it stays inline: ownership releases then go through Raft, and
 /// shutdown relies on them finishing before the cluster manager stops.
 fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
@@ -1816,13 +1895,13 @@ impl ServerApp {
         // viewers can land on different shards since SO_REUSEPORT
         // load-balances by connection, not by route (the route isn't known
         // until after the `publish`/`play` command, long after accept).
-        let mut relay_rxs: Vec<Option<std::sync::mpsc::Receiver<librtmp2::RelayFrame>>> =
+        let mut relay_rxs: Vec<Option<std::sync::mpsc::Receiver<ShardRelayMsg>>> =
             (0..n_shards).map(|_| None).collect();
-        let relay_txs: Option<Arc<Vec<std::sync::mpsc::SyncSender<librtmp2::RelayFrame>>>> =
+        let relay_txs: Option<Arc<Vec<std::sync::mpsc::SyncSender<ShardRelayMsg>>>> =
             if n_shards > 1 {
                 let mut txs = Vec::with_capacity(n_shards);
                 for slot in relay_rxs.iter_mut() {
-                    let (tx, rx) = std::sync::mpsc::sync_channel::<librtmp2::RelayFrame>(
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<ShardRelayMsg>(
                         CROSS_SHARD_RELAY_QUEUE_CAPACITY,
                     );
                     txs.push(tx);
@@ -1846,10 +1925,9 @@ impl ServerApp {
         {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             ready_rxs.push(ready_rx);
-            // Each shard starts with the full global cap; `ShardConnBudget`
-            // narrows it every tick to what the other shards leave free.
-            let shard_max_connections = rtmp_max_conn;
-            let conn_budget = (n_shards > 1).then(|| ShardConnBudget {
+            let (shard_max_connections, dynamic_budget) =
+                shard_connection_cap(rtmp_max_conn, n_shards, shard_index, rtmp_tls_enabled);
+            let conn_budget = dynamic_budget.then(|| ShardConnBudget {
                 counts: Arc::clone(&shard_conn_counts),
                 index: shard_index,
                 global: rtmp_max_conn.max(1) as usize,
@@ -1976,6 +2054,11 @@ impl ServerApp {
                     // before this readiness-aware path existed.
                     let mut readable: Option<HashSet<u64>> = None;
                     let mut readiness = ReadinessWaiter::new(shard_wake);
+                    let mut exported_routes = ExportedRoutes::default();
+                    // Route-end notices that didn't fit a full inbox yet:
+                    // (target shard, app, stream_name). Unlike frames these
+                    // must not be dropped, so they're retried every tick.
+                    let mut pending_route_ends: Vec<(usize, String, String)> = Vec::new();
 
                     loop {
                         if rtmp_stop_clone.load(Ordering::Relaxed) {
@@ -2111,17 +2194,42 @@ impl ServerApp {
                         // that falls behind drops frames past that bound rather than
                         // this shard's poll tick blocking on a slow/stuck peer, which
                         // would stall every connection on *this* shard too.
-                        if let Some(txs) = relay_txs.as_ref()
-                            && !exported_frames.is_empty()
-                        {
+                        if let Some(txs) = relay_txs.as_ref() {
+                            exported_routes.record(&exported_frames);
+                            let publishing: HashSet<u64> = server
+                                .connections
+                                .iter()
+                                .filter(|c| c.state == librtmp2::types::ConnState::Publishing)
+                                .map(|c| c.conn_id)
+                                .collect();
+                            for (app, stream_name) in exported_routes.take_ended(&publishing) {
+                                for i in (0..txs.len()).filter(|&i| i != shard_index) {
+                                    pending_route_ends.push((i, app.clone(), stream_name.clone()));
+                                }
+                            }
                             for (i, tx) in txs.iter().enumerate() {
                                 if i == shard_index {
                                     continue;
                                 }
                                 let mut sent = false;
                                 for frame in &exported_frames {
-                                    sent |= tx.try_send(frame.clone()).is_ok();
+                                    sent |=
+                                        tx.try_send(ShardRelayMsg::Frame(frame.clone())).is_ok();
                                 }
+                                // After this tick's frames, so the route is
+                                // released only once its last frames are in.
+                                pending_route_ends.retain(|(target, app, stream_name)| {
+                                    if *target != i {
+                                        return true;
+                                    }
+                                    let msg = ShardRelayMsg::RouteEnded {
+                                        app: app.clone(),
+                                        stream_name: stream_name.clone(),
+                                    };
+                                    let queued = tx.try_send(msg).is_ok();
+                                    sent |= queued;
+                                    !queued
+                                });
                                 if sent && let Some(wake) = &all_shard_wakes[i] {
                                     wake.signal();
                                 }
@@ -2133,15 +2241,22 @@ impl ServerApp {
                         // for a tick.
                         let mut injected_relay = false;
                         if let Some(rx) = relay_rx.as_ref() {
-                            while let Ok(frame) = rx.try_recv() {
+                            while let Ok(msg) = rx.try_recv() {
                                 injected_relay = true;
-                                let _ = server.inject_relay_frame(
-                                    &frame.app,
-                                    &frame.stream_name,
-                                    frame.frame_type,
-                                    frame.timestamp,
-                                    &frame.payload,
-                                );
+                                match msg {
+                                    ShardRelayMsg::Frame(frame) => {
+                                        let _ = server.inject_relay_frame(
+                                            &frame.app,
+                                            &frame.stream_name,
+                                            frame.frame_type,
+                                            frame.timestamp,
+                                            &frame.payload,
+                                        );
+                                    }
+                                    ShardRelayMsg::RouteEnded { app, stream_name } => {
+                                        server.release_injected_route(&app, &stream_name);
+                                    }
+                                }
                             }
                         }
 
@@ -2615,6 +2730,59 @@ mod tests {
         assert_eq!(shard_count_for(Some(6), 2, false, false, true), 6);
         assert_eq!(shard_count_for(Some(1000), 2, false, false, false), 32);
         assert_eq!(shard_count_for(Some(4), 8, true, false, false), 1);
+    }
+
+    #[test]
+    fn exported_routes_end_when_their_publisher_stops() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        routes.record(&[
+            frame(1, "a"),
+            frame(2, "b"),
+            // Injected from another shard: never announced back.
+            frame(1 << 63 | 5, "c"),
+        ]);
+        assert!(routes.take_ended(&HashSet::from([1, 2])).is_empty());
+        // Publisher 2 disconnected: only its route ends, and only once.
+        assert_eq!(
+            routes.take_ended(&HashSet::from([1])),
+            vec![("live".to_string(), "b".to_string())]
+        );
+        assert!(routes.take_ended(&HashSet::from([1])).is_empty());
+        let mut ended = routes.take_ended(&HashSet::new());
+        ended.sort();
+        assert_eq!(ended, vec![("live".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn tls_shards_split_the_connection_cap_statically() {
+        use super::shard_connection_cap;
+        // Single shard: the cap as configured, no budget.
+        assert_eq!(shard_connection_cap(10, 1, 0, true), (10, false));
+        assert_eq!(shard_connection_cap(10, 1, 0, false), (10, false));
+        // Plaintext: full cap per shard, narrowed by the per-tick budget.
+        assert_eq!(shard_connection_cap(10, 4, 3, false), (10, true));
+        // RTMPS: fixed shares that add up to exactly the global cap, since
+        // pending TLS handshakes are invisible to the other shards.
+        let shares: Vec<i32> = (0..4)
+            .map(|i| shard_connection_cap(10, 4, i, true).0)
+            .collect();
+        assert_eq!(shares, vec![3, 3, 2, 2]);
+        assert_eq!(shares.iter().sum::<i32>(), 10);
+        assert!((0..4).all(|i| !shard_connection_cap(10, 4, i, true).1));
+        let shares: Vec<i32> = (0..4)
+            .map(|i| shard_connection_cap(4, 4, i, true).0)
+            .collect();
+        assert_eq!(shares, vec![1, 1, 1, 1]);
     }
 
     #[test]

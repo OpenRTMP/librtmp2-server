@@ -25,12 +25,14 @@
 //! bound while the DB falls behind.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 
 use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
 
 /// Bound on authorization requests queued but not yet picked up by the
-/// worker thread. Generous enough to absorb a burst of simultaneous viewer
+/// worker thread (connection closes share the queue but don't count against
+/// it, see [`AuthWorkerHandle::try_submit_close`]). Generous enough to absorb a burst of simultaneous viewer
 /// joins; small enough that a stuck/slow DB fails new requests closed
 /// instead of growing this queue without limit.
 pub const AUTH_QUEUE_CAPACITY: usize = 512;
@@ -71,7 +73,10 @@ pub struct AuthCompletion {
 /// queue and worker thread.
 #[derive(Clone)]
 pub struct AuthWorkerHandle {
-    tx: SyncSender<Job>,
+    tx: Sender<Job>,
+    /// Authorization jobs queued and not yet taken by the worker; capped at
+    /// [`AUTH_QUEUE_CAPACITY`].
+    pending_auth: Arc<AtomicUsize>,
 }
 
 impl AuthWorkerHandle {
@@ -88,22 +93,23 @@ impl AuthWorkerHandle {
         app: &str,
         stream_key: &str,
     ) -> Result<(), ()> {
+        if self.pending_auth.fetch_add(1, Ordering::AcqRel) >= AUTH_QUEUE_CAPACITY {
+            self.pending_auth.fetch_sub(1, Ordering::AcqRel);
+            crate::log_warn!(
+                "RTMP auth worker queue full ({AUTH_QUEUE_CAPACITY} pending); denying conn={conn_id}"
+            );
+            return Err(());
+        }
         self.tx
-            .try_send(Job::Authorize(AuthRequest {
+            .send(Job::Authorize(AuthRequest {
                 kind,
                 conn_id,
                 app: app.to_string(),
                 stream_key: stream_key.to_string(),
             }))
-            .map_err(|e| {
-                match e {
-                    TrySendError::Full(_) => crate::log_warn!(
-                        "RTMP auth worker queue full ({AUTH_QUEUE_CAPACITY} pending); denying conn={conn_id}"
-                    ),
-                    TrySendError::Disconnected(_) => crate::log_error!(
-                        "RTMP auth worker thread is not running; denying conn={conn_id}"
-                    ),
-                }
+            .map_err(|_| {
+                self.pending_auth.fetch_sub(1, Ordering::AcqRel);
+                crate::log_error!("RTMP auth worker thread is not running; denying conn={conn_id}");
             })
     }
 }
@@ -116,12 +122,17 @@ impl AuthWorkerHandle {
     ///
     /// Because it shares the authorization queue, the release is always
     /// applied before any publish/play authorization submitted after it --
-    /// the same ordering the old inline call gave. Returns `Err(())` when
-    /// the queue is full or the worker is gone; the caller must then run
-    /// `on_close` itself so a release is never lost.
+    /// the same ordering the old inline call gave -- and always after any
+    /// authorization for the same connection submitted before it. Closes
+    /// are therefore never rejected for a full queue (running `on_close`
+    /// inline instead could overtake a still-queued authorization, which
+    /// would then recreate state for a dead connection that nothing
+    /// releases); they don't count against [`AUTH_QUEUE_CAPACITY`] and are
+    /// bounded by the number of connections anyway. Returns `Err(())` only
+    /// when the worker is gone; the caller must then run `on_close` itself.
     #[allow(clippy::result_unit_err)]
     pub fn try_submit_close(&self, conn_id: u64) -> Result<(), ()> {
-        self.tx.try_send(Job::Close(conn_id)).map_err(|_| ())
+        self.tx.send(Job::Close(conn_id)).map_err(|_| ())
     }
 }
 
@@ -184,22 +195,30 @@ pub fn spawn_with_notify(
     bridge: Arc<DbRtmpBridge>,
     notify: impl Fn() + Send + 'static,
 ) -> (AuthWorkerHandle, Receiver<AuthCompletion>) {
-    let (req_tx, req_rx) = sync_channel::<Job>(AUTH_QUEUE_CAPACITY);
+    let (req_tx, req_rx) = channel::<Job>();
     let (completion_tx, completion_rx) = sync_channel::<AuthCompletion>(AUTH_QUEUE_CAPACITY);
+    let pending_auth = Arc::new(AtomicUsize::new(0));
+    let taken = Arc::clone(&pending_auth);
+    let take = move |job: Job| {
+        if matches!(job, Job::Authorize(_)) {
+            taken.fetch_sub(1, Ordering::AcqRel);
+        }
+        job
+    };
 
     std::thread::Builder::new()
         .name("rtmp-auth-worker".to_string())
         .spawn(move || {
             // Blocks between requests -- no busy loop -- and exits cleanly
             // once every `AuthWorkerHandle` (and `req_tx`) is dropped.
-            while let Ok(first) = req_rx.recv() {
+            while let Ok(first) = req_rx.recv().map(&take) {
                 // Group commit: take whatever else is already queued (a
                 // burst of joins, publishes or closes) and run it in one
                 // SQLite transaction instead of one commit per job.
                 let mut jobs = vec![first];
                 while jobs.len() < MAX_BATCH_JOBS {
                     match req_rx.try_recv() {
-                        Ok(job) => jobs.push(job),
+                        Ok(job) => jobs.push(take(job)),
                         Err(_) => break,
                     }
                 }
@@ -236,7 +255,13 @@ pub fn spawn_with_notify(
         })
         .expect("failed to spawn RTMP auth worker thread");
 
-    (AuthWorkerHandle { tx: req_tx }, completion_rx)
+    (
+        AuthWorkerHandle {
+            tx: req_tx,
+            pending_auth,
+        },
+        completion_rx,
+    )
 }
 
 #[cfg(test)]
@@ -316,6 +341,64 @@ mod tests {
             completion.allow,
             "release must be ordered before the re-publish"
         );
+        assert!(!bridge.is_registered(1));
+    }
+
+    #[test]
+    fn close_is_queued_behind_its_authorization_even_when_the_queue_is_full() {
+        use crate::db::Stream;
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = Stream {
+            id: "s1".to_string(),
+            name: "S".to_string(),
+            app: "live".to_string(),
+            publish_key: crate::keygen::keygen_stream_key("pub_").unwrap(),
+            play_key: crate::keygen::keygen_stream_key("play_").unwrap(),
+            stats_key: crate::keygen::keygen_stream_key("stats_").unwrap(),
+            enabled: true,
+            ..Default::default()
+        };
+        db.stream_add(&s).unwrap();
+        let deleted = Arc::new(Mutex::new(HashSet::new()));
+        let bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db), deleted));
+        bridge.set_coordinator(Arc::new(StateCoordinator::standalone(Arc::clone(&db))));
+        let (handle, rx) = spawn(Arc::clone(&bridge));
+        bridge.on_connect(1, "127.0.0.1:1000");
+
+        // Stall the worker on the DB and fill its authorization queue, with
+        // conn 1's publish queued first; then conn 1 disconnects.
+        let submitted = db.with_conn(|_| {
+            handle
+                .try_submit(AuthKind::Publish, 1, "live", &s.publish_key)
+                .unwrap();
+            let mut submitted = 1;
+            let mut conn_id = 1_000;
+            while handle
+                .try_submit(AuthKind::Play, conn_id, "live", "nope")
+                .is_ok()
+            {
+                submitted += 1;
+                conn_id += 1;
+                assert!(submitted <= AUTH_QUEUE_CAPACITY + MAX_BATCH_JOBS + 1);
+            }
+            // The close is still queued (not run inline ahead of conn 1's
+            // queued authorization).
+            handle.try_submit_close(1).unwrap();
+            submitted
+        });
+
+        for _ in 0..submitted {
+            recv_within(&rx, Duration::from_secs(5)).unwrap();
+        }
+        // Conn 1 was authorized and then released by its close, in that
+        // order, so the stream's publisher slot is free again.
+        bridge.on_connect(2, "127.0.0.1:1001");
+        handle
+            .try_submit(AuthKind::Publish, 2, "live", &s.publish_key)
+            .unwrap();
+        let completion = recv_within(&rx, Duration::from_secs(5)).unwrap();
+        assert_eq!(completion.conn_id, 2);
+        assert!(completion.allow, "conn 1's slot must have been released");
         assert!(!bridge.is_registered(1));
     }
 
