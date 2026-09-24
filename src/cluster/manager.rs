@@ -48,6 +48,9 @@ const BOOTSTRAP_SEEDED_SETTING: &str = "bootstrap_seeded";
 const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
 /// Reject re-sent `admin_proof` values captured from the control plane.
 const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
+/// Bounded retry budget for re-learning peer media addresses after a restart.
+const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
+const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -449,23 +452,7 @@ impl ClusterManager {
                 if let Some(ref join_addr) = config.join {
                     mgr.refresh_topology_from_any(join_addr).await?;
                 } else {
-                    let peers = mgr.meta.all();
-                    let needs_media = peers
-                        .iter()
-                        .any(|(id, _, media)| *id != config.node_id && media.is_empty());
-                    if needs_media {
-                        let ctrl = peers
-                            .iter()
-                            .find(|(id, ctrl, _)| *id != config.node_id && !ctrl.is_empty())
-                            .map(|(_, ctrl, _)| ctrl.clone());
-                        if let Some(ctrl) = ctrl {
-                            if let Err(e) = mgr.refresh_topology_from_any(&ctrl).await {
-                                crate::log_warn!(
-                                    "Cluster: topology refresh after restart failed: {e}"
-                                );
-                            }
-                        }
-                    }
+                    mgr.recover_missing_media_addrs().await;
                 }
                 if db.setting_get(BOOTSTRAP_SEEDED_SETTING).is_none() {
                     // raft_has_state() only proves raft.initialize() ran; a
@@ -1609,6 +1596,59 @@ impl ClusterManager {
             }
         }
         Err(primary_err)
+    }
+
+    /// True while any non-self member still has no known media address.
+    fn missing_member_media_addrs(&self) -> bool {
+        self.meta
+            .all()
+            .iter()
+            .any(|(id, _, media)| *id != self.config.node_id && media.is_empty())
+    }
+
+    /// Re-query every known peer control address until every member's media
+    /// address is known or a bounded deadline expires. A single successful
+    /// refresh can still return an incomplete topology — a freshly restarted
+    /// responder may not know every member's media address yet — so retrying
+    /// instead of stopping at the first response is required for recovery.
+    async fn recover_missing_media_addrs(&self) {
+        let ctrls: Vec<String> = self
+            .meta
+            .all()
+            .into_iter()
+            .filter(|(id, ctrl, _)| *id != self.config.node_id && !ctrl.is_empty())
+            .map(|(_, ctrl, _)| ctrl)
+            .collect();
+        if ctrls.is_empty() || !self.missing_member_media_addrs() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(TOPOLOGY_RECOVERY_TIMEOUT_SECS);
+        loop {
+            let mut responded = false;
+            for ctrl in &ctrls {
+                if self.refresh_topology_from(ctrl).await.is_ok() {
+                    responded = true;
+                    if !self.missing_member_media_addrs() {
+                        return;
+                    }
+                }
+            }
+            if !self.missing_member_media_addrs() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                crate::log_warn!(
+                    "Cluster: peer media addresses still unknown after {TOPOLOGY_RECOVERY_TIMEOUT_SECS}s; media routing may stay degraded until peers recover"
+                );
+                return;
+            }
+            if !responded {
+                crate::log_warn!(
+                    "Cluster: topology refresh after restart failed for all peers; retrying"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(TOPOLOGY_RECOVERY_RETRY_MS)).await;
+        }
     }
 
     /// Sum active play sessions for `viewer_id` across peers (excludes local).
