@@ -31,6 +31,7 @@ begin at `1.0.0`.
   marker.
 
 ### Changed
+- Depends on `librtmp2` `0.9.3`.
 - SonarCloud now imports Rust LCOV coverage before evaluating the quality gate.
 - Package version `0.4.2` → `0.4.3`.
 
