@@ -160,6 +160,15 @@ pub struct DbRtmpBridge {
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
 /// leaving a stable per-client identity to key auth-failure tracking by.
 fn remote_ip_of(remote_addr: &str) -> String {
+    if let Ok(sock) = remote_addr.parse::<std::net::SocketAddr>() {
+        return match sock.ip() {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(|mapped| mapped.to_string())
+                .unwrap_or_else(|| v6.to_string()),
+        };
+    }
     if let Some(rest) = remote_addr.strip_prefix('[')
         && let Some(end) = rest.find(']')
     {
@@ -1556,6 +1565,13 @@ mod tests {
         let s = sample_stream(id, pub_key, play_key);
         db.stream_add(&s).unwrap();
         s
+    }
+
+    #[test]
+    fn remote_ip_canonicalizes_ipv4_mapped_ipv6() {
+        assert_eq!(remote_ip_of("203.0.113.7:5000"), "203.0.113.7");
+        assert_eq!(remote_ip_of("[2001:db8::7]:5000"), "2001:db8::7");
+        assert_eq!(remote_ip_of("[::ffff:203.0.113.7]:5000"), "203.0.113.7");
     }
 
     #[test]

@@ -13,6 +13,12 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- Wildcard RTMP/RTMPS binds (`0.0.0.0`) now serve IPv6 as well as IPv4 when
+  IPv6 is available. The server probes the actual `IPV6_V6ONLY` socket mode,
+  adds a separate IPv4 listener only when required, and falls back to IPv4
+  cleanly on hosts or containers with IPv6 disabled.
+
 ## [0.4.2] — 2026-09-23
 
 ### Changed
