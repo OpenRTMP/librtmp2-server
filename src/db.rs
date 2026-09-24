@@ -36,6 +36,24 @@ pub struct Db {
     /// on every `Db::open`, which already resets all `active` rows to 0 for
     /// the same reason (no session survives a process restart).
     active_player_counts: Mutex<HashMap<String, usize>>,
+    /// Latest not-yet-persisted stats per publisher/player row, queued by
+    /// the RTMP poll threads and written in one transaction by
+    /// [`Db::flush_pending_stats`]. Lock order: `conn` before this.
+    pending_stats: Mutex<PendingStats>,
+}
+
+/// Stats rows waiting for [`Db::flush_pending_stats`], keyed by row id; a
+/// newer queue for the same id replaces the older one.
+#[derive(Default)]
+struct PendingStats {
+    publishers: HashMap<String, Publisher>,
+    players: HashMap<String, Player>,
+}
+
+impl PendingStats {
+    fn is_empty(&self) -> bool {
+        self.publishers.is_empty() && self.players.is_empty()
+    }
 }
 
 /// Max simultaneous RTMP play connections per play key (not configurable).
@@ -406,6 +424,7 @@ impl Db {
         Ok(Db {
             conn: Mutex::new(conn),
             active_player_counts: Mutex::new(HashMap::new()),
+            pending_stats: Mutex::new(PendingStats::default()),
         })
     }
 
@@ -1654,6 +1673,8 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        // This full-row write supersedes any queued stats for the row.
+        self.pending_stats.lock().publishers.remove(id);
         if p.active {
             // Only re-verify the single-active-publisher invariant on a real
             // transition into (or across) an active slot. A row that is
@@ -1738,6 +1759,11 @@ impl Db {
     /// from the stale clone would resurrect a ghost active slot; restricting
     /// the UPDATE to `WHERE id=? AND active=1` makes the late flush a no-op.
     pub fn publisher_update_stats(&self, id: &str, p: &Publisher) -> bool {
+        let conn = self.conn.lock();
+        Self::write_publisher_stats(&conn, id, p)
+    }
+
+    fn write_publisher_stats(conn: &Connection, id: &str, p: &Publisher) -> bool {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
             crate::log_error!(
                 "publisher_update_stats: bytes_in {} overflows i64",
@@ -1745,7 +1771,6 @@ impl Db {
             );
             return false;
         };
-        let conn = self.conn.lock();
         match conn.execute(
             "UPDATE publishers SET \
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
@@ -1772,6 +1797,59 @@ impl Db {
                 false
             }
         }
+    }
+
+    /// Queue a stats-only update for publisher `id` (same semantics as
+    /// [`Self::publisher_update_stats`]) to be written by the next
+    /// [`Self::flush_pending_stats`], without touching SQLite or the
+    /// connection lock. For the RTMP poll threads, which must not block on
+    /// a per-connection SQLite transaction every second.
+    pub fn queue_publisher_stats(&self, id: &str, p: &Publisher) {
+        self.pending_stats
+            .lock()
+            .publishers
+            .insert(id.to_string(), p.clone());
+    }
+
+    /// Player counterpart of [`Self::queue_publisher_stats`].
+    pub fn queue_player_stats(&self, id: &str, p: &Player) {
+        self.pending_stats
+            .lock()
+            .players
+            .insert(id.to_string(), p.clone());
+    }
+
+    /// Write every queued stats update in a single transaction. Each row
+    /// keeps the `WHERE id=? AND active=1` guard, and a full-row
+    /// `publisher_update`/`player_update` drops any queued stats for its row
+    /// under the same `conn` lock, so a late flush can neither resurrect a
+    /// released row nor carry a previous session's numbers into a
+    /// reactivated one. Returns the number of queued rows processed.
+    pub fn flush_pending_stats(&self) -> usize {
+        let conn = self.conn.lock();
+        let pending = std::mem::take(&mut *self.pending_stats.lock());
+        if pending.is_empty() {
+            return 0;
+        }
+        let count = pending.publishers.len() + pending.players.len();
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                crate::log_error!("flush_pending_stats: begin failed: {e}");
+                return 0;
+            }
+        };
+        for (id, p) in &pending.publishers {
+            Self::write_publisher_stats(&tx, id, p);
+        }
+        for (id, p) in &pending.players {
+            Self::write_player_stats(&tx, id, p);
+        }
+        if let Err(e) = tx.commit() {
+            crate::log_error!("flush_pending_stats: commit failed: {e}");
+            return 0;
+        }
+        count
     }
 
     #[allow(dead_code)]
@@ -1926,6 +2004,8 @@ impl Db {
             return false;
         };
         let conn = self.conn.lock();
+        // This full-row write supersedes any queued stats for the row.
+        self.pending_stats.lock().players.remove(id);
         // Read the row's current (active, viewer_id) unconditionally — both
         // the cap re-check below (only for a transition into active) and
         // the in-memory counter sync after the write (for every active
@@ -2013,6 +2093,11 @@ impl Db {
     /// touches rows that are still `active=1`, so a stale ConnState clone
     /// cannot resurrect a deactivated player after `release_player`.
     pub fn player_update_stats(&self, id: &str, p: &Player) -> bool {
+        let conn = self.conn.lock();
+        Self::write_player_stats(&conn, id, p)
+    }
+
+    fn write_player_stats(conn: &Connection, id: &str, p: &Player) -> bool {
         let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
             crate::log_error!(
                 "player_update_stats: bytes_out {} overflows i64",
@@ -2020,7 +2105,6 @@ impl Db {
             );
             return false;
         };
-        let conn = self.conn.lock();
         match conn.execute(
             "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
              WHERE id=? AND active=1",
@@ -3107,6 +3191,92 @@ mod tests {
         assert_eq!(listed[0].bitrate_kbps, 1500.0);
         assert_eq!(listed[0].rtt_ms, 8.0);
         assert!(listed[0].active);
+    }
+
+    #[test]
+    fn queued_player_stats_are_written_by_flush_in_one_batch() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        let row = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&row));
+
+        let mut older = row.clone();
+        older.bytes_out = 100;
+        let mut newer = row.clone();
+        newer.bytes_out = 200;
+        newer.rtt_ms = 5.0;
+        db.queue_player_stats("pl0", &older);
+        db.queue_player_stats("pl0", &newer);
+        assert_eq!(
+            db.player_list(Some("stream1"))[0].bytes_out,
+            0,
+            "queueing must not touch SQLite"
+        );
+        assert_eq!(db.flush_pending_stats(), 1, "latest queue per row wins");
+        let listed = db.player_list(Some("stream1"));
+        assert_eq!(listed[0].bytes_out, 200);
+        assert_eq!(listed[0].rtt_ms, 5.0);
+        assert_eq!(db.flush_pending_stats(), 0);
+    }
+
+    #[test]
+    fn queued_stats_never_leak_across_release_or_reactivation() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        let row = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_try_acquire(&row));
+
+        // Stats queued, then the session is released before the flush.
+        let mut stale = row.clone();
+        stale.bytes_out = 9999;
+        db.queue_player_stats("pl0", &stale);
+        let mut released = row.clone();
+        released.active = false;
+        assert!(db.player_update("pl0", &released));
+        // Reactivated (same row id) for a new session.
+        assert!(db.player_update("pl0", &row));
+
+        db.flush_pending_stats();
+        let listed = db.player_list(Some("stream1"));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].bytes_out, 0,
+            "the previous session's queued stats must not reach the new one"
+        );
+
+        // A queue that races a release (flushed after it) is a no-op.
+        db.queue_player_stats("pl0", &stale);
+        let conn = db.conn.lock();
+        conn.execute("UPDATE players SET active=0 WHERE id='pl0'", [])
+            .unwrap();
+        drop(conn);
+        db.flush_pending_stats();
+        assert!(
+            db.player_list(Some("stream1")).is_empty(),
+            "a late flush must not resurrect a released row"
+        );
     }
 
     #[test]

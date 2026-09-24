@@ -110,6 +110,12 @@ pub(crate) fn clear_rtmp_poll_server() {
 /// once every tracked connection has reached a steady publish/play state.
 pub(crate) const POLL_INTERVAL_MS: u64 = 50;
 
+/// Queued publisher/player stats are written to SQLite once per
+/// `STATS_FLUSH_TICK * STATS_FLUSH_INTERVAL_TICKS` (1 s, matching the
+/// per-connection stats debounce), checking for shutdown every tick.
+const STATS_FLUSH_TICK: Duration = Duration::from_millis(100);
+const STATS_FLUSH_INTERVAL_TICKS: u32 = 10;
+
 /// Poll interval used instead of `POLL_INTERVAL_MS` while at least one
 /// tracked connection is still negotiating (handshake / connect /
 /// createStream / publish|play command, including a publish|play command
@@ -1440,6 +1446,28 @@ impl ServerApp {
         let sticky_deleted_streams = Arc::clone(&self.sticky_deleted_streams);
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
+        // Periodic publisher/player stats are queued in memory by the RTMP
+        // poll threads and written here in one transaction per interval,
+        // instead of one SQLite transaction per connection per second on
+        // the poll threads themselves (which blocked relay for every
+        // connection on the shard while it ran).
+        let stats_flush_db = Arc::clone(&self.db);
+        let stats_flush_stop = Arc::clone(&rtmp_stop);
+        let stats_flush_thread = std::thread::Builder::new()
+            .name("db-stats-flush".to_string())
+            .spawn(move || {
+                while !stats_flush_stop.load(Ordering::Relaxed) {
+                    for _ in 0..STATS_FLUSH_INTERVAL_TICKS {
+                        if stats_flush_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(STATS_FLUSH_TICK);
+                    }
+                    stats_flush_db.flush_pending_stats();
+                }
+            })
+            .map_err(|e| format!("failed to spawn stats flush thread: {e}"))?;
+        let final_stats_flush_db = Arc::clone(&self.db);
         let media_export_bytes = if media_output_config.needs_relay_export() {
             media_output_config.export_buffer_bytes()
         } else {
@@ -2097,6 +2125,9 @@ impl ServerApp {
             let _ = shard_thread.join();
         }
         crate::log_info!("RTMP shard threads joined.");
+        let _ = stats_flush_thread.join();
+        // Stats the shards queued while shutting down.
+        final_stats_flush_db.flush_pending_stats();
         #[cfg(feature = "cluster")]
         if let Some(mgr) = coordinator.cluster_manager() {
             mgr.shutdown_blocking();

@@ -21,6 +21,17 @@ begin at `1.0.0`.
   a player whose socket buffer filled mid-frame is flushed as soon as it can
   take more data rather than on the next inbound packet or poll interval.
 
+- Periodic publisher/player stats (bytes, bitrate, RTT) are no longer written
+  to SQLite from the RTMP poll threads, one transaction per connection per
+  second. The poll threads now only queue the latest row in memory and a
+  `db-stats-flush` thread writes all queued rows in a single transaction once
+  a second (and once more on shutdown). This removed the main per-viewer
+  stall on the relay loop: on the benchmark box, join latency for 100
+  concurrent viewers dropped from ~40 ms to ~27 ms on average (p95 ~58 ms to
+  ~32 ms). The `WHERE active=1` guard is unchanged, and full-row updates drop
+  any queued stats for their row, so a late flush cannot revive a released
+  session or leak into a reactivated one.
+
 ### Fixed
 - `scripts/run_rtmp_benchmarks.sh` used unprefixed `RTMP_BIND`/`HTTP_BIND`/
   `LOG_LEVEL` variables the server does not read, and hit the admin API rate
