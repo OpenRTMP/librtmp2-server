@@ -39,6 +39,7 @@ const MAX_UNBUDGETED_CONTROL_FRAME: u32 = 256 * 1024;
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Cap concurrent authenticated control-plane requests.
 const MAX_CONTROL_CONN_INFLIGHT: usize = 512;
 /// Cap aggregate resident memory for non-snapshot control reads above the
@@ -630,7 +631,14 @@ pub async fn serve_control_plane_listener(
         .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static bind parse"));
     tracing::info!(%bind, tls = tls_required, "cluster control plane listening");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::warn!(error = %e, "cluster control accept failed; retrying");
+                tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
+                continue;
+            }
+        };
         if !try_acquire_global_preauth_slot() {
             tracing::debug!(%peer, "control connection rejected: global preauth limit");
             continue;
