@@ -870,6 +870,9 @@ pub(crate) fn rtmp_play_auth_cb(conn_id: u64, app: &str, play_key: &str) -> Auth
 /// Returns whether at least one completion was applied, so the caller can
 /// poll again immediately (rather than take the full idle sleep) and pick
 /// up whatever the client sends right after receiving that `onStatus` reply.
+/// Applies one finished publish/play authorization to the server. A publish
+/// generation is only bumped while the connection is still tracked, so a
+/// completion drained after the connection closed cannot recreate state.
 fn apply_auth_completion(
     server: &mut librtmp2::server::Server,
     tracked: &HashMap<u64, TrackedConn>,
