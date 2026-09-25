@@ -231,6 +231,17 @@ impl ClusterConfig {
                             self.resume_at_mbps = Some(mbps);
                         }
                     }
+                    // An explicit env threshold override wins over a retained
+                    // file absolute: clear it so the re-normalization below
+                    // cannot recompute (and clobber) the env-provided value.
+                    "CLUSTER_DRAIN_THRESHOLD" => {
+                        self.drain_at_mbps = None;
+                        apply_cluster_kv(self, file_key, &val)?;
+                    }
+                    "CLUSTER_RESUME_THRESHOLD" => {
+                        self.resume_at_mbps = None;
+                        apply_cluster_kv(self, file_key, &val)?;
+                    }
                     _ => apply_cluster_kv(self, file_key, &val)?,
                 }
             }
