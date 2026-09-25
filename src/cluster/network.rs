@@ -39,6 +39,14 @@ const MAX_UNBUDGETED_CONTROL_FRAME: u32 = 256 * 1024;
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Logs a failed control-plane `accept` and backs off before the listener
+/// retries; a transient accept error must not stop Raft RPC handling.
+async fn control_accept_backoff(e: std::io::Error) {
+    tracing::warn!(error = %e, "cluster control accept failed; retrying");
+    tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
+}
 /// Cap concurrent authenticated control-plane requests.
 const MAX_CONTROL_CONN_INFLIGHT: usize = 512;
 /// Cap aggregate resident memory for non-snapshot control reads above the
@@ -630,7 +638,13 @@ pub async fn serve_control_plane_listener(
         .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static bind parse"));
     tracing::info!(%bind, tls = tls_required, "cluster control plane listening");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                control_accept_backoff(e).await;
+                continue;
+            }
+        };
         if !try_acquire_global_preauth_slot() {
             tracing::debug!(%peer, "control connection rejected: global preauth limit");
             continue;
@@ -1503,7 +1517,13 @@ pub async fn send_change_membership(
 
 #[cfg(test)]
 mod tests {
-    use super::tls_server_name_from_addr;
+    use super::{control_accept_backoff, tls_server_name_from_addr};
+
+    #[tokio::test]
+    async fn control_accept_backoff_survives_transient_errors() {
+        control_accept_backoff(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)).await;
+        control_accept_backoff(std::io::Error::from(std::io::ErrorKind::Interrupted)).await;
+    }
 
     #[test]
     fn tls_server_name_from_bracketed_ipv6_authority() {
