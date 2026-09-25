@@ -232,15 +232,20 @@ impl ClusterConfig {
                         }
                     }
                     // An explicit env threshold override wins over a retained
-                    // file absolute: clear it so the re-normalization below
-                    // cannot recompute (and clobber) the env-provided value.
+                    // file absolute: drop the absolute only when the override
+                    // parses, so an invalid value cannot discard the file
+                    // target that re-normalization may still need.
                     "CLUSTER_DRAIN_THRESHOLD" => {
-                        self.drain_at_mbps = None;
-                        apply_cluster_kv(self, file_key, &val)?;
+                        if let Ok(v) = val.parse::<f64>() {
+                            self.drain_at_mbps = None;
+                            self.drain_threshold = v;
+                        }
                     }
                     "CLUSTER_RESUME_THRESHOLD" => {
-                        self.resume_at_mbps = None;
-                        apply_cluster_kv(self, file_key, &val)?;
+                        if let Ok(v) = val.parse::<f64>() {
+                            self.resume_at_mbps = None;
+                            self.resume_threshold = v;
+                        }
                     }
                     _ => apply_cluster_kv(self, file_key, &val)?,
                 }
@@ -687,6 +692,31 @@ mod tests {
         assert_eq!(cfg.resume_threshold, 0.55);
         assert_eq!(cfg.drain_at_mbps, None);
         assert_eq!(cfg.resume_at_mbps, None);
+    }
+
+    #[test]
+    fn invalid_env_threshold_keeps_file_absolute_for_recompute() {
+        let mut cfg = ClusterConfig {
+            drain_at_mbps: Some(800.0),
+            resume_at_mbps: Some(500.0),
+            bandwidth_max_mbps: 1000.0,
+            drain_threshold: 0.8,
+            resume_threshold: 0.5,
+            ..ClusterConfig::default()
+        };
+        cfg.apply_env_overrides_from(|k| match k {
+            "LRTMP2_CLUSTER_DRAIN_THRESHOLD" => Some("not-a-number".to_string()),
+            "LRTMP2_CLUSTER_RESUME_THRESHOLD" => Some("not-a-number".to_string()),
+            "LRTMP2_CLUSTER_BANDWIDTH_MAX_MBPS" => Some("2000".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        // The invalid overrides are ignored, the retained absolutes survive,
+        // and re-normalization recalculates them against the new capacity.
+        assert_eq!(cfg.drain_at_mbps, Some(800.0));
+        assert_eq!(cfg.resume_at_mbps, Some(500.0));
+        assert_eq!(cfg.drain_threshold, 0.4);
+        assert_eq!(cfg.resume_threshold, 0.25);
     }
 
     #[test]
