@@ -668,6 +668,28 @@ mod tests {
     }
 
     #[test]
+    fn env_threshold_override_beats_file_absolute_mbps() {
+        let mut cfg = ClusterConfig {
+            drain_at_mbps: Some(800.0),
+            resume_at_mbps: Some(500.0),
+            bandwidth_max_mbps: 1000.0,
+            drain_threshold: 0.8,
+            resume_threshold: 0.5,
+            ..ClusterConfig::default()
+        };
+        cfg.apply_env_overrides_from(|k| match k {
+            "LRTMP2_CLUSTER_DRAIN_THRESHOLD" => Some("0.95".to_string()),
+            "LRTMP2_CLUSTER_RESUME_THRESHOLD" => Some("0.55".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.drain_threshold, 0.95);
+        assert_eq!(cfg.resume_threshold, 0.55);
+        assert_eq!(cfg.drain_at_mbps, None);
+        assert_eq!(cfg.resume_at_mbps, None);
+    }
+
+    #[test]
     fn absolute_bandwidth_thresholds_normalize_after_max() {
         let map = HashMap::from([
             ("CLUSTER_ENABLED", "true"),

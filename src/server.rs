@@ -3119,6 +3119,29 @@ mod tests {
             !drain_auth_completions(&mut server, &tracked),
             "the channel is now empty; no fast follow-up is needed"
         );
+        assert_eq!(
+            super::publisher_generation(999),
+            0,
+            "an untracked connection's completion must not re-create generation state"
+        );
+
+        // A completion for a connection that is still tracked bumps its
+        // publish generation (the line the untracked case above must skip).
+        let mut tracked_with_conn: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked_with_conn.entry(999).or_default();
+        let (tx2, rx2) = sync_channel(4);
+        tx2.send(AuthCompletion {
+            kind: AuthKind::Publish,
+            conn_id: 999,
+            allow: true,
+        })
+        .unwrap();
+        if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+            *guard = Some(rx2);
+        }
+        assert!(drain_auth_completions(&mut server, &tracked_with_conn));
+        assert_eq!(super::publisher_generation(999), 1);
+        super::clear_publish_generation(999);
 
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
             *guard = None;

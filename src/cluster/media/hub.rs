@@ -37,6 +37,18 @@ const SUBSCRIBE_NACK_RETRY: Duration = Duration::from_millis(200);
 const SUBSCRIBE_NACK_MAX: u8 = 3;
 const SUBSCRIBE_NACK_SEND_RETRIES: u8 = 3;
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Handles a failed media-plane `accept`: logs it and backs off, returning
+/// `false` once shutdown has been requested so the loop can exit. A transient
+/// accept error must not stop the media plane.
+async fn media_accept_retry(shutdown: &AtomicBool, e: std::io::Error) -> bool {
+    if shutdown.load(Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!(error = %e, "cluster media accept failed; retrying");
+    tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
+    true
+}
 static MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
@@ -504,11 +516,9 @@ impl MediaHub {
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(e) => {
-                    if self.shutdown.load(Ordering::Relaxed) {
+                    if !media_accept_retry(&self.shutdown, e).await {
                         break;
                     }
-                    tracing::warn!(error = %e, "cluster media accept failed; retrying");
-                    tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
                     continue;
                 }
             };
@@ -1163,6 +1173,17 @@ mod tests {
             None,
             Arc::new(|_: NodeId| true),
         )
+    }
+
+    #[tokio::test]
+    async fn media_accept_retry_backs_off_and_honors_shutdown() {
+        let shutdown = AtomicBool::new(false);
+        let err = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert!(media_accept_retry(&shutdown, err).await);
+
+        let shutdown = AtomicBool::new(true);
+        let err = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert!(!media_accept_retry(&shutdown, err).await);
     }
 
     #[tokio::test]
