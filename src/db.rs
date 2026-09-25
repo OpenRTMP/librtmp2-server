@@ -437,12 +437,6 @@ fn restrict_db_file_permissions(path: &str) {
 }
 
 impl Db {
-    #[cfg(test)]
-    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
-        let conn = self.conn.lock();
-        f(&conn)
-    }
-
     pub fn open(path: &str) -> rusqlite::Result<Db> {
         let conn = if path.is_empty() || path == ":memory:" {
             Connection::open(path)?
@@ -1682,7 +1676,7 @@ impl Db {
     }
 
     /// Low-level access for Raft storage (same mutex as the rest of `Db`).
-    #[cfg(any(feature = "cluster", feature = "test-support"))]
+    #[cfg(any(feature = "cluster", feature = "test-support", test))]
     pub fn with_conn<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Connection) -> R,
