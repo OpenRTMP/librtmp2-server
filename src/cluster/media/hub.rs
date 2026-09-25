@@ -36,6 +36,7 @@ const SUBSCRIBE_GATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SUBSCRIBE_NACK_RETRY: Duration = Duration::from_millis(200);
 const SUBSCRIBE_NACK_MAX: u8 = 3;
 const SUBSCRIBE_NACK_SEND_RETRIES: u8 = 3;
+const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 static MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PREAUTH_MEDIA_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
@@ -500,7 +501,17 @@ impl MediaHub {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            let (stream, peer_addr) = listener.accept().await?;
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    if self.shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tracing::warn!(error = %e, "cluster media accept failed; retrying");
+                    tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
+                    continue;
+                }
+            };
             let peer_ip = peer_addr.ip();
             if !try_acquire_global_preauth_media_slot() {
                 tracing::debug!(%peer_addr, "media connection rejected: global preauth limit");
