@@ -870,10 +870,14 @@ pub(crate) fn rtmp_play_auth_cb(conn_id: u64, app: &str, play_key: &str) -> Auth
 /// Returns whether at least one completion was applied, so the caller can
 /// poll again immediately (rather than take the full idle sleep) and pick
 /// up whatever the client sends right after receiving that `onStatus` reply.
-fn apply_auth_completion(server: &mut librtmp2::server::Server, completion: &AuthCompletion) {
+fn apply_auth_completion(
+    server: &mut librtmp2::server::Server,
+    tracked: &HashMap<u64, TrackedConn>,
+    completion: &AuthCompletion,
+) {
     match completion.kind {
         AuthKind::Publish => {
-            if completion.allow {
+            if completion.allow && tracked.contains_key(&completion.conn_id) {
                 bump_publish_generation(completion.conn_id);
             }
             let _ = server.complete_publish_authorization(completion.conn_id, completion.allow);
@@ -884,7 +888,10 @@ fn apply_auth_completion(server: &mut librtmp2::server::Server, completion: &Aut
     }
 }
 
-fn drain_auth_completions(server: &mut librtmp2::server::Server) -> bool {
+fn drain_auth_completions(
+    server: &mut librtmp2::server::Server,
+    tracked: &HashMap<u64, TrackedConn>,
+) -> bool {
     let mut any_completed = false;
     // Sharded RTMP thread: drain this shard's own fan-out receiver instead
     // of the single global one (see `SHARD_AUTH_COMPLETIONS_RX`).
@@ -895,7 +902,7 @@ fn drain_auth_completions(server: &mut librtmp2::server::Server) -> bool {
         };
         while let Ok(completion) = rx.try_recv() {
             any_completed = true;
-            apply_auth_completion(server, &completion);
+            apply_auth_completion(server, tracked, &completion);
         }
         true
     });
@@ -911,7 +918,7 @@ fn drain_auth_completions(server: &mut librtmp2::server::Server) -> bool {
     };
     while let Ok(completion) = rx.try_recv() {
         any_completed = true;
-        apply_auth_completion(server, &completion);
+        apply_auth_completion(server, tracked, &completion);
     }
     any_completed
 }
@@ -1144,7 +1151,7 @@ pub(crate) fn process_server_connections(
     revoked_now: &HashSet<String>,
     idle_timeout: Duration,
 ) -> (HashSet<u64>, bool) {
-    let just_authorized = drain_auth_completions(server);
+    let just_authorized = drain_auth_completions(server, tracked);
 
     let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
@@ -3082,9 +3089,10 @@ mod tests {
             max_connections_per_addr: i32::MAX,
         };
         let mut server = librtmp2::server::Server::new(cfg).unwrap();
+        let tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
         // Nothing queued: the poll loop must not force a fast follow-up tick.
-        assert!(!drain_auth_completions(&mut server));
+        assert!(!drain_auth_completions(&mut server, &tracked));
 
         // conn_id 999 doesn't exist on this server, so resolving it is a
         // harmless no-op (see `Server::complete_publish_authorization`) --
@@ -3103,12 +3111,12 @@ mod tests {
         }
 
         assert!(
-            drain_auth_completions(&mut server),
+            drain_auth_completions(&mut server, &tracked),
             "a drained completion must be reported so the poll loop can skip \
              the idle sleep on this tick"
         );
         assert!(
-            !drain_auth_completions(&mut server),
+            !drain_auth_completions(&mut server, &tracked),
             "the channel is now empty; no fast follow-up is needed"
         );
 
