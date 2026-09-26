@@ -36,11 +36,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@4314395b773db6ec53370cf7e57cc6bfefb6ae8f # cargo-llvm-cov
 
       - name: Generate test coverage
         run: |
-          cargo llvm-cov --features test-support,cluster --lcov --output-path lcov.info -- --test-threads=1
+          # Match Tests workflow: lib tests plus integration test binaries.
+          cargo llvm-cov --features test-support,cluster -- --test-threads=1
+          cargo llvm-cov --features test-support,cluster --append --test rtmp_http_e2e -- --test-threads=1
+          cargo llvm-cov --features test-support,cluster --append --test cluster_ha -- --test-threads=1
+          cargo llvm-cov --features test-support,cluster --append --test cluster_security -- --test-threads=1
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2
