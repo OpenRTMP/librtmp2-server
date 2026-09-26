@@ -190,6 +190,12 @@ impl ClusterManager {
             election_timeout_max: (config.heartbeat.as_millis() as u64)
                 .saturating_mul(6)
                 .max(2000),
+            // The openraft default (200 ms) is below the cost of connect +
+            // auth + a snapshot chunk, so installs never complete; align with
+            // the transport bound. Chunks are 1 MiB to keep each round trip
+            // (and its serde_json array-of-bytes expansion) within that bound.
+            install_snapshot_timeout: network::SNAPSHOT_ROUNDTRIP_TIMEOUT.as_millis() as u64,
+            snapshot_max_chunk_size: 1024 * 1024,
             ..Default::default()
         };
         let raft_cfg = Arc::new(

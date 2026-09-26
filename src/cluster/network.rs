@@ -105,7 +105,7 @@ fn release_preauth_slot(peer: IpAddr) {
 const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Snapshots may be tens of MiB; the synchronous control-write bound is too
 /// tight for serialize + transfer + install on a slow link.
-const SNAPSHOT_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const SNAPSHOT_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Combined IO trait so we can box plain TCP or rustls streams.
 trait ClusterIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -430,21 +430,30 @@ pub struct NetworkConnection {
 }
 
 impl NetworkConnection {
+    /// One authenticated control round trip. `hard_deadline` is the caller's
+    /// own bound on top of the transport's message-type default (e.g. the
+    /// openraft `RPCOption::hard_ttl()` for snapshot chunks), so an RPC never
+    /// outlives the deadline openraft will cancel it at.
     async fn roundtrip(
         &mut self,
         req: ControlMessage,
+        hard_deadline: Option<Duration>,
     ) -> Result<ControlMessage, RPCError<NodeId, BasicNode, typ::RaftError>> {
         let addr = &self.target_node.addr;
-        authed_roundtrip_inner(
+        let call = authed_roundtrip_inner(
             addr,
             &self.secret,
             self.local_id,
             self.tls_client.clone(),
             req,
-        )
-        .await
-        .map(|(msg, _read_budget)| msg)
-        .map_err(|e| {
+        );
+        let result = match hard_deadline {
+            Some(t) => tokio::time::timeout(t, call)
+                .await
+                .unwrap_or_else(|_| Err(format!("control round trip to {addr} timed out"))),
+            None => call.await,
+        };
+        result.map(|(msg, _read_budget)| msg).map_err(|e| {
             if e.contains("connect") || e.contains("tcp") {
                 RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e)))
             } else {
@@ -477,7 +486,10 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     ) -> Result<AppendEntriesResponse<NodeId>, typ::RPCError> {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        match self.roundtrip(ControlMessage::RaftAppend(req)).await? {
+        match self
+            .roundtrip(ControlMessage::RaftAppend(req), None)
+            .await?
+        {
             ControlMessage::RaftAppendResp(v) => {
                 let parsed: Result<AppendEntriesResponse<NodeId>, typ::RaftError> =
                     serde_json::from_value(v)
@@ -496,13 +508,13 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, typ::RPCError<openraft::error::InstallSnapshotError>>
     {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let msg = self
-            .roundtrip(ControlMessage::RaftSnapshot(req))
+            .roundtrip(ControlMessage::RaftSnapshot(req), Some(option.hard_ttl()))
             .await
             .map_err(map_rpc_transport_err)?;
         match msg {
@@ -530,7 +542,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     ) -> Result<VoteResponse<NodeId>, typ::RPCError> {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        match self.roundtrip(ControlMessage::RaftVote(req)).await? {
+        match self.roundtrip(ControlMessage::RaftVote(req), None).await? {
             ControlMessage::RaftVoteResp(v) => {
                 let parsed: Result<VoteResponse<NodeId>, typ::RaftError> =
                     serde_json::from_value(v)
