@@ -32,6 +32,11 @@ pub(crate) static AUTH_WORKER: StdMutex<Option<AuthWorkerHandle>> = StdMutex::ne
 /// [`drain_auth_completions`].
 pub(crate) static AUTH_COMPLETIONS_RX: StdMutex<Option<std::sync::mpsc::Receiver<AuthCompletion>>> =
     StdMutex::new(None);
+/// Set once `Server::run` starts shutting the RTMP shards down. While set,
+/// cluster-mode connection closes run inline instead of on the auth worker,
+/// so their ownership releases complete before `shutdown_blocking` stops the
+/// cluster manager; see [`close_conn_off_poll_thread`].
+static RTMP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static PUBLISH_GENERATIONS: LazyLock<StdMutex<HashMap<u64, u64>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -829,13 +834,16 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
 
 /// Runs `on_close` for a closed connection on the auth worker thread (see
 /// `AuthWorkerHandle::try_submit_close`) instead of inline, in order after
-/// any authorization still queued for the same connection; inline only
-/// when the worker isn't running. With HA clustering
-/// active it stays inline: ownership releases then go through Raft, and
-/// shutdown relies on them finishing before the cluster manager stops.
+/// any authorization still queued for the same connection. That ordering is
+/// required with or without HA clustering: an inline close would run before
+/// a pending authorization and let it recreate publisher/player state for a
+/// dead connection. Inline only when the worker isn't running, or once
+/// `RTMP_SHUTTING_DOWN` is set — ownership releases then go through Raft and
+/// must finish before the shard threads are joined and the cluster manager
+/// stops.
 fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
     #[cfg(feature = "cluster")]
-    if rtmp_bridge.cluster_manager().is_some() {
+    if rtmp_bridge.cluster_manager().is_some() && RTMP_SHUTTING_DOWN.load(Ordering::Relaxed) {
         rtmp_bridge.on_close(conn_id);
         return;
     }
@@ -1739,6 +1747,7 @@ impl ServerApp {
         let deleted_streams = Arc::clone(&self.deleted_streams);
         let sticky_deleted_streams = Arc::clone(&self.sticky_deleted_streams);
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
+        RTMP_SHUTTING_DOWN.store(false, Ordering::Relaxed);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
         // Periodic publisher/player stats are queued in memory by the RTMP
         // poll threads and written here in one transaction per interval,
@@ -2469,6 +2478,7 @@ impl ServerApp {
             // its poll loop (see the `loop { if rtmp_stop_clone.load(...) `
             // above) -- rather than returning this error with those shards'
             // listeners, auth routing, and relay channels left running.
+            RTMP_SHUTTING_DOWN.store(true, Ordering::Relaxed);
             rtmp_stop.store(true, Ordering::Relaxed);
             for shard_thread in shard_threads.drain(..) {
                 let _ = shard_thread.join();
@@ -2529,6 +2539,7 @@ impl ServerApp {
         // have those releases fail against an already-shut-down cluster
         // manager, leaving durable ownership rows behind that block
         // publishers routed to other nodes until the next failure sweep.
+        RTMP_SHUTTING_DOWN.store(true, Ordering::Relaxed);
         rtmp_stop.store(true, Ordering::Relaxed);
         for shard_thread in shard_threads {
             let _ = shard_thread.join();
