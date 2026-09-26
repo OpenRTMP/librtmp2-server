@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: rtmp_bridge (2026-08-10)
+Last scanned: keygen (2026-09-26)
 
 ## Modules
 
@@ -9,8 +9,21 @@ Last scanned: rtmp_bridge (2026-08-10)
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [ ] keygen — Stream key generation
+- [x] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-09-26 keygen pass)
+
+No critical bugs found. Re-verified `keygen.rs` (`SysRng`/`try_fill_bytes`,
+`keygen_with_entropy`, `is_valid_access_key`, prefix/length constants) and all
+callers: HTTP `resolve_or_generate_access_key`, `server::resolve_api_token`,
+`db::{stream_add,viewer_add,key_globally_in_use_locked,stream_find_by_*}`,
+`rtmp_bridge` session ids, `media_output` HLS player ids, cluster
+`create_stream` viewer id. RNG failures fail closed; generated keys meet
+`MIN_ACCESS_KEY_LEN`; runtime lookups reject legacy short keys; global UNIQUE
++ `access_key_globally_in_use` unchanged. Note: DB insert paths do not
+re-validate key shape (HTTP/cluster propose layer does); invalid keys in DB
+would be unusable on RTMP/stats hot paths, not a new gap.
 
 ## Findings (2026-08-10 rtmp_bridge pass)
 
