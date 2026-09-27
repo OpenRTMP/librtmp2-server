@@ -131,24 +131,25 @@ threads on this box):
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| librtmp2-server | 100% | **7775.6/s** | **3.08 ms** | **3.02 ms** | **4.84 ms** | **5.88 ms** | **6.18 ms** |
-| nginx-rtmp | 100% | 654.7/s | 44.43 ms | 44.18 ms | 47.33 ms | 47.82 ms | 48.16 ms |
-| MediaMTX | 100% | 6507.5/s | 3.68 ms | 3.62 ms | 7.19 ms | 8.79 ms | 9.10 ms |
-| SRS 8.0 | 100% | 492.3/s | 57.01 ms | 56.91 ms | 64.73 ms | 68.95 ms | 69.60 ms |
-| LiveForge | 100% | 6760.5/s | 3.55 ms | 3.34 ms | 7.04 ms | 8.56 ms | 8.88 ms |
+| librtmp2-server | 100% | **8630.7/s** | **2.76 ms** | **2.69 ms** | **4.37 ms** | **5.25 ms** | **5.58 ms** |
+| nginx-rtmp | 100% | 658.9/s | 44.34 ms | 44.06 ms | 46.47 ms | 47.00 ms | 47.41 ms |
+| MediaMTX | 100% | 5176.2/s | 6.73 ms | 3.80 ms | 17.99 ms | 18.96 ms | 20.11 ms |
+| SRS 8.0 | 100% | 511.8/s | 55.21 ms | 55.59 ms | 61.61 ms | 62.71 ms | 64.32 ms |
+| LiveForge | 100% | 6903.0/s | 3.35 ms | 2.98 ms | 6.93 ms | 8.22 ms | 9.89 ms |
 
 `librtmp2-server` is fastest on every column, ahead of LiveForge and
 MediaMTX and more than 10x faster than nginx-rtmp and SRS, even though it is
 the only server here that authenticates every publish against a database
 (per-stream keys in SQLite, via the auth worker); the others were run
-accepting any stream name. What gets it there: the poll loop waits on a
-persistent `epoll(7)` set and is woken through an `eventfd` as soon as an
-authorization completes, new connections are accepted immediately, every
-socket has `TCP_NODELAY`, authorizations are group-committed off the poll
-thread with `synchronous=NORMAL`, stats are batched on a separate thread,
-and connections are spread over one `SO_REUSEPORT` poll shard per CPU (up
-to 4). SRS 8.0 lands between nginx-rtmp and the three low-latency servers
-at ~57 ms.
+accepting any stream name. MediaMTX's mean includes one slow sweep (12.9 ms
+avg; 4.0 and 3.3 ms in the other two). What gets `librtmp2-server` there:
+the poll loop waits on a persistent `epoll(7)` set and is woken through an
+`eventfd` as soon as an authorization completes, new connections are
+accepted immediately, every socket has `TCP_NODELAY`, authorizations are
+group-committed off the poll thread with `synchronous=NORMAL`, stats are
+batched on a separate thread, and connections are spread over one
+`SO_REUSEPORT` poll shard per CPU (up to 4). SRS 8.0 lands between
+nginx-rtmp and the three low-latency servers at ~55 ms.
 
 ## Concurrent-viewer relay throughput and join latency
 
@@ -158,43 +159,44 @@ viewer received the full stream with no drops. Mean of the same three sweeps as 
 
 | Server | Players | Join latency avg / p95 / max | Steady throughput | Steady fps/player |
 |---|---|---|---|---|
-| librtmp2-server | 1 | 1.97 / 1.97 / 1.97 ms | 1.09 Mbps | 73.0 |
-| librtmp2-server | 25 | **2.32** / **3.64** / **3.84** ms | 27.36 Mbps | 73.0 |
-| librtmp2-server | 100 | 17.51 / **26.25** / **27.17** ms | 109.55 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 1 | 89.39 / 89.39 / 89.39 ms | 1.10 Mbps | 73.2 |
-| nginx-rtmp (1 worker) | 25 | 89.09 / 90.60 / 90.73 ms | 27.44 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 100 | 89.21 / 92.35 / 93.53 ms | 109.76 Mbps | 73.1 |
-| MediaMTX | 1 | 1.43 / 1.43 / 1.43 ms | 1.10 Mbps | 73.1 |
-| MediaMTX | 25 | 3.09 / 4.95 / 5.11 ms | 27.41 Mbps | 73.1 |
-| MediaMTX | 100 | 14.31 / 29.39 / 30.59 ms | 109.56 Mbps | 73.1 |
-| SRS 8.0 | 1 | 43.87 / 43.87 / 43.87 ms | 1.07 Mbps | 71.8 |
-| SRS 8.0 | 25 | 53.94 / 57.14 / 57.33 ms | 26.89 Mbps | 71.9 |
-| SRS 8.0 | 100 | 69.98 / 81.33 / 82.67 ms | 108.21 Mbps | 72.1 |
-| LiveForge | 1 | **1.26** / **1.26** / **1.26** ms | 1.10 Mbps | 73.1 |
-| LiveForge | 25 | 5.05 / 7.86 / 9.27 ms | 27.40 Mbps | 73.1 |
-| LiveForge | 100 | **13.37** / 26.55 / 28.62 ms | 109.60 Mbps | 73.1 |
+| librtmp2-server | 1 | **0.84** / **0.84** / **0.84** ms | 1.10 Mbps | 73.1 |
+| librtmp2-server | 25 | **1.71** / **2.75** / **3.01** ms | 27.39 Mbps | 73.1 |
+| librtmp2-server | 100 | 13.07 / 21.79 / 22.72 ms | 109.58 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 1 | 88.55 / 88.55 / 88.55 ms | 1.10 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 25 | 90.56 / 93.04 / 93.14 ms | 27.41 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 100 | 90.44 / 94.22 / 95.58 ms | 109.77 Mbps | 73.1 |
+| MediaMTX | 1 | 2.37 / 2.37 / 2.37 ms | 1.10 Mbps | 73.1 |
+| MediaMTX | 25 | 2.15 / 3.59 / 3.91 ms | 27.39 Mbps | 73.1 |
+| MediaMTX | 100 | 11.08 / **18.68** / **19.42** ms | 109.62 Mbps | 73.1 |
+| SRS 8.0 | 1 | 44.86 / 44.86 / 44.86 ms | 1.08 Mbps | 72.0 |
+| SRS 8.0 | 25 | 48.21 / 51.30 / 51.48 ms | 26.85 Mbps | 71.9 |
+| SRS 8.0 | 100 | 68.72 / 80.82 / 83.38 ms | 108.77 Mbps | 72.4 |
+| LiveForge | 1 | 1.08 / 1.08 / 1.08 ms | 1.10 Mbps | 73.1 |
+| LiveForge | 25 | 3.57 / 6.20 / 7.84 ms | 27.37 Mbps | 73.1 |
+| LiveForge | 100 | **9.73** / 21.12 / 23.91 ms | 109.62 Mbps | 73.1 |
 
 Takeaways:
 
 - **All five relayed every frame to every viewer with zero loss** at up to
   100 concurrent viewers of one stream on this 4-vCPU box (steady fps/player
   in the 72-73 range across the board).
-- **Join latency at 1 viewer**: LiveForge, MediaMTX and `librtmp2-server`
-  are all within a millisecond of each other (1.3 / 1.4 / 2.0 ms), far ahead
-  of SRS 8.0 (43.9 ms) and nginx-rtmp (89.4 ms). A single join is one
-  sample per sweep, so the repeated rounds below (60 joins per server) are
-  the better comparison for this row.
-- **Join latency at 25 viewers**: `librtmp2-server` is fastest (2.3 ms avg,
-  3.6 ms p95), ahead of MediaMTX (3.1 ms) and LiveForge (5.1 ms), and far
-  ahead of SRS 8.0 (53.9 ms) and nginx-rtmp (89.1 ms). SRS's default
+- **Join latency at 1 viewer**: `librtmp2-server` (0.8 ms), LiveForge
+  (1.1 ms) and MediaMTX (2.4 ms) are all within a couple of milliseconds of
+  each other, far ahead of SRS 8.0 (44.9 ms) and nginx-rtmp (88.6 ms). A
+  single join is one sample per sweep, so the repeated rounds below (60
+  joins per server) are the better comparison for this row.
+- **Join latency at 25 viewers**: `librtmp2-server` is fastest (1.7 ms avg,
+  2.8 ms p95), ahead of MediaMTX (2.2 ms) and LiveForge (3.6 ms), and far
+  ahead of SRS 8.0 (48.2 ms) and nginx-rtmp (90.6 ms). SRS's default
   merged-write buffering (see above) is most of what separates it here
   rather than raw per-connection cost.
-- **Join latency at 100 viewers**: LiveForge (13.4 ms avg) and MediaMTX
-  (14.3 ms) have the lowest averages in these sweeps and `librtmp2-server`
-  the lowest tail (26.3 ms p95 vs 26.6 and 29.4 ms, 17.5 ms avg), all well
-  ahead of SRS 8.0 (70.0 ms) and nginx-rtmp (89.2 ms). The spread between
-  individual sweeps at this concurrency is larger than the gaps between
-  these three, so see the repeated rounds below before ranking them.
+- **Join latency at 100 viewers**: LiveForge (9.7 ms avg), MediaMTX
+  (11.1 ms) and `librtmp2-server` (13.1 ms) are close, with MediaMTX's the
+  lowest tail (18.7 ms p95 vs 21.1 and 21.8 ms), all well ahead of SRS 8.0
+  (68.7 ms) and nginx-rtmp (90.4 ms). Individual sweeps at this concurrency
+  ranged from 10.1 to 17.3 ms for `librtmp2-server`, 8.7 to 13.5 ms for
+  MediaMTX and 7.1 to 14.1 ms for LiveForge, wider than the gaps between
+  them, so see the repeated rounds below before ranking them.
 - Aggregate throughput scales linearly with viewer count for all five, as
   expected for a simple relay (no transcoding) — 100 viewers at ~1.1 Mbps
   each is ~108-110 Mbps served, consistent across all five implementations.
@@ -211,22 +213,24 @@ that has been live for about 25 seconds:
 
 | Metric | librtmp2-server | LiveForge | MediaMTX |
 |---|---|---|---|
-| connect+publish, sequential (`bench_handshake --concurrency 1`, 3 × 100), avg / p50 | 0.59 / 0.45 ms | **0.38 / 0.34 ms** | 0.50 / 0.45 ms |
-| single-viewer join (3 × 20 sequential `bench_relay --players 1` joins), avg / p50 | 2.97 / 1.28 ms | 1.26 / 1.18 ms | **1.17 / 1.15 ms** |
-| 100-viewer join (3 rounds), avg / p50 / p95 | 8.6 / 9.3 / 11.9 ms | 21.7 / 24.2 / 42.1 ms | **6.5 / 7.1 / 10.4 ms** |
-| connect+publish, 30 concurrent (3 × 120), avg / p50 / p95 | **2.5 / 2.4 / 4.8 ms** | 2.8 / 2.5 / 6.4 ms | 3.2 / 3.0 / 5.5 ms |
-| steady fps per viewer at 100 viewers | 73.0-73.1 | 73.1 | 73.0-73.1 |
+| connect+publish, sequential (`bench_handshake --concurrency 1`, 3 × 100), avg / p50 | 0.54 / 0.41 ms | **0.43 / 0.39 ms** | 0.48 / 0.44 ms |
+| single-viewer join (3 × 20 sequential `bench_relay --players 1` joins), avg / p50 | **0.81 / 0.77 ms** | 1.10 / 1.06 ms | 1.15 / 1.13 ms |
+| 100-viewer join (3 rounds), avg / p50 / p95 | **3.6 / 3.2 / 7.6 ms** | 12.4 / 11.4 / 24.7 ms | 7.2 / 7.4 / 10.8 ms |
+| connect+publish, 30 concurrent (3 × 120), avg / p50 / p95 | **2.8 / 2.6 / 4.5 ms** | 3.0 / 2.8 / 5.9 ms | 3.5 / 3.3 / 6.5 ms |
+| steady fps per viewer at 100 viewers | 73.0-73.1 | 73.1-73.2 | 73.0-73.2 |
 
 `librtmp2-server` is the only one of the three that authenticates every
 publish and play here (per-stream keys looked up and session rows written in
-SQLite); the other two accept any stream name. It has the fastest
-30-concurrent connect+publish and stays within a few milliseconds of
-MediaMTX at 100 viewers, well ahead of LiveForge's tail there. The two
-sequential rows are where the per-connection auth cost shows: LiveForge and
-MediaMTX connect+publish in 0.4-0.5 ms against 0.6 ms, and while the median
-single-viewer join is on par (1.28 vs 1.15-1.18 ms), its average is pulled
-up by two slow joins out of 60 (10 ms and 90 ms); the other 58 all joined
-in under 2.7 ms.
+SQLite); the other two accept any stream name. It is fastest on three of
+the four rows: single-viewer joins (0.8 ms against 1.1 ms), 100-viewer
+joins (3.6 ms avg against 7.2 ms for MediaMTX and 12.4 ms for LiveForge)
+and 30 concurrent connect+publish. Plays are answered from an in-memory
+snapshot of the play keys as soon as the request arrives, and the viewer's
+session row is written by the auth worker right after, so a join no
+longer waits on SQLite. Sequential connect+publish is where the remaining
+per-connection auth cost shows: 0.54 ms against 0.43-0.48 ms, since each
+publish still waits for its session row to be committed. Every one of the
+60 single-viewer joins completed in under 2 ms.
 
 Sharding on its own, 1 vs 4 shards of the same build (4 interleaved rounds):
 30 concurrent connect+publish 4.95 -> 3.63 ms avg (p95 6.8 -> 5.9 ms),
