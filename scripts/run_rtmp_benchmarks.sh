@@ -9,7 +9,8 @@
 #     already run (for target/release/examples/bench_handshake, bench_relay)
 #   - this crate built in release mode
 #   - ffmpeg
-#   - nginx with the nginx-rtmp module (Debian/Ubuntu: `libnginx-mod-rtmp`)
+#   - nginx with the nginx-rtmp module (Debian/Ubuntu: `libnginx-mod-rtmp`),
+#     or a source build pointed at with NGINX_BIN and NGINX_RTMP_MODULE
 #   - a MediaMTX binary (set MEDIAMTX_BIN to its path; skipped if unset)
 #   - an SRS binary (set SRS_BIN to its path; skipped if unset) — build from
 #     https://github.com/ossrs/srs (`trunk/configure && make`) or use a
@@ -31,6 +32,10 @@ SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-}"
 SRS_BIN="${SRS_BIN:-}"
 LIVEFORGE_BIN="${LIVEFORGE_BIN:-}"
+# nginx and its RTMP module: the system package by default, or a source build
+# (e.g. the latest nginx release with nginx-rtmp-module as a dynamic module).
+NGINX_BIN="${NGINX_BIN:-nginx}"
+NGINX_RTMP_MODULE="${NGINX_RTMP_MODULE:-/usr/lib/nginx/modules/ngx_rtmp_module.so}"
 # Each server is started from its own work directory, so resolve relative
 # binary paths against the caller's directory first.
 for var in MEDIAMTX_BIN SRS_BIN LIVEFORGE_BIN; do
@@ -165,10 +170,10 @@ relay_sweep "lrtmp2-server" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$PLA
 stop_server "$WORK_DIR/lrtmp2-server.pid"
 
 ### 2. nginx-rtmp ###
-if command -v nginx >/dev/null && [[ -e /usr/lib/nginx/modules/ngx_rtmp_module.so ]]; then
+if command -v "$NGINX_BIN" >/dev/null && [[ -e "$NGINX_RTMP_MODULE" ]]; then
   echo "--- starting nginx-rtmp on :1936 ---"
   cat > "$WORK_DIR/nginx/nginx.conf" <<EOF
-load_module /usr/lib/nginx/modules/ngx_rtmp_module.so;
+load_module $NGINX_RTMP_MODULE;
 worker_processes 1; # see BENCHMARKS.md: nginx-rtmp relay state is per worker
 error_log $WORK_DIR/logs/nginx-error.log info;
 pid $WORK_DIR/nginx/nginx.pid;
@@ -181,13 +186,13 @@ rtmp {
     }
 }
 EOF
-  nginx -c "$WORK_DIR/nginx/nginx.conf"
+  "$NGINX_BIN" -c "$WORK_DIR/nginx/nginx.conf"
   echo "=== nginx-rtmp handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1936/live/hsbench --count 120 --concurrency 30
   relay_sweep "nginx" "rtmp://127.0.0.1:1936/live/bench" prefix "rtmp://127.0.0.1:1936/live/bench"
-  nginx -c "$WORK_DIR/nginx/nginx.conf" -s stop || true
+  "$NGINX_BIN" -c "$WORK_DIR/nginx/nginx.conf" -s stop || true
 else
-  echo "skipping nginx-rtmp: nginx or ngx_rtmp_module.so not found"
+  echo "skipping nginx-rtmp: $NGINX_BIN or $NGINX_RTMP_MODULE not found"
 fi
 
 ### 3. MediaMTX ###
