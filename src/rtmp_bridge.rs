@@ -1398,6 +1398,145 @@ impl DbRtmpBridge {
         Some(player_row)
     }
 
+    /// Authorizes a publish on the calling (RTMP) thread when the answer
+    /// needs no database round trip, like [`Self::try_fast_authorize_play`]:
+    /// the key is in [`Db::cached_publish_key`]'s up-to-date snapshot, the
+    /// connection isn't publishing yet, no local connection holds a
+    /// publisher for the stream, and HA clustering is off. The row is
+    /// returned for [`Self::persist_fast_publish`], which still has the
+    /// database confirm the stream has no other active publisher. `None`
+    /// means "ask the worker", never "deny".
+    pub fn try_fast_authorize_publish(
+        &self,
+        conn: ConnId,
+        app: &str,
+        stream_key: &str,
+    ) -> Option<Publisher> {
+        #[cfg(feature = "cluster")]
+        if self.cluster_manager().is_some() {
+            return None;
+        }
+        let stream = self.db.cached_publish_key(stream_key)?;
+        if !stream.enabled || stream.app != app {
+            return None;
+        }
+        let (remote_ip, peer) = self.remote_ip_and_peer(conn);
+        let rate_key = Self::auth_rate_key(conn, &remote_ip, "publish");
+        if self.is_auth_rate_limited(&rate_key) {
+            return None;
+        }
+        let pub_id = keygen::keygen_stream_key(PREFIX_PUBLISH_KEY).ok()?;
+        let pub_row = Publisher {
+            id: pub_id,
+            stream_id: stream.id.clone(),
+            app: app.to_string(),
+            stream_name: stream.name.clone(),
+            active: true,
+            connected_at: crate::db::now_ts(),
+            ..Default::default()
+        };
+        // Standalone ownership is local bookkeeping only (epoch 1, see
+        // `StateCoordinator::acquire_stream_owner`).
+        let record_ownership = self.coordinator.lock().is_some();
+        {
+            // Same lock nesting as `try_fast_authorize_play`.
+            let deleted = self.deleted_streams.lock();
+            if deleted.contains(&stream.id) {
+                return None;
+            }
+            let mut guard = self.conns.lock();
+            let stream_taken = guard.values().any(|cs| {
+                cs.publisher
+                    .as_ref()
+                    .is_some_and(|p| p.stream_id == stream.id)
+            });
+            let cs = guard.entry(conn).or_default();
+            if stream_taken || cs.publisher.is_some() {
+                return None;
+            }
+            if record_ownership {
+                let mut epochs = self.ownership_epochs.lock();
+                if epochs.contains_key(&conn) {
+                    return None;
+                }
+                epochs.insert(conn, (stream.id.clone(), 1));
+            }
+            cs.publisher = Some(pub_row.clone());
+            cs.stream_id = stream.id.clone();
+        }
+        self.clear_auth_failures(&rate_key);
+        crate::log_info!(
+            "RTMP: publish authorized stream='{}' publisher session={} from {peer}",
+            stream.id,
+            pub_row.id
+        );
+        Some(pub_row)
+    }
+
+    /// Takes back a [`Self::try_fast_authorize_publish`] admission whose row
+    /// could not be queued for writing.
+    pub fn cancel_fast_publish(&self, conn: ConnId, row: &Publisher) {
+        self.drop_fast_publisher(conn, row);
+    }
+
+    /// Clears `row` from `conn` (and the ownership entry it recorded) if the
+    /// connection still holds it.
+    fn drop_fast_publisher(&self, conn: ConnId, row: &Publisher) {
+        let mut guard = self.conns.lock();
+        if let Some(cs) = guard.get_mut(&conn)
+            && cs.publisher.as_ref().is_some_and(|p| p.id == row.id)
+        {
+            cs.publisher = None;
+            if cs.player.is_none() {
+                cs.stream_id.clear();
+            }
+        }
+        drop(guard);
+        let mut epochs = self.ownership_epochs.lock();
+        if epochs
+            .get(&conn)
+            .is_some_and(|(stream_id, _)| *stream_id == row.stream_id)
+        {
+            epochs.remove(&conn);
+        }
+    }
+
+    /// Writes the row of a publish admitted by
+    /// [`Self::try_fast_authorize_publish`], on the auth worker ahead of the
+    /// connection's `on_close`. The database still enforces one active
+    /// publisher per stream: if another one got there first (a publish the
+    /// worker was already handling when this one was admitted), or the
+    /// write fails, this publisher is disconnected. If the session was
+    /// dropped while the write was queued, the new row is deactivated.
+    pub fn persist_fast_publish(&self, conn: ConnId, row: &Publisher) {
+        if !self.db.publisher_try_acquire(row) {
+            crate::log_warn!(
+                "RTMP: publish revoked — stream '{}' already has an active publisher \
+                 or the session could not be recorded; closing conn={conn}",
+                row.stream_id
+            );
+            self.drop_fast_publisher(conn, row);
+            self.pending_force_close.lock().insert(conn);
+            return;
+        }
+        let still_held = self
+            .conns
+            .lock()
+            .get(&conn)
+            .and_then(|cs| cs.publisher.as_ref())
+            .is_some_and(|p| p.id == row.id);
+        if !still_held {
+            let mut inactive = row.clone();
+            inactive.active = false;
+            if !self.db.publisher_update(&inactive.id, &inactive) {
+                crate::log_error!(
+                    "RTMP: failed to deactivate dropped publisher session={}",
+                    row.id
+                );
+            }
+        }
+    }
+
     /// Takes back a [`Self::try_fast_authorize_play`] admission whose row
     /// could not be queued for writing.
     pub fn cancel_fast_play(&self, conn: ConnId, row: &Player) {
@@ -2303,7 +2442,7 @@ mod tests {
                 .try_fast_authorize_play(1, "live", &s.play_key)
                 .is_none()
         );
-        db.refresh_play_key_cache();
+        db.refresh_key_cache();
         let row = bridge
             .try_fast_authorize_play(1, "live", &s.play_key)
             .expect("cached key admits the play");
@@ -2326,7 +2465,7 @@ mod tests {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
         let bridge = test_bridge(Arc::clone(&db));
-        db.refresh_play_key_cache();
+        db.refresh_key_cache();
         assert!(db.cached_play_key(&s.play_key).is_some());
 
         assert!(db.stream_set_enabled("s1", false));
@@ -2336,7 +2475,7 @@ mod tests {
                 .try_fast_authorize_play(1, "live", &s.play_key)
                 .is_none()
         );
-        db.refresh_play_key_cache();
+        db.refresh_key_cache();
         // A disabled stream is still cached, but never admitted here: the
         // worker owns every rejection.
         assert!(
@@ -2357,7 +2496,7 @@ mod tests {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
         let bridge = test_bridge(Arc::clone(&db));
-        db.refresh_play_key_cache();
+        db.refresh_key_cache();
         let max = crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64;
         let mut rows = Vec::new();
         for conn in 0..max {
@@ -2390,7 +2529,7 @@ mod tests {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
         let bridge = test_bridge(Arc::clone(&db));
-        db.refresh_play_key_cache();
+        db.refresh_key_cache();
         let row = bridge
             .try_fast_authorize_play(1, "live", &s.play_key)
             .expect("admitted");
@@ -2405,7 +2544,7 @@ mod tests {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
         let bridge = test_bridge(Arc::clone(&db));
-        db.refresh_play_key_cache();
+        db.refresh_key_cache();
         let mut row = bridge
             .try_fast_authorize_play(1, "live", &s.play_key)
             .expect("admitted");
@@ -2415,5 +2554,110 @@ mod tests {
         assert!(bridge.take_pending_force_close(1));
         assert!(bridge.session_rows(1).1.is_none());
         assert_eq!(db.player_active_count_for_viewer(&row.viewer_id), 0);
+    }
+
+    fn active_publishers(db: &Db, stream_id: &str) -> Vec<Publisher> {
+        db.publisher_list(Some(stream_id))
+            .into_iter()
+            .filter(|p| p.active)
+            .collect()
+    }
+
+    #[test]
+    fn fast_publish_admits_one_publisher_per_stream() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        assert!(
+            bridge
+                .try_fast_authorize_publish(1, "live", &s.publish_key)
+                .is_none()
+        );
+        db.refresh_key_cache();
+        assert!(
+            bridge
+                .try_fast_authorize_publish(1, "other", &s.publish_key)
+                .is_none()
+        );
+        let row = bridge
+            .try_fast_authorize_publish(1, "live", &s.publish_key)
+            .expect("cached key admits the publish");
+        assert_eq!(bridge.stream_id_for_conn(1), "s1");
+        // A second publisher for the same stream goes to the worker, which
+        // rejects it once the first row is written.
+        assert!(
+            bridge
+                .try_fast_authorize_publish(2, "live", &s.publish_key)
+                .is_none()
+        );
+        bridge.persist_fast_publish(1, &row);
+        assert_eq!(active_publishers(&db, "s1").len(), 1);
+        assert!(bridge.authorize_publish(2, "live", &s.publish_key).is_err());
+
+        bridge.on_close(1);
+        assert!(active_publishers(&db, "s1").is_empty());
+        assert!(
+            bridge
+                .try_fast_authorize_publish(2, "live", &s.publish_key)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn fast_publish_that_loses_the_race_is_disconnected() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        let row = bridge
+            .try_fast_authorize_publish(1, "live", &s.publish_key)
+            .expect("admitted");
+        // Another publisher's row lands first (a publish the worker was
+        // already handling when this one was admitted).
+        let other = Publisher {
+            id: "other".into(),
+            stream_id: "s1".into(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&other));
+        bridge.persist_fast_publish(1, &row);
+        assert!(bridge.take_pending_force_close(1));
+        assert!(bridge.stream_id_for_conn(1).is_empty());
+        let rows = active_publishers(&db, "s1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "other");
+    }
+
+    #[test]
+    fn fast_publish_dropped_before_its_write_leaves_no_active_row() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        let row = bridge
+            .try_fast_authorize_publish(1, "live", &s.publish_key)
+            .expect("admitted");
+        bridge.abandon_roles_for_stream("s1");
+        bridge.persist_fast_publish(1, &row);
+        assert!(active_publishers(&db, "s1").is_empty());
+    }
+
+    #[test]
+    fn fast_publish_is_skipped_for_a_disabled_stream() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        assert!(db.cached_publish_key(&s.publish_key).is_some());
+        assert!(db.stream_set_enabled("s1", false));
+        assert!(db.cached_publish_key(&s.publish_key).is_none());
+        db.refresh_key_cache();
+        assert!(db.cached_publish_key(&s.publish_key).is_none());
+        assert!(
+            bridge
+                .try_fast_authorize_publish(1, "live", &s.publish_key)
+                .is_none()
+        );
     }
 }

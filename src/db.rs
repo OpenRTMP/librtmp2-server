@@ -121,13 +121,13 @@ pub struct Db {
     unpersisted_player_counts: Mutex<HashMap<String, usize>>,
     /// Bumped on every write to `streams` or `stream_viewers` (an SQLite
     /// update hook) and on every raw [`Self::with_conn`] access, so
-    /// `play_keys` can tell when it no longer matches the tables.
+    /// `access_keys` can tell when it no longer matches the tables.
     auth_generation: Arc<AtomicU64>,
-    /// Snapshot of every enabled play key and its viewer/stream rows, used
-    /// to authorize plays without a database round trip; only valid while
-    /// its generation equals `auth_generation`. See
-    /// [`Self::cached_play_key`].
-    play_keys: parking_lot::RwLock<PlayKeySnapshot>,
+    /// Snapshot of every enabled play and publish key with its rows, used
+    /// to authorize plays and publishes without a database round trip; only
+    /// valid while its generation equals `auth_generation`. See
+    /// [`Self::cached_play_key`] and [`Self::cached_publish_key`].
+    access_keys: parking_lot::RwLock<KeySnapshot>,
     /// Latest not-yet-persisted stats per publisher/player row, queued by
     /// the RTMP poll threads and written in one transaction by
     /// [`Db::flush_pending_stats`]. Lock order: `conn` before this.
@@ -137,13 +137,14 @@ pub struct Db {
     fail_next_batch_commit: std::sync::atomic::AtomicBool,
 }
 
-/// Every enabled play key with its viewer and stream rows, as of
-/// `generation` (a value of [`Db::auth_generation`]). `None` until the first
-/// [`Db::refresh_play_key_cache`].
+/// Every enabled play key with its viewer and stream rows, and every
+/// enabled stream by publish key, as of `generation` (a value of
+/// [`Db::auth_generation`]). `None` until the first [`Db::refresh_key_cache`].
 #[derive(Default)]
-struct PlayKeySnapshot {
+struct KeySnapshot {
     generation: Option<u64>,
-    by_key: HashMap<String, Arc<(StreamViewer, Stream)>>,
+    play: HashMap<String, Arc<(StreamViewer, Stream)>>,
+    publish: HashMap<String, Arc<Stream>>,
 }
 
 /// Stats rows waiting for [`Db::flush_pending_stats`], keyed by row id; a
@@ -542,7 +543,7 @@ impl Db {
             active_player_counts: Mutex::new(HashMap::new()),
             unpersisted_player_counts: Mutex::new(HashMap::new()),
             auth_generation,
-            play_keys: parking_lot::RwLock::new(PlayKeySnapshot::default()),
+            access_keys: parking_lot::RwLock::new(KeySnapshot::default()),
             pending_stats: Mutex::new(PendingStats::default()),
             #[cfg(test)]
             fail_next_batch_commit: std::sync::atomic::AtomicBool::new(false),
@@ -1312,19 +1313,30 @@ impl Db {
     /// [`Self::viewer_and_stream_by_play_key`]). A hit reflects the tables
     /// as of the last write to them, like a fresh query would.
     pub fn cached_play_key(&self, key: &str) -> Option<Arc<(StreamViewer, Stream)>> {
-        let snapshot = self.play_keys.read();
+        let snapshot = self.access_keys.read();
         if snapshot.generation != Some(self.auth_generation()) {
             return None;
         }
-        snapshot.by_key.get(key).cloned()
+        snapshot.play.get(key).cloned()
     }
 
-    /// Reloads the play-key snapshot if a write to `streams` or
-    /// `stream_viewers` has happened since it was taken. Cheap when nothing
-    /// changed; otherwise one query over every enabled viewer.
-    pub fn refresh_play_key_cache(&self) {
+    /// The enabled stream whose publish key is `key`, from the same
+    /// snapshot as [`Self::cached_play_key`] and under the same rules.
+    pub fn cached_publish_key(&self, key: &str) -> Option<Arc<Stream>> {
+        let snapshot = self.access_keys.read();
+        if snapshot.generation != Some(self.auth_generation()) {
+            return None;
+        }
+        snapshot.publish.get(key).cloned()
+    }
+
+    /// Reloads the key snapshot if a write to `streams` or `stream_viewers`
+    /// has happened since it was taken. Cheap when nothing changed;
+    /// otherwise one query over every enabled viewer and one over every
+    /// enabled stream.
+    pub fn refresh_key_cache(&self) {
         let generation = self.auth_generation();
-        if self.play_keys.read().generation == Some(generation) {
+        if self.access_keys.read().generation == Some(generation) {
             return;
         }
         let viewer_cols: Vec<String> = Self::VIEWER_COLS
@@ -1341,39 +1353,40 @@ impl Db {
             viewer_cols.join(","),
             stream_cols.join(","),
         );
-        let by_key = {
+        let publish_sql = format!("SELECT {} FROM streams WHERE enabled=1", Self::STREAM_COLS);
+        let (generation, play, publish) = {
             let conn = self.conn.lock();
             // Taken under the connection lock, before the query: any write
             // after this point bumps the generation past it, so a snapshot
             // missing that write is never used.
             let generation = self.auth_generation();
-            let mut stmt = match conn.prepare(&sql) {
-                Ok(stmt) => stmt,
-                Err(e) => {
-                    crate::log_error!("refresh_play_key_cache: prepare failed: {e}");
+            let play = conn.prepare(&sql).and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    let viewer = Self::load_viewer_row(row)?;
+                    let stream = Self::load_stream_row_at(row, viewer_cols.len())?;
+                    Ok((viewer.play_key.clone(), Arc::new((viewer, stream))))
+                })?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()
+            });
+            let publish = conn.prepare(&publish_sql).and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    let stream = Self::load_stream_row(row)?;
+                    Ok((stream.publish_key.clone(), Arc::new(stream)))
+                })?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()
+            });
+            match (play, publish) {
+                (Ok(play), Ok(publish)) => (generation, play, publish),
+                (Err(e), _) | (_, Err(e)) => {
+                    crate::log_error!("refresh_key_cache: query failed: {e}");
                     return;
                 }
-            };
-            let rows = stmt.query_map([], |row| {
-                let viewer = Self::load_viewer_row(row)?;
-                let stream = Self::load_stream_row_at(row, viewer_cols.len())?;
-                Ok((viewer, stream))
-            });
-            let Ok(rows) = rows else {
-                return;
-            };
-            let mut by_key = HashMap::new();
-            for pair in rows {
-                let Ok(pair) = pair else {
-                    return;
-                };
-                by_key.insert(pair.0.play_key.clone(), Arc::new(pair));
             }
-            (generation, by_key)
         };
-        let mut snapshot = self.play_keys.write();
-        snapshot.generation = Some(by_key.0);
-        snapshot.by_key = by_key.1;
+        let mut snapshot = self.access_keys.write();
+        snapshot.generation = Some(generation);
+        snapshot.play = play;
+        snapshot.publish = publish;
     }
 
     pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> DbLookup<StreamViewer> {
