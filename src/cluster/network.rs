@@ -29,6 +29,12 @@ use crate::cluster::security::{
 use crate::cluster::state::ClusterMeta;
 
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
+/// Largest accepted JSON-encoded snapshot frame. Snapshot chunks are sent in
+/// `snapshot_max_chunk_size` (1 MiB) pieces, which inflate to a few MiB as a
+/// JSON array of byte values. Capping the declared size keeps an
+/// authenticated peer that advertises a snapshot from reserving a large slice
+/// of the snapshot read budget for the whole snapshot timeout.
+const MAX_SNAPSHOT_FRAME: u32 = 8 * 1024 * 1024;
 /// Post-auth control-plane frames (Raft RPC, admin) — smaller than snapshot path.
 const MAX_CONTROL_FRAME: u32 = 8 * 1024 * 1024;
 /// Small control frames are bounded by the authenticated connection cap, so
@@ -105,7 +111,7 @@ fn release_preauth_slot(peer: IpAddr) {
 const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Snapshots may be tens of MiB; the synchronous control-write bound is too
 /// tight for serialize + transfer + install on a slow link.
-const SNAPSHOT_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const SNAPSHOT_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Combined IO trait so we can box plain TCP or rustls streams.
 trait ClusterIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -310,39 +316,61 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
     // Authenticated traffic may carry RaftSnapshot payloads up to MAX_FRAME;
     // non-snapshot control messages stay capped at MAX_CONTROL_FRAME after
     // decode so a peer cannot inflate ordinary RPCs to snapshot size.
-    tokio::time::timeout(CONTROL_READ_TIMEOUT, async {
-        let len = r.read_u32().await?;
-        if len > MAX_FRAME {
-            return Err(std::io::Error::other("frame too large"));
-        }
-        // Peek the variant tag before allocating/reserving so the budget class
-        // matches the actual message type.
-        const PEEK: usize = 32;
-        let mut prefix = [0u8; PEEK];
-        let prefix_len = (len as usize).min(PEEK);
-        r.read_exact(&mut prefix[..prefix_len]).await?;
-        let snapshot_prefix = prefix[..prefix_len].starts_with(b"{\"RaftSnapshot");
-        let read_budget = if len <= MAX_UNBUDGETED_CONTROL_FRAME {
-            None
+    //
+    // Header and variant prefix are bounded by the standard control timeout;
+    // the (potentially multi-megabyte) snapshot body instead gets the
+    // snapshot round-trip timeout, matching what OpenRaft and the sending
+    // transport already allow for a chunk transfer. A fixed 30 s body
+    // timeout would abort chunks the sender is still allowed to deliver.
+    const PEEK: usize = 32;
+    let (len, prefix, prefix_len, snapshot_prefix) =
+        tokio::time::timeout(CONTROL_READ_TIMEOUT, async {
+            let len = r.read_u32().await?;
+            if len > MAX_FRAME {
+                return Err(std::io::Error::other("frame too large"));
+            }
+            // Peek the variant tag before allocating/reserving so the budget
+            // class matches the actual message type.
+            let mut prefix = [0u8; PEEK];
+            let prefix_len = (len as usize).min(PEEK);
+            r.read_exact(&mut prefix[..prefix_len]).await?;
+            let snapshot_prefix = prefix[..prefix_len].starts_with(b"{\"RaftSnapshot");
+            if snapshot_prefix && len > MAX_SNAPSHOT_FRAME {
+                return Err(std::io::Error::other("snapshot frame too large"));
+            }
+            Ok::<_, std::io::Error>((len, prefix, prefix_len, snapshot_prefix))
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))??;
+
+    let read_budget = if len <= MAX_UNBUDGETED_CONTROL_FRAME {
+        None
+    } else {
+        let (counter, max, error) = if snapshot_prefix {
+            (
+                &SNAPSHOT_READ_BYTES_INFLIGHT,
+                MAX_SNAPSHOT_READ_BYTES_INFLIGHT,
+                "snapshot read memory budget exceeded",
+            )
         } else {
-            let (counter, max, error) = if snapshot_prefix {
-                (
-                    &SNAPSHOT_READ_BYTES_INFLIGHT,
-                    MAX_SNAPSHOT_READ_BYTES_INFLIGHT,
-                    "snapshot read memory budget exceeded",
-                )
-            } else {
-                (
-                    &CONTROL_READ_BYTES_INFLIGHT,
-                    MAX_CONTROL_READ_BYTES_INFLIGHT,
-                    "control read memory budget exceeded",
-                )
-            };
-            Some(
-                crate::cluster::security::try_reserve_inflight_bytes(counter, max, len as usize)
-                    .map_err(|_| std::io::Error::other(error))?,
+            (
+                &CONTROL_READ_BYTES_INFLIGHT,
+                MAX_CONTROL_READ_BYTES_INFLIGHT,
+                "control read memory budget exceeded",
             )
         };
+        Some(
+            crate::cluster::security::try_reserve_inflight_bytes(counter, max, len as usize)
+                .map_err(|_| std::io::Error::other(error))?,
+        )
+    };
+
+    let body_timeout = if snapshot_prefix {
+        SNAPSHOT_ROUNDTRIP_TIMEOUT
+    } else {
+        CONTROL_READ_TIMEOUT
+    };
+    tokio::time::timeout(body_timeout, async {
         let mut buf = Vec::with_capacity(len as usize);
         buf.extend_from_slice(&prefix[..prefix_len]);
         if (len as usize) > prefix_len {
@@ -430,21 +458,30 @@ pub struct NetworkConnection {
 }
 
 impl NetworkConnection {
+    /// One authenticated control round trip. `hard_deadline` is the caller's
+    /// own bound on top of the transport's message-type default (e.g. the
+    /// openraft `RPCOption::hard_ttl()` for snapshot chunks), so an RPC never
+    /// outlives the deadline openraft will cancel it at.
     async fn roundtrip(
         &mut self,
         req: ControlMessage,
+        hard_deadline: Option<Duration>,
     ) -> Result<ControlMessage, RPCError<NodeId, BasicNode, typ::RaftError>> {
         let addr = &self.target_node.addr;
-        authed_roundtrip_inner(
+        let call = authed_roundtrip_inner(
             addr,
             &self.secret,
             self.local_id,
             self.tls_client.clone(),
             req,
-        )
-        .await
-        .map(|(msg, _read_budget)| msg)
-        .map_err(|e| {
+        );
+        let result = match hard_deadline {
+            Some(t) => tokio::time::timeout(t, call)
+                .await
+                .unwrap_or_else(|_| Err(format!("control round trip to {addr} timed out"))),
+            None => call.await,
+        };
+        result.map(|(msg, _read_budget)| msg).map_err(|e| {
             if e.contains("connect") || e.contains("tcp") {
                 RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e)))
             } else {
@@ -477,7 +514,10 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     ) -> Result<AppendEntriesResponse<NodeId>, typ::RPCError> {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        match self.roundtrip(ControlMessage::RaftAppend(req)).await? {
+        match self
+            .roundtrip(ControlMessage::RaftAppend(req), None)
+            .await?
+        {
             ControlMessage::RaftAppendResp(v) => {
                 let parsed: Result<AppendEntriesResponse<NodeId>, typ::RaftError> =
                     serde_json::from_value(v)
@@ -496,13 +536,13 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, typ::RPCError<openraft::error::InstallSnapshotError>>
     {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let msg = self
-            .roundtrip(ControlMessage::RaftSnapshot(req))
+            .roundtrip(ControlMessage::RaftSnapshot(req), Some(option.hard_ttl()))
             .await
             .map_err(map_rpc_transport_err)?;
         match msg {
@@ -530,7 +570,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     ) -> Result<VoteResponse<NodeId>, typ::RPCError> {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        match self.roundtrip(ControlMessage::RaftVote(req)).await? {
+        match self.roundtrip(ControlMessage::RaftVote(req), None).await? {
             ControlMessage::RaftVoteResp(v) => {
                 let parsed: Result<VoteResponse<NodeId>, typ::RaftError> =
                     serde_json::from_value(v)
@@ -1517,12 +1557,44 @@ pub async fn send_change_membership(
 
 #[cfg(test)]
 mod tests {
-    use super::{control_accept_backoff, tls_server_name_from_addr};
+    use super::{control_accept_backoff, read_budgeted_frame, tls_server_name_from_addr};
 
     #[tokio::test]
     async fn control_accept_backoff_survives_transient_errors() {
         control_accept_backoff(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)).await;
         control_accept_backoff(std::io::Error::from(std::io::ErrorKind::Interrupted)).await;
+    }
+
+    #[tokio::test]
+    async fn declared_length_above_max_frame_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(super::MAX_FRAME + 1).to_be_bytes());
+        let mut reader: &[u8] = &bytes;
+
+        let err = match read_budgeted_frame(&mut reader, false).await {
+            Ok(_) => panic!("declared length above MAX_FRAME must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("frame too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_snapshot_frame_is_rejected_before_budget_reservation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::MAX_FRAME.to_be_bytes());
+        let mut prefix = [b' '; 32];
+        prefix[..15].copy_from_slice(b"{\"RaftSnapshot\"");
+        bytes.extend_from_slice(&prefix);
+        let mut reader: &[u8] = &bytes;
+
+        let err = match read_budgeted_frame(&mut reader, false).await {
+            Ok(_) => panic!("oversized snapshot frames must be capped"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("snapshot frame too large"),
+            "{err}"
+        );
     }
 
     #[test]

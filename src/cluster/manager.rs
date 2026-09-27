@@ -190,6 +190,12 @@ impl ClusterManager {
             election_timeout_max: (config.heartbeat.as_millis() as u64)
                 .saturating_mul(6)
                 .max(2000),
+            // The openraft default (200 ms) is below the cost of connect +
+            // auth + a snapshot chunk, so installs never complete; align with
+            // the transport bound. Chunks are 1 MiB to keep each round trip
+            // (and its serde_json array-of-bytes expansion) within that bound.
+            install_snapshot_timeout: network::SNAPSHOT_ROUNDTRIP_TIMEOUT.as_millis() as u64,
+            snapshot_max_chunk_size: 1024 * 1024,
             ..Default::default()
         };
         let raft_cfg = Arc::new(
@@ -1055,6 +1061,48 @@ impl ClusterManager {
             .set_addrs(node_id, control_addr.to_string(), media_addr.to_string());
     }
 
+    /// Forwards a join/rejoin to the current leader, which re-runs the same
+    /// membership/liveness pre-check with its own health view. Records the
+    /// peer's addresses and consumes the proof only when the leader accepted
+    /// the join. Used by both the new-learner and fenced-rejoin paths when
+    /// this node is a follower.
+    async fn forward_join_to_leader(
+        &self,
+        ftl: openraft::error::ForwardToLeader<NodeId, BasicNode>,
+        node_id: NodeId,
+        control_addr: String,
+        media_addr: String,
+        proof: String,
+    ) -> Result<(String, Vec<JoinPeerInfo>), String> {
+        let leader_addr = ftl
+            .leader_node
+            .map(|n| n.addr)
+            .or_else(|| {
+                ftl.leader_id
+                    .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
+            })
+            .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
+        let proof_for_cache = proof.clone();
+        let control_for_meta = control_addr.clone();
+        let media_for_meta = media_addr.clone();
+        let result = network::forward_join(
+            &leader_addr,
+            &self.config.secret,
+            self.config.node_id,
+            node_id,
+            control_addr,
+            media_addr,
+            proof,
+            self.tls_client.clone(),
+        )
+        .await;
+        if result.is_ok() {
+            self.record_joined_peer_addresses(node_id, &control_for_meta, &media_for_meta);
+            self.consume_admin_proof(&proof_for_cache);
+        }
+        result
+    }
+
     pub async fn accept_join(
         &self,
         node_id: NodeId,
@@ -1067,82 +1115,74 @@ impl ClusterManager {
         crate::cluster::security::validate_cluster_peer_addr(&media_addr, allow_loopback)?;
 
         use openraft::error::{ClientWriteError, RaftError};
-        match self
-            .raft
-            .add_learner(
-                node_id,
-                BasicNode {
-                    addr: control_addr.clone(),
-                },
-                true,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
-                let leader_addr = ftl
-                    .leader_node
-                    .map(|n| n.addr)
-                    .or_else(|| {
-                        ftl.leader_id
-                            .and_then(|id| self.meta.get(id).map(|(ctrl, _)| ctrl))
-                    })
-                    .ok_or_else(|| "forward_to_leader: no leader address available".to_string())?;
-                let proof_for_cache = proof.clone();
-                let control_for_meta = control_addr.clone();
-                let media_for_meta = media_addr.clone();
-                let result = network::forward_join(
-                    &leader_addr,
-                    &self.config.secret,
-                    self.config.node_id,
-                    node_id,
-                    control_addr,
-                    media_addr,
-                    proof,
-                    self.tls_client.clone(),
-                )
-                .await;
-                if result.is_ok() {
-                    self.record_joined_peer_addresses(node_id, &control_for_meta, &media_for_meta);
-                    self.consume_admin_proof(&proof_for_cache);
-                }
-                return result;
+        let in_membership = {
+            let metrics = self.raft.metrics();
+            let m = metrics.borrow();
+            m.membership_config
+                .membership()
+                .nodes()
+                .any(|(id, _)| *id == node_id)
+        };
+        if in_membership {
+            // A reseeded/replaced node can rejoin under its previous node ID
+            // with a fresh, empty database — often at a new address.
+            // `add_learner` is a silent no-op success for an existing member
+            // id, so decide from current membership instead: refuse while the
+            // existing member is still active, and only SetNodes once it has
+            // been fenced (DOWN/LEAVING) so a duplicate ID cannot redirect
+            // replication away from a live voter.
+            if self.active_member_blocks_rejoin(node_id) {
+                return Err(format!(
+                    "node {node_id} is already an active cluster member; \
+                     refuse address replacement until the existing member is DOWN or LEAVING"
+                ));
             }
-            Err(e) => {
-                let msg = e.to_string();
-                if !(msg.contains("already") || msg.contains("Exists") || msg.contains("exist")) {
-                    return Err(format!("add_learner: {e}"));
+            crate::log_warn!(
+                "Cluster: node {node_id} rejoined with an existing ID at {control_addr}; \
+                 updating registered address for catch-up (likely a reseeded replacement)"
+            );
+            match self
+                .raft
+                .change_membership(
+                    ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
+                        node_id,
+                        BasicNode {
+                            addr: control_addr.clone(),
+                        },
+                    )])),
+                    false,
+                )
+                .await
+            {
+                Ok(_) => {}
+                // A follower cannot write membership locally; forward the
+                // rejoin so the leader fences it with its own health view.
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                    return self
+                        .forward_join_to_leader(ftl, node_id, control_addr, media_addr, proof)
+                        .await;
                 }
-                // A reseeded/replaced node can rejoin under its previous node
-                // ID with a fresh, empty database — often at a new address.
-                // Treating "already exists" as a no-op success would leave
-                // Raft membership (and thus replication) still targeting the
-                // old address, so this blank learner would never catch up.
-                // Refuse while the existing member is still active; only
-                // SetNodes once it has been fenced (DOWN/LEAVING) so a
-                // duplicate ID cannot redirect replication away from a live voter.
-                if self.active_member_blocks_rejoin(node_id) {
-                    return Err(format!(
-                        "node {node_id} is already an active cluster member; \
-                         refuse address replacement until the existing member is DOWN or LEAVING"
-                    ));
+                Err(e) => return Err(format!("SetNodes for rejoined node {node_id}: {e}")),
+            }
+        } else {
+            match self
+                .raft
+                .add_learner(
+                    node_id,
+                    BasicNode {
+                        addr: control_addr.clone(),
+                    },
+                    true,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                    return self
+                        .forward_join_to_leader(ftl, node_id, control_addr, media_addr, proof)
+                        .await;
                 }
-                crate::log_warn!(
-                    "Cluster: node {node_id} rejoined with an existing ID at {control_addr}; \
-                     updating registered address for catch-up (likely a reseeded replacement)"
-                );
-                self.raft
-                    .change_membership(
-                        ChangeMembers::SetNodes(std::collections::BTreeMap::from([(
-                            node_id,
-                            BasicNode {
-                                addr: control_addr.clone(),
-                            },
-                        )])),
-                        false,
-                    )
-                    .await
-                    .map_err(|e| format!("SetNodes for rejoined node {node_id}: {e}"))?;
+                Err(e) => return Err(format!("add_learner: {e}")),
             }
         }
 

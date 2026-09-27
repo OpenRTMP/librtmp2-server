@@ -256,15 +256,24 @@ fn run_authorization_group(bridge: &DbRtmpBridge, group: Vec<Job>) -> Vec<AuthCo
 /// `handle` and every clone of it are dropped, at which point the request
 /// channel closes and the thread's loop ends on its own.
 pub fn spawn(bridge: Arc<DbRtmpBridge>) -> (AuthWorkerHandle, Receiver<AuthCompletion>) {
-    spawn_with_notify(bridge, || {})
+    let (handle, rx, _thread) = spawn_with_notify(bridge, || {});
+    (handle, rx)
 }
 
 /// [`spawn`], calling `notify` after each completion is queued so the
 /// receiving poll loop can be woken instead of finding it on its next tick.
+///
+/// Also returns the worker thread's [`std::thread::JoinHandle`] so a
+/// shutting-down server can wait for queued jobs (including connection
+/// closes) to be applied before it tears the cluster coordinator down.
 pub fn spawn_with_notify(
     bridge: Arc<DbRtmpBridge>,
     notify: impl Fn() + Send + 'static,
-) -> (AuthWorkerHandle, Receiver<AuthCompletion>) {
+) -> (
+    AuthWorkerHandle,
+    Receiver<AuthCompletion>,
+    std::thread::JoinHandle<()>,
+) {
     let (req_tx, req_rx) = channel::<Job>();
     let (completion_tx, completion_rx) = sync_channel::<AuthCompletion>(AUTH_QUEUE_CAPACITY);
     let pending_auth = Arc::new(AtomicUsize::new(0));
@@ -276,7 +285,7 @@ pub fn spawn_with_notify(
         job
     };
 
-    std::thread::Builder::new()
+    let worker_thread = std::thread::Builder::new()
         .name("rtmp-auth-worker".to_string())
         .spawn(move || {
             // Blocks between requests -- no busy loop -- and exits cleanly
@@ -318,6 +327,7 @@ pub fn spawn_with_notify(
             pending_auth,
         },
         completion_rx,
+        worker_thread,
     )
 }
 
