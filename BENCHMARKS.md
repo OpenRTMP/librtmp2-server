@@ -22,20 +22,22 @@ own target hardware before using any of this for capacity planning.
 
 | | librtmp2-server | nginx-rtmp | MediaMTX | SRS | LiveForge |
 |---|---|---|---|---|---|
-| Version | 0.5.0, built against librtmp2 0.10.0 | nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2 (Ubuntu package) | v1.11.3 | v8.0.48 (`v8.0-d0`, the SRS 8.0 release; bundled FFmpeg) | `main` @ 4e70fb3 (built with Go 1.26) |
+| Version | 0.6.0, built against librtmp2 0.10.1 | nginx 1.31.6 + nginx-rtmp-module `master` @ 6c7719d | v1.21.1 | v8.0.48 (`v8.0-d0`, the SRS 8.0 release; bundled FFmpeg) | `main` @ 4e70fb3 (built with Go 1.26) |
 | Language | Rust | C | Go | C++ | Go |
 | Role | what this repo ships | most common existing RTMP relay | modern multi-protocol media server with RTMP support | long-running open-source media server with RTMP/SRT/WebRTC support | newer multi-protocol Go live server (RTMP/RTSP/SRT/WebRTC/HLS) |
 
-nginx-rtmp was installed from the Ubuntu package archive; MediaMTX is its
-official prebuilt v1.11.3 release binary; SRS was built from source at the
-`v8.0-d0` release tag (`trunk/configure --ffmpeg-fit=on --sys-ffmpeg=off
---https=off --gb28181=off && make`; SRS 8 does not build against the system
-FFmpeg 6.1 headers) rather than run from a container, to keep every server
-here on the same footing (installed package or binary, nothing
-containerized). LiveForge was built from
-source (`go build ./cmd/liveforge`) and run with RTMP only: its sample
-config also enables recording to disk and a dozen other listeners, all
-switched off here (see the script).
+Every server is its latest release (or latest `main`, where the project
+has no newer release). nginx was built from source at the `release-1.31.6`
+tag with the newest nginx-rtmp-module commit as a dynamic module
+(`auto/configure --with-compat --add-dynamic-module=<nginx-rtmp-module>`);
+MediaMTX is its official prebuilt v1.21.1 release binary; SRS was built
+from source at the `v8.0-d0` release tag (`trunk/configure --ffmpeg-fit=on
+--sys-ffmpeg=off --https=off --gb28181=off && make`; SRS 8 does not build
+against the system FFmpeg 6.1 headers) rather than run from a container, to
+keep every server here on the same footing (native binary, nothing
+containerized). LiveForge was built from source (`go build ./cmd/liveforge`)
+and run with RTMP only: its sample config also enables recording to disk
+and a dozen other listeners, all switched off here (see the script).
 
 ## Methodology
 
@@ -120,26 +122,26 @@ Full commands, including exact server configs, are in
 
 - CPU: Intel Xeon @ 2.10GHz, 4 vCPUs (a shared VM — not bare metal)
 - RAM: 15 GiB, Linux 6.18 x86_64
-- rustc 1.95.0, g++ 13.3.0, Go 1.26.0 (LiveForge), ffmpeg 6.1.1
+- rustc 1.95.0, gcc/g++ 13.3.0, Go 1.26.0 (LiveForge), ffmpeg 6.1.1
 - Date: 2026-09-27
 
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
 Mean of three full sweeps of `scripts/run_rtmp_benchmarks.sh`,
-`librtmp2-server` 0.5.0 on librtmp2 0.10.0 (default sharding, 4 poll
+`librtmp2-server` 0.6.0 on librtmp2 0.10.1 (default sharding, 4 poll
 threads on this box):
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| librtmp2-server | 100% | **10446.9/s** | **2.19 ms** | **1.89 ms** | **4.93 ms** | **6.55 ms** | **6.99 ms** |
-| nginx-rtmp | 100% | 652.7/s | 44.55 ms | 44.00 ms | 47.52 ms | 49.50 ms | 49.65 ms |
-| MediaMTX | 100% | 5765.9/s | 4.14 ms | 3.87 ms | 7.75 ms | 8.98 ms | 9.47 ms |
-| SRS 8.0 | 100% | 514.4/s | 54.78 ms | 55.13 ms | 62.57 ms | 63.49 ms | 63.69 ms |
-| LiveForge | 100% | 7195.8/s | 3.13 ms | 2.76 ms | 6.60 ms | 8.56 ms | 8.99 ms |
+| librtmp2-server | 100% | **8804.7/s** | **2.45 ms** | **2.15 ms** | **5.38 ms** | **6.15 ms** | **6.47 ms** |
+| nginx-rtmp | 100% | 647.8/s | 44.27 ms | 44.08 ms | 46.22 ms | 47.87 ms | 48.53 ms |
+| MediaMTX | 100% | 6470.3/s | 3.69 ms | 3.32 ms | 7.06 ms | 9.19 ms | 9.59 ms |
+| SRS 8.0 | 100% | 504.0/s | 54.64 ms | 54.98 ms | 62.85 ms | 63.87 ms | 63.97 ms |
+| LiveForge | 100% | 6719.1/s | 3.59 ms | 3.42 ms | 6.78 ms | 7.82 ms | 8.32 ms |
 
 `librtmp2-server` leads on throughput and every latency column (all five
 servers complete every handshake), ahead of LiveForge and
-MediaMTX and more than 20x faster than nginx-rtmp and SRS, even though it
+MediaMTX and 18x faster than nginx-rtmp and 22x faster than SRS on average, even though it
 is the only server here that authenticates every publish against a
 database (per-stream keys in SQLite); the others were run accepting any
 stream name. What gets it there: a publish whose key is in the in-memory
@@ -161,42 +163,40 @@ viewer received the full stream with no drops. Mean of the same three sweeps as 
 
 | Server | Players | Join latency avg / p95 / max | Steady throughput | Steady fps/player |
 |---|---|---|---|---|
-| librtmp2-server | 1 | **1.06** / **1.06** / **1.06** ms | 1.10 Mbps | 73.1 |
-| librtmp2-server | 25 | **2.02** / 3.22 / 3.45 ms | 27.39 Mbps | 73.1 |
-| librtmp2-server | 100 | **3.54** / **7.76** / **9.20** ms | 109.55 Mbps | 73.1 |
-| nginx-rtmp (1 worker) | 1 | 86.93 / 86.93 / 86.93 ms | 1.10 Mbps | 73.2 |
-| nginx-rtmp (1 worker) | 25 | 90.15 / 91.74 / 92.06 ms | 27.45 Mbps | 73.2 |
-| nginx-rtmp (1 worker) | 100 | 91.22 / 95.40 / 96.75 ms | 109.72 Mbps | 73.1 |
-| MediaMTX | 1 | 1.61 / 1.61 / 1.61 ms | 1.09 Mbps | 72.8 |
-| MediaMTX | 25 | 2.14 / **3.21** / **3.33** ms | 27.38 Mbps | 73.1 |
-| MediaMTX | 100 | 10.78 / 17.93 / 19.54 ms | 109.60 Mbps | 73.1 |
-| SRS 8.0 | 1 | 43.75 / 43.75 / 43.75 ms | 1.08 Mbps | 72.1 |
-| SRS 8.0 | 25 | 52.18 / 54.56 / 55.59 ms | 27.02 Mbps | 72.1 |
-| SRS 8.0 | 100 | 73.32 / 86.84 / 89.26 ms | 107.98 Mbps | 71.9 |
-| LiveForge | 1 | 1.15 / 1.15 / 1.15 ms | 1.09 Mbps | 73.0 |
-| LiveForge | 25 | 4.36 / 7.41 / 8.09 ms | 27.39 Mbps | 73.1 |
-| LiveForge | 100 | 13.13 / 25.43 / 28.82 ms | 109.65 Mbps | 73.1 |
+| librtmp2-server | 1 | **0.82** / **0.82** / **0.82** ms | 1.09 Mbps | 73.0 |
+| librtmp2-server | 25 | **1.76** / **3.03** / **3.12** ms | 27.37 Mbps | 73.0 |
+| librtmp2-server | 100 | **3.42** / **6.65** / **9.18** ms | 109.49 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 1 | 86.49 / 86.49 / 86.49 ms | 1.10 Mbps | 73.2 |
+| nginx-rtmp (1 worker) | 25 | 88.72 / 90.43 / 91.85 ms | 27.44 Mbps | 73.1 |
+| nginx-rtmp (1 worker) | 100 | 89.75 / 93.59 / 95.23 ms | 109.76 Mbps | 73.1 |
+| MediaMTX | 1 | 1.37 / 1.37 / 1.37 ms | 1.09 Mbps | 73.0 |
+| MediaMTX | 25 | 3.02 / 4.71 / 4.78 ms | 27.40 Mbps | 73.1 |
+| MediaMTX | 100 | 6.22 / 10.58 / 13.25 ms | 109.58 Mbps | 73.1 |
+| SRS 8.0 | 1 | 45.67 / 45.67 / 45.67 ms | 1.07 Mbps | 71.9 |
+| SRS 8.0 | 25 | 50.77 / 53.99 / 54.84 ms | 26.88 Mbps | 72.0 |
+| SRS 8.0 | 100 | 71.64 / 85.43 / 86.93 ms | 108.70 Mbps | 72.4 |
+| LiveForge | 1 | 1.09 / 1.09 / 1.09 ms | 1.09 Mbps | 73.0 |
+| LiveForge | 25 | 3.99 / 6.67 / 8.18 ms | 27.37 Mbps | 73.0 |
+| LiveForge | 100 | 7.41 / 17.14 / 21.72 ms | 109.60 Mbps | 73.1 |
 
 Takeaways:
 
 - **All five relayed every frame to every viewer with zero loss** at up to
   100 concurrent viewers of one stream on this 4-vCPU box (steady fps/player
   in the 72-73 range across the board).
-- **Join latency at 1 viewer**: `librtmp2-server` (1.1 ms), LiveForge
-  (1.2 ms) and MediaMTX (1.6 ms) are within a millisecond of each other,
-  far ahead of SRS 8.0 (43.8 ms) and nginx-rtmp (86.9 ms). A single join is
+- **Join latency at 1 viewer**: `librtmp2-server` (0.8 ms), LiveForge
+  (1.1 ms) and MediaMTX (1.4 ms) are within a millisecond of each other,
+  far ahead of SRS 8.0 (45.7 ms) and nginx-rtmp (86.5 ms). A single join is
   one sample per sweep, so the repeated rounds below (60 joins per server)
   are the better comparison for this row.
-- **Join latency at 25 viewers**: `librtmp2-server` (2.0 ms avg) and
-  MediaMTX (2.1 ms avg, the lower tail at 3.2 ms p95) are on par, ahead of
-  LiveForge (4.4 ms) and far ahead of SRS 8.0 (52.2 ms) and nginx-rtmp
-  (90.2 ms). SRS's default merged-write buffering (see above) is most of
-  what separates it here rather than raw per-connection cost.
-- **Join latency at 100 viewers**: `librtmp2-server` is fastest by a wide
-  margin, 3.5 ms avg and 7.8 ms p95 against 10.8 / 17.9 ms for MediaMTX and
-  13.1 / 25.4 ms for LiveForge, and every one of its three sweeps (3.5,
-  3.5, 3.7 ms) beat the best sweep of either (8.2 and 11.0 ms). SRS 8.0
-  (73.3 ms) and nginx-rtmp (91.2 ms) trail well behind.
+- **Join latency at 25 viewers**: `librtmp2-server` (1.8 ms avg, 3.0 ms
+  p95) is ahead of MediaMTX (3.0 / 4.7 ms) and LiveForge (4.0 / 6.7 ms)
+  and far ahead of SRS 8.0 (50.8 ms) and nginx-rtmp (88.7 ms). SRS's
+  default merged-write buffering (see above) is most of what separates it
+  here rather than raw per-connection cost.
+- **Join latency at 100 viewers**: `librtmp2-server` is fastest, 3.4 ms avg
+  and 6.7 ms p95 against 6.2 / 10.6 ms for MediaMTX and 7.4 / 17.1 ms for
+  LiveForge. SRS 8.0 (71.6 ms) and nginx-rtmp (89.8 ms) trail well behind.
 - Aggregate throughput scales linearly with viewer count for all five, as
   expected for a simple relay (no transcoding) — 100 viewers at ~1.1 Mbps
   each is ~108-110 Mbps served, consistent across all five implementations.
@@ -213,25 +213,24 @@ that has been live for about 25 seconds:
 
 | Metric | librtmp2-server | LiveForge | MediaMTX |
 |---|---|---|---|
-| connect+publish, sequential (`bench_handshake --concurrency 1`, 3 × 100), avg / p50 | **0.30 / 0.27 ms** | 0.38 / 0.35 ms | 0.45 / 0.42 ms |
-| single-viewer join (3 × 20 sequential `bench_relay --players 1` joins), avg / p50 | **0.78 / 0.76 ms** | 1.06 / 1.02 ms | 1.13 / 1.14 ms |
-| 100-viewer join (3 rounds), avg / p50 / p95 | **3.6 / 3.5 / 7.3 ms** | 15.5 / 15.3 / 31.3 ms | 8.1 / 8.3 / 13.0 ms |
-| connect+publish, 30 concurrent (3 × 120), avg / p50 / p95 | **2.0 / 1.6 / 4.3 ms** | 3.4 / 3.1 / 6.4 ms | 3.0 / 2.6 / 6.0 ms |
-| steady fps per viewer at 100 viewers | 73.0 | 73.1 | 73.1 |
+| connect+publish, sequential (`bench_handshake --concurrency 1`, 3 × 100), avg / p50 | **0.32 / 0.26 ms** | 0.39 / 0.35 ms | 0.46 / 0.42 ms |
+| single-viewer join (3 × 20 sequential `bench_relay --players 1` joins), avg / p50 | **0.94 / 0.88 ms** | 1.09 / 1.03 ms | 1.17 / 1.18 ms |
+| 100-viewer join (3 rounds), avg / p50 / p95 | **4.4 / 4.5 / 7.7 ms** | 16.7 / 15.6 / 32.3 ms | 5.5 / 5.1 / 9.8 ms |
+| connect+publish, 30 concurrent (3 × 120), avg / p50 / p95 | **2.2 / 1.8 / 4.8 ms** | 3.0 / 2.6 / 6.1 ms | 2.6 / 2.4 / 5.5 ms |
+| steady fps per viewer at 100 viewers | 73.1 | 73.1 | 73.0 |
 
 `librtmp2-server` is the only one of the three that authenticates every
 publish and play here (per-stream keys looked up and session rows written in
 SQLite); the other two accept any stream name. It is fastest on every
 latency row, and all three hold the same frame rate:
-sequential connect+publish (0.30 ms against 0.38 and 0.45 ms),
-single-viewer joins (0.8 ms against 1.1 ms), 100-viewer joins (3.6 ms avg
-against 8.1 ms for MediaMTX and 15.5 ms for LiveForge) and 30 concurrent
-connect+publish. Publishes and plays are answered from an in-memory
+sequential connect+publish (0.32 ms against 0.39 and 0.46 ms),
+single-viewer joins (0.9 ms against 1.1 and 1.2 ms), 100-viewer joins (4.4 ms avg
+against 5.5 ms for MediaMTX and 16.7 ms for LiveForge) and 30 concurrent
+connect+publish (2.2 ms against 2.6 and 3.0 ms). Publishes and plays are answered from an in-memory
 snapshot of the stream and play keys as soon as the request arrives, and
 the session row is written by the auth worker right after, so neither
 waits on SQLite; one active publisher per stream and the per-key viewer
-limit are still enforced, the former by the database itself. Every one of the
-60 single-viewer joins completed in under 2 ms.
+limit are still enforced, the former by the database itself.
 
 Sharding on its own, 1 vs 4 shards of the same build (4 interleaved rounds):
 30 concurrent connect+publish 4.95 -> 3.63 ms avg (p95 6.8 -> 5.9 ms),
@@ -260,9 +259,21 @@ publishing the RTMP-path numbers above.
 # from a checkout of librtmp2-server, with a sibling ../librtmp2 checkout:
 (cd ../librtmp2 && cargo build --release --example bench_handshake --example bench_relay)
 cargo build --release
+NGINX_BIN=/path/to/nginx NGINX_RTMP_MODULE=/path/to/ngx_rtmp_module.so \
 MEDIAMTX_BIN=/path/to/mediamtx SRS_BIN=/path/to/srs LIVEFORGE_BIN=/path/to/liveforge \
   scripts/run_rtmp_benchmarks.sh
 ```
+
+`NGINX_BIN` and `NGINX_RTMP_MODULE` default to the distribution package
+(`nginx` on `PATH` and `/usr/lib/nginx/modules/ngx_rtmp_module.so`). To
+reproduce the nginx 1.31.6 numbers above, build nginx from
+[github.com/nginx/nginx](https://github.com/nginx/nginx) at the
+`release-1.31.6` tag with the module from
+[github.com/arut/nginx-rtmp-module](https://github.com/arut/nginx-rtmp-module):
+`auto/configure --prefix=$PWD/inst --with-compat --add-dynamic-module=../nginx-rtmp-module && make && make install`,
+then point `NGINX_BIN` at `inst/sbin/nginx` and `NGINX_RTMP_MODULE` at
+`inst/modules/ngx_rtmp_module.so`. Use MediaMTX's prebuilt release binary
+from [github.com/bluenviron/mediamtx](https://github.com/bluenviron/mediamtx/releases).
 
 None of MediaMTX, SRS or LiveForge is vendored or built by this script (no
 Go toolchain dependency for MediaMTX/LiveForge, and SRS's own build is a
