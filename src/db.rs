@@ -568,10 +568,14 @@ impl Db {
     /// tracked sessions (a no-op) so duplicate release/disconnect handling
     /// can never underflow.
     fn player_count_decr(&self, viewer_id: &str) {
-        let mut counts = self.active_player_counts.lock();
-        if let Some(count) = counts.get_mut(viewer_id) {
+        Self::decr_count(&mut self.active_player_counts.lock(), viewer_id);
+    }
+
+    /// Decrements `counts[key]`, removing the entry once it reaches zero.
+    fn decr_count(counts: &mut HashMap<String, usize>, key: &str) {
+        if let Some(count) = counts.get_mut(key) {
             if *count <= 1 {
-                counts.remove(viewer_id);
+                counts.remove(key);
             } else {
                 *count -= 1;
             }
@@ -2243,7 +2247,10 @@ impl Db {
     /// Takes one of `viewer_id`'s [`MAX_CONNECTIONS_PER_PLAY_KEY`] slots in
     /// `active_player_counts` if one is free.
     fn player_count_try_incr(&self, viewer_id: &str) -> bool {
-        let mut counts = self.active_player_counts.lock();
+        Self::try_incr_count(&mut self.active_player_counts.lock(), viewer_id)
+    }
+
+    fn try_incr_count(counts: &mut HashMap<String, usize>, viewer_id: &str) -> bool {
         let count = counts.entry(viewer_id.to_string()).or_insert(0);
         if *count >= MAX_CONNECTIONS_PER_PLAY_KEY {
             if *count == 0 {
@@ -2260,7 +2267,15 @@ impl Db {
     /// The row must follow through [`Self::player_insert_reserved`]; until
     /// then the slot counts against the cap like any active session.
     pub fn player_reserve(&self, viewer_id: &str) -> bool {
-        if viewer_id.is_empty() || !self.player_count_try_incr(viewer_id) {
+        if viewer_id.is_empty() {
+            return false;
+        }
+        // Both maps change under `active_player_counts` (lock order:
+        // active before unpersisted) so a concurrent
+        // `resync_active_player_counts` sees the reservation in both or
+        // neither.
+        let mut counts = self.active_player_counts.lock();
+        if !Self::try_incr_count(&mut counts, viewer_id) {
             return false;
         }
         *self
@@ -2275,37 +2290,33 @@ impl Db {
     /// [`Self::player_reserve`]. On failure the slot is released and the
     /// caller must drop the session it admitted.
     pub fn player_insert_reserved(&self, p: &Player) -> bool {
+        // Hold the connection until the reservation is settled, so a
+        // resync (which runs under it) never counts the new row and its
+        // pending reservation together.
+        let conn = self.conn.lock();
         let inserted = match i64::try_from(p.bytes_out) {
-            Ok(bytes_out) => {
-                let conn = self.conn.lock();
-                Self::insert_active_player(&conn, p, bytes_out)
-            }
+            Ok(bytes_out) => Self::insert_active_player(&conn, p, bytes_out),
             Err(_) => false,
         };
+        let mut counts = self.active_player_counts.lock();
         self.player_unreserve(&p.viewer_id);
         if !inserted {
-            self.player_count_decr(&p.viewer_id);
+            Self::decr_count(&mut counts, &p.viewer_id);
         }
         inserted
     }
 
     /// Marks one reservation for `viewer_id` as no longer pending.
     fn player_unreserve(&self, viewer_id: &str) {
-        let mut pending = self.unpersisted_player_counts.lock();
-        if let Some(n) = pending.get_mut(viewer_id) {
-            if *n <= 1 {
-                pending.remove(viewer_id);
-            } else {
-                *n -= 1;
-            }
-        }
+        Self::decr_count(&mut self.unpersisted_player_counts.lock(), viewer_id);
     }
 
     /// Releases a slot taken by [`Self::player_reserve`] whose row will
     /// never be written.
     pub fn player_cancel_reservation(&self, viewer_id: &str) {
+        let mut counts = self.active_player_counts.lock();
         self.player_unreserve(viewer_id);
-        self.player_count_decr(viewer_id);
+        Self::decr_count(&mut counts, viewer_id);
     }
 
     fn insert_active_player(conn: &Connection, p: &Player, bytes_out: i64) -> bool {

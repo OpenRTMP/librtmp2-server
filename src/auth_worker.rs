@@ -315,7 +315,12 @@ pub fn spawn_with_notify(
         job
     };
 
-    bridge.db().refresh_key_cache();
+    // Fast authorization is off whenever batching is (HA clustering), and
+    // Raft's `with_conn` traffic would otherwise force a rebuild per batch.
+    let key_cache = batching_allowed(&bridge);
+    if key_cache {
+        bridge.db().refresh_key_cache();
+    }
     let worker_thread = std::thread::Builder::new()
         .name("rtmp-auth-worker".to_string())
         .spawn(move || {
@@ -350,7 +355,9 @@ pub fn spawn_with_notify(
                 }
                 // Off the reply path: rebuild the play-key snapshot if the
                 // batch (or anything else) changed a stream or viewer.
-                bridge.db().refresh_key_cache();
+                if key_cache {
+                    bridge.db().refresh_key_cache();
+                }
             }
         })
         .expect("failed to spawn RTMP auth worker thread");

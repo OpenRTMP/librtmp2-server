@@ -137,7 +137,8 @@ threads on this box):
 | SRS 8.0 | 100% | 514.4/s | 54.78 ms | 55.13 ms | 62.57 ms | 63.49 ms | 63.69 ms |
 | LiveForge | 100% | 7195.8/s | 3.13 ms | 2.76 ms | 6.60 ms | 8.56 ms | 8.99 ms |
 
-`librtmp2-server` is fastest on every column, ahead of LiveForge and
+`librtmp2-server` leads on throughput and every latency column (all five
+servers complete every handshake), ahead of LiveForge and
 MediaMTX and more than 20x faster than nginx-rtmp and SRS, even though it
 is the only server here that authenticates every publish against a
 database (per-stream keys in SQLite); the others were run accepting any
@@ -220,7 +221,8 @@ that has been live for about 25 seconds:
 
 `librtmp2-server` is the only one of the three that authenticates every
 publish and play here (per-stream keys looked up and session rows written in
-SQLite); the other two accept any stream name. It is fastest on every row:
+SQLite); the other two accept any stream name. It is fastest on every
+latency row, and all three hold the same frame rate:
 sequential connect+publish (0.30 ms against 0.38 and 0.45 ms),
 single-viewer joins (0.8 ms against 1.1 ms), 100-viewer joins (3.6 ms avg
 against 8.1 ms for MediaMTX and 15.5 ms for LiveForge) and 30 concurrent
