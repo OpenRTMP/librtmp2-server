@@ -57,6 +57,9 @@ enum Job {
     /// Run `on_close` (deactivating the connection's publisher/player rows)
     /// for a connection the RTMP poll loop saw close.
     Close(u64),
+    /// Write the row of a play the RTMP thread already admitted from the
+    /// key cache (see `DbRtmpBridge::try_fast_authorize_play`).
+    PersistPlay(u64, Box<Player>),
 }
 
 /// Result of a completed authorization request. Produced by the worker
@@ -135,6 +138,18 @@ impl AuthWorkerHandle {
     pub fn try_submit_close(&self, conn_id: u64) -> Result<(), ()> {
         self.tx.send(Job::Close(conn_id)).map_err(|_| ())
     }
+
+    /// Queues the row write for a play admitted on the RTMP thread. Shares
+    /// the queue with closes, so it always lands before the connection's
+    /// `on_close`, and like closes it is never refused for a full queue.
+    /// Returns `Err(())` only when the worker is gone; the caller must then
+    /// take the admission back.
+    #[allow(clippy::result_unit_err)]
+    pub fn try_submit_persist_play(&self, conn_id: u64, row: Player) -> Result<(), ()> {
+        self.tx
+            .send(Job::PersistPlay(conn_id, Box::new(row)))
+            .map_err(|_| ())
+    }
 }
 
 /// Most jobs folded into one group-commit transaction. Bounds how long the
@@ -161,6 +176,7 @@ fn run_jobs(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
     for job in jobs {
         match job {
             Job::Close(conn_id) => bridge.on_close(conn_id),
+            Job::PersistPlay(conn_id, row) => bridge.persist_fast_play(conn_id, &row),
             Job::Authorize(req) => {
                 let allow = match req.kind {
                     AuthKind::Publish => bridge
@@ -182,14 +198,14 @@ fn run_jobs(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
 }
 
 /// Runs `jobs` in submission order, group-committing each run of
-/// consecutive authorizations. Closes run on their own, outside any group:
-/// they drop the connection's in-memory session before writing, so a
-/// deactivation rolled back with a failed group could never be retried.
+/// consecutive authorizations. Closes and fast-play writes run on their own,
+/// outside any group: both act on sessions the client already holds, so a
+/// write rolled back with a failed group could never be retried.
 fn run_grouped(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
     let mut completions = Vec::with_capacity(jobs.len());
     let mut group: Vec<Job> = Vec::new();
     for job in jobs {
-        if matches!(job, Job::Close(_)) {
+        if matches!(job, Job::Close(_) | Job::PersistPlay(..)) {
             completions.extend(run_authorization_group(bridge, std::mem::take(&mut group)));
             completions.extend(run_jobs(bridge, vec![job]));
         } else {
@@ -217,7 +233,7 @@ fn run_authorization_group(bridge: &DbRtmpBridge, group: Vec<Job>) -> Vec<AuthCo
                 let (publisher, player) = bridge.session_rows(req.conn_id);
                 Some((req.conn_id, publisher, player))
             }
-            Job::Close(_) => None,
+            Job::Close(_) | Job::PersistPlay(..) => None,
         })
         .collect();
     let (mut completions, committed) = bridge.db().batch(|| run_jobs(bridge, group));
@@ -276,6 +292,7 @@ pub fn spawn_with_notify(
         job
     };
 
+    bridge.db().refresh_play_key_cache();
     std::thread::Builder::new()
         .name("rtmp-auth-worker".to_string())
         .spawn(move || {
@@ -308,6 +325,9 @@ pub fn spawn_with_notify(
                 if delivered {
                     notify();
                 }
+                // Off the reply path: rebuild the play-key snapshot if the
+                // batch (or anything else) changed a stream or viewer.
+                bridge.db().refresh_play_key_cache();
             }
         })
         .expect("failed to spawn RTMP auth worker thread");

@@ -857,7 +857,36 @@ pub(crate) fn rtmp_publish_auth_cb(
 }
 
 pub(crate) fn rtmp_play_auth_cb(conn_id: u64, app: &str, play_key: &str) -> AuthorizationResult {
+    ensure_conn_registered_for_auth(conn_id);
+    if let Some(result) = fast_authorize_play(conn_id, app, play_key) {
+        return result;
+    }
     submit_auth(AuthKind::Play, conn_id, app, play_key)
+}
+
+thread_local! {
+    /// Set when [`fast_authorize_play`] allowed a play during this thread's
+    /// `server.poll`; taken by [`process_server_connections`] so the loop
+    /// re-polls at once, as it does for a worker completion.
+    static FAST_PLAY_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Answers a play from the bridge's play-key cache without waiting on the
+/// auth worker (see `DbRtmpBridge::try_fast_authorize_play`), queueing only
+/// the session's row write. `None` hands the request to the worker as usual.
+fn fast_authorize_play(conn_id: u64, app: &str, play_key: &str) -> Option<AuthorizationResult> {
+    let bridge = RTMP_BRIDGE.lock().ok()?.as_ref().map(Arc::clone)?;
+    let worker = AUTH_WORKER.lock().ok()?.as_ref().cloned()?;
+    let row = bridge.try_fast_authorize_play(conn_id, app, play_key)?;
+    if worker
+        .try_submit_persist_play(conn_id, row.clone())
+        .is_err()
+    {
+        bridge.cancel_fast_play(conn_id, &row);
+        return Some(AuthorizationResult::Deny);
+    }
+    FAST_PLAY_ALLOWED.with(|flag| flag.set(true));
+    Some(AuthorizationResult::Allow)
 }
 
 /// Applies every publish/play authorization the dedicated worker thread has
@@ -1154,7 +1183,8 @@ pub(crate) fn process_server_connections(
     revoked_now: &HashSet<String>,
     idle_timeout: Duration,
 ) -> (HashSet<u64>, bool) {
-    let just_authorized = drain_auth_completions(server, tracked);
+    let just_authorized =
+        drain_auth_completions(server, tracked) | FAST_PLAY_ALLOWED.with(std::cell::Cell::take);
 
     let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
