@@ -32,11 +32,10 @@ pub(crate) static AUTH_WORKER: StdMutex<Option<AuthWorkerHandle>> = StdMutex::ne
 /// [`drain_auth_completions`].
 pub(crate) static AUTH_COMPLETIONS_RX: StdMutex<Option<std::sync::mpsc::Receiver<AuthCompletion>>> =
     StdMutex::new(None);
-/// Set once `Server::run` starts shutting the RTMP shards down. While set,
-/// cluster-mode connection closes run inline instead of on the auth worker,
-/// so their ownership releases complete before `shutdown_blocking` stops the
-/// cluster manager; see [`close_conn_off_poll_thread`].
-static RTMP_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+/// The auth worker's thread handle, joined (bounded) at shutdown after the
+/// shards stop so queued authorization and close jobs are applied while the
+/// cluster manager is still running; see [`drain_auth_worker_for_shutdown`].
+static AUTH_WORKER_THREAD: StdMutex<Option<std::thread::JoinHandle<()>>> = StdMutex::new(None);
 static PUBLISH_GENERATIONS: LazyLock<StdMutex<HashMap<u64, u64>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -837,22 +836,56 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
 /// any authorization still queued for the same connection. That ordering is
 /// required with or without HA clustering: an inline close would run before
 /// a pending authorization and let it recreate publisher/player state for a
-/// dead connection. Inline only when the worker isn't running, or once
-/// `RTMP_SHUTTING_DOWN` is set — ownership releases then go through Raft and
-/// must finish before the shard threads are joined and the cluster manager
-/// stops.
+/// dead connection. Inline only when the worker isn't running; at shutdown
+/// queued closes are drained before the cluster manager stops (see
+/// [`drain_auth_worker_for_shutdown`]).
 fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
-    #[cfg(feature = "cluster")]
-    if rtmp_bridge.cluster_manager().is_some() && RTMP_SHUTTING_DOWN.load(Ordering::Relaxed) {
-        rtmp_bridge.on_close(conn_id);
-        return;
-    }
     let submitted = AUTH_WORKER
         .lock()
         .ok()
         .and_then(|guard| guard.as_ref().map(|h| h.try_submit_close(conn_id)));
     if !matches!(submitted, Some(Ok(()))) {
         rtmp_bridge.on_close(conn_id);
+    }
+}
+
+/// Stops accepting new authorization work and waits (bounded) for the auth
+/// worker to apply everything already queued. Shards queue their final
+/// connection closes while shutting down, and those closes release publisher
+/// ownership through the coordinator/Raft — so they must run while the
+/// cluster manager is still alive. Completion receivers are dropped first so
+/// the worker can never block on a full completion channel nobody drains.
+fn drain_auth_worker_for_shutdown() {
+    if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+        guard.take();
+    }
+    if let Ok(mut guard) = AUTH_WORKER.lock() {
+        guard.take();
+    }
+    let join = AUTH_WORKER_THREAD
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    let Some(join) = join else {
+        return;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("rtmp-auth-drain".to_string())
+        .spawn(move || {
+            let _ = join.join();
+            let _ = done_tx.send(());
+        });
+    let timed_out = match spawned {
+        Ok(_) => done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_err(),
+        Err(_) => true,
+    };
+    if timed_out {
+        crate::log_warn!(
+            "RTMP auth worker did not drain within 10s; shutting down without waiting for it"
+        );
     }
 }
 
@@ -1747,7 +1780,6 @@ impl ServerApp {
         let deleted_streams = Arc::clone(&self.deleted_streams);
         let sticky_deleted_streams = Arc::clone(&self.sticky_deleted_streams);
         let revoked_viewers = Arc::clone(&self.revoked_viewers);
-        RTMP_SHUTTING_DOWN.store(false, Ordering::Relaxed);
         let rtmp_stop = Arc::new(AtomicBool::new(false));
         // Periodic publisher/player stats are queued in memory by the RTMP
         // poll threads and written here in one transaction per interval,
@@ -1856,7 +1888,7 @@ impl ServerApp {
         } else {
             None
         };
-        let (auth_worker_handle, auth_completions_rx) =
+        let (auth_worker_handle, auth_completions_rx, auth_worker_thread) =
             auth_worker::spawn_with_notify(Arc::clone(&rtmp_bridge), move || {
                 if let Some(wake) = &worker_wake {
                     wake.signal();
@@ -1864,6 +1896,9 @@ impl ServerApp {
             });
         if let Ok(mut guard) = AUTH_WORKER.lock() {
             *guard = Some(auth_worker_handle);
+        }
+        if let Ok(mut guard) = AUTH_WORKER_THREAD.lock() {
+            *guard = Some(auth_worker_thread);
         }
         // Each shard may only apply a completion via its own `Server`, from
         // its own thread (librtmp2's single-thread-per-`Conn` rule), so with
@@ -2478,23 +2513,17 @@ impl ServerApp {
             // its poll loop (see the `loop { if rtmp_stop_clone.load(...) `
             // above) -- rather than returning this error with those shards'
             // listeners, auth routing, and relay channels left running.
-            RTMP_SHUTTING_DOWN.store(true, Ordering::Relaxed);
             rtmp_stop.store(true, Ordering::Relaxed);
             for shard_thread in shard_threads.drain(..) {
                 let _ = shard_thread.join();
             }
 
-            // Tear down the auth pipeline as part of failed startup too.
-            // Dropping the submission handle closes the worker request
-            // channel; once the worker exits, its completion channel closes
-            // and the dispatcher can be joined instead of being left
-            // detached after run returns an error.
-            if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
-                guard.take();
-            }
-            if let Ok(mut guard) = AUTH_WORKER.lock() {
-                guard.take();
-            }
+            // Tear down the auth pipeline as part of failed startup too:
+            // queued jobs (including connection closes) are applied before
+            // the bridge and any cluster manager go away, then the dispatcher
+            // is joined instead of being left detached after run returns an
+            // error.
+            drain_auth_worker_for_shutdown();
             if let Some(dispatch_thread) = auth_dispatch_thread.take() {
                 let _ = dispatch_thread.join();
             }
@@ -2539,12 +2568,15 @@ impl ServerApp {
         // have those releases fail against an already-shut-down cluster
         // manager, leaving durable ownership rows behind that block
         // publishers routed to other nodes until the next failure sweep.
-        RTMP_SHUTTING_DOWN.store(true, Ordering::Relaxed);
         rtmp_stop.store(true, Ordering::Relaxed);
         for shard_thread in shard_threads {
             let _ = shard_thread.join();
         }
         crate::log_info!("RTMP shard threads joined.");
+        // Apply queued authorization/close work from the joined shards --
+        // closes release publisher ownership through the coordinator -- before
+        // the cluster manager stops.
+        drain_auth_worker_for_shutdown();
         let _ = stats_flush_thread.join();
         // Stats the shards queued while shutting down.
         final_stats_flush_db.flush_pending_stats();

@@ -310,39 +310,58 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
     // Authenticated traffic may carry RaftSnapshot payloads up to MAX_FRAME;
     // non-snapshot control messages stay capped at MAX_CONTROL_FRAME after
     // decode so a peer cannot inflate ordinary RPCs to snapshot size.
-    tokio::time::timeout(CONTROL_READ_TIMEOUT, async {
-        let len = r.read_u32().await?;
-        if len > MAX_FRAME {
-            return Err(std::io::Error::other("frame too large"));
-        }
-        // Peek the variant tag before allocating/reserving so the budget class
-        // matches the actual message type.
-        const PEEK: usize = 32;
-        let mut prefix = [0u8; PEEK];
-        let prefix_len = (len as usize).min(PEEK);
-        r.read_exact(&mut prefix[..prefix_len]).await?;
-        let snapshot_prefix = prefix[..prefix_len].starts_with(b"{\"RaftSnapshot");
-        let read_budget = if len <= MAX_UNBUDGETED_CONTROL_FRAME {
-            None
+    //
+    // Header and variant prefix are bounded by the standard control timeout;
+    // the (potentially multi-megabyte) snapshot body instead gets the
+    // snapshot round-trip timeout, matching what OpenRaft and the sending
+    // transport already allow for a chunk transfer. A fixed 30 s body
+    // timeout would abort chunks the sender is still allowed to deliver.
+    const PEEK: usize = 32;
+    let (len, prefix, prefix_len, snapshot_prefix) =
+        tokio::time::timeout(CONTROL_READ_TIMEOUT, async {
+            let len = r.read_u32().await?;
+            if len > MAX_FRAME {
+                return Err(std::io::Error::other("frame too large"));
+            }
+            // Peek the variant tag before allocating/reserving so the budget
+            // class matches the actual message type.
+            let mut prefix = [0u8; PEEK];
+            let prefix_len = (len as usize).min(PEEK);
+            r.read_exact(&mut prefix[..prefix_len]).await?;
+            let snapshot_prefix = prefix[..prefix_len].starts_with(b"{\"RaftSnapshot");
+            Ok::<_, std::io::Error>((len, prefix, prefix_len, snapshot_prefix))
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))??;
+
+    let read_budget = if len <= MAX_UNBUDGETED_CONTROL_FRAME {
+        None
+    } else {
+        let (counter, max, error) = if snapshot_prefix {
+            (
+                &SNAPSHOT_READ_BYTES_INFLIGHT,
+                MAX_SNAPSHOT_READ_BYTES_INFLIGHT,
+                "snapshot read memory budget exceeded",
+            )
         } else {
-            let (counter, max, error) = if snapshot_prefix {
-                (
-                    &SNAPSHOT_READ_BYTES_INFLIGHT,
-                    MAX_SNAPSHOT_READ_BYTES_INFLIGHT,
-                    "snapshot read memory budget exceeded",
-                )
-            } else {
-                (
-                    &CONTROL_READ_BYTES_INFLIGHT,
-                    MAX_CONTROL_READ_BYTES_INFLIGHT,
-                    "control read memory budget exceeded",
-                )
-            };
-            Some(
-                crate::cluster::security::try_reserve_inflight_bytes(counter, max, len as usize)
-                    .map_err(|_| std::io::Error::other(error))?,
+            (
+                &CONTROL_READ_BYTES_INFLIGHT,
+                MAX_CONTROL_READ_BYTES_INFLIGHT,
+                "control read memory budget exceeded",
             )
         };
+        Some(
+            crate::cluster::security::try_reserve_inflight_bytes(counter, max, len as usize)
+                .map_err(|_| std::io::Error::other(error))?,
+        )
+    };
+
+    let body_timeout = if snapshot_prefix {
+        SNAPSHOT_ROUNDTRIP_TIMEOUT
+    } else {
+        CONTROL_READ_TIMEOUT
+    };
+    tokio::time::timeout(body_timeout, async {
         let mut buf = Vec::with_capacity(len as usize);
         buf.extend_from_slice(&prefix[..prefix_len]);
         if (len as usize) > prefix_len {
