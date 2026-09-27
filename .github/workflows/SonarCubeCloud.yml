@@ -41,10 +41,11 @@ jobs:
       - name: Generate test coverage
         run: |
           # Match Tests workflow: lib tests plus integration test binaries.
-          cargo llvm-cov --features test-support,cluster -- --test-threads=1
-          cargo llvm-cov --features test-support,cluster --append --test rtmp_http_e2e -- --test-threads=1
-          cargo llvm-cov --features test-support,cluster --append --test cluster_ha -- --test-threads=1
-          cargo llvm-cov --features test-support,cluster --append --test cluster_security -- --test-threads=1
+          # cargo-llvm-cov 0.7+ merges profiles via --no-report, not --append.
+          cargo llvm-cov --features test-support,cluster --no-report -- --test-threads=1
+          cargo llvm-cov --features test-support,cluster --no-report --test rtmp_http_e2e -- --test-threads=1
+          cargo llvm-cov --features test-support,cluster --no-report --test cluster_ha -- --test-threads=1
+          cargo llvm-cov --features test-support,cluster --no-report --test cluster_security -- --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: SonarQube Scan
