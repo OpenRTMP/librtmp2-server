@@ -13,6 +13,57 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-27
+
+### Changed
+- Package version `0.5.0` → `0.6.0`. Publishes and plays are now confirmed
+  before their session row is committed (see below).
+- Depends on librtmp2 `0.10.1` (chunk-stream cap, client acknowledgements
+  and E-RTMP parsing fixes).
+- A publish or play whose key is in an up-to-date in-memory snapshot of the
+  enabled stream and play keys is answered on the RTMP thread at once. The
+  auth worker writes its session row right after, ahead of the
+  connection's close. One active publisher per stream is still enforced by
+  the database: a publisher that loses that check, or a session whose row
+  can't be written, is disconnected. The per-key viewer limit counts
+  sessions whose row is still pending. Unknown or stale keys, a repeated
+  publish or play on the same connection, HA clustering and every
+  rejection still go through the auth worker as before. The snapshot is
+  invalidated by an SQLite update hook on `streams` and `stream_viewers`
+  and rebuilt by the worker, off the reply path. If the server crashes
+  between the reply and the write, that session's row is missing; session
+  rows are reset on every start anyway.
+- Sequential connect+publish averages 0.30 ms and a 100-viewer join 3.6 ms
+  on the benchmark box, ahead of MediaMTX and LiveForge on every latency
+  row. `BENCHMARKS.md` now benchmarks SRS at its 8.0 release and reports
+  the mean of three full sweeps plus three interleaved rounds.
+
+### Fixed
+- `scripts/run_rtmp_benchmarks.sh` recorded the launch subshell's PID
+  instead of the server's, so MediaMTX, SRS and LiveForge kept running
+  through every later leg and skewed its results. Each server now runs as
+  a direct child of the script and is stopped after its leg.
+- HA clustering: a transient `accept` error on the media plane or the
+  control plane no longer stops that listener; it is logged and retried.
+- HA clustering: `CLUSTER_DRAIN_THRESHOLD` / `CLUSTER_RESUME_THRESHOLD`
+  environment overrides now win over absolute Mbps values from the config
+  file. An unparseable override is ignored and keeps the file value.
+- A publish authorization completing after its connection closed no longer
+  leaves a stale entry in the publish-generation map.
+- HA clustering: a node that rejoins under its previous node ID (for
+  example after being rebuilt with an empty database at a new address) is
+  only accepted once the old member is fenced (down or leaving), and a
+  follower forwards the rejoin to the leader. A duplicate ID can no longer
+  redirect replication away from a live voter.
+- HA clustering: RTMP connection closes are queued on the auth worker
+  behind pending authorizations instead of running inline (except during
+  shutdown), and the worker is drained at shutdown before the cluster
+  coordinator is torn down.
+- HA clustering: Raft snapshot installs no longer time out on every attempt
+  (the 200 ms default was below one chunk's round trip). Chunks are 1 MiB,
+  the snapshot body gets its own read deadline, and a peer's declared
+  snapshot frame size is capped before any read budget is reserved.
+
 ## [0.5.0] — 2026-09-25
 
 ### Changed
@@ -730,7 +781,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.1...v0.4.2
