@@ -29,6 +29,12 @@ use crate::cluster::security::{
 use crate::cluster::state::ClusterMeta;
 
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
+/// Largest accepted JSON-encoded snapshot frame. Snapshot chunks are sent in
+/// `snapshot_max_chunk_size` (1 MiB) pieces, which inflate to a few MiB as a
+/// JSON array of byte values. Capping the declared size keeps an
+/// authenticated peer that advertises a snapshot from reserving a large slice
+/// of the snapshot read budget for the whole snapshot timeout.
+const MAX_SNAPSHOT_FRAME: u32 = 8 * 1024 * 1024;
 /// Post-auth control-plane frames (Raft RPC, admin) — smaller than snapshot path.
 const MAX_CONTROL_FRAME: u32 = 8 * 1024 * 1024;
 /// Small control frames are bounded by the authenticated connection cap, so
@@ -329,6 +335,9 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
             let prefix_len = (len as usize).min(PEEK);
             r.read_exact(&mut prefix[..prefix_len]).await?;
             let snapshot_prefix = prefix[..prefix_len].starts_with(b"{\"RaftSnapshot");
+            if snapshot_prefix && len > MAX_SNAPSHOT_FRAME {
+                return Err(std::io::Error::other("snapshot frame too large"));
+            }
             Ok::<_, std::io::Error>((len, prefix, prefix_len, snapshot_prefix))
         })
         .await
@@ -1548,12 +1557,44 @@ pub async fn send_change_membership(
 
 #[cfg(test)]
 mod tests {
-    use super::{control_accept_backoff, tls_server_name_from_addr};
+    use super::{control_accept_backoff, read_budgeted_frame, tls_server_name_from_addr};
 
     #[tokio::test]
     async fn control_accept_backoff_survives_transient_errors() {
         control_accept_backoff(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)).await;
         control_accept_backoff(std::io::Error::from(std::io::ErrorKind::Interrupted)).await;
+    }
+
+    #[tokio::test]
+    async fn declared_length_above_max_frame_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(super::MAX_FRAME + 1).to_be_bytes());
+        let mut reader: &[u8] = &bytes;
+
+        let err = match read_budgeted_frame(&mut reader, false).await {
+            Ok(_) => panic!("declared length above MAX_FRAME must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("frame too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_snapshot_frame_is_rejected_before_budget_reservation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::MAX_FRAME.to_be_bytes());
+        let mut prefix = [b' '; 32];
+        prefix[..15].copy_from_slice(b"{\"RaftSnapshot\"");
+        bytes.extend_from_slice(&prefix);
+        let mut reader: &[u8] = &bytes;
+
+        let err = match read_budgeted_frame(&mut reader, false).await {
+            Ok(_) => panic!("oversized snapshot frames must be capped"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("snapshot frame too large"),
+            "{err}"
+        );
     }
 
     #[test]
