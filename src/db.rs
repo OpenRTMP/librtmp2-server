@@ -9,6 +9,8 @@ use parking_lot::{Mutex, ReentrantMutex};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Open flags for on-disk databases. `SQLITE_OPEN_NOFOLLOW` blocks a local
@@ -111,6 +113,21 @@ pub struct Db {
     /// on every `Db::open`, which already resets all `active` rows to 0 for
     /// the same reason (no session survives a process restart).
     active_player_counts: Mutex<HashMap<String, usize>>,
+    /// Sessions counted in `active_player_counts` by [`Self::player_reserve`]
+    /// whose `players` row isn't written yet (see
+    /// [`Self::player_insert_reserved`]). [`Self::resync_active_player_counts`]
+    /// adds them back, since the table can't know about them. Lock order:
+    /// `active_player_counts` before this.
+    unpersisted_player_counts: Mutex<HashMap<String, usize>>,
+    /// Bumped on every write to `streams` or `stream_viewers` (an SQLite
+    /// update hook) and on every raw [`Self::with_conn`] access, so
+    /// `access_keys` can tell when it no longer matches the tables.
+    auth_generation: Arc<AtomicU64>,
+    /// Snapshot of every enabled play and publish key with its rows, used
+    /// to authorize plays and publishes without a database round trip; only
+    /// valid while its generation equals `auth_generation`. See
+    /// [`Self::cached_play_key`] and [`Self::cached_publish_key`].
+    access_keys: parking_lot::RwLock<KeySnapshot>,
     /// Latest not-yet-persisted stats per publisher/player row, queued by
     /// the RTMP poll threads and written in one transaction by
     /// [`Db::flush_pending_stats`]. Lock order: `conn` before this.
@@ -118,6 +135,16 @@ pub struct Db {
     /// Test hook: make the next [`Db::batch`] commit fail.
     #[cfg(test)]
     fail_next_batch_commit: std::sync::atomic::AtomicBool,
+}
+
+/// Every enabled play key with its viewer and stream rows, and every
+/// enabled stream by publish key, as of `generation` (a value of
+/// [`Db::auth_generation`]). `None` until the first [`Db::refresh_key_cache`].
+#[derive(Default)]
+struct KeySnapshot {
+    generation: Option<u64>,
+    play: HashMap<String, Arc<(StreamViewer, Stream)>>,
+    publish: HashMap<String, Arc<Stream>>,
 }
 
 /// Stats rows waiting for [`Db::flush_pending_stats`], keyed by row id; a
@@ -464,6 +491,18 @@ impl Db {
         // burst of concurrent viewers hits it. Headroom avoids that without
         // meaningfully growing memory use (each cached statement is small).
         conn.set_prepared_statement_cache_capacity(64);
+        let auth_generation = Arc::new(AtomicU64::new(0));
+        let hook_generation = Arc::clone(&auth_generation);
+        // Catches every row write to these tables whatever issues it. Not
+        // fired by SQLite's truncate optimization (an unqualified `DELETE
+        // FROM`), which only raw `with_conn` callers use; that bumps too.
+        conn.update_hook(Some(
+            move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                if table == "streams" || table == "stream_viewers" {
+                    hook_generation.fetch_add(1, Ordering::AcqRel);
+                }
+            },
+        ))?;
         conn.execute_batch(SCHEMA)?;
         // Migrate pre-existing databases created before `pending_delete` was
         // added to the `streams` table (CREATE TABLE IF NOT EXISTS above is a
@@ -502,6 +541,9 @@ impl Db {
         Ok(Db {
             conn: ReentrantMutex::new(conn),
             active_player_counts: Mutex::new(HashMap::new()),
+            unpersisted_player_counts: Mutex::new(HashMap::new()),
+            auth_generation,
+            access_keys: parking_lot::RwLock::new(KeySnapshot::default()),
             pending_stats: Mutex::new(PendingStats::default()),
             #[cfg(test)]
             fail_next_batch_commit: std::sync::atomic::AtomicBool::new(false),
@@ -526,10 +568,14 @@ impl Db {
     /// tracked sessions (a no-op) so duplicate release/disconnect handling
     /// can never underflow.
     fn player_count_decr(&self, viewer_id: &str) {
-        let mut counts = self.active_player_counts.lock();
-        if let Some(count) = counts.get_mut(viewer_id) {
+        Self::decr_count(&mut self.active_player_counts.lock(), viewer_id);
+    }
+
+    /// Decrements `counts[key]`, removing the entry once it reaches zero.
+    fn decr_count(counts: &mut HashMap<String, usize>, key: &str) {
+        if let Some(count) = counts.get_mut(key) {
             if *count <= 1 {
-                counts.remove(viewer_id);
+                counts.remove(key);
             } else {
                 *count -= 1;
             }
@@ -1260,6 +1306,93 @@ impl Db {
         }))
     }
 
+    /// Current [`Self::auth_generation`] value.
+    fn auth_generation(&self) -> u64 {
+        self.auth_generation.load(Ordering::Acquire)
+    }
+
+    /// The viewer and stream for an enabled `key`, from the in-memory
+    /// snapshot, or `None` when the key isn't in it or the snapshot is out
+    /// of date (the caller then falls back to
+    /// [`Self::viewer_and_stream_by_play_key`]). A hit reflects the tables
+    /// as of the last write to them, like a fresh query would.
+    pub fn cached_play_key(&self, key: &str) -> Option<Arc<(StreamViewer, Stream)>> {
+        let snapshot = self.access_keys.read();
+        if snapshot.generation != Some(self.auth_generation()) {
+            return None;
+        }
+        snapshot.play.get(key).cloned()
+    }
+
+    /// The enabled stream whose publish key is `key`, from the same
+    /// snapshot as [`Self::cached_play_key`] and under the same rules.
+    pub fn cached_publish_key(&self, key: &str) -> Option<Arc<Stream>> {
+        let snapshot = self.access_keys.read();
+        if snapshot.generation != Some(self.auth_generation()) {
+            return None;
+        }
+        snapshot.publish.get(key).cloned()
+    }
+
+    /// Reloads the key snapshot if a write to `streams` or `stream_viewers`
+    /// has happened since it was taken. Cheap when nothing changed;
+    /// otherwise one query over every enabled viewer and one over every
+    /// enabled stream.
+    pub fn refresh_key_cache(&self) {
+        let generation = self.auth_generation();
+        if self.access_keys.read().generation == Some(generation) {
+            return;
+        }
+        let viewer_cols: Vec<String> = Self::VIEWER_COLS
+            .split(',')
+            .map(|c| format!("sv.{c}"))
+            .collect();
+        let stream_cols: Vec<String> = Self::STREAM_COLS
+            .split(',')
+            .map(|c| format!("s.{c}"))
+            .collect();
+        let sql = format!(
+            "SELECT {},{} FROM stream_viewers sv \
+             JOIN streams s ON s.id = sv.stream_id WHERE sv.enabled=1",
+            viewer_cols.join(","),
+            stream_cols.join(","),
+        );
+        let publish_sql = format!("SELECT {} FROM streams WHERE enabled=1", Self::STREAM_COLS);
+        let (generation, play, publish) = {
+            let conn = self.conn.lock();
+            // Taken under the connection lock, before the query: any write
+            // after this point bumps the generation past it, so a snapshot
+            // missing that write is never used.
+            let generation = self.auth_generation();
+            let play = conn.prepare(&sql).and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    let viewer = Self::load_viewer_row(row)?;
+                    let stream = Self::load_stream_row_at(row, viewer_cols.len())?;
+                    Ok((viewer.play_key.clone(), Arc::new((viewer, stream))))
+                })?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()
+            });
+            let publish = conn.prepare(&publish_sql).and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    let stream = Self::load_stream_row(row)?;
+                    Ok((stream.publish_key.clone(), Arc::new(stream)))
+                })?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()
+            });
+            match (play, publish) {
+                (Ok(play), Ok(publish)) => (generation, play, publish),
+                (Err(e), _) | (_, Err(e)) => {
+                    crate::log_error!("refresh_key_cache: query failed: {e}");
+                    return;
+                }
+            }
+        };
+        let mut snapshot = self.access_keys.write();
+        snapshot.generation = Some(generation);
+        snapshot.play = play;
+        snapshot.publish = publish;
+    }
+
     pub fn viewer_get(&self, stream_id: &str, viewer_id: &str) -> DbLookup<StreamViewer> {
         let conn = self.conn.lock();
         map_optional(conn.query_row(
@@ -1682,6 +1815,9 @@ impl Db {
         F: FnOnce(&Connection) -> R,
     {
         let conn = self.conn.lock();
+        // Raw access may rewrite `streams`/`stream_viewers` in ways the
+        // update hook misses (see `Db::open`).
+        self.auth_generation.fetch_add(1, Ordering::AcqRel);
         f(&conn)
     }
 
@@ -1747,6 +1883,9 @@ impl Db {
             for (viewer_id, n) in rows.flatten() {
                 counts.insert(viewer_id, n.max(0) as usize);
             }
+        }
+        for (viewer_id, n) in self.unpersisted_player_counts.lock().iter() {
+            *counts.entry(viewer_id.clone()).or_insert(0) += n;
         }
     }
 
@@ -2091,23 +2230,100 @@ impl Db {
         };
         let conn = self.conn.lock();
         // In-memory cap check (see `active_player_counts`) instead of a
-        // `SELECT COUNT(*)`; held under the same `conn` lock as the insert
-        // below so check-then-insert stays atomic against a concurrent
-        // `player_try_acquire`/`player_update` on this connection.
-        if self
-            .active_player_counts
-            .lock()
-            .get(&p.viewer_id)
-            .copied()
-            .unwrap_or(0)
-            >= MAX_CONNECTIONS_PER_PLAY_KEY
-        {
+        // `SELECT COUNT(*)`. The slot is taken in the same step as the check,
+        // so neither a concurrent `player_try_acquire` nor a
+        // `player_reserve` from an RTMP thread (which doesn't hold `conn`)
+        // can claim it in between; it's handed back if the insert fails.
+        if !self.player_count_try_incr(&p.viewer_id) {
             return false;
         }
-        let tx = match DbTx::begin(&conn) {
+        let inserted = Self::insert_active_player(&conn, p, bytes_out);
+        if !inserted {
+            self.player_count_decr(&p.viewer_id);
+        }
+        inserted
+    }
+
+    /// Takes one of `viewer_id`'s [`MAX_CONNECTIONS_PER_PLAY_KEY`] slots in
+    /// `active_player_counts` if one is free.
+    fn player_count_try_incr(&self, viewer_id: &str) -> bool {
+        Self::try_incr_count(&mut self.active_player_counts.lock(), viewer_id)
+    }
+
+    fn try_incr_count(counts: &mut HashMap<String, usize>, viewer_id: &str) -> bool {
+        let count = counts.entry(viewer_id.to_string()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_PLAY_KEY {
+            if *count == 0 {
+                counts.remove(viewer_id);
+            }
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Claims a player slot for `viewer_id` without writing its `players`
+    /// row, so an RTMP thread can admit a viewer without waiting on SQLite.
+    /// The row must follow through [`Self::player_insert_reserved`]; until
+    /// then the slot counts against the cap like any active session.
+    pub fn player_reserve(&self, viewer_id: &str) -> bool {
+        if viewer_id.is_empty() {
+            return false;
+        }
+        // Both maps change under `active_player_counts` (lock order:
+        // active before unpersisted) so a concurrent
+        // `resync_active_player_counts` sees the reservation in both or
+        // neither.
+        let mut counts = self.active_player_counts.lock();
+        if !Self::try_incr_count(&mut counts, viewer_id) {
+            return false;
+        }
+        *self
+            .unpersisted_player_counts
+            .lock()
+            .entry(viewer_id.to_string())
+            .or_insert(0) += 1;
+        true
+    }
+
+    /// Writes the active `players` row for a slot taken by
+    /// [`Self::player_reserve`]. On failure the slot is released and the
+    /// caller must drop the session it admitted.
+    pub fn player_insert_reserved(&self, p: &Player) -> bool {
+        // Hold the connection until the reservation is settled, so a
+        // resync (which runs under it) never counts the new row and its
+        // pending reservation together.
+        let conn = self.conn.lock();
+        let inserted = match i64::try_from(p.bytes_out) {
+            Ok(bytes_out) => Self::insert_active_player(&conn, p, bytes_out),
+            Err(_) => false,
+        };
+        let mut counts = self.active_player_counts.lock();
+        self.player_unreserve(&p.viewer_id);
+        if !inserted {
+            Self::decr_count(&mut counts, &p.viewer_id);
+        }
+        inserted
+    }
+
+    /// Marks one reservation for `viewer_id` as no longer pending.
+    fn player_unreserve(&self, viewer_id: &str) {
+        Self::decr_count(&mut self.unpersisted_player_counts.lock(), viewer_id);
+    }
+
+    /// Releases a slot taken by [`Self::player_reserve`] whose row will
+    /// never be written.
+    pub fn player_cancel_reservation(&self, viewer_id: &str) {
+        let mut counts = self.active_player_counts.lock();
+        self.player_unreserve(viewer_id);
+        Self::decr_count(&mut counts, viewer_id);
+    }
+
+    fn insert_active_player(conn: &Connection, p: &Player, bytes_out: i64) -> bool {
+        let tx = match DbTx::begin(conn) {
             Ok(tx) => tx,
             Err(e) => {
-                crate::log_error!("player_try_acquire: begin tx failed: {e}");
+                crate::log_error!("player insert: begin tx failed: {e}");
                 return false;
             }
         };
@@ -2134,11 +2350,7 @@ impl Db {
         {
             return false;
         }
-        if tx.commit().is_err() {
-            return false;
-        }
-        self.player_count_incr(&p.viewer_id);
-        true
+        tx.commit().is_ok()
     }
 
     #[allow(dead_code)]

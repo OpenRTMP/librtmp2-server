@@ -894,11 +894,69 @@ pub(crate) fn rtmp_publish_auth_cb(
     app: &str,
     stream_key: &str,
 ) -> AuthorizationResult {
+    ensure_conn_registered_for_auth(conn_id);
+    if let Some(result) = fast_authorize_publish(conn_id, app, stream_key) {
+        return result;
+    }
     submit_auth(AuthKind::Publish, conn_id, app, stream_key)
 }
 
 pub(crate) fn rtmp_play_auth_cb(conn_id: u64, app: &str, play_key: &str) -> AuthorizationResult {
+    ensure_conn_registered_for_auth(conn_id);
+    if let Some(result) = fast_authorize_play(conn_id, app, play_key) {
+        return result;
+    }
     submit_auth(AuthKind::Play, conn_id, app, play_key)
+}
+
+thread_local! {
+    /// Set when [`fast_authorize_play`] or [`fast_authorize_publish`]
+    /// allowed a request during this thread's
+    /// `server.poll`; taken by [`process_server_connections`] so the loop
+    /// re-polls at once, as it does for a worker completion.
+    static FAST_AUTH_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Answers a publish from the bridge's key cache without waiting on the auth
+/// worker (see `DbRtmpBridge::try_fast_authorize_publish`), queueing only the
+/// session's row write. `None` hands the request to the worker as usual.
+fn fast_authorize_publish(
+    conn_id: u64,
+    app: &str,
+    stream_key: &str,
+) -> Option<AuthorizationResult> {
+    let bridge = RTMP_BRIDGE.lock().ok()?.as_ref().map(Arc::clone)?;
+    let worker = AUTH_WORKER.lock().ok()?.as_ref().cloned()?;
+    let row = bridge.try_fast_authorize_publish(conn_id, app, stream_key)?;
+    if worker
+        .try_submit_persist_publish(conn_id, row.clone())
+        .is_err()
+    {
+        bridge.cancel_fast_publish(conn_id, &row);
+        return Some(AuthorizationResult::Deny);
+    }
+    // As a worker completion does in `apply_auth_completion`.
+    bump_publish_generation(conn_id);
+    FAST_AUTH_ALLOWED.with(|flag| flag.set(true));
+    Some(AuthorizationResult::Allow)
+}
+
+/// Answers a play from the bridge's play-key cache without waiting on the
+/// auth worker (see `DbRtmpBridge::try_fast_authorize_play`), queueing only
+/// the session's row write. `None` hands the request to the worker as usual.
+fn fast_authorize_play(conn_id: u64, app: &str, play_key: &str) -> Option<AuthorizationResult> {
+    let bridge = RTMP_BRIDGE.lock().ok()?.as_ref().map(Arc::clone)?;
+    let worker = AUTH_WORKER.lock().ok()?.as_ref().cloned()?;
+    let row = bridge.try_fast_authorize_play(conn_id, app, play_key)?;
+    if worker
+        .try_submit_persist_play(conn_id, row.clone())
+        .is_err()
+    {
+        bridge.cancel_fast_play(conn_id, &row);
+        return Some(AuthorizationResult::Deny);
+    }
+    FAST_AUTH_ALLOWED.with(|flag| flag.set(true));
+    Some(AuthorizationResult::Allow)
 }
 
 /// Applies every publish/play authorization the dedicated worker thread has
@@ -1195,7 +1253,8 @@ pub(crate) fn process_server_connections(
     revoked_now: &HashSet<String>,
     idle_timeout: Duration,
 ) -> (HashSet<u64>, bool) {
-    let just_authorized = drain_auth_completions(server, tracked);
+    let just_authorized =
+        drain_auth_completions(server, tracked) | FAST_AUTH_ALLOWED.with(std::cell::Cell::take);
 
     let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
@@ -1238,7 +1297,7 @@ pub(crate) fn process_server_connections(
 
         if rtmp_bridge.take_pending_force_close(conn_id) {
             crate::log_info!(
-                "RTMP: force-closing conn={conn_id} from {} after delete-drain timeout",
+                "RTMP: force-closing conn={conn_id} from {} (session dropped by a stream delete or revoked)",
                 conn.remote_addr
             );
             reject_indices.push(idx);

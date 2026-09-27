@@ -61,6 +61,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Servers are launched as `(cd dir || exit 1; exec server ...) &`: the
+# subshell execs into the server, so `$!` is the server's own PID and the
+# server stays a child of this script. Backgrounding inside the subshell
+# instead (`(cd dir && server ... &)`) gives `$!` the subshell's PID, so
+# killing it left the server running into the next server's leg, and it
+# detaches the server from this script, so `wait` can't reap it.
+stop_server() {
+  local pid
+  pid="$(cat "$1")"
+  kill "$pid" >/dev/null 2>&1 || true
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -9 "$pid" >/dev/null 2>&1 || true
+}
+
+# Starts the ffmpeg publisher in the background (a child of this script, not
+# of a `$(...)` subshell) and leaves its PID in PUBLISH_PID.
 publish() {
   local url="$1" logfile="$2"
   ffmpeg -hide_banner -loglevel error -re \
@@ -68,9 +87,8 @@ publish() {
     -f lavfi -i sine=frequency=440 \
     -c:v libx264 -preset veryfast -tune zerolatency -b:v 2500k -g 60 \
     -c:a aac -b:a 128k -f flv "$url" >"$logfile" 2>&1 &
-  local pid=$!
-  PIDS+=("$pid")
-  echo "$pid"
+  PUBLISH_PID=$!
+  PIDS+=("$PUBLISH_PID")
 }
 
 relay_sweep() {
@@ -86,7 +104,8 @@ relay_sweep() {
     else
       target_url="${pub_url}${n}"
     fi
-    pid=$(publish "$target_url" "$WORK_DIR/logs/pub-$label-$n.log")
+    publish "$target_url" "$WORK_DIR/logs/pub-$label-$n.log"
+    pid=$PUBLISH_PID
     sleep 3
     if [[ "$play_arg_kind" = "list" ]]; then
       "$BENCH_RELAY" --url-list "$play_arg" --players "$n" --run-secs 15 --warmup-ms 3000
@@ -102,14 +121,14 @@ relay_sweep() {
 ### 1. librtmp2-server ###
 echo "--- starting librtmp2-server on :1935 (HTTP :8080) ---"
 (
-  cd "$SERVER_DIR"
+  cd "$SERVER_DIR" || exit 1
   LRTMP2_DB="$WORK_DIR/lrtmp2-server/server.db" \
   LRTMP2_RTMP_BIND=127.0.0.1:1935 LRTMP2_HTTP_BIND=127.0.0.1:8080 \
   LRTMP2_RTMP_MAX_CONNECTIONS=500 LRTMP2_LOG_LEVEL=1 \
   LRTMP2_HTTP_RATE_LIMIT_API=10000 LRTMP2_HTTP_RATE_LIMIT_DEFAULT=10000 \
-  ./target/release/librtmp2-server >"$WORK_DIR/logs/lrtmp2-server.log" 2>&1 &
-  echo $! > "$WORK_DIR/lrtmp2-server.pid"
-)
+  exec ./target/release/librtmp2-server
+) >"$WORK_DIR/logs/lrtmp2-server.log" 2>&1 &
+echo $! > "$WORK_DIR/lrtmp2-server.pid"
 PIDS+=("$(cat "$WORK_DIR/lrtmp2-server.pid")")
 sleep 2
 TOKEN=$(sed -n '/Generated API token/{n;p;q}' "$WORK_DIR/logs/lrtmp2-server.log")
@@ -143,7 +162,7 @@ done
 
 relay_sweep "lrtmp2-server" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$PLAY_URLS"
 
-kill "$(cat "$WORK_DIR/lrtmp2-server.pid")" >/dev/null 2>&1 || true
+stop_server "$WORK_DIR/lrtmp2-server.pid"
 
 ### 2. nginx-rtmp ###
 if command -v nginx >/dev/null && [[ -e /usr/lib/nginx/modules/ngx_rtmp_module.so ]]; then
@@ -192,14 +211,15 @@ srt: no
 paths:
   all_others:
 EOF
-  (cd "$WORK_DIR/mediamtx" && "$MEDIAMTX_BIN" ./mediamtx.yml >"$WORK_DIR/logs/mediamtx-stdout.log" 2>&1 &
-   echo $! > "$WORK_DIR/mediamtx.pid")
+  (cd "$WORK_DIR/mediamtx" || exit 1; exec "$MEDIAMTX_BIN" ./mediamtx.yml) \
+    >"$WORK_DIR/logs/mediamtx-stdout.log" 2>&1 &
+  echo $! > "$WORK_DIR/mediamtx.pid"
   PIDS+=("$(cat "$WORK_DIR/mediamtx.pid")")
   sleep 2
   echo "=== MediaMTX handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1937/live/hsbench --count 120 --concurrency 30
   relay_sweep "mediamtx" "rtmp://127.0.0.1:1937/live/bench" prefix "rtmp://127.0.0.1:1937/live/bench"
-  kill "$(cat "$WORK_DIR/mediamtx.pid")" >/dev/null 2>&1 || true
+  stop_server "$WORK_DIR/mediamtx.pid"
 else
   echo "skipping MediaMTX: set MEDIAMTX_BIN to a built binary to include it"
 fi
@@ -225,14 +245,15 @@ http_server {
 vhost __defaultVhost__ {
 }
 EOF
-  (cd "$WORK_DIR/srs" && "$SRS_BIN" -c ./srs.conf >"$WORK_DIR/logs/srs-stdout.log" 2>&1 &
-   echo $! > "$WORK_DIR/srs.pid")
+  (cd "$WORK_DIR/srs" || exit 1; exec "$SRS_BIN" -c ./srs.conf) \
+    >"$WORK_DIR/logs/srs-stdout.log" 2>&1 &
+  echo $! > "$WORK_DIR/srs.pid"
   PIDS+=("$(cat "$WORK_DIR/srs.pid")")
   sleep 2
   echo "=== SRS handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1938/live/hsbench --count 120 --concurrency 30
   relay_sweep "srs" "rtmp://127.0.0.1:1938/live/bench" prefix "rtmp://127.0.0.1:1938/live/bench"
-  kill "$(cat "$WORK_DIR/srs.pid")" >/dev/null 2>&1 || true
+  stop_server "$WORK_DIR/srs.pid"
 else
   echo "skipping SRS: set SRS_BIN to a built binary to include it"
 fi
@@ -274,14 +295,15 @@ dvr: {enabled: false}
 metrics: {enabled: false}
 api: {enabled: false}
 EOF
-  (cd "$WORK_DIR/liveforge" && "$LIVEFORGE_BIN" -c ./liveforge.yaml >"$WORK_DIR/logs/liveforge.log" 2>&1 &
-   echo $! > "$WORK_DIR/liveforge.pid")
+  (cd "$WORK_DIR/liveforge" || exit 1; exec "$LIVEFORGE_BIN" -c ./liveforge.yaml) \
+    >"$WORK_DIR/logs/liveforge.log" 2>&1 &
+  echo $! > "$WORK_DIR/liveforge.pid"
   PIDS+=("$(cat "$WORK_DIR/liveforge.pid")")
   sleep 2
   echo "=== LiveForge handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1939/live/hsbench --count 120 --concurrency 30
   relay_sweep "liveforge" "rtmp://127.0.0.1:1939/live/bench" prefix "rtmp://127.0.0.1:1939/live/bench"
-  kill "$(cat "$WORK_DIR/liveforge.pid")" >/dev/null 2>&1 || true
+  stop_server "$WORK_DIR/liveforge.pid"
 else
   echo "skipping LiveForge: set LIVEFORGE_BIN to a built binary to include it"
 fi
