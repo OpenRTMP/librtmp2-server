@@ -18,6 +18,8 @@ begin at `1.0.0`.
 ### Changed
 - Package version `0.5.0` → `0.6.0`. Publishes and plays are now confirmed
   before their session row is committed (see below).
+- Depends on librtmp2 `0.10.1` (chunk-stream cap, client acknowledgements
+  and E-RTMP parsing fixes).
 - A publish or play whose key is in an up-to-date in-memory snapshot of the
   enabled stream and play keys is answered on the RTMP thread at once. The
   auth worker writes its session row right after, ahead of the

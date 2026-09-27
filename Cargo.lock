@@ -1250,9 +1250,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "librtmp2"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7702ddaea0b8dc728f268073b39b99f061ab0a5d57fda7eabc14d07c4892d45c"
+checksum = "13641296f468cc7e2d37ebc367ba9d8f28b6381e040eb870030827f91e24e7be"
 dependencies = [
  "cc",
  "libc",
