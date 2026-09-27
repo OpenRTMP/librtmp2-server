@@ -36,6 +36,9 @@ LIVEFORGE_BIN="${LIVEFORGE_BIN:-}"
 # (e.g. the latest nginx release with nginx-rtmp-module as a dynamic module).
 NGINX_BIN="${NGINX_BIN:-nginx}"
 NGINX_RTMP_MODULE="${NGINX_RTMP_MODULE:-/usr/lib/nginx/modules/ngx_rtmp_module.so}"
+# nginx resolves a relative load_module path against its own prefix, not
+# this script's working directory, so pin it to an absolute path here.
+[[ "$NGINX_RTMP_MODULE" == /* ]] || NGINX_RTMP_MODULE="$PWD/$NGINX_RTMP_MODULE"
 # Each server is started from its own work directory, so resolve relative
 # binary paths against the caller's directory first.
 for var in MEDIAMTX_BIN SRS_BIN LIVEFORGE_BIN; do
