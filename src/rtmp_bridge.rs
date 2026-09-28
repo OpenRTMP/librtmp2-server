@@ -1349,6 +1349,9 @@ impl DbRtmpBridge {
         if self.cluster_manager().is_some() {
             return None;
         }
+        if !keygen::is_valid_access_key(stream_key) {
+            return None;
+        }
         let pair = self.db.cached_play_key(stream_key)?;
         let (viewer, stream) = &*pair;
         if !stream.enabled || stream.app != app {
@@ -1414,6 +1417,9 @@ impl DbRtmpBridge {
     ) -> Option<Publisher> {
         #[cfg(feature = "cluster")]
         if self.cluster_manager().is_some() {
+            return None;
+        }
+        if !keygen::is_valid_access_key(stream_key) {
             return None;
         }
         let stream = self.db.cached_publish_key(stream_key)?;
@@ -1844,6 +1850,46 @@ mod tests {
         assert_eq!(remote_ip_of("203.0.113.7:5000"), "203.0.113.7");
         assert_eq!(remote_ip_of("[2001:db8::7]:5000"), "2001:db8::7");
         assert_eq!(remote_ip_of("[::ffff:203.0.113.7]:5000"), "203.0.113.7");
+    }
+
+    #[test]
+    fn legacy_short_keys_cannot_use_fast_auth_path() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let short_pub = "a".to_string();
+        let short_play = "b".to_string();
+        let s = crate::db::Stream {
+            id: "legacy".to_string(),
+            name: "Legacy".to_string(),
+            app: "live".to_string(),
+            publish_key: short_pub.clone(),
+            play_key: short_play.clone(),
+            stats_key: "c".to_string(),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&s).unwrap();
+        db.refresh_key_cache();
+        let bridge = test_bridge(Arc::clone(&db));
+        assert!(
+            bridge
+                .try_fast_authorize_play(1, "live", &short_play)
+                .is_none(),
+            "fast play auth must not bypass MIN_ACCESS_KEY_LEN"
+        );
+        assert!(
+            bridge
+                .try_fast_authorize_publish(1, "live", &short_pub)
+                .is_none(),
+            "fast publish auth must not bypass MIN_ACCESS_KEY_LEN"
+        );
+        assert!(
+            bridge.authorize_play(1, "live", &short_play).is_err(),
+            "slow play auth must reject legacy short keys"
+        );
+        assert!(
+            bridge.authorize_publish(1, "live", &short_pub).is_err(),
+            "slow publish auth must reject legacy short keys"
+        );
     }
 
     #[test]
