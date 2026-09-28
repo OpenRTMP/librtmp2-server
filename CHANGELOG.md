@@ -22,6 +22,19 @@ begin at `1.0.0`.
   With 1000 viewers on one stream the server holds 32 MiB instead of
   59 MiB at the same CPU, and the 1000-viewer join averages 32.6 ms
   (93.8 ms p95), the lowest of the compared servers.
+- Code analysis now tracks new code per release: the crate version is
+  passed to SonarCloud with every scan.
+
+### Fixed
+- The in-memory fast path for publish and play authorization now rejects
+  keys shorter than 32 characters, like the database path does. A short
+  key left over from an old database could otherwise still publish or
+  play.
+
+### Tests
+- The real server entry point (`ServerApp::run_until`) now runs in the
+  test suite: startup, HTTP API, sharded RTMP relay, deleting a live
+  stream, recording, publish hooks and shutdown.
 
 ## [0.6.0] — 2026-09-27
 
