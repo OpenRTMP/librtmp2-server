@@ -35,6 +35,13 @@ begin at `1.0.0`.
 - The real server entry point (`ServerApp::run_until`) now runs in the
   test suite: startup, HTTP API, sharded RTMP relay, deleting a live
   stream, recording, publish hooks and shutdown.
+- New tests for media outputs (recording, HLS, push, hooks), the cluster
+  (manager, Raft state machine, media relay, control plane) and the HTTP
+  API error paths. Line coverage is 93%, up from 64%.
+
+### Internal
+- `ServerApp::run_until` is split into small functions; the RTMP shard
+  poll loop lives in its own struct. Behaviour is unchanged.
 
 ## [0.6.0] — 2026-09-27
 
