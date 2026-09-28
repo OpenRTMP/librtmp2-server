@@ -1557,7 +1557,15 @@ pub async fn send_change_membership(
 
 #[cfg(test)]
 mod tests {
-    use super::{control_accept_backoff, read_budgeted_frame, tls_server_name_from_addr};
+    use super::*;
+    use crate::cluster::command::{ClusterCommand, ClusterResponse};
+    use crate::cluster::raft::{LogStore, StateMachineStore};
+    use crate::db::Db;
+    use openraft::error::{Fatal, PayloadTooLarge, RaftError, Timeout};
+    use openraft::network::RPCTypes;
+    use openraft::{LogId, SnapshotMeta, Vote};
+    use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
 
     #[tokio::test]
     async fn control_accept_backoff_survives_transient_errors() {
@@ -1607,5 +1615,1338 @@ mod tests {
     fn tls_server_name_from_ipv4_socket_addr() {
         let name = tls_server_name_from_addr("203.0.113.5:1940").expect("parse");
         assert_eq!(name.to_str(), "203.0.113.5");
+    }
+
+    #[test]
+    fn tls_server_name_from_hostnames_and_invalid_input() {
+        assert_eq!(
+            tls_server_name_from_addr("node-a.cluster:1940")
+                .unwrap()
+                .to_str(),
+            "node-a.cluster"
+        );
+        assert_eq!(
+            tls_server_name_from_addr("node-a.cluster")
+                .unwrap()
+                .to_str(),
+            "node-a.cluster"
+        );
+        assert!(tls_server_name_from_addr("bad host!:1").is_err());
+    }
+
+    // ---- helpers -------------------------------------------------------
+
+    const SECRET: &str = "test-cluster-secret-32-chars-min--";
+    const GOOD_PROOF: &str = "good-proof";
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn test_ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
+    }
+
+    fn tls_for(node: u64) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cluster-tls");
+        let cert = dir.join(format!("node{node}.pem"));
+        let key = dir.join(format!("node{node}.key"));
+        let ca = dir.join("ca.pem");
+        (
+            crate::cluster::security::build_server_tls(&cert, &key, &ca).unwrap(),
+            crate::cluster::security::build_client_tls(&cert, &key, &ca).unwrap(),
+        )
+    }
+
+    struct RaftNode {
+        raft: Raft,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn raft_node(id: NodeId) -> RaftNode {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path().join("raft.db").to_str().unwrap()).unwrap());
+        let cfg = openraft::Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        let raft = openraft::Raft::new(
+            id,
+            Arc::new(cfg),
+            NetworkFactory::new(id, SECRET.into(), None),
+            LogStore::new(Arc::clone(&db)),
+            StateMachineStore::new(db).unwrap(),
+        )
+        .await
+        .unwrap();
+        RaftNode { raft, _dir: dir }
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        joins: Mutex<Vec<(NodeId, String, String)>>,
+        heartbeats: Mutex<Vec<HeartbeatInfo>>,
+        admin: Mutex<Vec<String>>,
+    }
+
+    struct Ctl {
+        addr: String,
+        rec: Arc<Recorded>,
+    }
+
+    /// Serve the real control plane on an ephemeral port. Members are 1–4;
+    /// `GOOD_PROOF` is the only valid admin proof; joiner 66 is refused.
+    async fn serve_ctl(
+        raft: Raft,
+        write_forward: Option<ClientWriteForwardCtx>,
+        tls_server: Option<Arc<ServerConfig>>,
+    ) -> Ctl {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let rec = Arc::new(Recorded::default());
+        let r = Arc::clone(&rec);
+        let on_join: JoinAcceptFn = Arc::new(move |id, ctrl, media, _proof| {
+            r.joins.lock().push((id, ctrl.clone(), media));
+            if id == 66 {
+                return Err("join refused".into());
+            }
+            Ok((
+                "cid".into(),
+                vec![JoinPeerInfo {
+                    node_id: 1,
+                    control_addr: ctrl,
+                    media_addr: String::new(),
+                }],
+            ))
+        });
+        let r = Arc::clone(&rec);
+        let on_heartbeat = Arc::new(move |hb: HeartbeatInfo| r.heartbeats.lock().push(hb));
+        let r = Arc::clone(&rec);
+        let on_admin = Arc::new(move |msg: ControlMessage| {
+            r.admin.lock().push(format!("{msg:?}"));
+            match msg {
+                ControlMessage::TopologyReq => ControlMessage::TopologyResp {
+                    ok: true,
+                    message: String::new(),
+                    cluster_id: "cid".into(),
+                    peers: Vec::new(),
+                },
+                ControlMessage::SessionCountReq { .. } => {
+                    ControlMessage::SessionCountResp { count: 3 }
+                }
+                ControlMessage::AdminRemove { node_id: 99 } => ControlMessage::AdminErr {
+                    message: "cannot remove".into(),
+                },
+                _ => ControlMessage::AdminOk,
+            }
+        });
+        let on_stats = Arc::new(|sid: String| serde_json::json!({ "stream": sid }));
+        let is_member: MembershipFn = Arc::new(|id| (1..=4).contains(&id));
+        let verify: AdminProofFn = Arc::new(|proof, _payload| proof == GOOD_PROOF);
+        tokio::spawn(serve_control_plane_listener(
+            listener,
+            SECRET.into(),
+            100,
+            raft,
+            on_join,
+            on_heartbeat,
+            on_admin,
+            on_stats,
+            is_member,
+            verify,
+            write_forward,
+            tls_server,
+        ));
+        Ctl { addr, rec }
+    }
+
+    /// Scripted control server: authenticates each connection and answers
+    /// the single request with the next canned response.
+    async fn fake_ctl(responses: Vec<ControlMessage>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            for resp in responses {
+                let Ok((mut s, peer)) = listener.accept().await else {
+                    return;
+                };
+                if server_auth_handshake(&mut s, peer.ip(), SECRET, 100, false, None)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let _ = read_control_frame(&mut s).await;
+                let _ = write_frame(&mut s, &resp).await;
+            }
+        });
+        addr
+    }
+
+    fn dead_addr() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    fn set_token(token: &str) -> ClusterCommand {
+        ClusterCommand::SetApiToken {
+            token: token.into(),
+        }
+    }
+
+    async fn wait_for_leader(raft: &Raft, leader: NodeId) {
+        let mut m = raft.metrics();
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if m.borrow().current_leader == Some(leader) {
+                    return;
+                }
+                m.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("leader was never observed");
+    }
+
+    fn frame_bytes(msg: &ControlMessage) -> Vec<u8> {
+        let body = serde_json::to_vec(msg).unwrap();
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    // ---- framing ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn frames_roundtrip_small_and_budgeted_sizes() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 16);
+        write_frame(&mut a, &ControlMessage::TopologyReq)
+            .await
+            .unwrap();
+        let (msg, guard) = read_frame(&mut b).await.unwrap();
+        assert!(matches!(msg, ControlMessage::TopologyReq));
+        assert!(guard.is_none(), "short frames are not budgeted");
+
+        // > 256 KiB non-snapshot frames reserve the control budget.
+        let big = ControlMessage::StatsProxyResp {
+            body: serde_json::Value::String("x".repeat(300 * 1024)),
+        };
+        let bytes = frame_bytes(&big);
+        let mut r: &[u8] = &bytes;
+        let (_, guard) = read_control_frame(&mut r).await.unwrap();
+        assert!(guard.is_some());
+
+        // Snapshot-tagged frames use the snapshot budget.
+        let snap = ControlMessage::RaftSnapshot(serde_json::Value::String("y".repeat(300 * 1024)));
+        let bytes = frame_bytes(&snap);
+        let mut r: &[u8] = &bytes;
+        let (msg, guard) = read_control_frame(&mut r).await.unwrap();
+        assert!(matches!(msg, ControlMessage::RaftSnapshot(_)));
+        assert!(guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn oversized_non_snapshot_control_frame_rejected_unless_allowed() {
+        let big = ControlMessage::StatsProxyResp {
+            body: serde_json::Value::String("z".repeat(MAX_CONTROL_FRAME as usize + 16)),
+        };
+        let bytes = frame_bytes(&big);
+        let mut r: &[u8] = &bytes;
+        let err = match read_control_frame(&mut r).await {
+            Ok(_) => panic!("server-side reads must cap non-snapshot frames"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("frame too large"), "{err}");
+
+        // Client-side response reads allow large responses.
+        let mut r: &[u8] = &bytes;
+        assert!(read_frame(&mut r).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn malformed_truncated_and_over_budget_frames_error() {
+        let mut bytes = 8u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"notjson!");
+        let mut r: &[u8] = &bytes;
+        assert!(read_control_frame(&mut r).await.is_err());
+
+        let mut bytes = 100u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[b'{'; 40]);
+        let mut r: &[u8] = &bytes;
+        assert!(read_control_frame(&mut r).await.is_err());
+
+        // Exhaust the control budget, then a budgeted read must fail fast.
+        let hold = crate::cluster::security::try_reserve_inflight_bytes(
+            &CONTROL_READ_BYTES_INFLIGHT,
+            MAX_CONTROL_READ_BYTES_INFLIGHT,
+            MAX_CONTROL_READ_BYTES_INFLIGHT - CONTROL_READ_BYTES_INFLIGHT.load(Ordering::Acquire),
+        )
+        .unwrap();
+        let big = ControlMessage::StatsProxyResp {
+            body: serde_json::Value::String("x".repeat(300 * 1024)),
+        };
+        let bytes = frame_bytes(&big);
+        let mut r: &[u8] = &bytes;
+        let err = match read_control_frame(&mut r).await {
+            Ok(_) => panic!("budget must be enforced"),
+            Err(e) => e,
+        };
+        drop(hold);
+        assert!(err.to_string().contains("budget exceeded"), "{err}");
+
+        // Auth frames are capped at MAX_AUTH_FRAME.
+        let mut bytes = (MAX_AUTH_FRAME + 1).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 16]);
+        let mut r: &[u8] = &bytes;
+        let err = read_auth_frame(&mut r).await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    // ---- handshakes ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn server_auth_handshake_rejects_bad_clients() {
+        // Rate-limited source.
+        let ip = test_ip(60);
+        for _ in 0..10 {
+            crate::cluster::security::record_cluster_auth_failure(ip);
+        }
+        let (mut c, mut s) = tokio::io::duplex(1 << 16);
+        assert!(
+            server_auth_handshake(&mut s, ip, SECRET, 1, false, None)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            read_auth_frame(&mut c).await.unwrap(),
+            ControlMessage::AuthFail
+        ));
+        crate::cluster::security::clear_cluster_auth_failures(ip);
+
+        // Wrong first message.
+        let (mut c, mut s) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            server_auth_handshake(&mut s, test_ip(61), SECRET, 1, false, None).await
+        });
+        let _ = read_auth_frame(&mut c).await.unwrap();
+        write_frame(&mut c, &ControlMessage::TopologyReq)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_auth_frame(&mut c).await.unwrap(),
+            ControlMessage::AuthFail
+        ));
+        assert!(server.await.unwrap().is_err());
+
+        // Wrong secret (client helper sees AuthFail).
+        let (mut c, mut s) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            server_auth_handshake(&mut s, test_ip(61), SECRET, 1, false, None).await
+        });
+        let err = client_auth_handshake(&mut c, "wrong-secret", 2)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("auth failed"), "{err}");
+        assert!(server.await.unwrap().is_err());
+
+        // mTLS identity mismatch.
+        let (mut c, mut s) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            server_auth_handshake(&mut s, test_ip(62), SECRET, 1, true, Some(3)).await
+        });
+        let _ = client_auth_handshake(&mut c, SECRET, 2).await;
+        let err = server.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+
+        // Success.
+        let (mut c, mut s) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            server_auth_handshake(&mut s, test_ip(63), SECRET, 1, true, Some(2)).await
+        });
+        client_auth_handshake(&mut c, SECRET, 2).await.unwrap();
+        assert_eq!(server.await.unwrap().unwrap(), 2);
+
+        // Client: server does not start with a challenge.
+        let (mut c, mut s) = tokio::io::duplex(1 << 16);
+        write_frame(&mut s, &ControlMessage::AdminOk).await.unwrap();
+        let err = client_auth_handshake(&mut c, SECRET, 2).await.unwrap_err();
+        assert!(err.to_string().contains("AuthChallenge"), "{err}");
+    }
+
+    // ---- served control plane: admin / topology / heartbeat ----------------
+
+    #[tokio::test]
+    async fn control_plane_dispatches_member_requests() {
+        let node = raft_node(100).await;
+        let ctl = serve_ctl(node.raft.clone(), None, None).await;
+
+        let (cid, peers) = send_topology(&ctl.addr, SECRET, 1, None).await.unwrap();
+        assert_eq!(cid, "cid");
+        assert!(peers.is_empty());
+        // Non-members are refused (the server closes without a response).
+        assert!(send_topology(&ctl.addr, SECRET, 9, None).await.is_err());
+
+        assert_eq!(
+            send_session_count(&ctl.addr, SECRET, 1, "s".into(), None)
+                .await
+                .unwrap(),
+            3
+        );
+
+        let (body, _guard) = send_stats_proxy(&ctl.addr, SECRET, 1, "s1".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(body["stream"], "s1");
+        assert!(
+            send_stats_proxy(&ctl.addr, SECRET, 9, "s1".into(), None)
+                .await
+                .is_err()
+        );
+
+        for msg in [
+            ControlMessage::AdminDrain {
+                node_id: 2,
+                proof: GOOD_PROOF.into(),
+            },
+            ControlMessage::AdminResume {
+                node_id: 2,
+                proof: GOOD_PROOF.into(),
+            },
+            ControlMessage::AdminRemove { node_id: 3 },
+            ControlMessage::DrainStream {
+                stream_id: "s".into(),
+            },
+            ControlMessage::RevokeViewer {
+                viewer_id: "v".into(),
+            },
+        ] {
+            send_admin(&ctl.addr, SECRET, 1, msg, None).await.unwrap();
+        }
+        assert_eq!(ctl.rec.admin.lock().len(), 7);
+
+        let err = send_admin(
+            &ctl.addr,
+            SECRET,
+            1,
+            ControlMessage::AdminRemove { node_id: 99 },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "cannot remove");
+        for bad in [
+            ControlMessage::AdminDrain {
+                node_id: 2,
+                proof: "bad".into(),
+            },
+            ControlMessage::AdminResume {
+                node_id: 2,
+                proof: "bad".into(),
+            },
+        ] {
+            assert!(send_admin(&ctl.addr, SECRET, 1, bad, None).await.is_err());
+        }
+        assert!(
+            send_admin(
+                &ctl.addr,
+                SECRET,
+                9,
+                ControlMessage::DrainStream {
+                    stream_id: "s".into()
+                },
+                None
+            )
+            .await
+            .is_err()
+        );
+        // Messages that are not requests get an explicit "unsupported".
+        let err = send_admin(&ctl.addr, SECRET, 1, ControlMessage::AdminOk, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "unsupported");
+
+        // Heartbeats are bound to the authenticated member identity.
+        send_heartbeat(
+            &ctl.addr,
+            SECRET,
+            2,
+            "healthy",
+            0.5,
+            "c".into(),
+            "m".into(),
+            1,
+            2,
+            vec![("s".into(), 2)],
+            vec![("v".into(), 1)],
+            None,
+        )
+        .await;
+        send_heartbeat(
+            &ctl.addr,
+            SECRET,
+            9,
+            "healthy",
+            0.5,
+            String::new(),
+            String::new(),
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .await;
+        let hbs = ctl.rec.heartbeats.lock();
+        assert_eq!(hbs.len(), 1);
+        assert_eq!(hbs[0].node_id, 2);
+        assert_eq!(hbs[0].players, 2);
+        assert_eq!(hbs[0].stream_players, vec![("s".to_string(), 2)]);
+        drop(hbs);
+
+        // Wrong secret: the client reports an auth failure.
+        let err = send_topology(&ctl.addr, "wrong-secret", 1, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("auth failed"), "{err}");
+        crate::cluster::security::clear_cluster_auth_failures(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // Nothing listening: reported as a connect error.
+        let err = send_topology(&dead_addr(), SECRET, 1, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("connect"), "{err}");
+        node.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_plane_join_flow() {
+        let node = raft_node(100).await;
+        let ctl = serve_ctl(node.raft.clone(), None, None).await;
+
+        let err = send_join(
+            &ctl.addr,
+            SECRET,
+            5,
+            "c".into(),
+            "m".into(),
+            String::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("CLUSTER_JOIN_PROOF"), "{err}");
+
+        let (cid, peers) = send_join(
+            &ctl.addr,
+            SECRET,
+            5,
+            "c5".into(),
+            "m5".into(),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cid, "cid");
+        assert_eq!(peers[0].control_addr, "c5");
+        assert_eq!(
+            ctl.rec.joins.lock()[0],
+            (5, "c5".to_string(), "m5".to_string())
+        );
+
+        // Invalid proof: server drops the connection.
+        assert!(
+            send_join(
+                &ctl.addr,
+                SECRET,
+                5,
+                "c".into(),
+                "m".into(),
+                "bad".into(),
+                None
+            )
+            .await
+            .is_err()
+        );
+        // Join callback refusal is surfaced verbatim.
+        let err = send_join(
+            &ctl.addr,
+            SECRET,
+            66,
+            "c".into(),
+            "m".into(),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "join refused");
+
+        // A member may proxy a join for another node; a non-member may not.
+        let (cid, _) = forward_join(
+            &ctl.addr,
+            SECRET,
+            2,
+            7,
+            "c7".into(),
+            "m7".into(),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cid, "cid");
+        assert!(
+            forward_join(
+                &ctl.addr,
+                SECRET,
+                8,
+                7,
+                "c7".into(),
+                "m7".into(),
+                GOOD_PROOF.into(),
+                None
+            )
+            .await
+            .is_err()
+        );
+        let err = forward_join(
+            &ctl.addr,
+            SECRET,
+            2,
+            66,
+            "c".into(),
+            "m".into(),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "join refused");
+        node.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_plane_over_mutual_tls() {
+        let node = raft_node(100).await;
+        let (server_cfg, _) = tls_for(2);
+        let (_, client_cfg) = tls_for(1);
+        let ctl = serve_ctl(node.raft.clone(), None, Some(server_cfg)).await;
+        let addr = ctl.addr.clone();
+
+        // Cert identity lrtmp2-node-1 matches the claimed node id.
+        let (cid, _) = send_topology(&addr, SECRET, 1, Some(Arc::clone(&client_cfg)))
+            .await
+            .unwrap();
+        assert_eq!(cid, "cid");
+        // Claiming another node id with node 1's certificate is rejected.
+        assert!(
+            send_topology(&addr, SECRET, 3, Some(Arc::clone(&client_cfg)))
+                .await
+                .is_err()
+        );
+        // Plaintext against a TLS listener fails the handshake.
+        assert!(send_topology(&addr, SECRET, 1, None).await.is_err());
+        node.raft.shutdown().await.unwrap();
+    }
+
+    // ---- client helpers against scripted responses --------------------------
+
+    #[tokio::test]
+    async fn join_follows_forward_to_leader_redirects() {
+        let leader = fake_ctl(vec![ControlMessage::JoinResponse {
+            ok: true,
+            message: String::new(),
+            cluster_id: "cid".into(),
+            peers: Vec::new(),
+        }])
+        .await;
+        let follower = fake_ctl(vec![ControlMessage::JoinResponse {
+            ok: false,
+            message: "forward_to_leader".into(),
+            cluster_id: String::new(),
+            peers: vec![JoinPeerInfo {
+                node_id: 1,
+                control_addr: leader.clone(),
+                media_addr: String::new(),
+            }],
+        }])
+        .await;
+        let (cid, _) = send_join(
+            &follower,
+            SECRET,
+            5,
+            "c".into(),
+            "m".into(),
+            "p".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cid, "cid");
+
+        // Redirect without a leader hint.
+        let no_hint = fake_ctl(vec![ControlMessage::JoinResponse {
+            ok: false,
+            message: "forward_to_leader: unknown".into(),
+            cluster_id: String::new(),
+            peers: Vec::new(),
+        }])
+        .await;
+        let err = send_join(
+            &no_hint,
+            SECRET,
+            5,
+            "c".into(),
+            "m".into(),
+            "p".into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("forward_to_leader"), "{err}");
+
+        // Redirect back to itself.
+        let cyc = fake_ctl_redirect_to_self().await;
+        let err = send_join(&cyc, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cycle"), "{err}");
+
+        // Endless redirects between two nodes hit the hop limit.
+        let (a, b) = fake_ctl_ping_pong().await;
+        assert_ne!(a, b);
+        let err = send_join(&a, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("hop limit"), "{err}");
+
+        // Unexpected response type.
+        let odd = fake_ctl(vec![ControlMessage::AdminOk, ControlMessage::AdminOk]).await;
+        let err = send_join(&odd, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "unexpected join response");
+        let err = forward_join(&odd, SECRET, 2, 5, "c".into(), "m".into(), "p".into(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "unexpected join response");
+    }
+
+    /// A fake node whose join answer redirects to its own address.
+    async fn fake_ctl_redirect_to_self() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let resp = ControlMessage::JoinResponse {
+            ok: false,
+            message: "forward_to_leader".into(),
+            cluster_id: String::new(),
+            peers: vec![JoinPeerInfo {
+                node_id: 1,
+                control_addr: addr.clone(),
+                media_addr: String::new(),
+            }],
+        };
+        serve_fake(listener, vec![resp]);
+        addr
+    }
+
+    /// Two fake nodes that redirect joins to each other forever.
+    async fn fake_ctl_ping_pong() -> (String, String) {
+        let la = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = la.local_addr().unwrap().to_string();
+        let b = lb.local_addr().unwrap().to_string();
+        let redirect = |to: &str| ControlMessage::JoinResponse {
+            ok: false,
+            message: "forward_to_leader".into(),
+            cluster_id: String::new(),
+            peers: vec![JoinPeerInfo {
+                node_id: 1,
+                control_addr: to.to_string(),
+                media_addr: String::new(),
+            }],
+        };
+        serve_fake(la, vec![redirect(&b), redirect(&b), redirect(&b)]);
+        serve_fake(lb, vec![redirect(&a), redirect(&a), redirect(&a)]);
+        (a, b)
+    }
+
+    fn serve_fake(listener: TcpListener, responses: Vec<ControlMessage>) {
+        tokio::spawn(async move {
+            for resp in responses {
+                let Ok((mut s, peer)) = listener.accept().await else {
+                    return;
+                };
+                if server_auth_handshake(&mut s, peer.ip(), SECRET, 100, false, None)
+                    .await
+                    .is_ok()
+                {
+                    let _ = read_control_frame(&mut s).await;
+                    let _ = write_frame(&mut s, &resp).await;
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn client_helpers_map_error_and_unexpected_responses() {
+        let admin_err = || ControlMessage::AdminErr {
+            message: "nope".into(),
+        };
+        let addr = fake_ctl(vec![
+            ControlMessage::TopologyResp {
+                ok: false,
+                message: "not ready".into(),
+                cluster_id: String::new(),
+                peers: Vec::new(),
+            },
+            ControlMessage::AdminOk,
+            admin_err(),
+            ControlMessage::AdminOk,
+            ControlMessage::SessionCountReq {
+                stream_id: String::new(),
+            },
+            admin_err(),
+            ControlMessage::AdminOk,
+            admin_err(),
+            ControlMessage::AdminOk,
+            ControlMessage::ClientWriteResp(serde_json::json!({ "ok": true })),
+            ControlMessage::ClientWriteResp(serde_json::json!({ "ok": false, "error": "e1" })),
+            ControlMessage::ClientWriteResp(serde_json::json!({ "ok": false })),
+            ControlMessage::ClientWriteResp(serde_json::json!({ "ok": true, "data": 5 })),
+            ControlMessage::ChangeMembershipResp {
+                ok: false,
+                message: "cm".into(),
+            },
+            admin_err(),
+            ControlMessage::AdminOk,
+        ])
+        .await;
+
+        assert_eq!(
+            send_topology(&addr, SECRET, 1, None).await.unwrap_err(),
+            "not ready"
+        );
+        assert_eq!(
+            send_topology(&addr, SECRET, 1, None).await.unwrap_err(),
+            "unexpected topology response"
+        );
+        assert_eq!(
+            send_session_count(&addr, SECRET, 1, "s".into(), None)
+                .await
+                .unwrap_err(),
+            "nope"
+        );
+        assert_eq!(
+            send_session_count(&addr, SECRET, 1, "s".into(), None)
+                .await
+                .unwrap_err(),
+            "unexpected session count response"
+        );
+        assert_eq!(
+            send_admin(&addr, SECRET, 1, ControlMessage::TopologyReq, None)
+                .await
+                .unwrap_err(),
+            "unexpected admin response"
+        );
+        assert_eq!(
+            send_stats_proxy(&addr, SECRET, 1, "s".into(), None)
+                .await
+                .err()
+                .unwrap(),
+            "nope"
+        );
+        assert_eq!(
+            send_stats_proxy(&addr, SECRET, 1, "s".into(), None)
+                .await
+                .err()
+                .unwrap(),
+            "unexpected stats proxy response"
+        );
+        let cw = || send_client_write(&addr, SECRET, 1, set_token("t"), "p".into(), None);
+        assert_eq!(cw().await.unwrap_err(), "nope");
+        assert_eq!(cw().await.unwrap_err(), "unexpected client write response");
+        assert_eq!(
+            cw().await.unwrap_err(),
+            "client write response missing data"
+        );
+        assert_eq!(cw().await.unwrap_err(), "e1");
+        assert_eq!(cw().await.unwrap_err(), "client write failed");
+        assert!(cw().await.is_err(), "undecodable data must be an error");
+        let cm = || {
+            send_change_membership(
+                &addr,
+                SECRET,
+                1,
+                openraft::ChangeMembers::AddVoterIds(BTreeSet::from([2])),
+                "p".into(),
+                None,
+            )
+        };
+        assert_eq!(cm().await.unwrap_err(), "cm");
+        assert_eq!(cm().await.unwrap_err(), "nope");
+        assert_eq!(
+            cm().await.unwrap_err(),
+            "unexpected change membership response"
+        );
+    }
+
+    // ---- raft RPC transport -------------------------------------------------
+
+    fn vote_req() -> VoteRequest<NodeId> {
+        VoteRequest::new(Vote::new(1, 7), None)
+    }
+
+    fn append_req() -> AppendEntriesRequest<TypeConfig> {
+        AppendEntriesRequest {
+            vote: Vote::new_committed(1, 7),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        }
+    }
+
+    fn snapshot_req() -> InstallSnapshotRequest<TypeConfig> {
+        InstallSnapshotRequest {
+            vote: Vote::new_committed(1, 7),
+            meta: SnapshotMeta {
+                last_log_id: Some(LogId::new(openraft::CommittedLeaderId::new(1, 7), 0)),
+                last_membership: Default::default(),
+                snapshot_id: "snap-1".into(),
+            },
+            offset: 0,
+            data: Vec::new(),
+            done: false,
+        }
+    }
+
+    async fn client_for(addr: &str) -> NetworkConnection {
+        let mut factory = NetworkFactory::new(7, SECRET.into(), None);
+        factory.upsert_node(1, addr.to_string());
+        assert_eq!(factory.nodes.read().get(&1).unwrap().addr, addr);
+        factory
+            .new_client(
+                1,
+                &BasicNode {
+                    addr: addr.to_string(),
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn raft_rpcs_roundtrip_through_control_plane() {
+        let node = raft_node(100).await;
+        let ctl = serve_ctl(node.raft.clone(), None, None).await;
+        let mut conn = client_for(&ctl.addr).await;
+        let opt = RPCOption::new(Duration::from_secs(5));
+
+        let v = conn.vote(vote_req(), opt.clone()).await.unwrap();
+        assert!(v.vote_granted, "an idle node grants a higher-term vote");
+        conn.append_entries(append_req(), opt.clone())
+            .await
+            .unwrap();
+        let snap = conn.install_snapshot(snapshot_req(), opt.clone()).await;
+        assert!(snap.is_ok(), "{snap:?}");
+
+        // A dead target is reported as unreachable for every RPC kind.
+        let mut dead = client_for(&dead_addr()).await;
+        assert!(matches!(
+            dead.vote(vote_req(), opt.clone()).await,
+            Err(RPCError::Unreachable(_))
+        ));
+        assert!(matches!(
+            dead.append_entries(append_req(), opt.clone()).await,
+            Err(RPCError::Unreachable(_))
+        ));
+        assert!(matches!(
+            dead.install_snapshot(snapshot_req(), opt).await,
+            Err(RPCError::Unreachable(_))
+        ));
+        node.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raft_rpcs_map_remote_errors_and_bad_payloads() {
+        let fatal = || RaftError::<NodeId>::Fatal(Fatal::Stopped);
+        let remote_append =
+            serde_json::to_value(Err::<AppendEntriesResponse<NodeId>, _>(fatal())).unwrap();
+        let remote_vote = serde_json::to_value(Err::<VoteResponse<NodeId>, _>(fatal())).unwrap();
+        let remote_snap = serde_json::to_value(Err::<
+            InstallSnapshotResponse<NodeId>,
+            RaftError<NodeId, openraft::error::InstallSnapshotError>,
+        >(RaftError::Fatal(Fatal::Stopped)))
+        .unwrap();
+        let junk = serde_json::json!({"junk": true});
+        let addr = fake_ctl(vec![
+            ControlMessage::RaftAppendResp(remote_append),
+            ControlMessage::RaftAppendResp(junk.clone()),
+            ControlMessage::AdminOk,
+            ControlMessage::RaftVoteResp(remote_vote),
+            ControlMessage::RaftVoteResp(junk.clone()),
+            ControlMessage::AdminOk,
+            ControlMessage::RaftSnapshotResp(remote_snap),
+            ControlMessage::RaftSnapshotResp(junk),
+            ControlMessage::AdminOk,
+        ])
+        .await;
+        let mut conn = client_for(&addr).await;
+        let opt = RPCOption::new(Duration::from_secs(5));
+
+        assert!(matches!(
+            conn.append_entries(append_req(), opt.clone()).await,
+            Err(RPCError::RemoteError(_))
+        ));
+        assert!(matches!(
+            conn.append_entries(append_req(), opt.clone()).await,
+            Err(RPCError::Network(_))
+        ));
+        assert!(matches!(
+            conn.append_entries(append_req(), opt.clone()).await,
+            Err(RPCError::Network(_))
+        ));
+        assert!(matches!(
+            conn.vote(vote_req(), opt.clone()).await,
+            Err(RPCError::RemoteError(_))
+        ));
+        assert!(matches!(
+            conn.vote(vote_req(), opt.clone()).await,
+            Err(RPCError::Network(_))
+        ));
+        assert!(matches!(
+            conn.vote(vote_req(), opt.clone()).await,
+            Err(RPCError::Network(_))
+        ));
+        assert!(matches!(
+            conn.install_snapshot(snapshot_req(), opt.clone()).await,
+            Err(RPCError::RemoteError(_))
+        ));
+        assert!(matches!(
+            conn.install_snapshot(snapshot_req(), opt.clone()).await,
+            Err(RPCError::Network(_))
+        ));
+        assert!(matches!(
+            conn.install_snapshot(snapshot_req(), opt).await,
+            Err(RPCError::Network(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn roundtrip_hard_deadline_and_transport_error_mapping() {
+        // A listener that accepts but never speaks: the hard deadline fires
+        // and is reported as a network error (not unreachable).
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent.local_addr().unwrap().to_string();
+        let mut conn = client_for(&addr).await;
+        let err = conn
+            .roundtrip(
+                ControlMessage::TopologyReq,
+                Some(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RPCError::Network(_)), "{err:?}");
+        drop(silent);
+
+        let timeout: RPCError<NodeId, BasicNode, typ::RaftError> = RPCError::Timeout(Timeout {
+            action: RPCTypes::Vote,
+            id: 1,
+            target: 2,
+            timeout: Duration::from_millis(1),
+        });
+        assert!(matches!(
+            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(timeout),
+            RPCError::Timeout(_)
+        ));
+        let too_large: RPCError<NodeId, BasicNode, typ::RaftError> =
+            RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint(1));
+        assert!(matches!(
+            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(too_large),
+            RPCError::PayloadTooLarge(_)
+        ));
+        let remote: RPCError<NodeId, BasicNode, typ::RaftError> =
+            RPCError::RemoteError(RemoteError::new(2, RaftError::Fatal(Fatal::Stopped)));
+        assert!(matches!(
+            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(remote),
+            RPCError::Network(_)
+        ));
+        let net: RPCError<NodeId, BasicNode, typ::RaftError> =
+            RPCError::Network(NetworkError::new(&std::io::Error::other("x")));
+        assert!(matches!(
+            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(net),
+            RPCError::Network(_)
+        ));
+    }
+
+    // ---- client writes and membership changes -------------------------------
+
+    #[tokio::test]
+    async fn client_write_and_membership_on_uninitialized_node() {
+        let node = raft_node(100).await;
+        // No forward context: a follower without a leader drops the request.
+        let ctl = serve_ctl(node.raft.clone(), None, None).await;
+        assert!(
+            send_client_write(
+                &ctl.addr,
+                SECRET,
+                1,
+                set_token("t"),
+                GOOD_PROOF.into(),
+                None
+            )
+            .await
+            .is_err()
+        );
+        // Bad proof / non-member are refused before touching Raft.
+        assert!(
+            send_client_write(&ctl.addr, SECRET, 1, set_token("t"), "bad".into(), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            send_client_write(
+                &ctl.addr,
+                SECRET,
+                9,
+                set_token("t"),
+                GOOD_PROOF.into(),
+                None
+            )
+            .await
+            .is_err()
+        );
+        // Undecodable command body.
+        let err = authed_roundtrip_inner(
+            &ctl.addr,
+            SECRET,
+            1,
+            None,
+            ControlMessage::ClientWrite {
+                req: serde_json::json!({"NotACommand": 1}),
+                proof: GOOD_PROOF.into(),
+            },
+        )
+        .await;
+        assert!(err.is_err());
+
+        // With a forward context but no known leader the error is reported.
+        let fwd = ClientWriteForwardCtx {
+            secret: SECRET.into(),
+            local_id: 100,
+            meta: Arc::new(ClusterMeta::new()),
+            tls_client: None,
+        };
+        let ctl2 = serve_ctl(node.raft.clone(), Some(fwd), None).await;
+        let err = send_client_write(
+            &ctl2.addr,
+            SECRET,
+            1,
+            set_token("t"),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("no leader"), "{err}");
+
+        // Membership change on an uninitialized node fails remotely.
+        let change = || openraft::ChangeMembers::AddVoterIds(BTreeSet::from([100]));
+        assert!(
+            send_change_membership(&ctl.addr, SECRET, 1, change(), "bad".into(), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            send_change_membership(&ctl.addr, SECRET, 9, change(), GOOD_PROOF.into(), None)
+                .await
+                .is_err()
+        );
+        let err = send_change_membership(&ctl.addr, SECRET, 1, change(), GOOD_PROOF.into(), None)
+            .await
+            .unwrap_err();
+        assert!(!err.is_empty());
+        // Proof valid but body is not a ChangeMembers value.
+        let err = authed_roundtrip_inner(
+            &ctl.addr,
+            SECRET,
+            1,
+            None,
+            ControlMessage::ChangeMembership {
+                req: serde_json::json!({"bogus": 1}),
+                proof: GOOD_PROOF.into(),
+            },
+        )
+        .await;
+        assert!(err.is_err());
+        node.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn follower_forwards_client_write_to_leader() {
+        // Leader (id 1) and a learner (id 2), each serving the control plane.
+        let leader = raft_node(1).await;
+        let leader_ctl = serve_ctl(leader.raft.clone(), None, None).await;
+        let follower = raft_node(2).await;
+        let fwd = ClientWriteForwardCtx {
+            secret: SECRET.into(),
+            local_id: 2,
+            meta: Arc::new(ClusterMeta::new()),
+            tls_client: None,
+        };
+        let follower_ctl = serve_ctl(follower.raft.clone(), Some(fwd), None).await;
+
+        leader
+            .raft
+            .initialize(BTreeMap::from([(
+                1,
+                BasicNode {
+                    addr: leader_ctl.addr.clone(),
+                },
+            )]))
+            .await
+            .unwrap();
+        wait_for_leader(&leader.raft, 1).await;
+
+        // A write sent straight to the leader commits.
+        let resp = send_client_write(
+            &leader_ctl.addr,
+            SECRET,
+            3,
+            set_token("t1"),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(resp, ClusterResponse::Ok), "{resp:?}");
+
+        // Replicate to the learner over the control plane (append_entries).
+        leader
+            .raft
+            .add_learner(
+                2,
+                BasicNode {
+                    addr: follower_ctl.addr.clone(),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        wait_for_leader(&follower.raft, 1).await;
+
+        // The learner forwards to the leader it learned from replication.
+        let resp = send_client_write(
+            &follower_ctl.addr,
+            SECRET,
+            3,
+            set_token("t2"),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(resp, ClusterResponse::Ok), "{resp:?}");
+
+        // Membership change through the control plane on the leader.
+        send_change_membership(
+            &leader_ctl.addr,
+            SECRET,
+            3,
+            openraft::ChangeMembers::AddVoterIds(BTreeSet::from([2])),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        leader.raft.shutdown().await.unwrap();
+        follower.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_control_plane_binds_and_reports_conflicts() {
+        let node = raft_node(100).await;
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let noop_join: JoinAcceptFn = Arc::new(|_, _, _, _| Err("x".into()));
+        let res = serve_control_plane(
+            taken.local_addr().unwrap(),
+            SECRET.into(),
+            100,
+            node.raft.clone(),
+            noop_join,
+            Arc::new(|_| {}),
+            Arc::new(|_| ControlMessage::AdminOk),
+            Arc::new(|_| serde_json::Value::Null),
+            Arc::new(|_| true),
+            Arc::new(|_, _| true),
+            None,
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "bind conflict must be reported");
+
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        tokio::spawn(serve_control_plane(
+            bind,
+            SECRET.into(),
+            100,
+            node.raft.clone(),
+            Arc::new(|_, _, _, _| Err("x".into())),
+            Arc::new(|_| {}),
+            Arc::new(|_| ControlMessage::AdminOk),
+            Arc::new(|_| serde_json::Value::Null),
+            Arc::new(|_| true),
+            Arc::new(|_, _| true),
+            None,
+            None,
+        ));
+        let addr = bind.to_string();
+        let ok = tokio::time::timeout(WAIT, async {
+            loop {
+                if send_admin(
+                    &addr,
+                    SECRET,
+                    1,
+                    ControlMessage::RevokeViewer {
+                        viewer_id: "v".into(),
+                    },
+                    None,
+                )
+                .await
+                .is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(ok.is_ok());
+        node.raft.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn control_preauth_slots_are_bounded_per_ip() {
+        let ip = test_ip(70);
+        for _ in 0..MAX_PREAUTH_CONN_PER_IP {
+            assert!(try_acquire_preauth_slot(ip));
+        }
+        assert!(!try_acquire_preauth_slot(ip));
+        for _ in 0..MAX_PREAUTH_CONN_PER_IP {
+            release_preauth_slot(ip);
+        }
+        assert!(!PREAUTH_CONN_PER_IP.lock().contains_key(&ip));
+        release_preauth_slot(ip);
+        // Shared with concurrently running tests, so only check it is usable.
+        assert!(try_acquire_global_preauth_slot());
+        release_global_preauth_slot();
     }
 }

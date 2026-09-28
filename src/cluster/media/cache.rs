@@ -144,3 +144,150 @@ impl InitCacheStore {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use librtmp2::types::FrameType;
+
+    const AVC_SEQ: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const AVC_KEY: &[u8] = &[0x17, 0x01, 0x00, 0x00, 0x00, 0x65];
+    const AVC_INTER: &[u8] = &[0x27, 0x01, 0x00, 0x00, 0x00, 0x41];
+    const AAC_SEQ: &[u8] = &[0xAF, 0x00, 0x12, 0x10];
+    const AAC_RAW: &[u8] = &[0xAF, 0x01, 0x21, 0x00];
+
+    #[test]
+    fn put_get_remove_are_keyed_by_app_and_stream() {
+        let store = InitCacheStore::new();
+        assert!(store.get("live", "s1").is_none());
+        store.put(
+            "live",
+            "s1",
+            InitCacheEntry {
+                metadata: Some(vec![1]),
+                epoch: 3,
+                ..InitCacheEntry::default()
+            },
+        );
+        let e = store.get("live", "s1").expect("entry stored");
+        assert_eq!(e.metadata, Some(vec![1]));
+        assert_eq!(e.epoch, 3);
+        assert!(store.get("other", "s1").is_none());
+        assert!(store.get("live", "s2").is_none());
+
+        // `put` replaces the whole entry.
+        store.put("live", "s1", InitCacheEntry::default());
+        assert_eq!(store.get("live", "s1").unwrap().metadata, None);
+
+        store.remove("live", "s1");
+        assert!(store.get("live", "s1").is_none());
+        // Removing a missing key is a no-op.
+        store.remove("live", "missing");
+    }
+
+    #[test]
+    fn update_from_frame_stages_each_init_field() {
+        let store = InitCacheStore::new();
+        store.update_from_frame("live", "s", 1, 1, 0, AVC_SEQ);
+        store.update_from_frame("live", "s", 1, 0, 0, AAC_SEQ);
+        store.update_from_frame("live", "s", 1, 3, 0, b"meta");
+        store.update_from_frame("live", "s", 1, 1, 40, AVC_KEY);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 1);
+        assert_eq!(e.avc_header.as_deref(), Some(AVC_SEQ));
+        assert_eq!(e.aac_header.as_deref(), Some(AAC_SEQ));
+        assert_eq!(e.metadata.as_deref(), Some(&b"meta"[..]));
+        assert_eq!(e.keyframe, Some((40, AVC_KEY.to_vec())));
+
+        // Script frames (type 2) also stage as metadata; a newer keyframe
+        // replaces the older one.
+        store.update_from_frame("live", "s", 1, 2, 0, b"script");
+        store.update_from_frame("live", "s", 1, 1, 80, AVC_KEY);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.metadata.as_deref(), Some(&b"script"[..]));
+        assert_eq!(e.keyframe.as_ref().map(|(ts, _)| *ts), Some(80));
+    }
+
+    #[test]
+    fn update_from_frame_ignores_live_only_and_unknown_types() {
+        let store = InitCacheStore::new();
+        store.update_from_frame("live", "s", 1, 1, 0, AVC_SEQ);
+        // Inter frames and raw audio are live-only: nothing new is staged.
+        store.update_from_frame("live", "s", 1, 1, 10, AVC_INTER);
+        store.update_from_frame("live", "s", 1, 0, 10, AAC_RAW);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.avc_header.as_deref(), Some(AVC_SEQ));
+        assert!(e.keyframe.is_none());
+        assert!(e.aac_header.is_none());
+        assert!(e.metadata.is_none());
+
+        // An unknown wire frame type is ignored entirely (no entry created).
+        store.update_from_frame("live", "other", 1, 9, 0, AVC_SEQ);
+        assert!(store.get("live", "other").is_none());
+    }
+
+    #[test]
+    fn update_from_frame_fences_stale_epochs_and_resets_on_newer_epoch() {
+        let store = InitCacheStore::new();
+        store.update_from_frame("live", "s", 5, 1, 0, AVC_SEQ);
+        store.update_from_frame("live", "s", 5, 0, 0, AAC_SEQ);
+
+        // A stale publisher (older epoch) must not overwrite current fields.
+        store.update_from_frame("live", "s", 4, 3, 0, b"stale-meta");
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 5);
+        assert!(e.metadata.is_none());
+
+        // A newer epoch wipes the previous publisher's init fields.
+        store.update_from_frame("live", "s", 6, 1, 0, AVC_KEY);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 6);
+        assert!(e.avc_header.is_none(), "old epoch header must be dropped");
+        assert!(e.aac_header.is_none(), "old epoch header must be dropped");
+        assert_eq!(e.keyframe, Some((0, AVC_KEY.to_vec())));
+    }
+
+    #[test]
+    fn observe_maps_librtmp2_frame_types() {
+        let store = InitCacheStore::new();
+        store.observe("live", "s", 2, FrameType::Video, 0, AVC_SEQ);
+        store.observe("live", "s", 2, FrameType::Audio, 0, AAC_SEQ);
+        store.observe("live", "s", 2, FrameType::Metadata, 0, b"m");
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.avc_header.as_deref(), Some(AVC_SEQ));
+        assert_eq!(e.aac_header.as_deref(), Some(AAC_SEQ));
+        assert_eq!(e.metadata.as_deref(), Some(&b"m"[..]));
+        store.observe("live", "s", 2, FrameType::Script, 0, b"sc");
+        assert_eq!(
+            store.get("live", "s").unwrap().metadata.as_deref(),
+            Some(&b"sc"[..])
+        );
+    }
+
+    #[test]
+    fn store_snapshot_and_apply_wire_replace_entry() {
+        let store = InitCacheStore::new();
+        let snap = librtmp2::server::StreamInitSnapshot {
+            metadata: Some(b"md".to_vec()),
+            avc_header: Some(AVC_SEQ.to_vec()),
+            aac_header: Some(AAC_SEQ.to_vec()),
+            last_keyframe: Some((7, AVC_KEY.to_vec())),
+            ..Default::default()
+        };
+        store.store_snapshot("live", "s", 9, &snap);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 9);
+        assert_eq!(e.metadata.as_deref(), Some(&b"md"[..]));
+        assert_eq!(e.avc_header.as_deref(), Some(AVC_SEQ));
+        assert_eq!(e.aac_header.as_deref(), Some(AAC_SEQ));
+        assert_eq!(e.keyframe, Some((7, AVC_KEY.to_vec())));
+
+        store.apply_wire("live", "s", 10, None, Some(vec![9]), None, None);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 10);
+        assert!(e.metadata.is_none());
+        assert_eq!(e.avc_header, Some(vec![9]));
+        assert!(e.aac_header.is_none());
+        assert!(e.keyframe.is_none());
+    }
+}
