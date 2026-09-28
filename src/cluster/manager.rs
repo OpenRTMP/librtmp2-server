@@ -862,6 +862,17 @@ impl ClusterManager {
         ))
         .await
         .map_err(|e| format!("remove node: {e}"))?;
+        // `RemoveVoters` only unlinks ids that appear in a voter config, so a
+        // node still registered as a learner (the normal state after
+        // `accept_join` -> `add_learner`, since promotion is an explicit
+        // operator POST) survives it and keeps receiving log replication.
+        // `RemoveNodes` drops it from the membership's node map; it is a no-op
+        // for a voter `RemoveVoters` already unlinked.
+        self.change_membership_forwarded(ChangeMembers::RemoveNodes(
+            std::collections::BTreeSet::from([node_id]),
+        ))
+        .await
+        .map_err(|e| format!("remove node: {e}"))?;
         if let Err(e) = self.release_owners_for_node(node_id) {
             crate::log_warn!(
                 "Cluster: node {node_id} removed from membership but releasing its stream \
