@@ -1686,6 +1686,14 @@ impl ServerApp {
 
     /// Runs until SIGINT/SIGTERM. Blocks the calling task.
     pub async fn run(&self) -> Result<(), String> {
+        self.run_until(shutdown_signal()).await
+    }
+
+    /// Runs until `shutdown` completes. Blocks the calling task.
+    pub async fn run_until(
+        &self,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), String> {
         crate::log_info!("OpenRTMP librtmp2-server alpha starting...");
 
         #[cfg(feature = "cluster")]
@@ -2609,7 +2617,7 @@ impl ServerApp {
         )
         .with_graceful_shutdown(async move {
             tokio::select! {
-                () = shutdown_signal() => {},
+                () = shutdown => {},
                 _ = rtmp_dead_rx.recv() => {
                     crate::log_error!(
                         "An RTMP shard thread exited unexpectedly; shutting down HTTP so the process does not keep serving a half-dead API"
