@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: rtmp_bridge (2026-08-10)
+Last scanned: keygen (2026-09-28)
 
 ## Modules
 
@@ -9,8 +9,19 @@ Last scanned: rtmp_bridge (2026-08-10)
 - [x] http — REST API, auth, stats endpoints
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
-- [ ] keygen — Stream key generation
+- [x] keygen — Stream key generation
 - [ ] logger — Logging
+
+## Findings (2026-09-28 keygen pass)
+
+- **Critical (fixed):** `is_valid_access_key()` / `MIN_ACCESS_KEY_LEN` were enforced on
+  DB lookups (`stream_find_by_*`, `viewer_and_stream_by_play_key`) but not on the RTMP
+  fast-auth cache path (`try_fast_authorize_play` / `try_fast_authorize_publish`).
+  Legacy databases can still hold sub-32-character keys; those keys remain in
+  `refresh_key_cache` snapshots, so publish/play on the fast path succeeded while the
+  worker path rejected the same credential — defeating the minimum-length policy and
+  leaving brute-forceable keys usable on the common standalone hot path. Fast auth now
+  rejects invalid keys before consulting the cache (same as slow lookup semantics).
 
 ## Findings (2026-08-10 rtmp_bridge pass)
 

@@ -13,6 +13,16 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-28
+
+### Changed
+- Depends on librtmp2 `0.10.2`: relayed frames are shared by all viewers
+  and sent with one vectored write per viewer per poll, and new viewers
+  get their first frames in the same write as `NetStream.Play.Start`.
+  With 1000 viewers on one stream the server holds 32 MiB instead of
+  59 MiB at the same CPU, and the 1000-viewer join averages 32.6 ms
+  (93.8 ms p95), the lowest of the compared servers.
+
 ## [0.6.0] — 2026-09-27
 
 ### Changed
@@ -781,7 +791,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.4.2...v0.4.3

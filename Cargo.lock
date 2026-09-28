@@ -1250,9 +1250,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "librtmp2"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13641296f468cc7e2d37ebc367ba9d8f28b6381e040eb870030827f91e24e7be"
+checksum = "f58d1a5afdb8f15e3d33c42493b5c0007c37d913e3ebb568aab2a5737413b65c"
 dependencies = [
  "cc",
  "libc",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "librtmp2-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "bytes",
@@ -2596,9 +2596,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
  "tokio",
