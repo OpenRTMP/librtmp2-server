@@ -305,3 +305,52 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+#[test]
+#[serial]
+fn run_with_shards_relays_across_shards() {
+    // SAFETY: serial test; see `RunningServer::start`.
+    unsafe { std::env::set_var("LRTMP2_RTMP_SHARDS", "4") };
+    let dir = temp_dir("shards");
+    let server = RunningServer::start(&dir, 19785, 19786, None);
+    server.create_stream("shard-stream");
+
+    let rtmp_port = server.rtmp_port;
+    let result = thread::spawn(move || -> Result<usize, ErrorCode> {
+        PLAYER_FRAMES.store(0, Ordering::SeqCst);
+        let mut publisher = Client::new();
+        publisher.connect(&format!("rtmp://127.0.0.1:{rtmp_port}/live/{PUB_KEY}"))?;
+        publisher.publish()?;
+
+        // SO_REUSEPORT spreads connections over the shards, so with several
+        // players at least one usually lands on another shard than the
+        // publisher and is fed through the cross-shard relay.
+        let mut players = Vec::new();
+        for _ in 0..4 {
+            let mut player = Client::new();
+            player.on_frame_cb = Some(on_player_frame);
+            player.connect(&format!("rtmp://127.0.0.1:{rtmp_port}/live/{PLAY_KEY}"))?;
+            player.play()?;
+            players.push(player);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ts = 0;
+        while PLAYER_FRAMES.load(Ordering::SeqCst) < 8 && Instant::now() < deadline {
+            send_keyframe(&mut publisher, ts)?;
+            ts += 40;
+            for player in &mut players {
+                player.poll(10)?;
+            }
+        }
+        Ok(PLAYER_FRAMES.load(Ordering::SeqCst))
+    })
+    .join()
+    .unwrap();
+    unsafe { std::env::remove_var("LRTMP2_RTMP_SHARDS") };
+
+    let frames = result.expect("publish/play across shards");
+    assert!(frames > 0, "players should receive relayed frames");
+    server.stop().expect("run_until returns Ok after shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
