@@ -279,7 +279,10 @@ fn run_with_media_outputs_records_and_runs_hooks() {
         .find(|p| p.extension().is_some_and(|e| e == "flv"))
         .expect("a recording file");
     let bytes = std::fs::read(&flv).unwrap();
-    assert!(bytes.starts_with(b"FLV"), "recording starts with an FLV header");
+    assert!(
+        bytes.starts_with(b"FLV"),
+        "recording starts with an FLV header"
+    );
     assert!(bytes.len() > 13, "recording holds at least one tag");
     let _ = std::fs::remove_dir_all(&dir);
 }
