@@ -378,7 +378,6 @@ CREATE TABLE IF NOT EXISTS stream_viewers (
 );
 CREATE INDEX IF NOT EXISTS idx_viewer_stream ON stream_viewers(stream_id);
 CREATE INDEX IF NOT EXISTS idx_viewer_play_key ON stream_viewers(play_key);
-CREATE INDEX IF NOT EXISTS idx_player_viewer ON players(viewer_id);
 CREATE TABLE IF NOT EXISTS stream_owners (
   stream_id TEXT PRIMARY KEY REFERENCES streams(id) ON DELETE CASCADE,
   owner_node_id INTEGER NOT NULL,
@@ -519,6 +518,7 @@ impl Db {
         for sql in [
             "ALTER TABLE publishers ADD COLUMN audio_sample_rate INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE publishers ADD COLUMN audio_channels INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE players ADD COLUMN viewer_id TEXT NOT NULL DEFAULT ''",
         ] {
             match conn.execute(sql, []) {
                 Ok(_) => {}
@@ -526,6 +526,15 @@ impl Db {
                 Err(e) => return Err(e),
             }
         }
+        // `idx_player_viewer` is deliberately created here rather than in the
+        // SCHEMA batch above: SCHEMA runs before these ALTERs, and on a database
+        // created before `viewer_id` existed the `CREATE INDEX ... ON
+        // players(viewer_id)` statement would abort the whole batch with
+        // "no such column: viewer_id" before the migration below could run.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_player_viewer ON players(viewer_id)",
+            [],
+        )?;
         let stale = conn
             .execute("UPDATE publishers SET active=0 WHERE active=1", [])
             .unwrap_or(0)
