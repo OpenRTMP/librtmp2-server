@@ -22,7 +22,7 @@ own target hardware before using any of this for capacity planning.
 
 | | librtmp2-server | nginx-rtmp | MediaMTX | SRS | LiveForge |
 |---|---|---|---|---|---|
-| Version | 0.6.0, built against librtmp2 0.10.2 | nginx 1.31.6 + nginx-rtmp-module `master` @ 6c7719d | v1.21.1 | v8.0.48 (`v8.0-d0`, the SRS 8.0 release; bundled FFmpeg) | `main` @ 4e70fb3 (built with Go 1.26) |
+| Version | 0.6.1, built against librtmp2 0.10.2 | nginx 1.31.6 + nginx-rtmp-module `master` @ 6c7719d | v1.21.1 | v8.0.48 (`v8.0-d0`, the SRS 8.0 release; bundled FFmpeg) | `main` @ 4e70fb3 (built with Go 1.26) |
 | Language | Rust | C | Go | C++ | Go |
 | Role | what this repo ships | most common existing RTMP relay | modern multi-protocol media server with RTMP support | long-running open-source media server with RTMP/SRT/WebRTC support | newer multi-protocol Go live server (RTMP/RTSP/SRT/WebRTC/HLS) |
 
@@ -134,7 +134,7 @@ Full commands, including exact server configs, are in
 ## Handshake latency (connect + publish, count=120, concurrency=30)
 
 Mean of three full sweeps of `scripts/run_rtmp_benchmarks.sh`,
-`librtmp2-server` 0.6.0 on librtmp2 0.10.2 (default sharding, 4 poll
+`librtmp2-server` 0.6.1 on librtmp2 0.10.2 (default sharding, 4 poll
 threads on this box):
 
 | Server | Success rate | Handshakes/s | avg | p50 | p95 | p99 | max |
