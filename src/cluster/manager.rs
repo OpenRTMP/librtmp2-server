@@ -2698,3 +2698,1276 @@ mod heartbeat_routing_tests {
         ));
     }
 }
+
+/// In-process tests against real loopback nodes. Every node binds fresh
+/// ephemeral ports (`free_port`), so tests never collide with each other or
+/// with `tests/cluster_ha.rs`.
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::cluster::network::ControlMessage;
+    use crate::db::{DbLookup, Player, Publisher};
+
+    const TOKEN: &str = "manager-unit-test-api-token-0123456789";
+
+    fn secret() -> String {
+        "manager-unit-test-cluster-secret-0123456789".to_string()
+    }
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// An address nothing listens on (connection refused immediately).
+    fn dead_addr() -> String {
+        format!("127.0.0.1:{}", free_port())
+    }
+
+    fn node_cfg(node_id: u64, bootstrap: bool, join: Option<String>) -> ClusterConfig {
+        let mut cfg = ClusterConfig {
+            enabled: true,
+            node_id,
+            bind: format!("127.0.0.1:{}", free_port()),
+            media_bind: format!("127.0.0.1:{}", free_port()),
+            bootstrap,
+            join,
+            secret: secret(),
+            heartbeat: Duration::from_millis(100),
+            allow_loopback_peer_addrs: true,
+            ..Default::default()
+        };
+        cfg.advertise_addr = Some(cfg.bind.clone());
+        cfg.media_advertise_addr = Some(cfg.media_bind.clone());
+        cfg
+    }
+
+    fn stream(id: &str) -> Stream {
+        let key = |prefix: &str| format!("{prefix}_{id:x<32}");
+        Stream {
+            id: id.into(),
+            name: id.into(),
+            app: "live".into(),
+            publish_key: key("pub"),
+            play_key: key("play"),
+            stats_key: key("stat"),
+            enabled: true,
+            created_at: 1,
+        }
+    }
+
+    fn viewer(stream_id: &str, id: &str) -> StreamViewer {
+        StreamViewer {
+            id: id.into(),
+            stream_id: stream_id.into(),
+            name: id.into(),
+            play_key: format!("pk_{id:y<32}"),
+            enabled: true,
+            created_at: 2,
+        }
+    }
+
+    fn publisher(id: &str, stream_id: &str) -> Publisher {
+        Publisher {
+            id: id.into(),
+            stream_id: stream_id.into(),
+            app: "live".into(),
+            stream_name: stream_id.into(),
+            active: true,
+            ..Default::default()
+        }
+    }
+
+    fn player(id: &str, stream_id: &str, viewer_id: &str) -> Player {
+        Player {
+            id: id.into(),
+            stream_id: stream_id.into(),
+            viewer_id: viewer_id.into(),
+            app: "live".into(),
+            stream_name: stream_id.into(),
+            active: true,
+            ..Default::default()
+        }
+    }
+
+    /// Observable side of the [`SessionHooks`] a test node was given.
+    #[derive(Clone)]
+    struct Hooks {
+        deleted: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+        revoked: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
+        token: Arc<parking_lot::RwLock<String>>,
+        forced: Arc<parking_lot::Mutex<Vec<String>>>,
+        sessions: Arc<AtomicU64>,
+    }
+
+    impl Hooks {
+        fn new() -> Self {
+            Self {
+                deleted: Arc::default(),
+                revoked: Arc::default(),
+                token: Arc::new(parking_lot::RwLock::new(TOKEN.to_string())),
+                forced: Arc::default(),
+                sessions: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn session_hooks(&self) -> SessionHooks {
+            let forced = Arc::clone(&self.forced);
+            let sessions = Arc::clone(&self.sessions);
+            SessionHooks {
+                deleted_streams: Arc::clone(&self.deleted),
+                revoked_viewers: Arc::clone(&self.revoked),
+                api_token: Arc::clone(&self.token),
+                force_unpublish_stream: Arc::new(move |s: &str| forced.lock().push(s.to_string())),
+                local_stream_sessions: Arc::new(move |_: &str| sessions.load(Ordering::SeqCst)),
+            }
+        }
+    }
+
+    struct Node {
+        mgr: Arc<ClusterManager>,
+        hooks: Hooks,
+        db_path: std::path::PathBuf,
+        _dir: Arc<TempDir>,
+    }
+
+    async fn start_in(cfg: ClusterConfig, dir: Arc<TempDir>) -> Node {
+        let db_path = dir.path().join(format!("n{}.db", cfg.node_id));
+        let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
+        let mgr = match ClusterManager::start(cfg, db, tokio::runtime::Handle::current()).await {
+            Ok(m) => m,
+            Err(e) => panic!("start cluster node: {e}"),
+        };
+        let hooks = Hooks::new();
+        mgr.register_session_hooks(hooks.session_hooks());
+        Node {
+            mgr,
+            hooks,
+            db_path,
+            _dir: dir,
+        }
+    }
+
+    async fn bootstrap(node_id: u64, tweak: impl FnOnce(&mut ClusterConfig)) -> Node {
+        let mut cfg = node_cfg(node_id, true, None);
+        tweak(&mut cfg);
+        let node = start_in(cfg, Arc::new(TempDir::new().unwrap())).await;
+        assert!(
+            wait_until(Duration::from_secs(10), || node
+                .mgr
+                .snapshot_metrics()
+                .is_leader)
+            .await,
+            "bootstrap node never became leader"
+        );
+        node
+    }
+
+    async fn join(leader: &Node, node_id: u64, join_addr: String) -> Node {
+        let mut cfg = node_cfg(node_id, false, Some(join_addr));
+        cfg.join_proof = leader
+            .mgr
+            .mint_join_proof(node_id, &cfg.bind, &cfg.media_bind)
+            .expect("mint join proof");
+        start_in(cfg, Arc::new(TempDir::new().unwrap())).await
+    }
+
+    async fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if f() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Add a Raft learner that never answers, so topology pruning keeps it
+    /// while every RPC to it fails fast with "connection refused".
+    async fn add_dead_learner(mgr: &ClusterManager, id: NodeId, with_meta: bool) {
+        let ctrl = dead_addr();
+        mgr.raft()
+            .add_learner(id, BasicNode { addr: ctrl.clone() }, false)
+            .await
+            .expect("add non-blocking learner");
+        if with_meta {
+            mgr.meta().set_addrs(id, ctrl, dead_addr());
+        }
+        mgr.health()
+            .note_peer(id, NodeHealthState::Ready, 0.0, None, None);
+    }
+
+    /// Propose an ownership change straight through Raft, bypassing the
+    /// manager's own tracker update, as a replicated apply from another node
+    /// would look to this node.
+    async fn raw_write(mgr: &ClusterManager, cmd: ClusterCommand) {
+        mgr.raft().client_write(cmd).await.expect("raft write");
+    }
+
+    fn raw_acquire(stream_id: &str, node_id: NodeId) -> ClusterCommand {
+        ClusterCommand::AcquireStreamOwner {
+            stream_id: stream_id.into(),
+            node_id,
+            epoch: 0,
+            acquired_at: 1,
+        }
+    }
+
+    /// Retry a membership change while a previous one is still in flight.
+    async fn promote(mgr: &ClusterManager, id: NodeId) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match mgr.promote_learner(id).await {
+                Ok(()) => return,
+                Err(e) if Instant::now() < deadline => {
+                    let _ = e;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("promote {id}: {e}"),
+            }
+        }
+    }
+
+    fn start_err(res: Result<Arc<ClusterManager>, String>) -> String {
+        match res {
+            Ok(_) => panic!("start unexpectedly succeeded"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn start_rejects_invalid_configs() {
+        let rt = tokio::runtime::Handle::current();
+        let db = || Arc::new(Db::open(":memory:").unwrap());
+
+        let mut cfg = node_cfg(1, true, None);
+        cfg.enabled = false;
+        let err = start_err(ClusterManager::start(cfg, db(), rt.clone()).await);
+        assert!(err.contains("CLUSTER_ENABLED=false"));
+
+        let cfg = node_cfg(0, true, None);
+        let err = start_err(ClusterManager::start(cfg, db(), rt.clone()).await);
+        assert!(err.contains("CLUSTER_NODE_ID"));
+
+        // A fresh join into a DB that already holds app data is refused.
+        let populated = db();
+        populated.stream_add(&stream("pre")).unwrap();
+        let cfg = node_cfg(2, false, Some(dead_addr()));
+        assert!(
+            ClusterManager::start(cfg, populated, rt.clone())
+                .await
+                .is_err()
+        );
+
+        // Control / media port already in use.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken_addr = taken.local_addr().unwrap().to_string();
+        let mut cfg = node_cfg(3, true, None);
+        cfg.bind = taken_addr.clone();
+        let err = start_err(ClusterManager::start(cfg, db(), rt.clone()).await);
+        assert!(err.contains("CLUSTER_BIND"));
+        let mut cfg = node_cfg(4, true, None);
+        cfg.media_bind = taken_addr;
+        assert!(ClusterManager::start(cfg, db(), rt.clone()).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_node_accessors_and_durable_writes() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        assert_eq!(m.node_id(), 1);
+        assert!(m.raft().metrics().borrow().current_leader == Some(1));
+        assert!(m.meta().get(1).is_some());
+        assert_eq!(m.media().peer_count(), 0);
+        assert!(m.ownership().get("none").is_none());
+        assert_eq!(m.health().local(), NodeHealthState::Ready);
+        assert!(m.admission().should_accept_new_publish());
+        assert!(m.should_accept_new_play());
+        assert!(
+            !m.cluster_id().starts_with("node-"),
+            "bootstrap sets a UUID"
+        );
+        m.enqueue_export(ExportedFrame {
+            app: "live".into(),
+            stream: "nobody".into(),
+            epoch: 1,
+            frame_type: 9,
+            timestamp: 0,
+            payload: vec![0x17, 0x01],
+        });
+        assert!(m.drain_injects().is_empty());
+
+        let s = stream("s1");
+        let dv = m.create_stream(&s).expect("create");
+        assert_eq!(dv.play_key, s.play_key);
+        assert_eq!(m.create_stream(&s), Err(CoordError::Duplicate));
+        let v2 = viewer("s1", "v2");
+        m.create_viewer(&v2).unwrap();
+        assert_eq!(m.create_viewer(&v2), Err(CoordError::Duplicate));
+        m.delete_viewer("s1", "v2").unwrap();
+        assert_eq!(m.delete_viewer("s1", &dv.id), Err(CoordError::Conflict));
+        m.set_stream_enabled("s1", false).unwrap();
+        assert_eq!(
+            m.set_stream_enabled("ghost", true),
+            Err(CoordError::NotFound)
+        );
+        m.set_stream_enabled("s1", true).unwrap();
+
+        // Raft side effects flow into the registered session hooks.
+        m.set_api_token("rotated-api-token").unwrap();
+        m.poll_side_effects();
+        assert!(
+            wait_until(Duration::from_secs(5), || *n.hooks.token.read()
+                == "rotated-api-token")
+            .await
+        );
+        *n.hooks.token.write() = TOKEN.to_string();
+
+        assert_eq!(m.begin_delete_stream("ghost"), Err(CoordError::NotFound));
+        m.begin_delete_stream("s1").unwrap();
+        m.poll_side_effects();
+        assert!(
+            wait_until(Duration::from_secs(5), || n
+                .hooks
+                .deleted
+                .lock()
+                .contains("s1"))
+            .await
+        );
+        m.finalize_delete_stream("s1").unwrap();
+        m.poll_side_effects();
+        assert!(
+            wait_until(Duration::from_secs(5), || !n
+                .hooks
+                .deleted
+                .lock()
+                .contains("s1"))
+            .await
+        );
+        assert!(matches!(m.db().stream_get("s1"), DbLookup::Missing));
+
+        // Viewer delete propagates a revoke marker.
+        let s2 = stream("s2");
+        m.create_stream(&s2).unwrap();
+        m.create_viewer(&viewer("s2", "v3")).unwrap();
+        m.delete_viewer("s2", "v3").unwrap();
+        m.poll_side_effects();
+        assert!(
+            wait_until(Duration::from_secs(5), || n
+                .hooks
+                .revoked
+                .lock()
+                .contains_key("v3"))
+            .await
+        );
+
+        let stats = m.local_stream_stats_json("s2");
+        assert_eq!(stats["stream_id"], "s2");
+        assert_eq!(stats["owner_node_id"], 1);
+        assert_eq!(stats["publishers"], 0);
+
+        m.shutdown().await;
+        assert_eq!(m.health().local(), NodeHealthState::Leaving);
+        assert!(!m.admission().should_accept_new_publish());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ownership_admission_and_ambiguous_acquires() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        let s = stream("own");
+        let dv = m.create_stream(&s).unwrap();
+        assert!(m.db().player_try_acquire(&player("p1", "own", &dv.id)));
+
+        m.health().set_local(NodeHealthState::Isolated);
+        assert!(matches!(
+            m.acquire_stream_owner("own", 1, 0, 1),
+            Err(CoordError::Cluster(msg)) if msg.contains("quorum")
+        ));
+        m.health().set_local(NodeHealthState::Ready);
+        m.admission().force_drain();
+        assert!(matches!(
+            m.acquire_stream_owner("own", 1, 0, 1),
+            Err(CoordError::Cluster(msg)) if msg.contains("draining")
+        ));
+        m.admission().force_resume();
+
+        let epoch = m.acquire_stream_owner("own", 1, 0, 10).unwrap();
+        assert_eq!(m.ownership().get("own"), Some((1, epoch)));
+        assert_eq!(m.snapshot_metrics().owned_streams, 1);
+        assert_eq!(
+            m.acquire_stream_owner("own", 2, 0, 11),
+            Err(CoordError::Conflict)
+        );
+        assert_eq!(
+            m.acquire_stream_owner("missing", 1, 0, 11),
+            Err(CoordError::NotFound)
+        );
+        m.release_stream_owner("own", epoch).unwrap();
+        assert!(m.ownership().get("own").is_none());
+
+        m.acquire_stream_owner("own", 7, 0, 12).unwrap();
+        m.release_owners_for_node(7).unwrap();
+        assert!(m.db().stream_owner_get("own").is_none());
+
+        // A timed-out acquire whose write never landed is kept for retry.
+        m.pending_ambiguous_acquires
+            .lock()
+            .push(("never-landed".into(), 1, 5));
+        m.reconcile_ambiguous_acquires();
+        assert!(
+            wait_until(Duration::from_secs(2), || m
+                .pending_ambiguous_acquires
+                .lock()
+                .iter()
+                .any(|(s, _, _)| s == "never-landed"))
+            .await
+        );
+        // One superseded by a different acquire is dropped; one that did land
+        // for us is released.
+        m.acquire_stream_owner("own", 1, 0, 77).unwrap();
+        m.pending_ambiguous_acquires
+            .lock()
+            .push(("own".into(), 2, 77));
+        m.reconcile_ambiguous_acquires();
+        assert!(m.db().stream_owner_get("own").is_some());
+        m.pending_ambiguous_acquires
+            .lock()
+            .push(("own".into(), 1, 77));
+        m.reconcile_ambiguous_acquires();
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("own")
+                .is_none())
+            .await
+        );
+        assert!(
+            !m.pending_ambiguous_acquires
+                .lock()
+                .iter()
+                .any(|(s, _, _)| s == "own")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drain_resume_and_admin_proofs() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+
+        m.drain_node(1).await.unwrap();
+        assert_eq!(m.health().local(), NodeHealthState::Draining);
+        assert!(!m.admission().should_accept_new_publish());
+        m.resume_node(1).await.unwrap();
+        assert_eq!(m.health().local(), NodeHealthState::Ready);
+        assert!(m.admission().should_accept_new_publish());
+
+        let err = m.drain_node(99).await.unwrap_err();
+        assert!(err.contains("unknown node 99"));
+        assert!(m.resume_node(99).await.is_err());
+        // Fall back to the Raft network table when meta has no entry.
+        let dead = dead_addr();
+        m.network.upsert_node(98, dead);
+        assert!(m.drain_node(98).await.is_err());
+
+        // Join proofs validate addresses and stay retryable until consumed.
+        assert!(m.mint_join_proof(5, "not an addr", "127.0.0.1:1").is_err());
+        assert!(m.mint_join_proof(5, "127.0.0.1:1", "not an addr").is_err());
+        let proof = m
+            .mint_join_proof(5, "127.0.0.1:1000", "127.0.0.1:1001")
+            .unwrap();
+        let payload = crate::cluster::security::join_admin_proof_payload(
+            5,
+            "127.0.0.1:1000",
+            "127.0.0.1:1001",
+        );
+        assert!(m.verify_admin_proof(&proof, &payload));
+        assert!(m.verify_admin_proof(&proof, &payload));
+        m.consume_admin_proof(&proof);
+        assert!(!m.verify_admin_proof(&proof, &payload));
+
+        // Other admin proofs are single use.
+        let admin = m.admin_action_proof("AdminDrain:1").unwrap();
+        assert!(!m.verify_admin_proof(&admin, "AdminDrain:2"));
+        assert!(m.verify_admin_proof(&admin, "AdminDrain:1"));
+        assert!(!m.verify_admin_proof(&admin, "AdminDrain:1"));
+
+        // Malformed proofs.
+        assert!(!m.verify_admin_proof("", "AdminDrain:1"));
+        assert!(!m.verify_admin_proof("no-dot", "AdminDrain:1"));
+        assert!(!m.verify_admin_proof("abcd.mac", "AdminDrain:1"));
+        let non_hex = format!("{}.mac", "z".repeat(32));
+        assert!(!m.verify_admin_proof(&non_hex, "AdminDrain:1"));
+
+        // An empty API token disables admin proofs entirely.
+        *n.hooks.token.write() = String::new();
+        let fresh = ClusterManager::mint_fresh_admin_proof(TOKEN, "AdminDrain:1");
+        assert!(!m.verify_admin_proof(&fresh, "AdminDrain:1"));
+        assert!(m.admin_action_proof("x").is_err());
+        *n.hooks.token.write() = TOKEN.to_string();
+
+        // Without session hooks nothing can be proven or minted.
+        *m.session_hooks.lock() = None;
+        assert!(!m.verify_admin_proof(&fresh, "AdminDrain:1"));
+        assert!(m.mint_join_proof(5, "127.0.0.1:1", "127.0.0.1:2").is_err());
+        assert!(
+            m.drain_node(99)
+                .await
+                .unwrap_err()
+                .contains("API token unavailable")
+        );
+        // Local leader writes do not need the token.
+        m.create_stream(&stream("nohooks")).unwrap();
+        m.register_session_hooks(n.hooks.session_hooks());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_control_messages() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        let live = stream("live1");
+        m.create_stream(&live).unwrap();
+        let pending = stream("pend1");
+        m.create_stream(&pending).unwrap();
+        m.begin_delete_stream("pend1").unwrap();
+        m.create_viewer(&viewer("live1", "vlive")).unwrap();
+
+        let ok = |msg| matches!(msg, ControlMessage::AdminOk);
+        assert!(ok(m.handle_admin_control(ControlMessage::AdminDrain {
+            node_id: 1,
+            proof: String::new()
+        })));
+        assert_eq!(m.health().local(), NodeHealthState::Draining);
+        assert!(ok(m.handle_admin_control(ControlMessage::AdminResume {
+            node_id: 1,
+            proof: String::new()
+        })));
+        assert_eq!(m.health().local(), NodeHealthState::Ready);
+        // Admin messages addressed to another node are not handled here.
+        assert!(matches!(
+            m.handle_admin_control(ControlMessage::AdminDrain {
+                node_id: 2,
+                proof: String::new()
+            }),
+            ControlMessage::AdminErr { .. }
+        ));
+        assert!(matches!(
+            m.handle_admin_control(ControlMessage::AdminRemove { node_id: 2 }),
+            ControlMessage::AdminErr { message } if message.contains("DELETE")
+        ));
+
+        // Drain hints are accepted only for pending/missing streams.
+        assert!(!ok(m.handle_admin_control(ControlMessage::DrainStream {
+            stream_id: "live1".into()
+        })));
+        assert!(!n.hooks.deleted.lock().contains("live1"));
+        n.hooks.deleted.lock().clear();
+        assert!(ok(m.handle_admin_control(ControlMessage::DrainStream {
+            stream_id: "pend1".into()
+        })));
+        assert!(ok(m.handle_admin_control(ControlMessage::DrainStream {
+            stream_id: "gone".into()
+        })));
+        assert!(n.hooks.deleted.lock().contains("gone"));
+
+        // Revoke hints are accepted only for viewers that no longer exist.
+        assert!(!ok(m.handle_admin_control(ControlMessage::RevokeViewer {
+            viewer_id: "vlive".into()
+        })));
+        assert!(ok(m.handle_admin_control(ControlMessage::RevokeViewer {
+            viewer_id: "vgone".into()
+        })));
+        assert!(n.hooks.revoked.lock().contains_key("vgone"));
+
+        n.hooks.sessions.store(3, Ordering::SeqCst);
+        assert!(matches!(
+            m.handle_admin_control(ControlMessage::SessionCountReq {
+                stream_id: "live1".into()
+            }),
+            ControlMessage::SessionCountResp { count: 3 }
+        ));
+        match m.handle_admin_control(ControlMessage::TopologyReq) {
+            ControlMessage::TopologyResp {
+                ok,
+                cluster_id,
+                peers,
+                ..
+            } => {
+                assert!(ok);
+                assert_eq!(cluster_id, m.cluster_id());
+                assert!(peers.iter().any(|p| p.node_id == 1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            m.handle_admin_control(ControlMessage::AuthFail),
+            ControlMessage::AdminErr { message } if message == "unsupported admin"
+        ));
+
+        // Without hooks, markers are silently skipped and counts read as 0.
+        *m.session_hooks.lock() = None;
+        assert!(matches!(
+            m.handle_admin_control(ControlMessage::SessionCountReq {
+                stream_id: "live1".into()
+            }),
+            ControlMessage::SessionCountResp { count: 0 }
+        ));
+        m.force_unpublish_and_drain("live1");
+        m.mark_stream_drain_clear("live1");
+        m.apply_api_token("ignored");
+        assert!(n.hooks.forced.lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drain_clear_waits_for_local_sessions() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("busy")).unwrap();
+        n.hooks.sessions.store(2, Ordering::SeqCst);
+        m.begin_delete_stream("busy").unwrap();
+        m.finalize_delete_stream("busy").unwrap();
+        m.poll_side_effects();
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .pending_drain_clears
+                .lock()
+                .contains("busy"))
+            .await
+        );
+        // Still has live sessions: the marker must stay set.
+        m.retry_pending_drain_clears();
+        assert!(n.hooks.deleted.lock().contains("busy"));
+
+        n.hooks.sessions.store(0, Ordering::SeqCst);
+        m.retry_pending_drain_clears();
+        assert!(!m.pending_drain_clears.lock().contains("busy"));
+        assert!(!n.hooks.deleted.lock().contains("busy"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_metrics_and_node_listing() {
+        let n = bootstrap(1, |c| c.bandwidth_max_mbps = 100.0).await;
+        let m = &n.mgr;
+        let s = stream("st");
+        let dv = m.create_stream(&s).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub1", "st")));
+        assert!(m.db().player_try_acquire(&player("pl1", "st", &dv.id)));
+
+        let h = m.health();
+        h.note_peer(
+            2,
+            NodeHealthState::Ready,
+            0.5,
+            Some("127.0.0.1:2".into()),
+            Some("127.0.0.1:3".into()),
+        );
+        h.note_peer(3, NodeHealthState::Isolated, 0.0, None, None);
+        h.note_peer(4, NodeHealthState::Learner, 0.0, None, None);
+        m.peer_session_counts.lock().insert(2, (2, 5));
+        m.peer_stream_players
+            .lock()
+            .insert(2, HashMap::from([("st".to_string(), 4)]));
+        m.peer_viewer_players
+            .lock()
+            .insert(2, HashMap::from([(dv.id.clone(), 3)]));
+
+        let status = m.cluster_status_json();
+        assert_eq!(status["role"], "leader");
+        assert_eq!(status["quorum"], true);
+        assert_eq!(status["healthy_nodes"], 3);
+        assert_eq!(status["unavailable_nodes"], 1);
+        assert_eq!(status["local_publishers"], 1);
+        assert_eq!(status["total_publishers"], 3);
+        assert_eq!(status["total_players"], 6);
+        assert_eq!(status["load"]["capacity_mbps"], 100.0);
+        assert_eq!(status["total_rx_mbps"], 50.0);
+        assert_eq!(status["load"]["admission"], "ready");
+        let block = m.health_cluster_block();
+        assert_eq!(block["role"], "leader");
+        assert_eq!(block["node_id"], 1);
+        let agg = m.aggregate_stats_json();
+        assert_eq!(agg["cluster"]["total_players"], 6);
+        let metrics = m.metrics().await;
+        assert!(metrics.is_leader);
+        assert_eq!(metrics.voter_count, 1);
+        assert_eq!(metrics.peer_count, 3);
+
+        let nodes = m.nodes_info();
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes[0].role, "leader");
+        assert!(nodes[0].voter && nodes[0].healthy);
+        assert_eq!(nodes[0].publishers, 1);
+        let peer = |id| nodes.iter().find(|x| x.id == id).unwrap();
+        assert_eq!(peer(2).role, "learner");
+        assert_eq!(peer(2).players, 5);
+        assert_eq!(peer(2).rx_mbps, 50.0);
+        assert_eq!(peer(2).control_addr.as_deref(), Some("127.0.0.1:2"));
+        assert!(!peer(3).healthy);
+        assert!(peer(4).media_addr.is_none());
+
+        let streams = m.streams_info();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].cluster_players, 5);
+        assert!(streams[0].owner_node_id.is_none());
+        assert_eq!(m.remote_stream_session_count_cached("st"), 4);
+        assert_eq!(m.remote_viewer_session_count_cached(&dv.id), 3);
+        // No peer control addresses: live count is local-only.
+        assert_eq!(m.remote_stream_session_count("st").await, 0);
+
+        // Local unavailability is reflected in role/quorum/health fields.
+        h.set_local(NodeHealthState::Isolated);
+        let status = m.cluster_status_json();
+        assert_eq!(status["quorum"], false);
+        assert_eq!(status["unavailable_nodes"], 2);
+        assert!(!m.nodes_info()[0].healthy);
+        h.set_local(NodeHealthState::Draining);
+        assert_eq!(m.cluster_status_json()["load"]["admission"], "draining");
+        h.set_local(NodeHealthState::Ready);
+
+        // Without cached Raft metrics everything reports as a non-leader.
+        let saved = m.last_metrics.lock().take();
+        h.set_local(NodeHealthState::Learner);
+        let status = m.cluster_status_json();
+        assert_eq!(status["role"], "learner");
+        assert_eq!(m.nodes_info()[0].role, "learner");
+        h.set_local(NodeHealthState::Ready);
+        assert_eq!(m.cluster_status_json()["role"], "follower");
+        let metrics = m.snapshot_metrics();
+        assert!(!metrics.is_leader && metrics.leader_id.is_none());
+        assert_eq!(m.nodes_info()[0].role, "follower");
+        *m.last_metrics.lock() = saved;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn media_replicas_subscriptions_and_remote_queries() {
+        let n = bootstrap(1, |c| c.media_replicas = 1).await;
+        let m = &n.mgr;
+        add_dead_learner(m, 5, true).await;
+        add_dead_learner(m, 6, true).await;
+        add_dead_learner(m, 7, false).await;
+
+        let s = stream("rep");
+        let dv = m.create_stream(&s).unwrap();
+        assert!(m.db().player_try_acquire(&player("pl", "rep", &dv.id)));
+        assert!(m.db().publisher_try_acquire(&publisher("pb", "rep")));
+
+        // Owned by a remote peer: this node is the deterministic standby.
+        raw_write(m, raw_acquire("rep", 5)).await;
+        m.poll_side_effects();
+        m.health()
+            .note_peer(5, NodeHealthState::Ready, 0.0, None, None);
+        assert_eq!(m.standby_candidates(Some(5), &[]), vec![1]);
+        assert_eq!(m.standby_candidates(None, &[1]), vec![5]);
+        m.reconcile_media_replicas();
+        assert_eq!(
+            m.standby_subs
+                .lock()
+                .get(&("live".to_string(), "rep".to_string())),
+            Some(&5)
+        );
+        let info = m.streams_info();
+        assert_eq!(info[0].owner_node_id, Some(5));
+        assert_eq!(info[0].standby_nodes, vec![1]);
+
+        // Ownership moved away from this node while a local publisher is live.
+        assert!(
+            wait_until(Duration::from_secs(5), || n
+                .hooks
+                .forced
+                .lock()
+                .iter()
+                .any(|s| s == "rep"))
+            .await
+        );
+
+        // Remote-owner helpers against unreachable peers degrade gracefully.
+        m.notify_play_subscription("live", "rep");
+        m.notify_play_unsubscribe("live", "rep");
+        assert!(m.proxy_stream_stats("rep").await.is_none());
+        m.peer_stream_players
+            .lock()
+            .insert(5, HashMap::from([("rep".to_string(), 2)]));
+        assert_eq!(m.remote_stream_session_count("rep").await, 2);
+        m.broadcast_drain_stream("rep").await;
+        assert!(n.hooks.deleted.lock().contains("rep"));
+        m.broadcast_revoke_viewer("vx").await;
+        assert!(n.hooks.revoked.lock().contains_key("vx"));
+
+        // Owner changes 5 -> 6 through replicated applies: the tracker sync
+        // unsubscribes from the old owner; the standby sub moves too.
+        raw_write(m, ClusterCommand::ReleaseOwnersForNode { node_id: 5 }).await;
+        raw_write(m, raw_acquire("rep", 6)).await;
+        m.poll_side_effects();
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .ownership()
+                .get("rep")
+                .map(|(n, _)| n)
+                == Some(6))
+            .await
+        );
+        m.health()
+            .note_peer(6, NodeHealthState::Ready, 0.0, None, None);
+        m.reconcile_media_replicas();
+        assert_eq!(
+            m.standby_subs
+                .lock()
+                .get(&("live".to_string(), "rep".to_string())),
+            Some(&6)
+        );
+        // Owner without a known media address: nothing to subscribe to.
+        m.release_owners_for_node(6).unwrap();
+        m.acquire_stream_owner("rep", 7, 0, 3).unwrap();
+        m.reconcile_media_replicas();
+        m.notify_play_subscription("live", "rep");
+        assert!(m.proxy_stream_stats("rep").await.is_none());
+        // No owner at all: the standby subscription is dropped.
+        m.release_owners_for_node(7).unwrap();
+        m.reconcile_media_replicas();
+        assert!(m.standby_subs.lock().is_empty());
+        m.notify_play_subscription("live", "rep");
+        m.notify_play_unsubscribe("live", "rep");
+        assert!(m.proxy_stream_stats("rep").await.is_none());
+
+        // Owned locally: stats are served in-process.
+        m.acquire_stream_owner("rep", 1, 0, 4).unwrap();
+        let (body, guard) = m.proxy_stream_stats("rep").await.unwrap();
+        assert!(guard.is_none());
+        assert_eq!(body["owner_node_id"], 1);
+        m.notify_play_subscription("live", "rep");
+        m.notify_play_unsubscribe("live", "rep");
+
+        // Inbound subscribe authorization.
+        assert!(!m.authorize_inbound_media_subscribe(1, "live", "rep").await);
+        assert!(!m.authorize_inbound_media_subscribe(42, "live", "rep").await);
+        assert!(
+            !m.authorize_inbound_media_subscribe(5, "live", "nostream")
+                .await
+        );
+        m.health()
+            .note_peer(5, NodeHealthState::Ready, 0.0, None, None);
+        // Peer 5 is the standby replica for streams this node owns.
+        assert!(m.authorize_inbound_media_subscribe(5, "live", "rep").await);
+        // Peer 6 is not a standby; its session-count RPC fails -> refused.
+        assert!(!m.authorize_inbound_media_subscribe(6, "live", "rep").await);
+        // Peer 7 has no known control address.
+        m.health()
+            .note_peer(5, NodeHealthState::Down, 0.0, None, None);
+        m.health()
+            .note_peer(6, NodeHealthState::Down, 0.0, None, None);
+        assert!(!m.authorize_inbound_media_subscribe(7, "live", "rep").await);
+        m.release_owners_for_node(1).unwrap();
+        m.acquire_stream_owner("rep", 5, 0, 5).unwrap();
+        assert!(!m.authorize_inbound_media_subscribe(5, "live", "rep").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topology_pruning_promotion_and_eviction() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+
+        // Unknown (non-member) nodes are pruned from every topology cache.
+        m.meta().set_addrs(42, dead_addr(), dead_addr());
+        m.peer_session_counts.lock().insert(42, (1, 1));
+        m.prune_topology_to_membership();
+        assert!(m.meta().get(42).is_none());
+        assert!(!m.peer_session_counts.lock().contains_key(&42));
+
+        // A local Learner that is already a voter is reconciled to Ready.
+        m.health().set_local(NodeHealthState::Learner);
+        m.prune_topology_to_membership();
+        assert_eq!(m.health().local(), NodeHealthState::Ready);
+
+        // Membership that no longer contains this node forces it out.
+        m.create_stream(&stream("evict")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pe", "evict")));
+        let mut fake = m.last_metrics.lock().clone().expect("metrics cached");
+        fake.membership_config = Arc::new(openraft::StoredMembership::new(
+            None,
+            openraft::Membership::new(vec![BTreeSet::from([7u64])], ()),
+        ));
+        *m.last_metrics.lock() = Some(fake);
+        m.prune_topology_to_membership();
+        assert!(!m.admission().should_accept_new_publish());
+        assert!(n.hooks.forced.lock().iter().any(|s| s == "evict"));
+        assert!(matches!(
+            m.health().local(),
+            NodeHealthState::Leaving | NodeHealthState::Isolated
+        ));
+
+        // Empty membership is ignored.
+        let mut empty = m.last_metrics.lock().clone().unwrap();
+        empty.membership_config = Arc::new(openraft::StoredMembership::default());
+        *m.last_metrics.lock() = Some(empty);
+        m.meta().set_addrs(43, dead_addr(), dead_addr());
+        m.prune_topology_to_membership();
+        assert!(m.meta().get(43).is_some());
+
+        // Topology recovery with no peers is a no-op.
+        m.meta().remove(43);
+        m.recover_missing_media_addrs().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_loop_recovers_quorum_and_releases_down_owners() {
+        let n = bootstrap(1, |c| {
+            c.bandwidth_interface = "lo".into();
+            c.bandwidth_max_mbps = 10_000.0;
+        })
+        .await;
+        let m = &n.mgr;
+        m.create_stream(&stream("iso")).unwrap();
+        m.create_stream(&stream("taken")).unwrap();
+        m.create_stream(&stream("down")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("p-iso", "iso")));
+        m.acquire_stream_owner("taken", 99, 0, 1).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("p-taken", "taken")));
+
+        // Quorum "restored" after isolation: reacquire local publishers'
+        // streams, force off the one another node already owns.
+        m.health().set_local(NodeHealthState::Isolated);
+        assert!(
+            wait_until(Duration::from_secs(5), || m.health().local()
+                == NodeHealthState::Ready)
+            .await
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("iso")
+                .map(|o| o.owner_node_id)
+                == Some(1))
+            .await
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || n
+                .hooks
+                .forced
+                .lock()
+                .iter()
+                .any(|s| s == "taken"))
+            .await
+        );
+
+        // Pending cleanup for a removed node is retried by the leader loop.
+        m.pending_node_cleanups.lock().insert(77);
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .pending_node_cleanups
+                .lock()
+                .is_empty())
+            .await
+        );
+
+        // A peer that stops heart-beating is marked DOWN and, after the grace
+        // period, its stream ownership is released by the leader.
+        m.acquire_stream_owner("down", 55, 0, 1).unwrap();
+        m.health()
+            .note_peer(55, NodeHealthState::Ready, 0.0, None, None);
+        m.peer_session_counts.lock().insert(55, (1, 1));
+        assert!(
+            wait_until(Duration::from_secs(10), || m
+                .db()
+                .stream_owner_get("down")
+                .is_none())
+            .await
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || !m
+                .peer_session_counts
+                .lock()
+                .contains_key(&55))
+            .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_loop_tolerates_bandwidth_probe_errors() {
+        let n = bootstrap(1, |c| {
+            c.bandwidth_interface = "no-such-iface0".into();
+            c.bandwidth_max_mbps = 1000.0;
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(n.mgr.health().local(), NodeHealthState::Ready);
+        assert_eq!(n.mgr.admission().current_load(), 0.0);
+        n.mgr.shutdown_blocking();
+        assert_eq!(n.mgr.health().local(), NodeHealthState::Leaving);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn follower_forwarding_admin_and_membership() {
+        let n1 = bootstrap(1, |_| {}).await;
+        let n2 = join(&n1, 2, n1.mgr.config.advertise_control()).await;
+        assert!(
+            wait_until(Duration::from_secs(10), || n1
+                .mgr
+                .snapshot_metrics()
+                .learner_count
+                == 1)
+            .await
+        );
+        // Joining through a follower forwards the join to the leader.
+        let n3 = join(&n1, 3, n2.mgr.config.advertise_control()).await;
+        assert!(
+            wait_until(Duration::from_secs(10), || n1
+                .mgr
+                .snapshot_metrics()
+                .learner_count
+                == 2)
+            .await
+        );
+        assert!(n2.mgr.meta().get(3).is_some());
+
+        // Membership changes proposed on non-leaders are forwarded.
+        promote(&n2.mgr, 2).await;
+        promote(&n3.mgr, 3).await;
+        assert!(
+            wait_until(Duration::from_secs(10), || n1
+                .mgr
+                .snapshot_metrics()
+                .voter_count
+                == 3)
+            .await
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || n2.mgr.health().local()
+                == NodeHealthState::Ready)
+            .await
+        );
+
+        // Durable writes from a follower are forwarded with an admin proof.
+        let s = stream("fw");
+        n2.mgr.create_stream(&s).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || matches!(
+                n3.mgr.db().stream_get("fw"),
+                DbLookup::Ok(_)
+            ))
+            .await
+        );
+        *n2.mgr.session_hooks.lock() = None;
+        assert!(matches!(
+            n2.mgr.set_api_token("t2"),
+            Err(CoordError::Cluster(msg)) if msg.contains("API token unavailable")
+        ));
+        n2.mgr.register_session_hooks(n2.hooks.session_hooks());
+
+        // Remote drain / resume through the control plane.
+        n1.mgr.drain_node(3).await.unwrap();
+        assert_eq!(n3.mgr.health().local(), NodeHealthState::Draining);
+        n1.mgr.resume_node(3).await.unwrap();
+        assert_eq!(n3.mgr.health().local(), NodeHealthState::Ready);
+
+        // Heartbeats carry per-stream session counts to peers.
+        n1.mgr.acquire_stream_owner("fw", 1, 0, 1).unwrap();
+        n2.hooks.sessions.store(2, Ordering::SeqCst);
+        n3.hooks.sessions.store(2, Ordering::SeqCst);
+        assert_eq!(n1.mgr.remote_stream_session_count("fw").await, 4);
+        assert!(
+            n1.mgr
+                .authorize_inbound_media_subscribe(2, "live", "fw")
+                .await
+        );
+        n2.hooks.sessions.store(0, Ordering::SeqCst);
+        assert!(
+            !n1.mgr
+                .authorize_inbound_media_subscribe(2, "live", "fw")
+                .await
+        );
+        n3.hooks.sessions.store(0, Ordering::SeqCst);
+
+        // Stats for a stream owned elsewhere are proxied from the owner.
+        assert!(
+            wait_until(Duration::from_secs(5), || n2
+                .mgr
+                .db()
+                .stream_owner_get("fw")
+                .is_some())
+            .await
+        );
+        let (body, _guard) = n2.mgr.proxy_stream_stats("fw").await.unwrap();
+        assert_eq!(body["owner_node_id"], 1);
+        n2.mgr.notify_play_subscription("live", "fw");
+        n2.mgr.notify_play_unsubscribe("live", "fw");
+
+        // Best-effort drain / revoke broadcasts reach peers whose DB agrees.
+        n1.mgr.begin_delete_stream("fw").unwrap();
+        n1.mgr.broadcast_drain_stream("fw").await;
+        assert!(
+            wait_until(Duration::from_secs(5), || n3
+                .hooks
+                .deleted
+                .lock()
+                .contains("fw"))
+            .await
+        );
+        n1.mgr.broadcast_revoke_viewer("never-existed").await;
+        assert!(
+            wait_until(Duration::from_secs(5), || n3
+                .hooks
+                .revoked
+                .lock()
+                .contains_key("never-existed"))
+            .await
+        );
+
+        // Nodes list shows the full voter set with heartbeat-learned addresses.
+        assert!(wait_until(Duration::from_secs(5), || n1.mgr.nodes_info().len() == 3).await);
+        let nodes = n1.mgr.nodes_info();
+        assert!(nodes.iter().all(|x| x.voter));
+        assert_eq!(n2.mgr.nodes_info()[0].role, "follower");
+        assert!(
+            n2.mgr
+                .nodes_info()
+                .iter()
+                .any(|x| x.id == 1 && x.role == "leader")
+        );
+
+        // Rejoining under an active member's id is refused.
+        let n3_ctrl = n3.mgr.config.advertise_control();
+        let n3_media = n3.mgr.config.advertise_media();
+        let err = n1
+            .mgr
+            .accept_join(3, n3_ctrl.clone(), n3_media.clone(), String::new())
+            .await
+            .unwrap_err();
+        assert!(err.contains("already an active cluster member"));
+        assert!(
+            n1.mgr
+                .accept_join(9, "bad addr".into(), n3_media.clone(), String::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            n1.mgr
+                .accept_join(9, n3_ctrl.clone(), "bad addr".into(), String::new())
+                .await
+                .is_err()
+        );
+        // Once fenced DOWN, the same id may re-register its address.
+        n1.mgr
+            .health()
+            .note_peer(3, NodeHealthState::Down, 0.0, None, None);
+        let (cid, peers) = n1
+            .mgr
+            .accept_join(3, n3_ctrl.clone(), n3_media.clone(), "rejoin-proof".into())
+            .await
+            .unwrap();
+        assert_eq!(cid, n1.mgr.cluster_id());
+        assert!(peers.iter().any(|p| p.node_id == 3));
+        // On a follower the rejoin is forwarded to the leader (which still
+        // sees node 3 as alive and refuses it).
+        n2.mgr
+            .health()
+            .note_peer(3, NodeHealthState::Down, 0.0, None, None);
+        let proof = n1.mgr.mint_join_proof(3, &n3_ctrl, &n3_media).unwrap();
+        n1.mgr
+            .health()
+            .note_peer(3, NodeHealthState::Ready, 0.0, None, None);
+        assert!(
+            n2.mgr
+                .accept_join(3, n3_ctrl, n3_media, proof)
+                .await
+                .is_err()
+        );
+
+        // Remove node 3; every remaining member prunes it from its caches.
+        n1.mgr.remove_peer(3).await.unwrap();
+        assert!(n1.mgr.meta().get(3).is_none());
+        assert!(n1.mgr.pending_node_cleanups.lock().is_empty());
+        assert!(wait_until(Duration::from_secs(10), || n2.mgr.meta().get(3).is_none()).await);
+
+        // Losing the only other voter drops the leader into ISOLATED.
+        // (`shutdown` leaves the heartbeat loop running until process exit,
+        // so also forget the leader's address to make node 2 go silent.)
+        n2.mgr.shutdown().await;
+        n2.mgr.meta().remove(1);
+        assert!(
+            wait_until(Duration::from_secs(15), || n1.mgr.health().local()
+                == NodeHealthState::Isolated)
+            .await
+        );
+        assert_eq!(n1.mgr.cluster_status_json()["quorum"], false);
+        // Writes can no longer commit and time out.
+        assert!(matches!(
+            n1.mgr.set_api_token("no-quorum"),
+            Err(CoordError::Cluster(_))
+        ));
+        n3.mgr.shutdown_blocking();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restart_resumes_existing_membership() {
+        let n1 = bootstrap(1, |_| {}).await;
+        let n2 = join(&n1, 2, n1.mgr.config.advertise_control()).await;
+        promote(&n1.mgr, 2).await;
+        assert!(
+            wait_until(Duration::from_secs(10), || n2.mgr.db().raft_has_state()
+                && n2
+                    .mgr
+                    .state_machine
+                    .last_membership()
+                    .membership()
+                    .voter_ids()
+                    .count()
+                    == 2)
+            .await
+        );
+
+        // Restart node 2 (same DB, new ports) with CLUSTER_JOIN still set:
+        // it resumes instead of re-joining and refreshes topology.
+        n2.mgr.shutdown().await;
+        let dir2 = Arc::clone(&n2._dir);
+        let join_addr = n1.mgr.config.advertise_control();
+        let r2 = start_in(node_cfg(2, false, Some(join_addr)), Arc::clone(&dir2)).await;
+        assert_eq!(r2.db_path, n2.db_path);
+        assert_eq!(r2.mgr.health().local(), NodeHealthState::Ready);
+        assert!(
+            r2.mgr
+                .meta()
+                .get(1)
+                .is_some_and(|(_, media)| !media.is_empty())
+        );
+
+        // Unreachable join address: falls back to persisted members.
+        r2.mgr.shutdown().await;
+        let r2b = start_in(node_cfg(2, false, Some(dead_addr())), Arc::clone(&dir2)).await;
+        assert!(
+            r2b.mgr
+                .meta()
+                .get(1)
+                .is_some_and(|(_, media)| !media.is_empty())
+        );
+        r2b.mgr.shutdown().await;
+
+        // Restart the bootstrap node: it resumes and finishes an interrupted
+        // seed marker without re-initializing Raft.
+        n1.mgr.shutdown().await;
+        n1.mgr.db().with_conn(|c| {
+            c.execute(
+                "DELETE FROM settings WHERE key=?",
+                [BOOTSTRAP_SEEDED_SETTING],
+            )
+            .unwrap();
+        });
+        let cid = n1.mgr.cluster_id();
+        let r1 = start_in(node_cfg(1, true, None), Arc::clone(&n1._dir)).await;
+        assert_eq!(r1.mgr.health().local(), NodeHealthState::Ready);
+        assert_eq!(r1.mgr.cluster_id(), cid);
+        assert_eq!(
+            r1.mgr.db().setting_get(BOOTSTRAP_SEEDED_SETTING).as_deref(),
+            Some("1")
+        );
+        // Peer 2 was restored from membership (control address only).
+        assert!(r1.mgr.meta().get(2).is_some());
+    }
+}

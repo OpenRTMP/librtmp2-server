@@ -1232,4 +1232,985 @@ mod tests {
         );
         assert_eq!(hub1.peer_count(), 1);
     }
+
+    // ---- helpers -------------------------------------------------------
+
+    const SECRET: &str = "test-cluster-secret-32-chars-min--";
+    const WAIT: Duration = Duration::from_secs(5);
+    const AVC_SEQ: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const AVC_KEY: &[u8] = &[0x17, 0x01, 0x00, 0x00, 0x00, 0x65];
+
+    struct Node {
+        hub: Arc<MediaHub>,
+        inject: Arc<InjectQueue>,
+        ownership: Arc<OwnershipTracker>,
+    }
+
+    fn node_with(
+        local_id: NodeId,
+        tls: Option<(Arc<ServerConfig>, Arc<ClientConfig>)>,
+        allowed: MediaMembershipFn,
+    ) -> Node {
+        let ownership = Arc::new(OwnershipTracker::new());
+        let inject = InjectQueue::new(8);
+        let (tls_server, tls_client) = match tls {
+            Some((s, c)) => (Some(s), Some(c)),
+            None => (None, None),
+        };
+        let hub = MediaHub::new(
+            local_id,
+            SECRET.to_string(),
+            8,
+            1,
+            Arc::clone(&ownership),
+            Arc::clone(&inject),
+            tls_server,
+            tls_client,
+            allowed,
+        );
+        Node {
+            hub,
+            inject,
+            ownership,
+        }
+    }
+
+    fn node(local_id: NodeId) -> Node {
+        node_with(local_id, None, Arc::new(|_: NodeId| true))
+    }
+
+    fn tls_for(node: u64) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cluster-tls");
+        let cert = dir.join(format!("node{node}.pem"));
+        let key = dir.join(format!("node{node}.key"));
+        let ca = dir.join("ca.pem");
+        (
+            crate::cluster::security::build_server_tls(&cert, &key, &ca).unwrap(),
+            crate::cluster::security::build_client_tls(&cert, &key, &ca).unwrap(),
+        )
+    }
+
+    /// Run the hub's accept loop on an ephemeral port and return its address.
+    async fn listen(hub: &Arc<MediaHub>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Arc::clone(hub).accept_loop(listener));
+        addr
+    }
+
+    /// Dial a hub's media plane as `node_id` (client auth + Hello).
+    async fn dial_hub(addr: SocketAddr, node_id: NodeId) -> tokio::net::TcpStream {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let MediaMessage::AuthChallenge { nonce } = next(&mut s).await else {
+            panic!("expected challenge");
+        };
+        peer::write_media_frame(
+            &mut s,
+            &MediaMessage::Auth {
+                node_id,
+                response: crate::cluster::security::auth_response(SECRET, node_id, &nonce),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(next(&mut s).await, MediaMessage::AuthOk));
+        send(
+            &mut s,
+            MediaMessage::Hello {
+                version: crate::cluster::media::MEDIA_PROTOCOL_VERSION,
+                node_id,
+            },
+        )
+        .await;
+        s
+    }
+
+    /// Accept one outbound `MediaPeer` connection as scripted owner `owner_id`.
+    async fn accept_from_hub(listener: &TcpListener, owner_id: NodeId) -> tokio::net::TcpStream {
+        let (mut s, a) = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .expect("hub never dialed")
+            .unwrap();
+        peer::accept_auth(&mut s, a.ip(), SECRET, owner_id, false, None)
+            .await
+            .unwrap();
+        s
+    }
+
+    async fn next<R: tokio::io::AsyncReadExt + Unpin>(s: &mut R) -> MediaMessage {
+        tokio::time::timeout(WAIT, peer::read_media_frame(s))
+            .await
+            .expect("timed out waiting for a media frame")
+            .expect("media read failed")
+    }
+
+    async fn send<W: tokio::io::AsyncWriteExt + Unpin>(s: &mut W, msg: MediaMessage) {
+        peer::write_media_frame(s, &msg).await.unwrap();
+    }
+
+    async fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if f() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    async fn drain_at_least(q: &InjectQueue, n: usize) -> Vec<InjectedFrame> {
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(WAIT, async {
+            while out.len() < n {
+                out.extend(q.drain());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        out
+    }
+
+    fn media_frame(epoch: u64, ts: u32, payload: &[u8]) -> MediaMessage {
+        MediaMessage::MediaFrame {
+            app: "live".into(),
+            stream: "s".into(),
+            epoch,
+            frame_type: 1,
+            timestamp: ts,
+            timeline_ts: ts,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn subscribe(generation: u64) -> MediaMessage {
+        MediaMessage::Subscribe {
+            app: "live".into(),
+            stream: "s".into(),
+            epoch: 0,
+            generation,
+        }
+    }
+
+    fn denied(generation: u64) -> MediaMessage {
+        subscribe_denied_error("live", "s", generation)
+    }
+
+    fn injected(payload_len: usize) -> InjectedFrame {
+        InjectedFrame {
+            app: "live".into(),
+            stream: "s".into(),
+            epoch: 1,
+            frame_type: 1,
+            timestamp: 0,
+            payload: vec![0; payload_len],
+        }
+    }
+
+    fn exported(epoch: u64, ts: u32, payload: &[u8]) -> ExportedFrame {
+        ExportedFrame {
+            app: "live".into(),
+            stream: "s".into(),
+            epoch,
+            frame_type: 1,
+            timestamp: ts,
+            payload: payload.to_vec(),
+        }
+    }
+
+    const KB: usize = 1024;
+
+    // ---- queues and slot accounting -------------------------------------
+
+    #[test]
+    fn inject_queue_drops_oldest_on_overflow_and_rejects_oversized() {
+        let q = InjectQueue::new(0); // clamps to 1 MiB
+        q.try_send(injected(400 * KB)).unwrap();
+        q.try_send(injected(400 * KB)).unwrap();
+        // Third frame does not fit: the oldest is evicted to make room.
+        q.try_send(injected(400 * KB)).unwrap();
+        let frames = q.drain();
+        assert_eq!(frames.len(), 2);
+        assert!(q.drain().is_empty());
+
+        // A frame larger than the whole budget is refused.
+        q.try_send(injected(10)).unwrap();
+        assert!(q.try_send(injected(2 * 1024 * KB)).is_err());
+        assert!(q.drain().is_empty(), "overflow eviction empties the queue");
+    }
+
+    #[tokio::test]
+    async fn export_queue_drops_oldest_and_wakes_waiter() {
+        let q = ExportQueue::new(0);
+        let waiter = {
+            let q = Arc::clone(&q);
+            tokio::spawn(async move { q.wait_and_drain().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        q.push(exported(1, 0, &[1]));
+        let got = tokio::time::timeout(WAIT, waiter).await.unwrap().unwrap();
+        assert_eq!(got.len(), 1);
+
+        q.push(exported(1, 1, &vec![0; 400 * KB]));
+        q.push(exported(1, 2, &vec![0; 400 * KB]));
+        q.push(exported(1, 3, &vec![0; 400 * KB]));
+        let frames = q.drain();
+        assert_eq!(
+            frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
+            vec![2, 3],
+            "drop-oldest keeps FIFO order of the survivors"
+        );
+
+        // Oversized: every queued frame is evicted and the new one dropped.
+        q.push(exported(1, 4, &[1]));
+        q.push(exported(1, 5, &vec![0; 2 * 1024 * KB]));
+        assert!(q.drain().is_empty());
+        // Frames already queued are returned immediately.
+        q.push(exported(1, 6, &[1]));
+        assert_eq!(q.wait_and_drain().await.len(), 1);
+    }
+
+    #[test]
+    fn preauth_slots_are_bounded_per_ip_and_released() {
+        let ip: IpAddr = "198.51.100.77".parse().unwrap();
+        for _ in 0..MAX_PREAUTH_MEDIA_CONN_PER_IP {
+            assert!(try_acquire_preauth_media_slot(ip));
+        }
+        assert!(!try_acquire_preauth_media_slot(ip));
+        for _ in 0..MAX_PREAUTH_MEDIA_CONN_PER_IP {
+            release_preauth_media_slot(ip);
+        }
+        assert!(!PREAUTH_MEDIA_CONN_PER_IP.lock().contains_key(&ip));
+        // Releasing an untracked IP is a no-op.
+        release_preauth_media_slot(ip);
+
+        // The guard releases both the per-IP and the global slot. (The global
+        // counter is shared with concurrently running tests, so only the
+        // per-IP side is asserted exactly.)
+        assert!(try_acquire_global_preauth_media_slot());
+        assert!(try_acquire_preauth_media_slot(ip));
+        drop(PreauthMediaGuard(ip));
+        assert!(!PREAUTH_MEDIA_CONN_PER_IP.lock().contains_key(&ip));
+    }
+
+    #[test]
+    fn subscribe_denied_payload_roundtrips() {
+        assert_eq!(
+            parse_subscribe_denied(&subscribe_denied_payload("live", "s")),
+            Some(("live".to_string(), "s".to_string()))
+        );
+        assert_eq!(parse_subscribe_denied("no-tab"), None);
+        assert_eq!(parse_subscribe_denied("\ts"), None);
+        assert_eq!(parse_subscribe_denied("live\t"), None);
+    }
+
+    // ---- lifecycle ------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_reports_bind_conflicts_and_serve_accepts() {
+        let n = node(1);
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let err = n
+            .hub
+            .start(taken.local_addr().unwrap())
+            .await
+            .expect_err("bind conflict must fail startup");
+        assert!(err.contains("cluster media bind"), "{err}");
+        assert!(
+            Arc::clone(&n.hub)
+                .serve(taken.local_addr().unwrap())
+                .await
+                .is_err()
+        );
+
+        let port = free_local_port();
+        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        tokio::spawn(Arc::clone(&n.hub).serve(bind));
+        let mut connected = None;
+        for _ in 0..100 {
+            if let Ok(s) = tokio::net::TcpStream::connect(bind).await {
+                connected = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut s = connected.expect("serve must accept connections");
+        assert!(matches!(
+            next(&mut s).await,
+            MediaMessage::AuthChallenge { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_peers_sinks_and_stops_accepting() {
+        let owner = node(2);
+        let owner_addr = listen(&owner.hub).await;
+        let sub = node(1);
+        sub.hub
+            .connect_peer(2, &owner_addr.to_string())
+            .await
+            .unwrap();
+        let sub_addr = listen(&sub.hub).await;
+        let _inbound = dial_hub(sub_addr, 3).await;
+        assert!(eventually(|| sub.hub.inbound_sinks.lock().contains_key(&3)).await);
+        let peer = sub.hub.peers.lock().get(&2).cloned().unwrap();
+        let sink = sub.hub.inbound_sinks.lock().get(&3).cloned().unwrap();
+
+        sub.hub.shutdown();
+        assert!(peer.is_closed());
+        assert!(sink.is_closed());
+        // The accept loop observes shutdown on its next wakeup and exits,
+        // dropping the listener.
+        let _ = tokio::net::TcpStream::connect(sub_addr).await;
+        assert!(
+            eventually(|| std::net::TcpStream::connect(sub_addr).is_err()).await,
+            "listener must close after shutdown"
+        );
+        owner.hub.shutdown();
+    }
+
+    // ---- inbound (owner-side) session ------------------------------------
+
+    #[tokio::test]
+    async fn inbound_session_serves_subscribe_frames_and_init_cache() {
+        let owner = node(1);
+        let addr = listen(&owner.hub).await;
+        // Peer 2 is the recorded owner of "s" at epoch 7 for inbound frames.
+        owner.ownership.set("s", 2, 7);
+        owner.hub.put_init_cache(
+            "live",
+            "s",
+            7,
+            InitCacheEntry {
+                avc_header: Some(AVC_SEQ.to_vec()),
+                ..InitCacheEntry::default()
+            },
+        );
+
+        let mut c = dial_hub(addr, 2).await;
+        send(&mut c, subscribe(1)).await;
+        match next(&mut c).await {
+            MediaMessage::InitCache {
+                epoch, avc_header, ..
+            } => {
+                assert_eq!(epoch, 7);
+                assert_eq!(avc_header.as_deref(), Some(AVC_SEQ));
+            }
+            other => panic!("expected InitCache first, got {other:?}"),
+        }
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![2]).await);
+        assert_eq!(owner.hub.subscription_count(), 1);
+
+        // Local publisher frames fan out over the inbound sink.
+        owner.hub.fanout_local_frame(exported(7, 40, AVC_KEY)).await;
+        match next(&mut c).await {
+            MediaMessage::MediaFrame { payload, .. } => assert_eq!(payload, AVC_KEY),
+            other => panic!("unexpected {other:?}"),
+        }
+        // A stream nobody subscribed to is not sent anywhere.
+        owner
+            .hub
+            .fanout_local_frame(ExportedFrame {
+                stream: "other".into(),
+                ..exported(7, 40, AVC_KEY)
+            })
+            .await;
+
+        // Frames from the owner at the right epoch are injected; stale ones
+        // are fenced.
+        send(&mut c, media_frame(6, 10, &[9])).await;
+        send(&mut c, media_frame(7, 20, &[1, 2, 3])).await;
+        let frames = drain_at_least(&owner.inject, 1).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, vec![1, 2, 3]);
+
+        // Inbound InitCache: stale epoch ignored, current epoch cached and
+        // injected (metadata, avc, aac, keyframe).
+        send(
+            &mut c,
+            MediaMessage::InitCache {
+                app: "live".into(),
+                stream: "s".into(),
+                epoch: 3,
+                metadata: Some(b"stale".to_vec()),
+                avc_header: None,
+                aac_header: None,
+                keyframe: None,
+            },
+        )
+        .await;
+        send(
+            &mut c,
+            MediaMessage::InitCache {
+                app: "live".into(),
+                stream: "s".into(),
+                epoch: 7,
+                metadata: Some(b"md".to_vec()),
+                avc_header: Some(AVC_SEQ.to_vec()),
+                aac_header: Some(vec![0xAF, 0x00, 0x12, 0x10]),
+                keyframe: Some((100, AVC_KEY.to_vec())),
+            },
+        )
+        .await;
+        let frames = drain_at_least(&owner.inject, 4).await;
+        assert_eq!(
+            frames.iter().map(|f| f.frame_type).collect::<Vec<_>>(),
+            vec![2, 1, 0, 1]
+        );
+        assert_eq!(
+            owner
+                .hub
+                .cache
+                .get("live", "s")
+                .unwrap()
+                .metadata
+                .as_deref(),
+            Some(&b"md"[..])
+        );
+
+        // Ignored / forwarded control messages keep the session alive.
+        send(
+            &mut c,
+            MediaMessage::StatsReq {
+                stream_id: "s".into(),
+            },
+        )
+        .await;
+        send(
+            &mut c,
+            MediaMessage::Error {
+                code: "x".into(),
+                message: "y".into(),
+                generation: 0,
+            },
+        )
+        .await;
+        send(
+            &mut c,
+            MediaMessage::StreamStop {
+                app: "live".into(),
+                stream: "s".into(),
+                epoch: 7,
+            },
+        )
+        .await;
+
+        // Unsubscribe releases this connection's ref.
+        send(
+            &mut c,
+            MediaMessage::Unsubscribe {
+                app: "live".into(),
+                stream: "s".into(),
+            },
+        )
+        .await;
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s").is_empty()).await);
+        // Unsubscribe for a stream this connection never subscribed is harmless.
+        send(
+            &mut c,
+            MediaMessage::Unsubscribe {
+                app: "live".into(),
+                stream: "never".into(),
+            },
+        )
+        .await;
+
+        // Two refs, then the connection drops without Unsubscribe: teardown
+        // releases exactly this connection's refs.
+        send(&mut c, subscribe(2)).await;
+        let _ = next(&mut c).await; // InitCache
+        send(&mut c, subscribe(3)).await;
+        let _ = next(&mut c).await; // InitCache
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![2]).await);
+        drop(c);
+        assert!(eventually(|| owner.hub.subscription_count() == 0).await);
+        assert!(eventually(|| owner.hub.inbound_sinks.lock().is_empty()).await);
+
+        owner.hub.evict_init_cache("live", "s");
+        assert!(owner.hub.cache.get("live", "s").is_none());
+        owner.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn inbound_reconnect_replaces_previous_sink() {
+        let owner = node(1);
+        let addr = listen(&owner.hub).await;
+        let _c1 = dial_hub(addr, 2).await;
+        assert!(eventually(|| owner.hub.inbound_sinks.lock().contains_key(&2)).await);
+        let first = owner.hub.inbound_sinks.lock().get(&2).cloned().unwrap();
+        let _c2 = dial_hub(addr, 2).await;
+        assert!(
+            eventually(|| owner
+                .hub
+                .inbound_sinks
+                .lock()
+                .get(&2)
+                .is_some_and(|s| !Arc::ptr_eq(s, &first)))
+            .await
+        );
+        assert!(first.is_closed(), "superseded sink must be closed");
+        owner.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn inbound_auth_failure_and_non_member_are_dropped() {
+        let owner = node_with(1, None, Arc::new(|id: NodeId| id != 9));
+        let addr = listen(&owner.hub).await;
+
+        // Non-member authenticates but is rejected by the membership gate.
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let MediaMessage::AuthChallenge { nonce } = next(&mut s).await else {
+            panic!()
+        };
+        send(
+            &mut s,
+            MediaMessage::Auth {
+                node_id: 9,
+                response: crate::cluster::security::auth_response(SECRET, 9, &nonce),
+            },
+        )
+        .await;
+        assert!(matches!(next(&mut s).await, MediaMessage::AuthOk));
+        send(
+            &mut s,
+            MediaMessage::Hello {
+                version: crate::cluster::media::MEDIA_PROTOCOL_VERSION,
+                node_id: 9,
+            },
+        )
+        .await;
+        let closed = tokio::time::timeout(WAIT, peer::read_media_frame(&mut s))
+            .await
+            .unwrap();
+        assert!(closed.is_err(), "non-member connection must be closed");
+        assert!(owner.hub.inbound_sinks.lock().is_empty());
+        owner.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn inbound_subscribe_gate_denies_then_retries_until_allowed() {
+        let owner = node(1);
+        let addr = listen(&owner.hub).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        owner
+            .hub
+            .set_inbound_subscribe_gate(Arc::new(move |_peer, _app, stream| {
+                let n = calls_c.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    // "s" is allowed on the second attempt (membership
+                    // converging); "deny" never is.
+                    stream == "s" && n >= 1
+                })
+            }));
+        let mut c = dial_hub(addr, 2).await;
+        send(&mut c, subscribe(0)).await;
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![2]).await);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+
+        send(
+            &mut c,
+            MediaMessage::Subscribe {
+                app: "live".into(),
+                stream: "deny".into(),
+                epoch: 0,
+                generation: 42,
+            },
+        )
+        .await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), peer::read_media_frame(&mut c))
+            .await
+            .unwrap()
+            .unwrap();
+        match reply {
+            MediaMessage::Error {
+                code,
+                message,
+                generation,
+            } => {
+                assert_eq!(code, SUBSCRIBE_DENIED);
+                assert_eq!(message, "live\tdeny");
+                assert_eq!(generation, 42);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(owner.hub.subscribed_nodes_for("live", "deny").is_empty());
+        owner.hub.shutdown();
+    }
+
+    // ---- outbound (subscriber-side) handling -----------------------------
+
+    #[tokio::test]
+    async fn handle_inbound_fences_and_injects_owner_traffic() {
+        let n = node(1);
+        n.ownership.set("s", 2, 5);
+
+        // Wrong sender / epoch: dropped.
+        n.hub.handle_inbound(3, media_frame(5, 0, &[1]));
+        n.hub.handle_inbound(2, media_frame(4, 0, &[1]));
+        n.hub.handle_inbound(
+            3,
+            MediaMessage::InitCache {
+                app: "live".into(),
+                stream: "s".into(),
+                epoch: 5,
+                metadata: Some(vec![1]),
+                avc_header: None,
+                aac_header: None,
+                keyframe: None,
+            },
+        );
+        assert!(n.inject.drain().is_empty());
+        assert!(n.hub.cache.get("live", "s").is_none());
+
+        // Owner frames are injected and clear pending NACK state.
+        n.hub
+            .subscribe_nacks
+            .lock()
+            .insert(MediaHub::sub_key(2, "live", "s"), 2);
+        n.hub.handle_inbound(2, media_frame(5, 1000, &[7]));
+        let frames = n.inject.drain();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].timestamp, 1000);
+        assert!(n.hub.subscribe_nacks.lock().is_empty());
+        assert_eq!(n.hub.sub_gen(2, "live", "s"), 1);
+
+        // Owner InitCache mid-stream reuses the last remapped timestamp.
+        n.hub.handle_inbound(
+            2,
+            MediaMessage::InitCache {
+                app: "live".into(),
+                stream: "s".into(),
+                epoch: 5,
+                metadata: None,
+                avc_header: Some(AVC_SEQ.to_vec()),
+                aac_header: None,
+                keyframe: Some((10, AVC_KEY.to_vec())),
+            },
+        );
+        let frames = n.inject.drain();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| f.timestamp == 1000));
+        assert!(n.hub.cache.get("live", "s").is_some());
+
+        // Other message kinds are ignored.
+        n.hub.handle_inbound(2, MediaMessage::AuthOk);
+        assert!(n.inject.drain().is_empty());
+    }
+
+    #[test]
+    fn inject_init_cache_live_timestamps() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let n = rt.block_on(async { node(1) });
+
+        // Fresh timeline with a keyframe: map the keyframe timestamp.
+        n.hub.inject_init_cache_live(
+            "live".into(),
+            "a".into(),
+            InitCacheEntry {
+                keyframe: Some((500, AVC_KEY.to_vec())),
+                epoch: 1,
+                ..InitCacheEntry::default()
+            },
+        );
+        let f = n.inject.drain();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].timestamp, 500);
+
+        // No keyframe: headers reuse the last output timestamp.
+        n.hub.inject_init_cache_live(
+            "live".into(),
+            "a".into(),
+            InitCacheEntry {
+                metadata: Some(vec![1]),
+                aac_header: Some(vec![2]),
+                epoch: 1,
+                ..InitCacheEntry::default()
+            },
+        );
+        let f = n.inject.drain();
+        assert_eq!(
+            f.iter().map(|x| x.timestamp).collect::<Vec<_>>(),
+            vec![500, 500]
+        );
+        assert_eq!(
+            f.iter().map(|x| x.frame_type).collect::<Vec<_>>(),
+            vec![2, 0]
+        );
+
+        // Resetting the timeline makes the next keyframe map afresh.
+        n.hub.reset_timelines_for(&["a".to_string()]);
+        n.hub.inject_init_cache_live(
+            "live".into(),
+            "a".into(),
+            InitCacheEntry {
+                keyframe: Some((7, AVC_KEY.to_vec())),
+                epoch: 2,
+                ..InitCacheEntry::default()
+            },
+        );
+        assert_eq!(n.inject.drain()[0].timestamp, 7);
+        rt.block_on(async { n.hub.shutdown() });
+    }
+
+    #[tokio::test]
+    async fn subscribe_denied_nacks_retry_then_give_up() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = listener.local_addr().unwrap().to_string();
+
+        // Not subscribed / wrong code / malformed payload: ignored.
+        n.hub.handle_inbound(2, denied(0));
+        n.hub.handle_inbound(
+            2,
+            MediaMessage::Error {
+                code: "other".into(),
+                message: "live\ts".into(),
+                generation: 0,
+            },
+        );
+        n.hub.handle_inbound(
+            2,
+            MediaMessage::Error {
+                code: SUBSCRIBE_DENIED.into(),
+                message: "garbage".into(),
+                generation: 0,
+            },
+        );
+        assert!(n.hub.subscribe_nacks.lock().is_empty());
+
+        n.hub.subscribe_remote(&owner_addr, 2, "live", "s", 0).await;
+        let mut s = accept_from_hub(&listener, 2).await;
+        assert!(matches!(next(&mut s).await, MediaMessage::Subscribe { .. }));
+
+        // A NACK for a stale generation is ignored.
+        n.hub.handle_inbound(2, denied(99));
+        assert!(n.hub.subscribe_nacks.lock().is_empty());
+
+        // A matching NACK schedules a retry that re-sends Subscribe.
+        let generation = n.hub.sub_gen(2, "live", "s");
+        n.hub.handle_inbound(2, denied(generation));
+        match next(&mut s).await {
+            MediaMessage::Subscribe { generation: g, .. } => assert_eq!(g, generation),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Exhausting the retry budget drops the local refs entirely.
+        for _ in 0..SUBSCRIBE_NACK_MAX {
+            n.hub.handle_inbound(2, denied(0));
+        }
+        assert!(n.hub.subscribed_nodes_for("live", "s").is_empty());
+        assert!(n.hub.subscribe_nacks.lock().is_empty());
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn subscribe_retry_guards() {
+        let n = node(1);
+        // Not subscribed at all.
+        Arc::clone(&n.hub)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0)
+            .await;
+        // Subscribed but no peer connection known.
+        n.hub.subscribe_remote("", 2, "live", "s", 0).await;
+        Arc::clone(&n.hub)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0)
+            .await;
+        // Generation moved on.
+        Arc::clone(&n.hub)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 5, 0)
+            .await;
+
+        // Peer whose queue is full: the retry reschedules while budget remains.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        n.hub.connect_peer(2, &dead).await.unwrap();
+        let p = n.hub.peers.lock().get(&2).cloned().unwrap();
+        while p.try_send(MediaMessage::AuthOk).is_ok() {}
+        Arc::clone(&n.hub)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 1)
+            .await;
+        Arc::clone(&n.hub)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0)
+            .await;
+
+        // After shutdown, retries are no-ops.
+        n.hub.shutdown();
+        Arc::clone(&n.hub)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 1)
+            .await;
+        assert_eq!(n.hub.subscribed_nodes_for("live", "s"), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_remote_refcounts_redials_and_unsubscribes() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        // First subscribe creates the peer; the fresh-peer resubscribe sends it.
+        n.hub.subscribe_remote(&addr, 2, "live", "s", 0).await;
+        let mut s = accept_from_hub(&listener, 2).await;
+        assert!(
+            matches!(next(&mut s).await, MediaMessage::Subscribe { ref stream, .. } if stream == "s")
+        );
+        // Same stream again only bumps the refcount (no wire message).
+        n.hub.subscribe_remote(&addr, 2, "live", "s", 0).await;
+        // A second stream on the existing peer is sent directly.
+        n.hub.subscribe_remote(&addr, 2, "live", "t", 3).await;
+        match next(&mut s).await {
+            MediaMessage::Subscribe { stream, epoch, .. } => {
+                assert_eq!(stream, "t");
+                assert_eq!(epoch, 3);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(n.hub.peer_count(), 1);
+
+        // Unsubscribe: first release keeps the ref, second sends Unsubscribe.
+        n.hub.unsubscribe_remote(2, "live", "s").await;
+        n.hub.unsubscribe_remote(2, "live", "s").await;
+        assert!(
+            matches!(next(&mut s).await, MediaMessage::Unsubscribe { ref stream, .. } if stream == "s")
+        );
+        // Unknown stream: nothing to do.
+        n.hub.unsubscribe_remote(2, "live", "zzz").await;
+
+        // Owner drops the connection: the peer reconnects and the hub
+        // resubscribes the still-held stream on the new connection.
+        drop(s);
+        let mut s = accept_from_hub(&listener, 2).await;
+        assert!(
+            matches!(next(&mut s).await, MediaMessage::Subscribe { ref stream, .. } if stream == "t")
+        );
+
+        // Owner address changes: the old peer is closed and a new one dials.
+        let old = n.hub.peers.lock().get(&2).cloned().unwrap();
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap().to_string();
+        n.hub.connect_peer(2, &addr2).await.unwrap();
+        assert!(old.is_closed());
+        let mut s2 = accept_from_hub(&listener2, 2).await;
+        assert!(
+            matches!(next(&mut s2).await, MediaMessage::Subscribe { ref stream, .. } if stream == "t")
+        );
+
+        // A closed peer at the same address is replaced as well.
+        let cur = n.hub.peers.lock().get(&2).cloned().unwrap();
+        cur.close();
+        n.hub.connect_peer(2, &addr2).await.unwrap();
+        let replaced = n.hub.peers.lock().get(&2).cloned().unwrap();
+        assert!(!Arc::ptr_eq(&cur, &replaced));
+        // Same live address: reused.
+        n.hub.connect_peer(2, &addr2).await.unwrap();
+        assert!(Arc::ptr_eq(&replaced, n.hub.peers.lock().get(&2).unwrap()));
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn subscribe_remote_rolls_back_when_queue_is_full() {
+        let n = node(1);
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        n.hub.connect_peer(2, &dead).await.unwrap();
+        let p = n.hub.peers.lock().get(&2).cloned().unwrap();
+        while p.try_send(MediaMessage::AuthOk).is_ok() {}
+        let gen_before = n.hub.sub_gen(2, "live", "s");
+        n.hub.subscribe_remote(&dead, 2, "live", "s", 0).await;
+        assert!(
+            n.hub.subscribed_nodes_for("live", "s").is_empty(),
+            "failed first Subscribe must roll back the refcount"
+        );
+        assert_eq!(n.hub.sub_gen(2, "live", "s"), gen_before + 1);
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn disconnect_peer_clears_state_and_bumps_generations() {
+        let n = node(1);
+        let owner = node(2);
+        let owner_addr = listen(&owner.hub).await;
+        let hub_addr = listen(&n.hub).await;
+
+        n.hub
+            .subscribe_remote(&owner_addr.to_string(), 2, "live", "s", 0)
+            .await;
+        let _inbound = dial_hub(hub_addr, 2).await;
+        assert!(eventually(|| n.hub.inbound_sinks.lock().contains_key(&2)).await);
+        n.hub
+            .subscribe_nacks
+            .lock()
+            .insert(MediaHub::sub_key(2, "live", "nacked"), 1);
+        let peer = n.hub.peers.lock().get(&2).cloned().unwrap();
+        let sink = n.hub.inbound_sinks.lock().get(&2).cloned().unwrap();
+
+        n.hub.disconnect_peer(2);
+        assert_eq!(n.hub.peer_count(), 0);
+        assert!(peer.is_closed());
+        assert!(sink.is_closed());
+        assert!(n.hub.subscribe_nacks.lock().is_empty());
+        assert_eq!(n.hub.subscription_count(), 0);
+        assert_eq!(n.hub.sub_gen(2, "live", "s"), 1);
+        assert_eq!(n.hub.sub_gen(2, "live", "nacked"), 1);
+        // Unknown peers are a no-op.
+        n.hub.disconnect_peer(42);
+        n.hub.shutdown();
+        owner.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn fanout_falls_back_to_outbound_peer_without_inbound_sink() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Hub 1 holds an outbound peer to 2 and 2 is subscribed to "s".
+        n.hub.connect_peer(2, &addr).await.unwrap();
+        let mut s = accept_from_hub(&listener, 2).await;
+        n.hub.subs.add(2, "live", "s");
+        n.hub.fanout_local_frame(exported(1, 0, AVC_SEQ)).await;
+        match next(&mut s).await {
+            MediaMessage::MediaFrame { payload, .. } => assert_eq!(payload, AVC_SEQ),
+            other => panic!("unexpected {other:?}"),
+        }
+        // The frame was staged in the local init cache as well.
+        assert_eq!(
+            n.hub.cache.get("live", "s").unwrap().avc_header.as_deref(),
+            Some(AVC_SEQ)
+        );
+        assert!(Arc::ptr_eq(n.hub.ownership(), &n.ownership));
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_hubs_relay_owner_frames_to_subscriber() {
+        let owner = node_with(2, Some(tls_for(2)), Arc::new(|_: NodeId| true));
+        let sub = node_with(1, Some(tls_for(1)), Arc::new(|_: NodeId| true));
+        let owner_addr = listen(&owner.hub).await;
+        owner.ownership.set("s", 2, 4);
+        sub.ownership.set("s", 2, 4);
+
+        sub.hub
+            .subscribe_remote(&owner_addr.to_string(), 2, "live", "s", 4)
+            .await;
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![1]).await);
+
+        owner.hub.fanout_local_frame(exported(4, 33, AVC_KEY)).await;
+        let frames = drain_at_least(&sub.inject, 1).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, AVC_KEY);
+        assert_eq!(frames[0].epoch, 4);
+        owner.hub.shutdown();
+        sub.hub.shutdown();
+    }
 }

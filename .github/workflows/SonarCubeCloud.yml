@@ -38,6 +38,10 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@6db3a280da9eee4283c045c7431ab5116f1a0089 # cargo-llvm-cov
 
+      - name: Read crate version
+        id: crate_version
+        run: echo "version=$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+
       - name: Generate test coverage
         run: |
           # Match Tests workflow: lib tests plus integration test binaries.
@@ -52,3 +56,4 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@ba9859eae8dd6bd29e412f25ddbbef3d032000f4 # v8.2.2
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_SCANNER_OPTS: -Dsonar.projectVersion=${{ steps.crate_version.outputs.version }}

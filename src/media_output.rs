@@ -1995,4 +1995,1411 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    // ---- shared helpers -------------------------------------------------
+
+    use crate::db::Stream;
+    use crate::keygen::{PREFIX_PLAY_KEY, PREFIX_PUBLISH_KEY, PREFIX_STATS_KEY};
+    use serial_test::serial;
+
+    fn key_body(seed: char) -> String {
+        std::iter::repeat_n(seed, 32).collect()
+    }
+
+    fn add_stream(db: &Db, id: &str, name: &str, seed: char, enabled: bool) -> StreamViewer {
+        let stream = Stream {
+            id: id.to_string(),
+            name: name.to_string(),
+            app: "live".to_string(),
+            publish_key: format!("{PREFIX_PUBLISH_KEY}{}", key_body(seed)),
+            play_key: format!("{PREFIX_PLAY_KEY}{}", key_body(seed)),
+            stats_key: format!("{PREFIX_STATS_KEY}{}", key_body(seed)),
+            enabled,
+            created_at: 0,
+        };
+        db.stream_add(&stream).unwrap()
+    }
+
+    fn test_db() -> Arc<Db> {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        add_stream(&db, "s1", "Cam One", 'a', true);
+        add_stream(&db, "s2", "cam2", 'b', true);
+        db
+    }
+
+    fn frame(conn_id: u64, frame_type: FrameType, timestamp: u32, payload: &[u8]) -> RelayFrame {
+        RelayFrame {
+            frame_type,
+            timestamp,
+            payload: payload.to_vec(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: "cam".to_string(),
+            publisher_conn_id: conn_id,
+        }
+    }
+
+    /// Poll `check` until it returns true or `timeout` elapses.
+    fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if check() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(std::ffi::OsStr::to_str) == Some(extension))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// Write an executable fake FFmpeg that records its argv to `<script>.args`,
+    /// creates the HLS playlist named by its last argument and then runs `body`
+    /// (which decides how stdin is handled).
+    #[cfg(unix)]
+    fn fake_ffmpeg(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join(name);
+        let args_file = dir.join(format!("{name}.args"));
+        let text = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" > '{args}.tmp' && mv '{args}.tmp' '{args}'\n\
+             for last; do :; done\n\
+             case \"$last\" in *.m3u8) printf '#EXTM3U\\n' > \"$last\";; esac\n\
+             {body}\n",
+            args = args_file.display()
+        );
+        {
+            let mut file = File::create(&script).unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    // ---- configuration --------------------------------------------------
+
+    #[test]
+    fn config_defaults_are_disabled() {
+        let config = MediaOutputConfig::default();
+        assert!(!config.recording_enabled);
+        assert_eq!(config.recording_path, PathBuf::from("/data/recordings"));
+        assert_eq!(config.hls_path, PathBuf::from("/data/hls"));
+        assert_eq!(config.hls_time_secs, 4);
+        assert_eq!(config.hls_list_size, 6);
+        assert_eq!(config.hls_segment_type, "fmp4");
+        assert!(config.hls_require_key);
+        assert_eq!(config.ffmpeg_bin, "ffmpeg");
+        assert!(!config.enabled());
+        assert!(!config.needs_relay_export());
+        assert_eq!(config.export_buffer_bytes(), DEFAULT_QUEUE_MB * 1024 * 1024);
+    }
+
+    #[test]
+    fn config_enabled_tracks_each_output() {
+        let mut config = MediaOutputConfig {
+            exec_publish: "true".to_string(),
+            ..Default::default()
+        };
+        assert!(config.enabled());
+        assert!(!config.needs_relay_export(), "hooks alone need no relay");
+        config.exec_publish.clear();
+        config.exec_publish_done = "true".to_string();
+        assert!(config.enabled());
+        config.exec_publish_done.clear();
+        config.push_targets = parse_push_targets("rtmp://example/live/x");
+        assert!(config.enabled());
+        assert!(config.needs_relay_export());
+        config.push_targets.clear();
+        config.hls_enabled = true;
+        assert!(config.needs_relay_export());
+        config.hls_enabled = false;
+        config.recording_enabled = true;
+        assert!(config.needs_relay_export());
+    }
+
+    #[test]
+    fn config_apply_parses_valid_values() {
+        let mut config = MediaOutputConfig::default();
+        config.apply("MEDIA_RECORDING_ENABLED", "yes");
+        config.apply("MEDIA_RECORDING_PATH", " /tmp/rec ");
+        config.apply("MEDIA_HLS_ENABLED", "ON");
+        config.apply("MEDIA_HLS_PATH", "/tmp/hls");
+        config.apply("MEDIA_HLS_TIME_SECS", "2");
+        config.apply("MEDIA_HLS_LIST_SIZE", "10");
+        config.apply("MEDIA_HLS_SEGMENT_TYPE", " MPEGTS ");
+        config.apply("MEDIA_HLS_TRANSCODE", "1");
+        config.apply("MEDIA_HLS_REQUIRE_KEY", "false");
+        config.apply("MEDIA_PUSH_TARGETS", "cam|rtmp://a/live/{stream_id}");
+        config.apply("MEDIA_PUSH_TRANSCODE", "true");
+        config.apply("MEDIA_EXEC_PUBLISH", "echo start");
+        config.apply("MEDIA_EXEC_PUBLISH_DONE", "echo done");
+        config.apply("MEDIA_FFMPEG_BIN", " /opt/ffmpeg ");
+        config.apply("MEDIA_QUEUE_MB", "64");
+        config.apply("MEDIA_UNKNOWN", "ignored");
+
+        assert!(config.recording_enabled);
+        assert_eq!(config.recording_path, PathBuf::from("/tmp/rec"));
+        assert!(config.hls_enabled);
+        assert_eq!(config.hls_path, PathBuf::from("/tmp/hls"));
+        assert_eq!(config.hls_time_secs, 2);
+        assert_eq!(config.hls_list_size, 10);
+        assert_eq!(config.hls_segment_type, "mpegts");
+        assert!(config.hls_transcode);
+        assert!(!config.hls_require_key);
+        assert_eq!(
+            config.push_targets,
+            vec![PushTarget {
+                selector: "cam".to_string(),
+                url_template: "rtmp://a/live/{stream_id}".to_string(),
+            }]
+        );
+        assert!(config.push_transcode);
+        assert_eq!(config.exec_publish, "echo start");
+        assert_eq!(config.exec_publish_done, "echo done");
+        assert_eq!(config.ffmpeg_bin, "/opt/ffmpeg");
+        assert_eq!(config.queue_mb, 64);
+        assert_eq!(config.export_buffer_bytes(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn config_apply_ignores_or_clamps_invalid_values() {
+        let mut config = MediaOutputConfig::default();
+        config.apply("MEDIA_RECORDING_ENABLED", "maybe");
+        config.apply("MEDIA_RECORDING_PATH", "   ");
+        config.apply("MEDIA_HLS_PATH", "");
+        config.apply("MEDIA_HLS_TIME_SECS", "abc");
+        config.apply("MEDIA_HLS_LIST_SIZE", "-3");
+        config.apply("MEDIA_HLS_SEGMENT_TYPE", "webm");
+        config.apply("MEDIA_FFMPEG_BIN", " ");
+        config.apply("MEDIA_QUEUE_MB", "lots");
+        assert!(!config.recording_enabled);
+        assert_eq!(config.recording_path, PathBuf::from("/data/recordings"));
+        assert_eq!(config.hls_path, PathBuf::from("/data/hls"));
+        assert_eq!(config.hls_time_secs, 4);
+        assert_eq!(config.hls_list_size, 6);
+        assert_eq!(config.hls_segment_type, "fmp4");
+        assert_eq!(config.ffmpeg_bin, "ffmpeg");
+        assert_eq!(config.queue_mb, DEFAULT_QUEUE_MB);
+
+        config.apply("MEDIA_HLS_TIME_SECS", "0");
+        config.apply("MEDIA_HLS_LIST_SIZE", "1000");
+        config.apply("MEDIA_QUEUE_MB", "100000");
+        assert_eq!(config.hls_time_secs, 1);
+        assert_eq!(config.hls_list_size, 100);
+        assert_eq!(config.queue_mb, 512);
+        config.apply("MEDIA_QUEUE_MB", "0");
+        assert_eq!(config.queue_mb, 1);
+
+        config.apply("MEDIA_RECORDING_ENABLED", "true");
+        config.apply("MEDIA_RECORDING_ENABLED", "off");
+        assert!(!config.recording_enabled);
+    }
+
+    #[test]
+    fn push_target_parser_rejects_invalid_entries() {
+        let targets = parse_push_targets(
+            " ; rtmp://default/live ; |rtmp://empty/selector ; cam|http://not/rtmp ; cam|rtmps://ok",
+        );
+        assert_eq!(
+            targets,
+            vec![
+                PushTarget {
+                    selector: "*".to_string(),
+                    url_template: "rtmp://default/live".to_string(),
+                },
+                PushTarget {
+                    selector: "cam".to_string(),
+                    url_template: "rtmps://ok".to_string(),
+                },
+            ]
+        );
+        assert!(!targets[1].matches("id", "other"));
+        assert!(targets[1].matches("cam", "other"));
+    }
+
+    #[test]
+    fn env_lines_skip_comments_and_strip_quotes() {
+        assert_eq!(parse_env_line(""), None);
+        assert_eq!(parse_env_line("   # comment"), None);
+        assert_eq!(parse_env_line("NO_EQUALS"), None);
+        assert_eq!(
+            parse_env_line(" KEY = value "),
+            Some(("KEY".to_string(), "value".to_string()))
+        );
+        assert_eq!(
+            parse_env_line("KEY=\"quoted value\""),
+            Some(("KEY".to_string(), "quoted value".to_string()))
+        );
+        assert_eq!(
+            parse_env_line("KEY='single'"),
+            Some(("KEY".to_string(), "single".to_string()))
+        );
+        assert_eq!(
+            parse_env_line("KEY=\""),
+            Some(("KEY".to_string(), "\"".to_string()))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_load_reads_file_then_env_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join("server.env");
+        fs::write(
+            &env_file,
+            "# media outputs\n\
+             MEDIA_RECORDING_ENABLED=true\n\
+             MEDIA_RECORDING_PATH=\"/srv/rec\"\n\
+             MEDIA_HLS_PATH=/srv/hls\n\
+             MEDIA_EXEC_PUBLISH='echo hi'\n\
+             MEDIA_FFMPEG_BIN=/usr/bin/ffmpeg\n\
+             LRTMP2_API_TOKEN=ignored\n",
+        )
+        .unwrap();
+
+        // SAFETY: #[serial] keeps env-mutating tests from overlapping, and the
+        // variables are removed before the assertions.
+        unsafe {
+            std::env::set_var("LRTMP2_MEDIA_HLS_PATH", "/env/hls");
+            std::env::set_var("LRTMP2_MEDIA_EXEC_PUBLISH", "");
+            std::env::set_var("LRTMP2_MEDIA_FFMPEG_BIN", "");
+            std::env::set_var("LRTMP2_MEDIA_QUEUE_MB", "8");
+        }
+        let config = MediaOutputConfig::load(env_file.to_str().unwrap());
+        unsafe {
+            std::env::remove_var("LRTMP2_MEDIA_HLS_PATH");
+            std::env::remove_var("LRTMP2_MEDIA_EXEC_PUBLISH");
+            std::env::remove_var("LRTMP2_MEDIA_FFMPEG_BIN");
+            std::env::remove_var("LRTMP2_MEDIA_QUEUE_MB");
+        }
+
+        assert!(config.recording_enabled);
+        assert_eq!(config.recording_path, PathBuf::from("/srv/rec"));
+        assert_eq!(config.hls_path, PathBuf::from("/env/hls"));
+        assert_eq!(config.exec_publish, "", "empty env clears hooks");
+        assert_eq!(
+            config.ffmpeg_bin, "/usr/bin/ffmpeg",
+            "empty env must not clear non-clearable keys"
+        );
+        assert_eq!(config.queue_mb, 8);
+
+        let missing = MediaOutputConfig::load(dir.path().join("absent.env").to_str().unwrap());
+        assert!(!missing.recording_enabled);
+        let empty = MediaOutputConfig::load("");
+        assert_eq!(empty.hls_path, PathBuf::from("/data/hls"));
+    }
+
+    // ---- sinks and queues -----------------------------------------------
+
+    #[test]
+    fn sink_sender_disables_when_byte_limit_exceeded() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut sink = make_sink("limit".to_string(), 8, move |_rx, _queued, _failed| {
+            let _ = release_rx.recv();
+        });
+        sink.try_send(Arc::new(vec![0; 4]));
+        assert!(sink.tx.is_some());
+        assert_eq!(sink.queued_bytes.load(Ordering::Acquire), 4);
+        sink.try_send(Arc::new(vec![0; 5]));
+        assert!(sink.tx.is_none());
+        assert!(sink.failed.load(Ordering::Acquire));
+        assert_eq!(sink.queued_bytes.load(Ordering::Acquire), 4);
+        // Further sends are dropped silently once disabled.
+        sink.try_send(Arc::new(vec![0; 1]));
+        sink.disable("again");
+        drop(release_tx);
+        sink.stop();
+    }
+
+    #[test]
+    fn sink_sender_disables_when_message_queue_full() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut sink = make_sink(
+            "full".to_string(),
+            usize::MAX,
+            move |rx, _queued, _failed| {
+                let _ = release_rx.recv();
+                drop(rx);
+            },
+        );
+        for _ in 0..SINK_QUEUE_MESSAGES {
+            sink.try_send(Arc::new(vec![1]));
+        }
+        assert!(sink.tx.is_some());
+        sink.try_send(Arc::new(vec![1]));
+        assert!(sink.tx.is_none());
+        assert!(sink.failed.load(Ordering::Acquire));
+        assert_eq!(
+            sink.queued_bytes.load(Ordering::Acquire),
+            SINK_QUEUE_MESSAGES
+        );
+        drop(release_tx);
+        sink.stop();
+    }
+
+    #[test]
+    fn sink_sender_disables_when_worker_exited() {
+        let mut sink = make_sink("exit".to_string(), usize::MAX, |rx, _queued, _failed| {
+            drop(rx);
+        });
+        let worker_done = wait_until(Duration::from_secs(5), || {
+            sink.worker.as_ref().is_some_and(|w| w.is_finished())
+        });
+        assert!(worker_done);
+        sink.try_send(Arc::new(vec![1, 2, 3]));
+        assert!(sink.tx.is_none());
+        assert!(sink.failed.load(Ordering::Acquire));
+        assert_eq!(sink.queued_bytes.load(Ordering::Acquire), 0);
+        sink.stop();
+    }
+
+    #[test]
+    fn sink_stop_tolerates_panicked_and_missing_workers() {
+        let sink = make_sink("panic".to_string(), 16, |_rx, _queued, _failed| {
+            panic!("worker panic for coverage");
+        });
+        sink.stop();
+
+        let mut sink = make_sink("none".to_string(), 16, |_rx, _queued, _failed| {});
+        if let Some(worker) = sink.worker.take() {
+            worker.join().unwrap();
+        }
+        sink.stop();
+    }
+
+    #[test]
+    fn consume_queue_writes_until_disconnected() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        tx.send(Arc::new(vec![1, 2])).unwrap();
+        queued.fetch_add(2, Ordering::AcqRel);
+        let sender = thread::spawn(move || {
+            // Arrives after at least one receive timeout.
+            thread::sleep(Duration::from_millis(150));
+            tx.send(Arc::new(vec![3])).unwrap();
+        });
+        queued.fetch_add(1, Ordering::AcqRel);
+        let mut written = Vec::new();
+        consume_queue(rx, Arc::clone(&queued), failed, |tag| {
+            written.extend_from_slice(tag);
+            Ok(())
+        })
+        .unwrap();
+        sender.join().unwrap();
+        assert_eq!(written, vec![1, 2, 3]);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn consume_queue_propagates_write_errors() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let queued = Arc::new(AtomicUsize::new(3));
+        tx.send(Arc::new(vec![1, 2, 3])).unwrap();
+        let err = consume_queue(rx, Arc::clone(&queued), Arc::default(), |_| {
+            Err(io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "disk full");
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn consume_queue_stops_and_resets_when_failed() {
+        // Failure raised by the writer stops after the current tag.
+        let (tx, rx) = mpsc::sync_channel(4);
+        let queued = Arc::new(AtomicUsize::new(2));
+        let failed = Arc::new(AtomicBool::new(false));
+        tx.send(Arc::new(vec![1])).unwrap();
+        tx.send(Arc::new(vec![2])).unwrap();
+        let writer_failed = Arc::clone(&failed);
+        let mut writes = 0;
+        consume_queue(rx, Arc::clone(&queued), Arc::clone(&failed), |_| {
+            writes += 1;
+            writer_failed.store(true, Ordering::Release);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(writes, 1);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+
+        // Already failed: nothing is written and the byte counter is cleared.
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.send(Arc::new(vec![9])).unwrap();
+        let queued = Arc::new(AtomicUsize::new(1));
+        let failed = Arc::new(AtomicBool::new(true));
+        consume_queue(rx, Arc::clone(&queued), failed, |_| {
+            panic!("must not write after failure")
+        })
+        .unwrap();
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn consume_queue_drops_tag_received_after_failure() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let queued = Arc::new(AtomicUsize::new(1));
+        let failed = Arc::new(AtomicBool::new(false));
+        let setter_failed = Arc::clone(&failed);
+        let sender = thread::spawn(move || {
+            // Let the consumer block in recv_timeout, then fail and deliver.
+            thread::sleep(Duration::from_millis(30));
+            setter_failed.store(true, Ordering::Release);
+            let _ = tx.send(Arc::new(vec![7]));
+        });
+        consume_queue(rx, Arc::clone(&queued), failed, |_| {
+            panic!("must not write after failure")
+        })
+        .unwrap();
+        sender.join().unwrap();
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
+
+    // ---- HLS directory housekeeping --------------------------------------
+
+    #[test]
+    fn clean_hls_dir_removes_only_owned_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("session");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        for name in [
+            "index.m3u8",
+            "index.m3u8.tmp",
+            "init.mp4",
+            "segment_000001.m4s",
+            "segment_000002.ts",
+            "segment_000003.txt",
+            "notes.txt",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        clean_hls_dir(&dir).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["nested", "notes.txt", "segment_000003.txt"]);
+
+        // A missing directory is created instead.
+        let fresh = tmp.path().join("fresh");
+        clean_hls_dir(&fresh).unwrap();
+        assert!(fresh.is_dir());
+    }
+
+    #[test]
+    fn clean_older_hls_sessions_keeps_current_and_newer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stream_dir = tmp.path();
+        for name in ["session-001", "session-002", "session-003", "other"] {
+            fs::create_dir_all(stream_dir.join(name)).unwrap();
+        }
+        fs::write(stream_dir.join("session-000-file"), b"x").unwrap();
+        clean_older_hls_sessions(stream_dir, &stream_dir.join("session-002")).unwrap();
+        assert!(!stream_dir.join("session-001").exists());
+        assert!(stream_dir.join("session-002").is_dir());
+        assert!(stream_dir.join("session-003").is_dir());
+        assert!(stream_dir.join("other").is_dir());
+        assert!(stream_dir.join("session-000-file").is_file());
+
+        // A current path without a file name is a no-op.
+        clean_older_hls_sessions(stream_dir, Path::new("/")).unwrap();
+        assert!(stream_dir.join("session-003").is_dir());
+        assert!(clean_older_hls_sessions(&stream_dir.join("absent"), Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn hls_session_dir_names_sort_by_creation() {
+        let first = hls_session_dir_name(1, 2);
+        let second = hls_session_dir_name(1, 2);
+        assert!(first.starts_with("session-"));
+        assert!(first < second);
+        assert_eq!(safe_component(&first), first);
+    }
+
+    #[test]
+    fn ffmpeg_codec_args_follow_transcode_flag() {
+        let args = |transcode| {
+            let mut cmd = Command::new("ffmpeg");
+            add_ffmpeg_input(&mut cmd);
+            add_codec_args(&mut cmd, transcode);
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let copy = args(false);
+        assert!(copy.starts_with("-hide_banner -loglevel warning -f flv -i pipe:0"));
+        assert!(copy.ends_with("-c copy"));
+        let transcode = args(true);
+        assert!(transcode.contains("-c:v libx264"));
+        assert!(transcode.contains("-c:a aac"));
+    }
+
+    #[test]
+    fn flv_tag_maps_frame_types_and_rejects_oversized_payloads() {
+        assert_eq!(flv_tag(FrameType::Audio, 0, &[]).unwrap()[0], 8);
+        assert_eq!(flv_tag(FrameType::Script, 0, &[]).unwrap()[0], 18);
+        assert_eq!(flv_tag(FrameType::Metadata, 0, &[]).unwrap()[0], 18);
+        assert!(flv_tag(FrameType::Video, 0, &vec![0; MAX_FLV_PAYLOAD + 1]).is_none());
+    }
+
+    // ---- manager / recording --------------------------------------------
+
+    #[test]
+    fn disabled_manager_ignores_publishers_and_frames() {
+        let mut manager = MediaOutputManager::new(MediaOutputConfig::default(), test_db());
+        assert!(!manager.enabled());
+        manager.ensure_publisher(1, "s1", 1);
+        manager.handle_frame(&frame(1, FrameType::Video, 0, &[1]), "s1", 1);
+        assert!(manager.sessions.is_empty());
+        manager.stop_all();
+    }
+
+    #[test]
+    fn recording_sink_writes_flv_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("recordings");
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: root.clone(),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        assert!(manager.enabled());
+        assert!(root.is_dir(), "recording root is created and hardened");
+
+        // Empty or unknown stream ids never create sessions.
+        manager.ensure_publisher(7, "", 1);
+        manager.handle_frame(&frame(7, FrameType::Video, 0, &[1]), "", 1);
+        manager.ensure_publisher(7, "missing", 1);
+        manager.handle_frame(&frame(7, FrameType::Video, 0, &[1]), "missing", 1);
+        assert!(manager.sessions.is_empty());
+
+        manager.ensure_publisher(7, "s1", 1);
+        manager.ensure_publisher(7, "s1", 1); // same route and generation: no-op
+        assert_eq!(manager.sessions.len(), 1);
+        let frames = [
+            frame(7, FrameType::Script, 0, b"meta"),
+            frame(7, FrameType::Video, 0, &[0x17, 0, 0, 0, 0]),
+            frame(7, FrameType::Audio, 20, &[0xaf, 0x01, 0x21]),
+            // Oversized payloads are skipped rather than written.
+            frame(7, FrameType::Video, 40, &vec![0; MAX_FLV_PAYLOAD + 1]),
+            frame(7, FrameType::Video, 40, &[0x27, 1, 0, 0, 0, 9]),
+        ];
+        for f in &frames {
+            manager.handle_frame(f, "s1", 1);
+        }
+        assert_eq!(manager.sessions[&7].last_timestamp, Some(40));
+        manager.stop_all();
+        assert!(manager.sessions.is_empty());
+
+        let files = files_with_extension(&root.join("s1"), "flv");
+        assert_eq!(files.len(), 1, "one recording per publish session");
+        let data = fs::read(&files[0]).unwrap();
+        assert!(data.starts_with(flv_header()));
+        let mut expected = flv_header().to_vec();
+        for f in frames.iter().filter(|f| f.payload.len() <= MAX_FLV_PAYLOAD) {
+            expected.extend(flv_tag(f.frame_type, f.timestamp, &f.payload).unwrap());
+        }
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn manager_restarts_sessions_on_route_generation_and_timestamp_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("recordings");
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: root.clone(),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        let video = |ts| frame(3, FrameType::Video, ts, &[0x17, 0]);
+        // Recording file names are millisecond timestamps; keep sessions apart.
+        let next_ms = || thread::sleep(Duration::from_millis(3));
+
+        let current_file = |m: &MediaOutputManager| m.sessions[&3].recording_file.clone();
+
+        // handle_frame starts a session on its own.
+        manager.handle_frame(&video(u32::MAX - 5), "s1", 1);
+        assert_eq!(manager.sessions[&3].stream_id, "s1");
+        let first = current_file(&manager);
+
+        // u32 wraparound and small backwards jitter are continuations.
+        manager.handle_frame(&video(10), "s1", 1);
+        manager.handle_frame(&video(5), "s1", 1);
+        manager.handle_frame(&video(5_000), "s1", 1);
+        assert_eq!(current_file(&manager), first);
+
+        // A large backwards jump is a same-connection republish.
+        next_ms();
+        manager.handle_frame(&video(0), "s1", 1);
+        assert_ne!(current_file(&manager), first);
+
+        // A new generation replaces the session too.
+        next_ms();
+        manager.ensure_publisher(3, "s1", 2);
+        assert_eq!(manager.sessions[&3].generation, 2);
+
+        // Switching the route retires the old stream's session.
+        manager.handle_frame(&video(100), "s2", 2);
+        assert_eq!(manager.sessions[&3].stream_id, "s2");
+
+        // Publishers that are no longer live are retired.
+        manager.retain_publishers(&HashSet::from([3]));
+        assert_eq!(manager.sessions.len(), 1);
+        manager.retain_publishers(&HashSet::new());
+        assert!(manager.sessions.is_empty());
+        manager.stop_all();
+
+        assert_eq!(files_with_extension(&root.join("s1"), "flv").len(), 3);
+        let s2 = files_with_extension(&root.join("s2"), "flv");
+        assert_eq!(s2.len(), 1);
+        assert!(fs::read(&s2[0]).unwrap().starts_with(flv_header()));
+    }
+
+    #[test]
+    fn manager_aborts_sessions_when_reaper_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: tmp.path().join("rec"),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+
+        // No reaper: sessions are cancelled inline.
+        let saved_tx = manager.retire_tx.take();
+        manager.ensure_publisher(1, "s1", 1);
+        manager.ensure_publisher(1, "s1", 2);
+        assert_eq!(manager.sessions[&1].generation, 2);
+
+        // Retirement queue full (rendezvous channel nobody receives on).
+        let (full_tx, _full_rx) = mpsc::sync_channel(0);
+        manager.retire_tx = Some(full_tx);
+        manager.ensure_publisher(1, "s1", 3);
+        assert_eq!(manager.sessions[&1].generation, 3);
+
+        // Reaper disconnected.
+        let (gone_tx, gone_rx) = mpsc::sync_channel(1);
+        drop(gone_rx);
+        manager.retire_tx = Some(gone_tx);
+        manager.ensure_publisher(1, "s1", 4);
+        assert_eq!(manager.sessions[&1].generation, 4);
+
+        drop(saved_tx);
+        manager.stop_all();
+    }
+
+    #[test]
+    fn manager_warns_when_media_roots_cannot_be_hardened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("file");
+        fs::write(&not_a_dir, b"x").unwrap();
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: not_a_dir.clone(),
+            hls_enabled: true,
+            hls_path: not_a_dir.clone(),
+            ffmpeg_bin: tmp.path().join("no-ffmpeg").display().to_string(),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        manager.ensure_publisher(1, "s1", 1);
+        // Both workers fail to create their directories under a regular file.
+        let failed = wait_until(Duration::from_secs(5), || {
+            manager.sessions[&1]
+                .sinks
+                .iter()
+                .all(|s| s.failed.load(Ordering::Acquire))
+        });
+        assert!(failed);
+        manager.handle_frame(&frame(1, FrameType::Video, 0, &[1]), "s1", 1);
+        assert!(manager.sessions[&1].sinks.iter().all(|s| s.tx.is_none()));
+        manager.stop_all();
+        assert!(not_a_dir.is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn harden_media_tree_restricts_existing_entries_and_skips_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/file.flv"), b"x").unwrap();
+        fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.join("a/b/file.flv"), fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(tmp.path(), root.join("link")).unwrap();
+        harden_media_tree(&root).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.join("a")), 0o700);
+        assert_eq!(mode(&root.join("a/b")), 0o700);
+        assert_eq!(mode(&root.join("a/b/file.flv")), 0o600);
+        assert_eq!(mode(tmp.path()) & 0o700, 0o700);
+    }
+
+    // ---- exec hooks -------------------------------------------------------
+
+    #[cfg(unix)]
+    fn read_env_dump(path: &Path) -> HashMap<String, String> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn dump_env_command(target: &Path) -> String {
+        format!(
+            "env | grep '^OPENRTMP_' > '{p}.tmp' && mv '{p}.tmp' '{p}'",
+            p = target.display()
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exec_hooks_receive_publish_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let publish_env = tmp.path().join("publish.env");
+        let done_env = tmp.path().join("done.env");
+        let rec_root = tmp.path().join("rec");
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: rec_root.clone(),
+            // The publish hook keeps running until the session stops it.
+            exec_publish: format!("{}; exec sleep 30", dump_env_command(&publish_env)),
+            exec_publish_done: dump_env_command(&done_env),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        manager.ensure_publisher(42, "s1", 1);
+        assert!(manager.sessions[&42].publish_exec.is_some());
+        assert!(wait_until(Duration::from_secs(5), || publish_env.exists()));
+
+        let started = Instant::now();
+        manager.stop_all();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "long-running publish hook is terminated on stop"
+        );
+
+        let env = read_env_dump(&publish_env);
+        assert_eq!(env["OPENRTMP_EVENT"], "publish");
+        assert_eq!(env["OPENRTMP_STREAM_ID"], "s1");
+        assert_eq!(env["OPENRTMP_STREAM_NAME"], "Cam One");
+        assert_eq!(env["OPENRTMP_APP"], "live");
+        assert_eq!(env["OPENRTMP_PUBLISHER_CONN_ID"], "42");
+        let recording = PathBuf::from(&env["OPENRTMP_RECORDING_FILE"]);
+        assert!(recording.starts_with(rec_root.join("s1")));
+        assert_eq!(
+            env.get("OPENRTMP_HLS_PLAYLIST").map(String::as_str),
+            Some("")
+        );
+
+        assert!(wait_until(Duration::from_secs(5), || done_env.exists()));
+        let done = read_env_dump(&done_env);
+        assert_eq!(done["OPENRTMP_EVENT"], "publish_done");
+        assert_eq!(done["OPENRTMP_STREAM_ID"], "s1");
+        assert_eq!(done["OPENRTMP_RECORDING_FILE"], recording.to_string_lossy());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_only_sessions_start_without_relay_sinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("hook.env");
+        let config = MediaOutputConfig {
+            exec_publish: dump_env_command(&marker),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        manager.ensure_publisher(9, "s2", 1);
+        assert!(manager.sessions[&9].sinks.is_empty());
+        assert!(wait_until(Duration::from_secs(5), || marker.exists()));
+        let env = read_env_dump(&marker);
+        assert_eq!(env["OPENRTMP_STREAM_NAME"], "cam2");
+        assert_eq!(env["OPENRTMP_RECORDING_FILE"], "");
+        // Frames still flow through without sinks.
+        manager.handle_frame(&frame(9, FrameType::Audio, 0, &[1]), "s2", 1);
+        manager.stop_all();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminate_hook_child_escalates_to_sigkill() {
+        let env = ExecEnv {
+            conn_id: 1,
+            stream_id: "s1",
+            stream_name: "cam",
+            app: "live",
+            recording_file: None,
+            hls_playlist: None,
+        };
+        // Ignoring SIGTERM (inherited by `sleep`) forces the SIGKILL path.
+        let mut child = spawn_hook("trap '' TERM; sleep 30", "publish", &env).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        terminate_hook_child(&mut child);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some());
+
+        // An already-exited hook is simply reaped.
+        let mut done = spawn_hook("exit 0", "publish", &env).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || {
+            done.try_wait().ok().flatten().is_some()
+        }));
+        terminate_hook_child(&mut done);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn aborting_a_session_terminates_its_publish_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MediaOutputConfig {
+            exec_publish: "exec sleep 30".to_string(),
+            recording_enabled: true,
+            recording_path: tmp.path().join("rec"),
+            ..Default::default()
+        };
+        let session = MediaSession::start(5, 1, "s1", "cam", "live", &config);
+        assert!(session.publish_exec.is_some());
+        assert_eq!(session.sinks.len(), 1);
+        let started = Instant::now();
+        session.abort("test");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // ---- FFmpeg-backed sinks ---------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn hls_sink_runs_ffmpeg_and_replaces_older_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hls_root = tmp.path().join("hls");
+        let stream_dir = hls_root.join("s1");
+        fs::create_dir_all(stream_dir.join("session-0")).unwrap();
+        fs::create_dir_all(stream_dir.join("keep")).unwrap();
+        let ffmpeg = fake_ffmpeg(tmp.path(), "ffmpeg-hls", "exec cat > /dev/null");
+        let config = MediaOutputConfig {
+            hls_enabled: true,
+            hls_path: hls_root.clone(),
+            ffmpeg_bin: ffmpeg.display().to_string(),
+            hls_time_secs: 2,
+            hls_list_size: 3,
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        manager.ensure_publisher(11, "s1", 4);
+        let playlist = manager.sessions[&11].hls_playlist.clone().unwrap();
+        assert!(playlist.starts_with(&stream_dir));
+        assert!(wait_until(Duration::from_secs(5), || playlist.exists()));
+        for ts in [0, 40, 80] {
+            manager.handle_frame(&frame(11, FrameType::Video, ts, &[0x17, 0, 1]), "s1", 4);
+        }
+        manager.stop_all();
+
+        assert!(!stream_dir.join("session-0").exists());
+        assert!(stream_dir.join("keep").is_dir());
+        let args = fs::read_to_string(tmp.path().join("ffmpeg-hls.args")).unwrap();
+        assert!(args.contains("-f flv -i pipe:0"), "{args}");
+        assert!(args.contains("-c copy"), "{args}");
+        assert!(args.contains("-hls_time 2 -hls_list_size 3"), "{args}");
+        assert!(args.contains("-hls_segment_type fmp4"), "{args}");
+        assert!(args.contains("segment_%06d.m4s"), "{args}");
+        assert!(args.trim_end().ends_with("index.m3u8"), "{args}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hls_sink_supports_mpegts_and_transcoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(tmp.path(), "ffmpeg-ts", "exec cat > /dev/null");
+        let config = MediaOutputConfig {
+            hls_enabled: true,
+            hls_path: tmp.path().join("hls"),
+            hls_segment_type: "mpegts".to_string(),
+            hls_transcode: true,
+            ffmpeg_bin: ffmpeg.display().to_string(),
+            ..Default::default()
+        };
+        let mut sinks = Vec::new();
+        let playlist = setup_hls_sink(&config, "s1", 1, 1, "s1", 1024 * 1024, &mut sinks).unwrap();
+        assert_eq!(sinks.len(), 1);
+        assert!(wait_until(Duration::from_secs(5), || playlist.exists()));
+        for sink in sinks {
+            sink.stop();
+        }
+        let args = fs::read_to_string(tmp.path().join("ffmpeg-ts.args")).unwrap();
+        assert!(args.contains("-c:v libx264"), "{args}");
+        assert!(args.contains("segment_%06d.ts"), "{args}");
+        assert!(!args.contains("-hls_segment_type"), "{args}");
+
+        let disabled = MediaOutputConfig::default();
+        let mut none = Vec::new();
+        assert!(setup_hls_sink(&disabled, "s1", 1, 1, "s1", 1, &mut none).is_none());
+        assert!(setup_recording_sink(&disabled, "s1", 1, &mut none).is_none());
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn push_sinks_render_matching_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(tmp.path(), "ffmpeg-push", "exec cat > /dev/null");
+        let config = MediaOutputConfig {
+            push_targets: vec![
+                PushTarget {
+                    selector: "s1".to_string(),
+                    url_template: "rtmp://example/{app}/{stream_name}".to_string(),
+                },
+                PushTarget {
+                    selector: "other".to_string(),
+                    url_template: "rtmp://unused/live".to_string(),
+                },
+                PushTarget {
+                    selector: "*".to_string(),
+                    url_template: "{app}/not-rtmp".to_string(),
+                },
+            ],
+            push_transcode: true,
+            ffmpeg_bin: ffmpeg.display().to_string(),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        manager.ensure_publisher(2, "s1", 1);
+        assert_eq!(manager.sessions[&2].sinks.len(), 1);
+        assert_eq!(manager.sessions[&2].sinks[0].label, "push#0:s1");
+        let args_file = tmp.path().join("ffmpeg-push.args");
+        assert!(wait_until(Duration::from_secs(5), || args_file.exists()));
+        manager.handle_frame(&frame(2, FrameType::Audio, 0, &[0xaf, 0]), "s1", 1);
+        manager.stop_all();
+        let args = fs::read_to_string(&args_file).unwrap();
+        assert!(args.contains("-c:v libx264"), "{args}");
+        assert!(
+            args.trim_end()
+                .ends_with("-f flv rtmp://example/live/Cam%20One"),
+            "{args}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn push_sink_fails_when_ffmpeg_cannot_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MediaOutputConfig {
+            ffmpeg_bin: tmp.path().join("missing-ffmpeg").display().to_string(),
+            ..Default::default()
+        };
+        let mut sink = spawn_push_sink(&config, "rtmp://x/live".to_string(), 1024, "p".into());
+        assert!(wait_until(Duration::from_secs(5), || {
+            sink.failed.load(Ordering::Acquire)
+        }));
+        sink.try_send(Arc::new(vec![1]));
+        assert!(sink.tx.is_none());
+        sink.stop();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ffmpeg_worker_fails_when_encoder_exits_early() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(tmp.path(), "ffmpeg-exit", "exit 1");
+        let config = MediaOutputConfig {
+            ffmpeg_bin: ffmpeg.display().to_string(),
+            ..Default::default()
+        };
+        let mut sink =
+            spawn_push_sink(&config, "rtmp://x/live".to_string(), usize::MAX, "e".into());
+        // Keep feeding until the broken pipe is noticed by the worker.
+        let failed = wait_until(Duration::from_secs(10), || {
+            sink.try_send(Arc::new(vec![0; 4096]));
+            sink.failed.load(Ordering::Acquire)
+        });
+        assert!(failed);
+        sink.stop();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ffmpeg_worker_kills_stalled_encoder_when_sink_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Never reads stdin: the worker blocks once the pipe buffer fills.
+        let ffmpeg = fake_ffmpeg(tmp.path(), "ffmpeg-stall", "exec sleep 30");
+        let config = MediaOutputConfig {
+            ffmpeg_bin: ffmpeg.display().to_string(),
+            ..Default::default()
+        };
+        let mut sink = spawn_push_sink(&config, "rtmp://x/live".to_string(), 1 << 20, "s".into());
+        let chunk = Arc::new(vec![0u8; 64 * 1024]);
+        let disabled = wait_until(Duration::from_secs(10), || {
+            sink.try_send(Arc::clone(&chunk));
+            sink.tx.is_none()
+        });
+        assert!(disabled, "byte limit disables the stalled sink");
+        let started = Instant::now();
+        sink.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "monitor kills the stalled encoder"
+        );
+    }
+
+    #[test]
+    fn wait_child_bounded_terminates_overrunning_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_child_bounded(&mut child, Duration::from_millis(50));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    // ---- HLS HTTP serving -------------------------------------------------
+
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const SESSION_OLD: &str = "session-00000000000000000001-a";
+    const SESSION_NEW: &str = "session-00000000000000000002-b";
+    const PLAYLIST: &str = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_000001.m4s\n";
+
+    struct HlsFixture {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        db: Arc<Db>,
+        key_s1: String,
+        key_s2: String,
+        key_disabled: String,
+    }
+
+    fn hls_fixture() -> HlsFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("hls");
+        let s1 = root.join("s1");
+        fs::create_dir_all(s1.join(SESSION_OLD)).unwrap();
+        fs::create_dir_all(s1.join(SESSION_NEW)).unwrap();
+        // Not a safe component: must never be chosen as the active session.
+        fs::create_dir_all(s1.join("session-zz bad")).unwrap();
+        fs::write(s1.join("session-zzz-file"), b"x").unwrap();
+        let session = s1.join(SESSION_NEW);
+        fs::write(session.join("index.m3u8"), PLAYLIST).unwrap();
+        fs::write(session.join("segment_000001.m4s"), b"SEGMENT").unwrap();
+        fs::write(session.join("init.mp4"), b"INIT").unwrap();
+        fs::create_dir_all(root.join("s2")).unwrap();
+
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let key_s1 = add_stream(&db, "s1", "cam", 'a', true).play_key;
+        let key_s2 = add_stream(&db, "s2", "cam2", 'b', true).play_key;
+        let key_disabled = add_stream(&db, "s3", "cam3", 'c', false).play_key;
+        HlsFixture {
+            _tmp: tmp,
+            root,
+            db,
+            key_s1,
+            key_s2,
+            key_disabled,
+        }
+    }
+
+    fn hls_app(fx: &HlsFixture, require_key: bool) -> Router {
+        hls_router(
+            fx.root.clone(),
+            Arc::clone(&fx.db),
+            require_key,
+            4,
+            Vec::new(),
+            None,
+        )
+    }
+
+    async fn hls_get(app: &Router, uri: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [192, 0, 2, 10],
+                40000,
+            ))));
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn hls_requires_valid_enabled_play_key_for_stream() {
+        let fx = hls_fixture();
+        let app = hls_app(&fx, true);
+        let (status, _, _) = hls_get(&app, "/hls/s1/index.m3u8").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, _) = hls_get(&app, "/hls/s1/index.m3u8?key=nope").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let wrong = format!("/hls/s1/index.m3u8?key={}", fx.key_s2);
+        assert_eq!(hls_get(&app, &wrong).await.0, StatusCode::FORBIDDEN);
+        let disabled = format!("/hls/s3/index.m3u8?key={}", fx.key_disabled);
+        assert_eq!(hls_get(&app, &disabled).await.0, StatusCode::FORBIDDEN);
+        let (status, _, _) = hls_get(&app, "/hls/bad%20id/index.m3u8").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn hls_redirects_to_latest_session_and_rewrites_playlist() {
+        let fx = hls_fixture();
+        let app = hls_app(&fx, true);
+        let key = &fx.key_s1;
+
+        let (status, headers, _) = hls_get(&app, &format!("/hls/s1/index.m3u8?key={key}")).await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        let location = headers[header::LOCATION].to_str().unwrap();
+        assert_eq!(
+            location,
+            format!("/hls/s1/{SESSION_NEW}/index.m3u8?key={key}")
+        );
+
+        let (status, headers, body) = hls_get(&app, location).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        assert_eq!(
+            headers[header::CACHE_CONTROL],
+            "no-cache, no-store, must-revalidate"
+        );
+        assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            text.contains(&format!("URI=\"init.mp4?key={key}\"")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("segment_000001.m4s?key={key}")),
+            "{text}"
+        );
+
+        let segment = format!("/hls/s1/{SESSION_NEW}/segment_000001.m4s?key={key}");
+        let (status, headers, body) = hls_get(&app, &segment).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "video/iso.segment");
+        assert_eq!(body, b"SEGMENT");
+
+        let init = format!("/hls/s1/{SESSION_NEW}/init.mp4?key={key}");
+        let (status, headers, body) = hls_get(&app, &init).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(body, b"INIT");
+
+        // The same client renews its slot instead of consuming another.
+        assert_eq!(
+            hls_get(&app, &segment).await.0,
+            StatusCode::OK,
+            "renewal keeps the viewer admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_without_key_requirement_serves_unmodified_playlists() {
+        let fx = hls_fixture();
+        let app = hls_app(&fx, false);
+        let (status, headers, _) = hls_get(&app, "/hls/s1/index.m3u8").await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            headers[header::LOCATION],
+            format!("/hls/s1/{SESSION_NEW}/index.m3u8").as_str()
+        );
+        let (status, _, body) = hls_get(
+            &app,
+            &format!("/hls/s1/{SESSION_NEW}/index.m3u8?key=anything"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, PLAYLIST.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn hls_rejects_traversal_and_reports_missing_files() {
+        let fx = hls_fixture();
+        let app = hls_app(&fx, false);
+        for uri in [
+            "/hls/s1/../s2/index.m3u8",
+            "/hls/s1/%2E%2E/secret.m3u8",
+            &format!("/hls/s1/{SESSION_NEW}/index.html"),
+            &format!("/hls/s1/{SESSION_NEW}/.hidden/../x.ts"),
+        ] {
+            let status = hls_get(&app, uri).await.0;
+            assert!(
+                matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND),
+                "{uri}: {status}"
+            );
+        }
+        assert_eq!(
+            hls_get(&app, "/hls/s1/x/../../s2/a.ts").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let missing = format!("/hls/s1/{SESSION_NEW}/segment_999999.m4s");
+        assert_eq!(hls_get(&app, &missing).await.0, StatusCode::NOT_FOUND);
+        let missing_playlist = format!("/hls/s1/{SESSION_OLD}/index.m3u8");
+        assert_eq!(
+            hls_get(&app, &missing_playlist).await.0,
+            StatusCode::NOT_FOUND
+        );
+        // Stream directory without sessions, and no directory at all.
+        assert_eq!(
+            hls_get(&app, "/hls/s2/index.m3u8").await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            hls_get(&app, "/hls/s9/index.m3u8").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn hls_refuses_symlinks_that_escape_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let fx = hls_fixture();
+        let outside = fx._tmp.path().join("outside");
+        fs::create_dir_all(outside.join(SESSION_NEW)).unwrap();
+        fs::write(outside.join("leak.m3u8"), "#EXTM3U\nsecret\n").unwrap();
+        symlink(&outside, fx.root.join("s4")).unwrap();
+        symlink(&outside, fx.root.join("s1").join("escape")).unwrap();
+
+        let app = hls_app(&fx, false);
+        assert_eq!(
+            hls_get(&app, "/hls/s4/index.m3u8").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            hls_get(&app, "/hls/s4/leak.m3u8").await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            hls_get(&app, "/hls/s1/escape/leak.m3u8").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_rejects_oversized_playlists_and_missing_root() {
+        let fx = hls_fixture();
+        let big = fx.root.join("s1").join(SESSION_NEW).join("big.m3u8");
+        fs::write(&big, vec![b'#'; MAX_HLS_PLAYLIST_BYTES as usize + 1]).unwrap();
+        let app = hls_app(&fx, false);
+        let uri = format!("/hls/s1/{SESSION_NEW}/big.m3u8");
+        assert_eq!(hls_get(&app, &uri).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let missing_root = hls_router(
+            fx.root.join("absent"),
+            Arc::clone(&fx.db),
+            false,
+            4,
+            Vec::new(),
+            None,
+        );
+        assert_eq!(
+            hls_get(&missing_root, "/hls/s1/index.m3u8").await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_counts_remote_cluster_sessions_toward_the_cap() {
+        let fx = hls_fixture();
+        let remote: ViewerRemoteSessionCountFn =
+            Arc::new(|_viewer| crate::db::MAX_CONNECTIONS_PER_PLAY_KEY as u64);
+        let app = hls_router(
+            fx.root.clone(),
+            Arc::clone(&fx.db),
+            true,
+            4,
+            Vec::new(),
+            Some(remote),
+        );
+        let uri = format!("/hls/s1/index.m3u8?key={}", fx.key_s1);
+        assert_eq!(hls_get(&app, &uri).await.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn hls_headers_map_extensions_to_content_types() {
+        for (ext, expected) in [
+            ("m3u8", "application/vnd.apple.mpegurl"),
+            ("m4s", "video/iso.segment"),
+            ("mp4", "video/mp4"),
+            ("ts", "video/mp2t"),
+            ("bin", "application/octet-stream"),
+        ] {
+            assert_eq!(hls_headers(ext)[header::CONTENT_TYPE], expected);
+        }
+    }
+
+    #[test]
+    fn playlist_rewriter_keeps_absolute_and_keyed_uris() {
+        let input = "#EXTM3U\n\n#EXT-X-KEY:METHOD=NONE,URI=\"k?x=1\"\nhttps://cdn/seg.ts\nseg.ts?key=old\nseg2.ts?a=b\n#BROKEN:URI=\"open\n";
+        let out = rewrite_playlist_key(input, "k1");
+        assert!(out.contains("URI=\"k?x=1&key=k1\""), "{out}");
+        assert!(out.contains("\nhttps://cdn/seg.ts\n"), "{out}");
+        assert!(out.contains("\nseg.ts?key=old\n"), "{out}");
+        assert!(out.contains("\nseg2.ts?a=b&key=k1\n"), "{out}");
+        assert!(out.contains("#BROKEN:URI=\"open\n"), "{out}");
+        assert!(out.contains("#EXTM3U\n\n"), "{out}");
+        assert!(safe_hls_path("/abs/index.m3u8").is_none());
+    }
+
+    #[test]
+    fn hls_registry_releases_expired_viewer_slots() {
+        let db = Db::open(":memory:").unwrap();
+        let viewer = add_stream(&db, "s1", "cam", 'a', true);
+        let DbLookup::Ok(stream) = db.stream_get("s1") else {
+            panic!("stream missing");
+        };
+        let sessions = HlsSessionRegistry::default();
+        let client = IpAddr::from([192, 0, 2, 1]);
+        let ttl = Duration::from_secs(30);
+        assert!(sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
+
+        // Still fresh: the slot is kept.
+        sessions.purge_stale(&db, ttl);
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
+
+        // Expired while the stream exists: the DB slot is released.
+        sessions.purge_stale(&db, Duration::ZERO);
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
+        assert!(sessions.inner.lock().is_empty());
+
+        // Expired after the stream was deleted: the entry is simply dropped.
+        assert!(sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0));
+        assert_eq!(db.stream_delete("s1"), Some(true));
+        sessions.purge_stale(&db, Duration::ZERO);
+        assert!(sessions.inner.lock().is_empty());
+    }
 }
