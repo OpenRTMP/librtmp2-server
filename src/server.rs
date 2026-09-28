@@ -2693,6 +2693,7 @@ mod tests {
     use crate::config::ServerConfig;
     use crate::db::Db;
     use crate::rtmp_bridge::{DbRtmpBridge, RtmpEventHandler};
+    use librtmp2::types::AuthorizationResult;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
@@ -3189,6 +3190,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn drain_auth_completions_reports_when_a_completion_was_applied() {
         let cfg = librtmp2::types::ServerConfig {
             max_connections: 8,
@@ -3495,6 +3497,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn create_generates_api_token_on_first_start() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("token.db");
@@ -3517,6 +3520,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn bootstrap_seeds_api_token_from_env_on_first_start() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("env-token.db");
@@ -3535,5 +3539,913 @@ mod tests {
         assert_eq!(app.config.api_token, env_token);
         let db = crate::db::Db::open(db_path_str).expect("reopen db");
         assert_eq!(db.token_get().unwrap().as_deref(), Some(env_token));
+    }
+
+    // ---------- process-global helpers (env, auth worker, RTMP bridge) ----------
+
+    fn sample_stream(id: &str) -> crate::db::Stream {
+        crate::db::Stream {
+            id: id.to_string(),
+            name: id.to_uppercase(),
+            app: "live".to_string(),
+            publish_key: format!("pub_{id}_key_with_sufficient_length_here"),
+            play_key: format!("play_{id}_key_with_sufficient_length_here"),
+            stats_key: format!("st_{id}_key_with_sufficient_length_here"),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        }
+    }
+
+    fn bridge_with_streams(ids: &[&str]) -> (Arc<Db>, Arc<DbRtmpBridge>) {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        for id in ids {
+            db.stream_add(&sample_stream(id)).unwrap();
+        }
+        let deleted = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let bridge = Arc::new(DbRtmpBridge::new(Arc::clone(&db), deleted));
+        (db, bridge)
+    }
+
+    /// Sets (or, with `None`, removes) an environment variable for the rest
+    /// of the calling `#[serial]` test.
+    fn set_env(key: &str, value: Option<&str>) {
+        // SAFETY: every test that touches the environment is `#[serial]`.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    fn set_rtmp_bridge(bridge: Option<Arc<DbRtmpBridge>>) {
+        *super::RTMP_BRIDGE.lock().unwrap() = bridge;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_shard_count_reads_the_shard_env_var() {
+        use super::resolve_shard_count;
+
+        set_env("LRTMP2_RTMP_SHARDS", Some("3"));
+        assert_eq!(resolve_shard_count(false, false, false), 3);
+        assert_eq!(
+            resolve_shard_count(true, false, false),
+            1,
+            "media outputs force a single shard even when shards are requested"
+        );
+        assert_eq!(resolve_shard_count(false, true, false), 1);
+
+        set_env("LRTMP2_RTMP_SHARDS", Some("not-a-number"));
+        assert_eq!(
+            resolve_shard_count(false, false, true),
+            1,
+            "an unparsable value falls back to the unset default"
+        );
+
+        set_env("LRTMP2_RTMP_SHARDS", None);
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(
+            resolve_shard_count(false, false, false),
+            cpus.clamp(1, super::AUTO_SHARDS_MAX)
+        );
+    }
+
+    #[test]
+    fn conn_ids_map_to_the_shard_that_allocated_them() {
+        use super::{SHARD_ID_SPACE, shard_for_conn_id};
+        assert_eq!(shard_for_conn_id(0), 0);
+        assert_eq!(shard_for_conn_id(1), 0);
+        assert_eq!(shard_for_conn_id(SHARD_ID_SPACE), 0);
+        assert_eq!(shard_for_conn_id(1 + SHARD_ID_SPACE), 1);
+        assert_eq!(shard_for_conn_id(1 + 3 * SHARD_ID_SPACE + 17), 3);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sharded_thread_drains_only_its_own_completion_receiver() {
+        // The shard receiver is thread-local; run on a fresh thread so it
+        // can't leak into other tests.
+        std::thread::spawn(|| {
+            let mut server = unbound_rtmp_server(8);
+            let tracked: HashMap<u64, TrackedConn> = HashMap::new();
+
+            // A completion sitting on the global receiver must be ignored by
+            // a shard thread, which owns its own fan-out receiver.
+            let (global_tx, global_rx) = sync_channel(4);
+            global_tx
+                .send(AuthCompletion {
+                    kind: AuthKind::Play,
+                    conn_id: 5,
+                    allow: true,
+                })
+                .unwrap();
+            *AUTH_COMPLETIONS_RX.lock().unwrap() = Some(global_rx);
+
+            let (tx, rx) = sync_channel(4);
+            super::set_shard_auth_completions_rx(rx);
+            assert!(!drain_auth_completions(&mut server, &tracked));
+
+            tx.send(AuthCompletion {
+                kind: AuthKind::Play,
+                conn_id: 7,
+                allow: false,
+            })
+            .unwrap();
+            assert!(drain_auth_completions(&mut server, &tracked));
+            assert!(!drain_auth_completions(&mut server, &tracked));
+
+            let global = AUTH_COMPLETIONS_RX.lock().unwrap().take().unwrap();
+            assert_eq!(global.try_recv().unwrap().conn_id, 5);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn api_tokens_are_masked_in_logs() {
+        use super::mask_api_token;
+        assert_eq!(mask_api_token(""), "***");
+        assert_eq!(mask_api_token("twelve-chars"), "***");
+        assert_eq!(
+            mask_api_token("0123456789abcdef0123456789abcdef"),
+            "01234567...cdef"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_api_token_prefers_the_stored_token() {
+        use super::resolve_api_token;
+        let db = Db::open(":memory:").unwrap();
+        let stored = "stored0123456789abcdef0123456789abcdef";
+        assert!(db.token_set(stored).unwrap());
+
+        set_env(
+            "LRTMP2_API_TOKEN",
+            Some("different0123456789abcdef0123456789abcdef"),
+        );
+        assert_eq!(resolve_api_token(&db, ":memory:").unwrap(), stored);
+        set_env("LRTMP2_API_TOKEN", Some(stored));
+        assert_eq!(resolve_api_token(&db, ":memory:").unwrap(), stored);
+        set_env("LRTMP2_API_TOKEN", None);
+        assert_eq!(resolve_api_token(&db, ":memory:").unwrap(), stored);
+        assert_eq!(db.token_get().unwrap().as_deref(), Some(stored));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_api_token_rejects_a_malformed_env_token() {
+        use super::resolve_api_token;
+        let db = Db::open(":memory:").unwrap();
+        for bad in ["too-short", "has spaces but is long enough to pass length"] {
+            set_env("LRTMP2_API_TOKEN", Some(bad));
+            let err = resolve_api_token(&db, ":memory:").unwrap_err();
+            assert!(err.contains("LRTMP2_API_TOKEN must be"), "{bad}: {err}");
+            assert_eq!(db.token_get().unwrap(), None, "nothing may be stored");
+        }
+
+        // Whitespace-only counts as unset: a token is generated instead.
+        set_env("LRTMP2_API_TOKEN", Some("   "));
+        let generated = resolve_api_token(&db, ":memory:").unwrap();
+        set_env("LRTMP2_API_TOKEN", None);
+        assert_eq!(generated.len(), 64);
+        assert_eq!(db.token_get().unwrap(), Some(generated));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn create_requires_a_database_path_from_the_environment() {
+        set_env("LRTMP2_DB", None);
+        set_env("LRTMP2_DB_PATH", None);
+        let err = ServerApp::create(ServerConfig::default()).err().unwrap();
+        assert!(err.contains("LRTMP2_DB"), "{err}");
+
+        // An empty LRTMP2_DB counts as unset.
+        set_env("LRTMP2_DB", Some(""));
+        assert!(ServerApp::create(ServerConfig::default()).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("create.db");
+        set_env("LRTMP2_DB", None);
+        set_env("LRTMP2_DB_PATH", Some(path.to_str().unwrap()));
+        let app = ServerApp::create(ServerConfig::default());
+        set_env("LRTMP2_DB_PATH", None);
+        let app = app.expect("create with LRTMP2_DB_PATH");
+        assert_eq!(app.config.api_token.len(), 64);
+        assert!(path.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bootstrap_reports_an_unopenable_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-dir").join("x.db");
+        let err = ServerApp::bootstrap(ServerConfig::default(), path.to_str().unwrap())
+            .err()
+            .unwrap();
+        assert!(err.contains("Failed to open database"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bootstrap_finishes_deletes_abandoned_by_a_previous_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recover.db");
+        let path = path.to_str().unwrap();
+        {
+            let db = Db::open(path).unwrap();
+            db.stream_add(&sample_stream("half")).unwrap();
+            db.stream_add(&sample_stream("kept")).unwrap();
+            // Crash mid-delete: disabled + pending, row still present.
+            assert_eq!(db.stream_disable("half"), Some(true));
+            // Administratively disabled, but not being deleted.
+            assert!(db.stream_set_enabled("kept", false));
+        }
+
+        let app = ServerApp::bootstrap(ServerConfig::default(), path).unwrap();
+        assert!(matches!(
+            app.db.stream_get("half"),
+            crate::db::DbLookup::Missing
+        ));
+        assert!(matches!(
+            app.db.stream_get("kept"),
+            crate::db::DbLookup::Ok(ref s) if !s.enabled
+        ));
+        assert!(app.db.stream_ids_pending_delete().is_empty());
+    }
+
+    #[test]
+    fn recover_pending_deletes_reports_db_errors_and_keeps_going() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream("a")).unwrap();
+        assert_eq!(db.stream_disable("a"), Some(true));
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER keep_streams BEFORE DELETE ON streams \
+                 BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+            )
+        })
+        .unwrap();
+        super::recover_pending_stream_deletes(&db);
+        assert_eq!(
+            db.stream_ids_pending_delete(),
+            vec!["a".to_string()],
+            "a failed recovery leaves the row pending for the next start"
+        );
+    }
+
+    #[test]
+    fn listener_inspection_fails_without_a_listener() {
+        let server = unbound_rtmp_server(8);
+        let err = super::last_listener_is_ipv6_dual_stack(&server).unwrap_err();
+        assert!(err.contains("listener fd missing"), "{err}");
+    }
+
+    #[test]
+    fn specific_address_binds_only_that_address() {
+        let port = free_local_port();
+        let mut server = unbound_rtmp_server(8);
+        let listeners =
+            bind_rtmp_listener_set(&mut server, "127.0.0.1", port, true, None, "RTMP", true)
+                .expect("bind loopback with reuseport");
+        assert_eq!(listeners, vec![format!("127.0.0.1:{port}")]);
+        assert_eq!(server.listener_fds().len(), 1);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn bind_failures_name_the_listener_and_address() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let mut server = unbound_rtmp_server(8);
+        let err = bind_rtmp_listener_set(
+            &mut server,
+            &format!("127.0.0.1:{port}"),
+            port,
+            false,
+            None,
+            "RTMPS",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with(&format!("RTMPS bind on 127.0.0.1:{port} failed")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_on_a_taken_port_fails_after_the_ipv4_fallback() {
+        // Hold the port on every family so neither the IPv6 wildcard nor the
+        // IPv4 fallback can bind it.
+        let v4 = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let _v6 = std::net::TcpListener::bind(("::", port)).ok();
+        let mut server = unbound_rtmp_server(8);
+        let err = bind_rtmp_listener_set(&mut server, "0.0.0.0", port, false, None, "RTMP", true)
+            .unwrap_err();
+        assert!(err.starts_with("RTMP "), "{err}");
+        assert!(err.contains(&format!("0.0.0.0:{port}")), "{err}");
+    }
+
+    /// Self-signed cert + key written by the `openssl` CLI (present on every
+    /// CI image this repo builds on).
+    fn self_signed_cert(dir: &std::path::Path) -> (String, String) {
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            ])
+            .args(["-subj", "/CN=localhost", "-keyout"])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("the openssl CLI is required to generate a test certificate");
+        assert!(
+            status.success(),
+            "openssl failed to create a test certificate"
+        );
+        (
+            cert.to_str().unwrap().to_string(),
+            key.to_str().unwrap().to_string(),
+        )
+    }
+
+    #[test]
+    fn tls_listeners_bind_with_and_without_reuseport() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = self_signed_cert(dir.path());
+        let mut server = unbound_rtmp_server(8);
+        for reuseport in [false, true] {
+            let port = free_local_port();
+            let listeners = bind_rtmp_listener_set(
+                &mut server,
+                &format!("127.0.0.1:{port}"),
+                port,
+                reuseport,
+                Some((&cert, &key)),
+                "RTMPS",
+                false,
+            )
+            .expect("bind RTMPS listener");
+            assert_eq!(listeners, vec![format!("127.0.0.1:{port}")]);
+            assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        }
+        assert_eq!(server.listener_fds().len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_conn_registered_for_auth_records_the_peer_once() {
+        let port = free_local_port();
+        let mut server = listening_rtmp_server(8, port);
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accept_one(&mut server);
+        let conn_id = server.connections[0].conn_id;
+
+        let (_db, bridge) = bridge_with_streams(&[]);
+        set_rtmp_bridge(Some(Arc::clone(&bridge)));
+
+        // Outside `server.poll()` there is no server to resolve the peer from.
+        super::ensure_conn_registered_for_auth(conn_id);
+        assert!(!bridge.is_registered(conn_id));
+
+        super::set_rtmp_poll_server(&mut server);
+        super::ensure_conn_registered_for_auth(conn_id + 1000);
+        assert!(!bridge.is_registered(conn_id + 1000), "unknown conn");
+        super::ensure_conn_registered_for_auth(conn_id);
+        assert!(bridge.is_registered(conn_id));
+        assert!(
+            bridge
+                .remote_addr_for_conn(conn_id)
+                .starts_with("127.0.0.1:")
+        );
+        // Already registered: a second call is a no-op.
+        super::ensure_conn_registered_for_auth(conn_id);
+        assert!(bridge.is_registered(conn_id));
+        super::clear_rtmp_poll_server();
+
+        set_rtmp_bridge(None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_callbacks_fail_closed_without_a_worker() {
+        let (_db, bridge) = bridge_with_streams(&["fc"]);
+        let publish_key = sample_stream("fc").publish_key;
+        let play_key = sample_stream("fc").play_key;
+
+        // No bridge, no worker: deny rather than let anything through.
+        assert_eq!(
+            super::rtmp_publish_auth_cb(1, "live", &publish_key),
+            AuthorizationResult::Deny
+        );
+        assert_eq!(
+            super::rtmp_play_auth_cb(1, "live", &play_key),
+            AuthorizationResult::Deny
+        );
+        assert!(!super::rtmp_media_cb(
+            1,
+            librtmp2::types::FrameType::Video,
+            None
+        ));
+
+        // With the bridge registered but no worker, still deny; closes run
+        // inline on the calling thread.
+        set_rtmp_bridge(Some(Arc::clone(&bridge)));
+        assert_eq!(
+            super::rtmp_publish_auth_cb(1, "live", &publish_key),
+            AuthorizationResult::Deny
+        );
+        bridge.on_connect(2, "127.0.0.1:2000");
+        assert!(bridge.authorize_play(2, "live", &play_key).is_ok());
+        super::close_conn_off_poll_thread(&bridge, 2);
+        assert!(!bridge.has_player(2));
+        set_rtmp_bridge(None);
+
+        // Nothing to drain: returns at once.
+        super::drain_auth_worker_for_shutdown();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_callbacks_route_through_fast_path_and_worker() {
+        let (_db, bridge) = bridge_with_streams(&["fw", "fw2"]);
+        let s = sample_stream("fw");
+        set_rtmp_bridge(Some(Arc::clone(&bridge)));
+        let (handle, completions, thread) =
+            crate::auth_worker::spawn_with_notify(Arc::clone(&bridge), || {});
+        *super::AUTH_WORKER.lock().unwrap() = Some(handle);
+        *super::AUTH_WORKER_THREAD.lock().unwrap() = Some(thread);
+
+        // Cached keys are answered on the calling thread.
+        bridge.on_connect(1, "127.0.0.1:1001");
+        assert_eq!(
+            super::rtmp_publish_auth_cb(1, "live", &s.publish_key),
+            AuthorizationResult::Allow
+        );
+        assert!(bridge.has_publisher(1));
+        assert_eq!(super::publisher_generation(1), 1);
+        bridge.on_connect(2, "127.0.0.1:1002");
+        assert_eq!(
+            super::rtmp_play_auth_cb(2, "live", &s.play_key),
+            AuthorizationResult::Allow
+        );
+        assert!(bridge.has_player(2));
+
+        // Unknown keys go to the worker, which answers asynchronously.
+        bridge.on_connect(3, "127.0.0.1:1003");
+        assert_eq!(
+            super::rtmp_publish_auth_cb(3, "live", "unknown_publish_key_long_enough_000"),
+            AuthorizationResult::Pending
+        );
+        let done = completions.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            (done.conn_id, done.kind, done.allow),
+            (3, AuthKind::Publish, false)
+        );
+        assert_eq!(
+            super::rtmp_play_auth_cb(3, "live", "unknown_play_key_long_enough_00000"),
+            AuthorizationResult::Pending
+        );
+        let done = completions.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            (done.conn_id, done.kind, done.allow),
+            (3, AuthKind::Play, false)
+        );
+
+        // Media callbacks reach the bridge; non-A/V frames are accepted as-is.
+        assert!(super::rtmp_media_cb(
+            1,
+            librtmp2::types::FrameType::Script,
+            None
+        ));
+        super::rtmp_media_cb(1, librtmp2::types::FrameType::Audio, Some("AAC"));
+        super::rtmp_media_cb(1, librtmp2::types::FrameType::Video, Some("H264"));
+
+        // Closes queue behind pending work; shutdown drains the queue.
+        super::close_conn_off_poll_thread(&bridge, 2);
+        super::close_conn_off_poll_thread(&bridge, 1);
+        super::drain_auth_worker_for_shutdown();
+        assert!(super::AUTH_WORKER.lock().unwrap().is_none());
+        assert!(super::AUTH_WORKER_THREAD.lock().unwrap().is_none());
+        assert!(
+            !bridge.has_player(2),
+            "queued close applied before shutdown"
+        );
+        assert!(!bridge.has_publisher(1));
+
+        set_rtmp_bridge(None);
+        super::clear_publish_generation(1);
+    }
+
+    fn rtmp_conn(conn_id: u64, publishing: bool, playing: bool) -> librtmp2::session::conn::Conn {
+        let mut conn = librtmp2::session::conn::Conn::new();
+        conn.conn_id = conn_id;
+        conn.remote_addr = "127.0.0.1:1000".into();
+        conn.current_stream = Some(Box::new(librtmp2::session::stream::Stream {
+            stream_id: 1,
+            is_publishing: publishing,
+            is_playing: playing,
+            name: "live".into(),
+            paused: false,
+            receive_audio: true,
+            receive_video: true,
+        }));
+        conn
+    }
+
+    #[test]
+    fn drain_deleted_roles_kicks_pre_auth_conns_by_tracked_stream() {
+        let (_db, bridge) = bridge_with_streams(&[]);
+        bridge.on_connect(1, "127.0.0.1:1000");
+        let mut conn = rtmp_conn(1, false, false);
+        let deleted: HashSet<String> = ["gone".to_string()].into();
+
+        let mut entry = TrackedConn {
+            stream_id: "gone".into(),
+            ..Default::default()
+        };
+        assert!(drain_deleted_stream_roles(
+            &mut conn, &mut entry, &bridge, 1, &deleted
+        ));
+
+        let mut other = TrackedConn {
+            stream_id: "alive".into(),
+            ..Default::default()
+        };
+        assert!(!drain_deleted_stream_roles(
+            &mut conn, &mut other, &bridge, 1, &deleted
+        ));
+        let mut unsynced = TrackedConn::default();
+        assert!(!drain_deleted_stream_roles(
+            &mut conn,
+            &mut unsynced,
+            &bridge,
+            1,
+            &deleted
+        ));
+    }
+
+    #[test]
+    fn drain_deleted_roles_kicks_a_publisher_with_no_other_role() {
+        let (_db, bridge) = bridge_with_streams(&["p1"]);
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &sample_stream("p1").publish_key)
+                .is_ok()
+        );
+        let mut conn = rtmp_conn(1, true, false);
+        let mut entry = TrackedConn {
+            connected: true,
+            publishing: true,
+            stream_id: "p1".into(),
+            video_codec: "H264".into(),
+            audio_codec: "AAC".into(),
+            ..Default::default()
+        };
+        let deleted: HashSet<String> = ["p1".to_string()].into();
+
+        assert!(drain_deleted_stream_roles(
+            &mut conn, &mut entry, &bridge, 1, &deleted
+        ));
+        assert!(!bridge.has_publisher(1));
+        assert!(!entry.publishing);
+        assert!(entry.video_codec.is_empty() && entry.audio_codec.is_empty());
+        assert!(!conn.current_stream.as_ref().unwrap().is_publishing);
+    }
+
+    #[test]
+    fn drain_deleted_publish_keeps_dual_role_player_and_relays_its_stream() {
+        let (_db, bridge) = bridge_with_streams(&["s1", "s2"]);
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &sample_stream("s1").publish_key)
+                .is_ok()
+        );
+        assert!(
+            bridge
+                .authorize_play(1, "live", &sample_stream("s2").play_key)
+                .is_ok()
+        );
+        let mut conn = rtmp_conn(1, true, true);
+        conn.relay_key = "s1".into();
+        let mut entry = TrackedConn {
+            connected: true,
+            publishing: true,
+            playing: true,
+            stream_id: "s1".into(),
+            ..Default::default()
+        };
+        let deleted: HashSet<String> = ["s1".to_string()].into();
+
+        assert!(!drain_deleted_stream_roles(
+            &mut conn, &mut entry, &bridge, 1, &deleted
+        ));
+        assert!(!bridge.has_publisher(1));
+        assert!(bridge.has_player(1));
+        assert!(!entry.publishing && entry.playing);
+        assert_eq!(entry.stream_id, "s2");
+        assert_eq!(conn.relay_key, "s2");
+        assert!(conn.relay_enabled);
+    }
+
+    // ---------- process_server_connections on a real accepted connection ----------
+
+    const NO_IDLE_EVICTION: Duration = Duration::from_secs(3600);
+
+    struct PollHarness {
+        server: librtmp2::server::Server,
+        _client: std::net::TcpStream,
+        conn_id: u64,
+        tracked: HashMap<u64, TrackedConn>,
+        bridge: Arc<DbRtmpBridge>,
+    }
+
+    impl PollHarness {
+        fn new(streams: &[&str]) -> Self {
+            let port = free_local_port();
+            let mut server = listening_rtmp_server(8, port);
+            let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            accept_one(&mut server);
+            let conn_id = server.connections[0].conn_id;
+            let (_db, bridge) = bridge_with_streams(streams);
+            let mut h = PollHarness {
+                server,
+                _client: client,
+                conn_id,
+                tracked: HashMap::new(),
+                bridge,
+            };
+            // First pass registers the connection with the bridge.
+            let (ids, _) = h.tick_with(&HashSet::new(), &HashSet::new(), NO_IDLE_EVICTION);
+            assert!(ids.contains(&conn_id));
+            assert!(h.bridge.is_registered(conn_id));
+            assert!(h.tracked[&conn_id].connected);
+            h
+        }
+
+        fn tick_with(
+            &mut self,
+            deleted: &HashSet<String>,
+            revoked: &HashSet<String>,
+            idle: Duration,
+        ) -> (HashSet<u64>, bool) {
+            super::process_server_connections(
+                &mut self.server,
+                &mut self.tracked,
+                &self.bridge,
+                deleted,
+                revoked,
+                idle,
+            )
+        }
+
+        fn tick(&mut self) {
+            self.tick_with(&HashSet::new(), &HashSet::new(), NO_IDLE_EVICTION);
+        }
+
+        /// What the RTMP session itself currently says it is doing.
+        fn set_session(&mut self, publishing: bool, playing: bool) {
+            self.conn().current_stream = Some(Box::new(librtmp2::session::stream::Stream {
+                stream_id: 1,
+                is_publishing: publishing,
+                is_playing: playing,
+                name: "live".into(),
+                paused: false,
+                receive_audio: true,
+                receive_video: true,
+            }));
+        }
+
+        fn conn(&mut self) -> &mut librtmp2::session::conn::Conn {
+            let id = self.conn_id;
+            self.server
+                .connections
+                .iter_mut()
+                .find(|c| c.conn_id == id)
+                .expect("connection still open")
+        }
+
+        fn is_open(&self) -> bool {
+            self.server
+                .connections
+                .iter()
+                .any(|c| c.conn_id == self.conn_id)
+        }
+
+        fn entry(&self) -> &TrackedConn {
+            &self.tracked[&self.conn_id]
+        }
+
+        fn publish(&self, id: &str) {
+            let key = sample_stream(id).publish_key;
+            assert!(
+                self.bridge
+                    .authorize_publish(self.conn_id, "live", &key)
+                    .is_ok()
+            );
+        }
+
+        fn play(&self, id: &str) {
+            let key = sample_stream(id).play_key;
+            assert!(
+                self.bridge
+                    .authorize_play(self.conn_id, "live", &key)
+                    .is_ok()
+            );
+        }
+
+        fn assert_closed(&self) {
+            assert!(!self.is_open(), "connection must be closed");
+            assert!(!self.tracked.contains_key(&self.conn_id));
+            assert!(!self.bridge.is_registered(self.conn_id));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn poll_pass_evicts_connections_idle_before_auth() {
+        let mut h = PollHarness::new(&[]);
+        h.tick();
+        assert!(h.is_open(), "within the idle window nothing happens");
+        h.tick_with(&HashSet::new(), &HashSet::new(), Duration::ZERO);
+        h.assert_closed();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn poll_pass_closes_sessions_the_bridge_did_not_authorize() {
+        let mut h = PollHarness::new(&[]);
+        h.set_session(true, false);
+        h.tick();
+        h.assert_closed();
+
+        let mut h = PollHarness::new(&[]);
+        h.set_session(false, true);
+        h.tick();
+        h.assert_closed();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn poll_pass_follows_a_publisher_through_unpublish() {
+        let mut h = PollHarness::new(&["pub1"]);
+        h.publish("pub1");
+        h.set_session(true, false);
+        h.tick();
+        assert!(h.entry().publishing);
+        assert_eq!(h.entry().stream_id, "pub1");
+        assert_eq!(h.conn().relay_key, "pub1");
+        assert!(h.conn().relay_enabled);
+        h.tick();
+        assert!(h.entry().publishing, "steady state keeps the role");
+
+        // FCUnpublish without closing TCP: the role is torn down, the
+        // connection stays open, and its idle window restarts.
+        h.set_session(false, false);
+        h.tick();
+        assert!(h.is_open());
+        assert!(!h.bridge.has_publisher(h.conn_id));
+        assert!(!h.entry().publishing);
+        assert!(h.entry().stream_id.is_empty());
+        assert!(h.conn().relay_key.is_empty());
+        assert!(!h.conn().relay_enabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn poll_pass_keeps_the_surviving_role_of_a_dual_role_connection() {
+        let mut h = PollHarness::new(&["s1", "s2"]);
+        h.publish("s1");
+        h.play("s2");
+        h.set_session(true, true);
+        h.tick();
+        assert!(h.entry().publishing && h.entry().playing);
+        assert!(h.entry().awaiting_first_frame.is_some());
+
+        // Stop playing, keep publishing: relay follows the publisher.
+        h.set_session(true, false);
+        h.tick();
+        assert!(!h.bridge.has_player(h.conn_id));
+        assert!(h.entry().publishing && !h.entry().playing);
+        assert!(h.entry().awaiting_first_frame.is_none());
+        assert_eq!(h.entry().stream_id, "s1");
+        assert_eq!(h.conn().relay_key, "s1");
+
+        // Play again, then stop publishing: relay follows the player.
+        h.play("s2");
+        h.set_session(true, true);
+        h.tick();
+        assert!(h.entry().playing);
+        h.set_session(false, true);
+        h.tick();
+        assert!(!h.bridge.has_publisher(h.conn_id));
+        assert!(!h.entry().publishing && h.entry().playing);
+        assert_eq!(h.entry().stream_id, "s2");
+        assert_eq!(h.conn().relay_key, "s2");
+        assert!(h.conn().relay_enabled);
+
+        // Stop playing too: nothing left, relay is off.
+        h.set_session(false, false);
+        h.tick();
+        assert!(h.is_open());
+        assert!(!h.entry().playing);
+        assert!(h.entry().stream_id.is_empty());
+        assert!(!h.conn().relay_enabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn poll_pass_kicks_deleted_revoked_and_force_closed_sessions() {
+        // Stream deleted while publishing.
+        let mut h = PollHarness::new(&["del"]);
+        h.publish("del");
+        h.set_session(true, false);
+        h.tick();
+        let deleted: HashSet<String> = ["del".to_string()].into();
+        h.tick_with(&deleted, &HashSet::new(), NO_IDLE_EVICTION);
+        h.assert_closed();
+
+        // Play key revoked while playing.
+        let mut h = PollHarness::new(&["rev"]);
+        h.play("rev");
+        h.set_session(false, true);
+        h.tick();
+        assert!(h.entry().playing);
+        let viewer = h.bridge.viewer_id_for_conn(h.conn_id);
+        assert!(!viewer.is_empty());
+        let revoked: HashSet<String> = [viewer].into();
+        h.tick_with(&HashSet::new(), &revoked, NO_IDLE_EVICTION);
+        h.assert_closed();
+
+        // Delete-drain timeout abandoned the role and queued a force close.
+        let mut h = PollHarness::new(&["stuck"]);
+        h.publish("stuck");
+        h.set_session(true, false);
+        h.tick();
+        h.bridge.abandon_roles_for_stream("stuck");
+        h.tick();
+        h.assert_closed();
+    }
+
+    #[test]
+    fn drain_deleted_roles_never_relays_a_stream_whose_release_failed() {
+        let (db, bridge) = bridge_with_streams(&["s1"]);
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(
+            bridge
+                .authorize_publish(1, "live", &sample_stream("s1").publish_key)
+                .is_ok()
+        );
+        // The row vanishes under the publisher, so deactivating it fails and
+        // the bridge keeps the role for a retry on close.
+        assert_eq!(db.stream_delete("s1"), Some(true));
+        let mut conn = rtmp_conn(1, true, false);
+        conn.relay_key = "s1".into();
+        conn.relay_enabled = true;
+        let mut entry = TrackedConn {
+            connected: true,
+            publishing: true,
+            stream_id: "s1".into(),
+            ..Default::default()
+        };
+        let deleted: HashSet<String> = ["s1".to_string()].into();
+
+        assert!(!drain_deleted_stream_roles(
+            &mut conn, &mut entry, &bridge, 1, &deleted
+        ));
+        assert!(bridge.has_publisher(1), "role kept for a retry on close");
+        assert!(entry.publishing);
+        assert!(conn.relay_key.is_empty());
+        assert!(
+            !conn.relay_enabled,
+            "a deleted stream must never be relayed"
+        );
+    }
+
+    #[test]
+    fn deleted_marker_helpers_fall_back_to_the_tracker_before_auth() {
+        let (_db, bridge) = bridge_with_streams(&[]);
+        let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked.insert(
+            4,
+            TrackedConn {
+                stream_id: "tracked-only".into(),
+                ..Default::default()
+            },
+        );
+        tracked.insert(5, TrackedConn::default());
+
+        assert_eq!(eviction_stream_id(&bridge, 4, &tracked[&4]), "tracked-only");
+        let live = live_stream_ids_for_deleted_markers(&tracked, &bridge);
+        assert_eq!(live, HashSet::from(["tracked-only".to_string()]));
     }
 }

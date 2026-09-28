@@ -3604,4 +3604,843 @@ mod tests {
         assert!(matches!(state.db.stream_get("sticky"), DbLookup::Missing));
         assert!(!state.deleted_streams.lock().contains("sticky"));
     }
+
+    // ---------- handler coverage: shared helpers ----------
+
+    const TOKEN: &str = "a-strong-random-secret-value";
+
+    /// App state with rate limits high enough that a test can make dozens of
+    /// requests through one router without tripping 429s.
+    fn roomy_state() -> Arc<AppState> {
+        test_state_with_config(ServerConfig {
+            api_token: TOKEN.to_string(),
+            http_rate_limit_api: 10_000,
+            http_rate_limit_stats: 10_000,
+            http_rate_limit_default: 10_000,
+            ..Default::default()
+        })
+    }
+
+    /// Send one request through the router and return the status and body.
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        auth: bool,
+        json_body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if auth {
+            builder = builder.header("Authorization", format!("Bearer {TOKEN}"));
+        }
+        let req = match json_body {
+            Some(body) => builder
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn error_code(body: &str) -> String {
+        let json: Value = serde_json::from_str(body).unwrap();
+        json["error"]["code"].as_str().unwrap().to_string()
+    }
+
+    fn sample_stream(id: &str) -> Stream {
+        Stream {
+            id: id.to_string(),
+            name: format!("Stream {id}"),
+            app: "live".to_string(),
+            publish_key: format!("pub_{id}_key_with_sufficient_length_here"),
+            play_key: format!("play_{id}_key_with_sufficient_length_here"),
+            stats_key: format!("st_{id}_key_with_sufficient_length_here"),
+            enabled: true,
+            created_at: now_ts(),
+        }
+    }
+
+    /// Adds `id` to the DB and returns its default viewer id.
+    fn add_stream(state: &AppState, id: &str) -> String {
+        state.db.stream_add(&sample_stream(id)).unwrap().id
+    }
+
+    fn exec_sql(state: &AppState, sql: &str) {
+        state.db.with_conn(|c| c.execute_batch(sql)).unwrap();
+    }
+
+    /// Makes every `streams` read fail (the SELECT names a column that no
+    /// longer exists) so handlers hit their `DbLookup::Failed` branches.
+    fn break_stream_reads(state: &AppState) {
+        exec_sql(
+            state,
+            "ALTER TABLE streams RENAME COLUMN name TO name_gone;",
+        );
+    }
+
+    /// Registers RTMP conn 1 as the live publisher of `id`, so a delete must
+    /// take the async (202) drain path.
+    fn go_live(state: &AppState, id: &str) {
+        state.rtmp_bridge.on_connect(1, "127.0.0.1:1000");
+        let key = format!("pub_{id}_key_with_sufficient_length_here");
+        assert!(state.rtmp_bridge.authorize_publish(1, "live", &key).is_ok());
+    }
+
+    async fn wait_for(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // ---------- POST /api/v1/streams ----------
+
+    #[tokio::test]
+    async fn create_stream_validation_errors() {
+        let state = roomy_state();
+        let app = router(state.clone());
+        let post = |body: Option<&'static str>, auth: bool| {
+            let app = app.clone();
+            async move { send(&app, "POST", "/api/v1/streams", auth, body).await }
+        };
+
+        let (status, body) = post(Some(r#"{"id":"x"}"#), false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error_code(&body), "UNAUTHORIZED");
+
+        // No JSON body at all and a blank id both mean "missing id".
+        let (status, body) = post(None, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Missing 'id' field"));
+        let (status, _) = post(Some(r#"{"id":"   "}"#), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = post(Some(r#"{"id":"ctl","name":"bad\u0001name"}"#), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Name must be"));
+
+        let (status, body) = post(Some(r#"{"id":"k1","play_key":"bad/key"}"#), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("play_key:"));
+
+        let (status, body) = post(Some(r#"{"id":"k2","stats_key":"short"}"#), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("stats_key:"));
+
+        // An id whose previous incarnation is still draining is refused.
+        state.deleted_streams.lock().insert("draining".to_string());
+        let (status, body) = post(Some(r#"{"id":"draining"}"#), true).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("being deleted"));
+        assert!(matches!(state.db.stream_get("draining"), DbLookup::Missing));
+    }
+
+    #[tokio::test]
+    async fn create_stream_defaults_and_duplicate_id() {
+        let state = roomy_state();
+        let app = router(state.clone());
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams",
+            true,
+            Some(r#"{"id":"dflt"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["name"], "dflt", "name defaults to the id");
+        assert_eq!(json["app"], "live", "app defaults to live");
+        assert_eq!(json["players"].as_array().unwrap().len(), 1);
+        assert_eq!(json["players"][0]["play_key"], json["play_key"]);
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams",
+            true,
+            Some(r#"{"id":"dflt"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn create_stream_reports_db_failure() {
+        let state = roomy_state();
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_viewers BEFORE INSERT ON stream_viewers \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+        let app = router(state.clone());
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams",
+            true,
+            Some(r#"{"id":"dbfail"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_code(&body), "INTERNAL_ERROR");
+        assert!(
+            matches!(state.db.stream_get("dbfail"), DbLookup::Missing),
+            "a failed default-viewer insert must roll back the stream row"
+        );
+    }
+
+    // ---------- DELETE /api/v1/streams/:id ----------
+
+    #[tokio::test]
+    async fn delete_stream_rejects_bad_requests() {
+        let state = roomy_state();
+        add_stream(&state, "keep");
+        let app = router(state.clone());
+
+        let (status, _) = send(&app, "DELETE", "/api/v1/streams/keep", false, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = send(&app, "DELETE", "/api/v1/streams/-bad", true, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Invalid stream id"));
+        let (status, body) = send(&app, "DELETE", "/api/v1/streams/nope", true, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_code(&body), "NOT_FOUND");
+        assert!(matches!(state.db.stream_get("keep"), DbLookup::Ok(_)));
+
+        break_stream_reads(&state);
+        let (status, body) = send(&app, "DELETE", "/api/v1/streams/keep", true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to load stream"));
+        assert!(!state.deleted_streams.lock().contains("keep"));
+    }
+
+    #[tokio::test]
+    async fn delete_stream_reports_failure_to_disable() {
+        let state = roomy_state();
+        add_stream(&state, "stuck");
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_disable BEFORE UPDATE ON streams \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+        let app = router(state.clone());
+        let (status, body) = send(&app, "DELETE", "/api/v1/streams/stuck", true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to disable stream"));
+        assert!(!state.deleted_streams.lock().contains("stuck"));
+        assert!(!state.sticky_deleted_streams.lock().contains("stuck"));
+        let DbLookup::Ok(s) = state.db.stream_get("stuck") else {
+            panic!("stream must survive a failed disable");
+        };
+        assert!(s.enabled);
+    }
+
+    #[tokio::test]
+    async fn delete_stream_reenables_stream_when_finalize_fails() {
+        let state = roomy_state();
+        add_stream(&state, "undead");
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_delete BEFORE DELETE ON streams \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+        let app = router(state.clone());
+        let (status, body) = send(&app, "DELETE", "/api/v1/streams/undead", true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to delete stream"));
+        let DbLookup::Ok(s) = state.db.stream_get("undead") else {
+            panic!("stream must survive a failed finalize");
+        };
+        assert!(s.enabled, "a failed finalize must roll back the disable");
+        assert!(state.db.stream_ids_pending_delete().is_empty());
+        assert!(!state.deleted_streams.lock().contains("undead"));
+    }
+
+    #[tokio::test]
+    async fn background_finalize_treats_vanished_row_as_deleted() {
+        let state = roomy_state();
+        add_stream(&state, "vanish");
+        go_live(&state, "vanish");
+        let app = router(state.clone());
+        let (status, _) = send(&app, "DELETE", "/api/v1/streams/vanish", true, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // Someone else (e.g. startup recovery) removes the row mid-drain.
+        assert_eq!(state.db.stream_delete("vanish"), Some(true));
+        state.rtmp_bridge.on_close(1);
+        wait_for("delete marker to clear", Duration::from_secs(5), || {
+            !state.deleted_streams.lock().contains("vanish")
+        })
+        .await;
+        assert!(!state.sticky_deleted_streams.lock().contains("vanish"));
+    }
+
+    #[tokio::test]
+    async fn background_finalize_keeps_stream_when_delete_was_rolled_back() {
+        let state = roomy_state();
+        add_stream(&state, "revived");
+        go_live(&state, "revived");
+        let app = router(state.clone());
+        let (status, _) = send(&app, "DELETE", "/api/v1/streams/revived", true, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // The pending-delete flag is cleared before the drain finishes, so
+        // finalize sees a Conflict and must not delete the row.
+        assert!(state.db.stream_set_enabled("revived", true));
+        state.rtmp_bridge.on_close(1);
+        wait_for("delete marker to clear", Duration::from_secs(5), || {
+            !state.deleted_streams.lock().contains("revived")
+        })
+        .await;
+        let DbLookup::Ok(s) = state.db.stream_get("revived") else {
+            panic!("a rolled-back delete must keep the stream");
+        };
+        assert!(s.enabled);
+    }
+
+    #[tokio::test]
+    async fn background_finalize_abandons_stuck_sessions_after_timeout() {
+        let state = roomy_state();
+        add_stream(&state, "wedged");
+        go_live(&state, "wedged");
+        let app = router(state.clone());
+        let (status, _) = send(&app, "DELETE", "/api/v1/streams/wedged", true, None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // The session never disconnects: the drain gives up after
+        // DELETE_DRAIN_TIMEOUT, drops the local roles, and finalizes anyway.
+        wait_for(
+            "delete to finalize after drain timeout",
+            DELETE_DRAIN_TIMEOUT + Duration::from_secs(3),
+            || matches!(state.db.stream_get("wedged"), DbLookup::Missing),
+        )
+        .await;
+        assert_eq!(state.rtmp_bridge.live_conn_count_for_stream("wedged"), 0);
+        wait_for("delete marker to clear", Duration::from_secs(2), || {
+            !state.deleted_streams.lock().contains("wedged")
+        })
+        .await;
+    }
+
+    // ---------- /api/v1/streams/:id/players ----------
+
+    #[tokio::test]
+    async fn players_list_endpoint() {
+        let state = roomy_state();
+        let default_viewer = add_stream(&state, "plist");
+        let app = router(state.clone());
+
+        let (status, _) = send(&app, "GET", "/api/v1/streams/plist/players", false, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send(&app, "GET", "/api/v1/streams/-bad/players", true, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(&app, "GET", "/api/v1/streams/nope/players", true, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = send(&app, "GET", "/api/v1/streams/plist/players", true, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: Vec<Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"], default_viewer);
+        assert_eq!(list[0]["name"], "Player 1");
+        assert_eq!(list[0]["enabled"], true);
+
+        break_stream_reads(&state);
+        let (status, _) = send(&app, "GET", "/api/v1/streams/plist/players", true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn player_create_validation_errors() {
+        let state = roomy_state();
+        add_stream(&state, "pc");
+        add_stream(&state, "other");
+        let app = router(state.clone());
+        let uri = "/api/v1/streams/pc/players";
+
+        let (status, _) = send(&app, "POST", uri, false, Some("{}")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/-bad/players",
+            true,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/nope/players",
+            true,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = send(&app, "POST", uri, true, Some(r#"{"name":"a\u0007b"}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Name must be"));
+        let (status, body) = send(&app, "POST", uri, true, Some(r#"{"play_key":"bad key"}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("play_key:"));
+
+        // A play key must not collide with this stream's keys, another
+        // stream's keys, or an existing viewer's key.
+        for taken in [
+            "pub_pc_key_with_sufficient_length_here",
+            "st_pc_key_with_sufficient_length_here",
+            "play_pc_key_with_sufficient_length_here",
+            "pub_other_key_with_sufficient_length_here",
+        ] {
+            let (status, body) = send(
+                &app,
+                "POST",
+                uri,
+                true,
+                Some(&format!(r#"{{"play_key":"{taken}"}}"#)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{taken}");
+            assert_eq!(error_code(&body), "CONFLICT");
+        }
+        assert_eq!(state.db.viewer_list("pc").len(), 1);
+
+        // No body: the slot gets a generated key and a numbered name.
+        let (status, body) = send(&app, "POST", uri, true, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["name"], "Player 2");
+        assert!(is_valid_access_key(json["play_key"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn player_create_reports_db_failures() {
+        let state = roomy_state();
+        add_stream(&state, "pcdb");
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_viewers BEFORE INSERT ON stream_viewers \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+        let app = router(state.clone());
+        let uri = "/api/v1/streams/pcdb/players";
+        let (status, body) = send(&app, "POST", uri, true, Some(r#"{"name":"Guest"}"#)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to create play key"));
+
+        break_stream_reads(&state);
+        let (status, body) = send(&app, "POST", uri, true, Some(r#"{"name":"Guest"}"#)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to load stream"));
+    }
+
+    #[tokio::test]
+    async fn player_delete_validation_errors() {
+        let state = roomy_state();
+        let only_viewer = add_stream(&state, "pd");
+        let app = router(state.clone());
+        let player_uri = format!("/api/v1/streams/pd/players/{only_viewer}");
+
+        let (status, _) = send(&app, "DELETE", &player_uri, false, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = send(
+            &app,
+            "DELETE",
+            &format!("/api/v1/streams/-bad/players/{only_viewer}"),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Invalid stream id"));
+        let (status, body) = send(&app, "DELETE", "/api/v1/streams/pd/players/x", true, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Invalid player id"));
+        let (status, body) = send(
+            &app,
+            "DELETE",
+            &format!("/api/v1/streams/nope/players/{only_viewer}"),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("Stream not found"));
+        let (status, body) = send(
+            &app,
+            "DELETE",
+            "/api/v1/streams/pd/players/vw_does_not_exist_but_is_long_enough",
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("Player not found"));
+
+        let (status, body) = send(&app, "DELETE", &player_uri, true, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Cannot delete the last play key"));
+        assert_eq!(state.db.viewer_list("pd").len(), 1);
+        assert!(state.revoked_viewers.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn player_delete_reports_db_failures() {
+        let state = roomy_state();
+        let first = add_stream(&state, "pddb");
+        let app = router(state.clone());
+        let (status, _) = send(&app, "POST", "/api/v1/streams/pddb/players", true, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let player_uri = format!("/api/v1/streams/pddb/players/{first}");
+
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_viewer_delete BEFORE DELETE ON stream_viewers \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+        let (status, body) = send(&app, "DELETE", &player_uri, true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to delete play key"));
+        assert!(!state.revoked_viewers.lock().contains_key(&first));
+
+        exec_sql(
+            &state,
+            "ALTER TABLE stream_viewers RENAME COLUMN name TO name_gone;",
+        );
+        let (status, body) = send(&app, "DELETE", &player_uri, true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to load player"));
+
+        break_stream_reads(&state);
+        let (status, body) = send(&app, "DELETE", &player_uri, true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to load stream"));
+    }
+
+    // ---------- GET /api/v1/streams/:id/stats ----------
+
+    fn add_live_sessions(db: &Db, id: &str, viewer_id: &str) {
+        use crate::db::{Player, Publisher};
+        assert!(db.publisher_try_acquire(&Publisher {
+            id: format!("{id}_pub"),
+            stream_id: id.to_string(),
+            app: "live".to_string(),
+            stream_name: format!("Stream {id}"),
+            video_codec: "H264".to_string(),
+            audio_codec: "AAC".to_string(),
+            video_width: 1280,
+            video_height: 720,
+            fps: 30.0,
+            bitrate_kbps: 3000.0,
+            bytes_in: 4096,
+            active: true,
+            connected_at: now_ts() - 5,
+            ..Default::default()
+        }));
+        assert!(db.player_try_acquire(&Player {
+            id: format!("{id}_player"),
+            stream_id: id.to_string(),
+            viewer_id: viewer_id.to_string(),
+            app: "live".to_string(),
+            stream_name: format!("Stream {id}"),
+            bytes_out: 2048,
+            bitrate_kbps: 1500.0,
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+    }
+
+    #[tokio::test]
+    async fn stream_stats_with_bearer_returns_full_json() {
+        let state = roomy_state();
+        let viewer = add_stream(&state, "sx");
+        add_stream(&state, "idle");
+        add_live_sessions(&state.db, "sx", &viewer);
+        let app = router(state.clone());
+
+        let (status, body) = send(&app, "GET", "/api/v1/streams/sx/stats", true, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["summary"]["publishers"], 1);
+        assert_eq!(json["summary"]["players"], 1);
+        assert_eq!(json["summary"]["total_clients"], 2);
+        assert_eq!(json["streams"][0]["id"], "sx");
+        assert_eq!(json["streams"][0]["video"]["codec"], "H264");
+        assert_eq!(json["streams"][0]["video"]["width"], 1280);
+        assert_eq!(json["streams"][0]["audio"]["codec"], "AAC");
+        assert!(json["streams"][0]["uptime"].as_i64().unwrap() >= 5);
+        assert_eq!(json["players"][0]["id"], "sx_player");
+        assert_eq!(json["players"][0]["bytes_out"], 2048);
+
+        let (status, body) = send(&app, "GET", "/api/v1/streams/idle/stats", true, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["summary"]["total_clients"], 0);
+
+        let (status, body) = send(&app, "GET", "/api/v1/streams/-bad/stats", true, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Invalid stream id"));
+        let (status, body) = send(&app, "GET", "/api/v1/streams/nope/stats", true, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_code(&body), "NOT_FOUND");
+
+        break_stream_reads(&state);
+        let (status, body) = send(&app, "GET", "/api/v1/streams/sx/stats", true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to load stream"));
+    }
+
+    #[tokio::test]
+    async fn stream_stats_with_stats_key_returns_public_json_or_offline() {
+        let state = roomy_state();
+        let viewer = add_stream(&state, "pk");
+        add_stream(&state, "pk2");
+        let app = router(state.clone());
+        let key = "st_pk_key_with_sufficient_length_here";
+
+        // Anything short of the right key for the right stream is
+        // indistinguishable from an offline stream.
+        for uri in [
+            "/api/v1/streams/-bad/stats".to_string(),
+            "/api/v1/streams/pk/stats".to_string(),
+            "/api/v1/streams/pk/stats?key=wrong".to_string(),
+            "/api/v1/streams/pk2/stats?key=st_pk_key_with_sufficient_length_here".to_string(),
+            format!("/api/v1/streams/pk/stats?key={key}"),
+        ] {
+            let (status, body) = send(&app, "GET", &uri, false, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(body, PUBLIC_STATS_OFFLINE_MSG, "{uri}");
+        }
+
+        add_live_sessions(&state.db, "pk", &viewer);
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/streams/pk/stats?key={key}"),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["bitrate_kbps"], 3000.0);
+        assert_eq!(json["video"]["height"], 720);
+        assert!(json.get("id").is_none() && json.get("players").is_none());
+    }
+
+    // ---------- stats-nginx / stat.xsl ----------
+
+    #[tokio::test]
+    async fn stat_xsl_serves_stylesheet() {
+        let app = router(roomy_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stat.xsl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["Content-Type"], "text/xsl; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, STAT_XSL);
+    }
+
+    #[tokio::test]
+    async fn stats_nginx_missing_and_invalid_keys() {
+        let state = roomy_state();
+        let viewer = add_stream(&state, "nx");
+        add_live_sessions(&state.db, "nx", &viewer);
+        let app = router(state);
+
+        let (status, body) = send(&app, "GET", "/stats-nginx", false, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("<error>Missing stats key</error>"));
+
+        // A wrong key gets the same empty document a valid offline key
+        // would, never the live stream's data.
+        let (status, body) = send(&app, "GET", "/stats-nginx?key=wrong", false, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<nclients>0</nclients>"));
+        assert!(!body.contains("<stream>"));
+    }
+
+    #[test]
+    fn nginx_xml_unredacted_uses_real_names_for_all_streams() {
+        use crate::db::Player;
+
+        let db = Db::open(":memory:").unwrap();
+        let viewer = db.stream_add(&sample_stream("a")).unwrap().id;
+        let mut other = sample_stream("b");
+        other.app = "games".to_string();
+        let other_viewer = db.stream_add(&other).unwrap().id;
+        assert!(db.player_try_acquire(&Player {
+            id: "b_player".to_string(),
+            stream_id: "b".to_string(),
+            viewer_id: other_viewer,
+            app: "games".to_string(),
+            stream_name: "b<&>name".to_string(),
+            bytes_out: 10,
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+
+        // Player-only: the application name comes from the player row.
+        let xml = build_nginx_xml(&db, None, false);
+        assert!(xml.contains("<name>games</name>"));
+        assert!(xml.contains("<name>b&lt;&amp;&gt;name</name>"));
+        assert!(xml.contains("<publisher>0</publisher>"));
+        assert!(!xml.contains("<publishing/>"));
+        assert!(!xml.contains("<meta>"));
+
+        add_live_sessions(&db, "a", &viewer);
+        let xml = build_nginx_xml(&db, None, false);
+        assert!(xml.contains("<name>live</name>"), "publisher app wins");
+        assert!(xml.contains("<name>Stream a</name>"));
+        assert!(xml.contains("<name>b&lt;&amp;&gt;name</name>"));
+        assert!(xml.contains("<nclients>3</nclients>"));
+        assert_eq!(xml.matches("<stream>").count(), 2);
+    }
+
+    #[test]
+    fn xml_escape_drops_control_characters() {
+        assert_eq!(xml_escape("a\u{1}b\tc\u{1f}"), "ab\tc");
+    }
+
+    #[test]
+    fn stream_key_part_rejects_empty_and_overlong() {
+        assert!(!is_valid_stream_key_part(""));
+        assert!(!is_valid_stream_key_part(&"a".repeat(64)));
+        assert!(is_valid_stream_key_part(&"a".repeat(63)));
+        assert!(!is_valid_stream_key_part("_leading"));
+    }
+
+    // ---------- cluster endpoints in standalone mode ----------
+
+    #[tokio::test]
+    async fn cluster_endpoints_require_bearer() {
+        let app = router(roomy_state());
+        for (method, uri) in [
+            ("GET", "/api/v1/cluster"),
+            ("GET", "/api/v1/cluster/nodes"),
+            ("GET", "/api/v1/cluster/streams"),
+            ("POST", "/api/v1/cluster/nodes/2/drain"),
+            ("POST", "/api/v1/cluster/nodes/2/resume"),
+            ("POST", "/api/v1/cluster/nodes/2/promote"),
+            ("DELETE", "/api/v1/cluster/nodes/2"),
+            ("POST", "/api/v1/cluster/join-proof"),
+        ] {
+            let (status, body) = send(&app, method, uri, false, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert_eq!(error_code(&body), "UNAUTHORIZED");
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_read_endpoints_describe_standalone_node() {
+        let state = roomy_state();
+        let viewer = add_stream(&state, "solo");
+        add_live_sessions(&state.db, "solo", &viewer);
+        add_stream(&state, "quiet");
+        let app = router(state);
+
+        let (status, body) = send(&app, "GET", "/api/v1/cluster", true, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"enabled": false})
+        );
+
+        let (status, body) = send(&app, "GET", "/api/v1/cluster/nodes", true, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!([]));
+
+        let (status, body) = send(&app, "GET", "/api/v1/cluster/streams", true, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: Vec<Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(list.len(), 2);
+        let solo = list.iter().find(|s| s["stream_id"] == "solo").unwrap();
+        assert_eq!(solo["owner_node_id"], Value::Null);
+        assert_eq!(solo["epoch"], Value::Null);
+        assert_eq!(solo["subscribed_nodes"], json!([]));
+        assert_eq!(solo["cluster_players"], 1);
+        let quiet = list.iter().find(|s| s["stream_id"] == "quiet").unwrap();
+        assert_eq!(quiet["cluster_players"], 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_node_actions_are_rejected_in_standalone_mode() {
+        let app = router(roomy_state());
+        for (method, uri) in [
+            ("POST", "/api/v1/cluster/nodes/2/drain"),
+            ("POST", "/api/v1/cluster/nodes/2/resume"),
+            ("POST", "/api/v1/cluster/nodes/2/promote"),
+            ("DELETE", "/api/v1/cluster/nodes/2"),
+        ] {
+            let (status, body) = send(&app, method, uri, true, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+            assert_eq!(error_code(&body), "CLUSTER_DISABLED");
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_join_proof_validates_request() {
+        let app = router(roomy_state());
+        let uri = "/api/v1/cluster/join-proof";
+
+        let (status, body) = send(&app, "POST", uri, true, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Missing request body"));
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            uri,
+            true,
+            Some(r#"{"node_id":0,"control_addr":"10.0.0.2:7000","media_addr":"10.0.0.2:7001"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("node_id must be a positive integer"));
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            uri,
+            true,
+            Some(r#"{"node_id":2,"control_addr":"  ","media_addr":"10.0.0.2:7001"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("control_addr and media_addr are required"));
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            uri,
+            true,
+            Some(r#"{"node_id":2,"control_addr":"10.0.0.2:7000","media_addr":"10.0.0.2:7001"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(&body), "CLUSTER_DISABLED");
+    }
 }
