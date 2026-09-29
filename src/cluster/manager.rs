@@ -2569,12 +2569,19 @@ impl ClusterManager {
                 });
             }
             if let Some(new_owner) = new_owner {
-                let Some((_, media_addr)) = self.meta.get(new_owner) else {
-                    // The owner's media address is not known yet, so no Subscribe
-                    // is issued. `standby_subs` was already advanced to the
+                let Some((_, media_addr)) = self.meta.get(new_owner).filter(|(_, m)| !m.is_empty())
+                else {
+                    // The owner's media address is not known yet — either absent
+                    // from `meta`, or the empty string
+                    // `restore_topology_from_membership` seeds for a peer whose
+                    // address has not been learned since the restart (which it
+                    // marks Ready all the same). `subscribe_remote` takes an
+                    // empty address without erroring — it keeps the refcount and
+                    // skips the dial — so treating it as known would strand the
+                    // replica. `standby_subs` was already advanced to the
                     // intended owner above, which would make the unchanged key a
-                    // no-op on every later tick and strand the replica — drop the
-                    // key again so the next tick re-emits the subscribe.
+                    // no-op on every later tick — drop the key again so the next
+                    // tick re-emits the subscribe once the address is known.
                     self.standby_subs
                         .lock()
                         .remove(&(app.clone(), stream_id.clone()));
