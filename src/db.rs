@@ -3811,7 +3811,7 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute_batch(
                 "CREATE TRIGGER block_stats_flush BEFORE UPDATE OF bytes_in ON publishers
-                 BEGIN SELECT RAISE(FAIL, 'blocked'); END;",
+                 BEGIN SELECT RAISE(ROLLBACK, 'blocked'); END;",
             )
         })
         .unwrap();
