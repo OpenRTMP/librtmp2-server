@@ -1372,6 +1372,21 @@ async fn handle_stream_delete(
 
     mark_http_delete_sticky(&state, &id);
     if let Err(e) = state.coordinator.begin_delete_stream(&id) {
+        // The row is gone as far as the coordinator is concerned (a cluster
+        // follower's local read at the check above can lag behind the leader):
+        // the resource simply does not exist, so answer 404 like the
+        // `DbLookup::Missing` arm does instead of a retryable server error.
+        if matches!(&e, CoordError::NotFound) {
+            clear_http_delete_marker(&state, &id);
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::NOT_FOUND,
+                "stream not found",
+            );
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        }
         #[cfg(feature = "cluster")]
         let ambiguous_timeout = matches!(
             &e,
