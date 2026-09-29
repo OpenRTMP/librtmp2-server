@@ -330,11 +330,16 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
                 return Err(std::io::Error::other("frame too large"));
             }
             // Peek the variant tag before allocating/reserving so the budget
-            // class matches the actual message type.
+            // class matches the actual message type. serde_json skips leading
+            // JSON whitespace before dispatching on the variant tag, so trim it
+            // first or a pretty-printed frame is misclassified as a control.
             let mut prefix = [0u8; PEEK];
             let prefix_len = (len as usize).min(PEEK);
             r.read_exact(&mut prefix[..prefix_len]).await?;
-            let snapshot_prefix = prefix[..prefix_len].starts_with(b"{\"RaftSnapshot");
+            let snapshot_prefix = prefix[..prefix_len]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .is_some_and(|i| prefix[i..].starts_with(b"{\"RaftSnapshot"));
             if snapshot_prefix && len > MAX_SNAPSHOT_FRAME {
                 return Err(std::io::Error::other("snapshot frame too large"));
             }
