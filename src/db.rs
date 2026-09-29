@@ -403,6 +403,34 @@ CREATE TABLE IF NOT EXISTS raft_snapshots (
 );
 ";
 
+/// The on-disk file a [`Db::open`] `path` names, or `None` when the database
+/// has no backing file to restrict: an empty path, `:memory:`, or a `file:`
+/// URI in memory mode. `on_disk_db_open_flags` enables `SQLITE_OPEN_URI`, so a
+/// `file:` URI *without* `mode=memory` is an ordinary on-disk
+/// read/write/create database and must be restricted like any other path. The
+/// name is derived the way `sqlite3ParseUri` derives it: drop the `file:`
+/// scheme, a `//authority` component, and the `?query`/`#fragment` tail. A
+/// percent-encoded name is not decoded, so such a path is simply not found and
+/// `restrict_db_file_permissions` logs it.
+fn on_disk_db_path(path: &str) -> Option<&str> {
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    let Some(uri) = path.strip_prefix("file:") else {
+        return Some(path);
+    };
+    let file = uri.split(['?', '#']).next().unwrap_or(uri);
+    if file == ":memory:" || uri.contains("mode=memory") {
+        return None;
+    }
+    let file = file.strip_prefix("//").map_or(file, |rest| {
+        // `file://[authority]/path`: SQLite accepts only an empty authority or
+        // `localhost`; anything else is rejected, so skip to the path.
+        rest.find('/').map_or("", |slash| &rest[slash..])
+    });
+    (!file.is_empty()).then_some(file)
+}
+
 /// WAL mode creates sibling `-wal`/`-shm` files; restrict all three so stream
 /// keys stored in SQLite are not world-readable on multi-user hosts.
 #[cfg(unix)]
@@ -410,10 +438,10 @@ fn restrict_db_file_permissions(path: &str) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    // In-memory and URI-style databases have no backing file to restrict.
-    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+    // In-memory databases have no backing file to restrict.
+    let Some(path) = on_disk_db_path(path) else {
         return;
-    }
+    };
 
     let mode = fs::Permissions::from_mode(0o600);
     for candidate in [path, &format!("{path}-wal"), &format!("{path}-shm")] {
@@ -431,9 +459,9 @@ fn restrict_db_file_permissions(path: &str) {
     use std::path::Path;
     use std::process::Command;
 
-    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+    let Some(path) = on_disk_db_path(path) else {
         return;
-    }
+    };
 
     let username = std::env::var("USERNAME").unwrap_or_default();
     if username.is_empty() {
