@@ -404,10 +404,12 @@ const CLUSTER_FILE_KEYS: &[&str] = &[
     "CLUSTER_NODE_TIMEOUT_MS",
     "CLUSTER_CAPACITY",
     "CLUSTER_CAPACITY_MBPS",
-    "CLUSTER_DRAIN_THRESHOLD",
+    // Keep absolute targets before ratio thresholds: load_from_kv's threshold
+    // handlers clear the matching absolute so an explicit ratio wins.
     "CLUSTER_DRAIN_AT_MBPS",
-    "CLUSTER_RESUME_THRESHOLD",
+    "CLUSTER_DRAIN_THRESHOLD",
     "CLUSTER_RESUME_AT_MBPS",
+    "CLUSTER_RESUME_THRESHOLD",
     "CLUSTER_BANDWIDTH_INTERFACE",
     "CLUSTER_BANDWIDTH_MODE",
     "CLUSTER_BANDWIDTH_MAX_MBPS",
