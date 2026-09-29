@@ -427,8 +427,17 @@ impl MediaHub {
         let e = gens.entry(Self::sub_key(peer_id, app, stream)).or_insert(0);
         *e = e.wrapping_add(1);
         if gens.len() > MAX_SUB_GENS {
-            gens.retain(|key @ (owner, _, _), _| {
-                *owner == peer_id || self.subs.peers_for_stream(&key.1, &key.2).contains(owner)
+            // Keep only the generations that still fence something: a live
+            // subscription, or a NACK chain whose `schedule_subscribe_retry`
+            // task may still be in flight. The bumping peer's own inactive
+            // entries must go too — keeping them is what let one peer that
+            // churns distinct streams grow the map past the cap for good.
+            // A pruned key reads back as generation 0, which a delayed retry
+            // can only act on while `peers_for_stream` still holds the peer.
+            let nacks = self.subscribe_nacks.lock();
+            gens.retain(|key, _| {
+                nacks.contains_key(key)
+                    || self.subs.peers_for_stream(&key.1, &key.2).contains(&key.0)
             });
         }
     }
