@@ -2570,6 +2570,14 @@ impl ClusterManager {
             }
             if let Some(new_owner) = new_owner {
                 let Some((_, media_addr)) = self.meta.get(new_owner) else {
+                    // The owner's media address is not known yet, so no Subscribe
+                    // is issued. `standby_subs` was already advanced to the
+                    // intended owner above, which would make the unchanged key a
+                    // no-op on every later tick and strand the replica — drop the
+                    // key again so the next tick re-emits the subscribe.
+                    self.standby_subs
+                        .lock()
+                        .remove(&(app.clone(), stream_id.clone()));
                     continue;
                 };
                 let epoch = self
