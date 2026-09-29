@@ -36,6 +36,12 @@ pub(crate) static AUTH_COMPLETIONS_RX: StdMutex<Option<std::sync::mpsc::Receiver
 /// shards stop so queued authorization and close jobs are applied while the
 /// cluster manager is still running; see [`drain_auth_worker_for_shutdown`].
 static AUTH_WORKER_THREAD: StdMutex<Option<std::thread::JoinHandle<()>>> = StdMutex::new(None);
+/// How long shutdown waits for the auth worker to apply its queued jobs
+/// before leaving the rest to the next start. Generous for a healthy cluster
+/// (a release is a single Raft round trip, and `Db::open` plus
+/// `ClusterManager::start` recover whatever a deadline leaves behind), but
+/// bounded because each release can burn its own two-second write timeout.
+const AUTH_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 static PUBLISH_GENERATIONS: LazyLock<StdMutex<HashMap<u64, u64>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -849,18 +855,25 @@ fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
     }
 }
 
-/// Stops accepting new authorization work and waits for the auth worker to
-/// apply everything already queued. Shards queue their final connection closes
-/// while shutting down, and those closes release publisher ownership through
-/// the coordinator/Raft — so they must run while the cluster manager is still
-/// alive. Completion receivers are dropped first so the worker can never block
-/// on a full completion channel nobody drains.
+/// Stops accepting new authorization work and waits (bounded) for the auth
+/// worker to apply everything already queued. Shards queue their final
+/// connection closes while shutting down, and those closes release publisher
+/// ownership through the coordinator/Raft — so they must run while the
+/// cluster manager is still alive. Completion receivers are dropped first so
+/// the worker can never block on a full completion channel nobody drains.
 ///
-/// The wait is unbounded: the shard threads that queued those closes were
-/// already joined without a timeout, and every queued close is for a
-/// connection this process owned. Giving up early would only let the releases
-/// run after `shutdown_blocking()` and leave their durable ownership rows
-/// behind.
+/// The wait is bounded because the closes are processed serially and each
+/// ownership release is its own Raft write with its own two-second timeout
+/// (see `ClusterManager::block_on_write`): with quorum gone, a full
+/// `RTMP_MAX_CONNECTIONS` worth of publisher closes would take minutes here,
+/// against a cluster manager that is about to be torn down. Closes are left
+/// in submission order for the worker; the caller does not run them itself,
+/// which would jump ahead of jobs already queued. What a deadline leaves
+/// unapplied is recovered on the next start instead — `Db::open` clears the
+/// `publishers.active` flags and `ClusterManager::start` releases any
+/// `stream_owners` row still naming this node — so the cutoff cannot leave a
+/// durable block behind the way an unapplied release after
+/// `shutdown_blocking()` would.
 fn drain_auth_worker_for_shutdown() {
     if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
         guard.take();
@@ -872,8 +885,25 @@ fn drain_auth_worker_for_shutdown() {
         .lock()
         .ok()
         .and_then(|mut guard| guard.take());
-    if let Some(join) = join {
-        let _ = join.join();
+    let Some(join) = join else {
+        return;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("rtmp-auth-drain".to_string())
+        .spawn(move || {
+            let _ = join.join();
+            let _ = done_tx.send(());
+        });
+    let timed_out = match spawned {
+        Ok(_) => done_rx.recv_timeout(AUTH_DRAIN_TIMEOUT).is_err(),
+        Err(_) => true,
+    };
+    if timed_out {
+        crate::log_warn!(
+            "RTMP auth worker did not drain within {AUTH_DRAIN_TIMEOUT:?}; \
+             unreleased stream ownership is dropped on the next start"
+        );
     }
 }
 

@@ -562,6 +562,35 @@ impl ClusterManager {
             }
         }
 
+        // A restart owns no publisher until the RTMP shards bind, so any
+        // `stream_owners` row still naming this node is stale -- including
+        // the ones whose `on_close` a shutdown drain left unapplied when it
+        // hit its deadline (`server::drain_auth_worker_for_shutdown`).
+        // `Db::open` already cleared their `publishers.active` flag, but the
+        // ownership row is what blocks a publisher routed here from another
+        // node, and the leader's failure sweep never fires for a node that
+        // is UP rather than DOWN. Releasing them through Raft replays those
+        // closes on this boot: the streams stay in the cluster and any node
+        // can take them again. This runs before `ServerApp::run_until`
+        // spawns the shards, so a publisher cannot have acquired one in
+        // between.
+        let stale_owners = db
+            .stream_owner_list()
+            .iter()
+            .filter(|o| o.owner_node_id == config.node_id)
+            .count();
+        if stale_owners > 0 {
+            match mgr.release_owners_for_node(config.node_id) {
+                Ok(()) => crate::log_info!(
+                    "Cluster: released {stale_owners} stream ownership row(s) left by a previous run"
+                ),
+                Err(e) => crate::log_warn!(
+                    "Cluster: releasing {stale_owners} stale stream ownership row(s) failed ({e:?}); \
+                     they stay blocked for other nodes until this node is fenced DOWN"
+                ),
+            }
+        }
+
         let bg = Arc::clone(&mgr);
         tokio::spawn(async move { bg.metrics_loop().await });
         let bg = Arc::clone(&mgr);
