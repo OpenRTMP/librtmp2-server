@@ -428,11 +428,7 @@ impl MediaHub {
         *e = e.wrapping_add(1);
         if gens.len() > MAX_SUB_GENS {
             gens.retain(|key @ (owner, _, _), _| {
-                *owner == peer_id
-                    || self
-                        .subs
-                        .peers_for_stream(&key.1, &key.2)
-                        .contains(owner)
+                *owner == peer_id || self.subs.peers_for_stream(&key.1, &key.2).contains(owner)
             });
         }
     }
