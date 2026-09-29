@@ -347,7 +347,10 @@ impl SqliteStateMachine {
         }
     }
 
-    fn build_app_snapshot(&self) -> Result<AppSnapshot, String> {
+    /// `last_applied` is passed in rather than read here so the caller can pin
+    /// one `last_applied` acquisition across both this row read and the index
+    /// it records as `last_applied_index`; see `build_snapshot`.
+    fn build_app_snapshot(&self, last_applied: Option<LogId<u64>>) -> Result<AppSnapshot, String> {
         let (streams, viewers, owners, api_token, cluster_id, pending_delete_stream_ids) =
             self.db.read_replicated_snapshot()?;
         Ok(AppSnapshot {
@@ -356,7 +359,7 @@ impl SqliteStateMachine {
             owners,
             api_token,
             cluster_id,
-            last_applied_index: self.last_applied.lock().map(|l| l.index),
+            last_applied_index: last_applied.map(|l| l.index),
             pending_delete_stream_ids,
         })
     }
@@ -721,11 +724,26 @@ impl SqliteStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let last_applied = *self.last_applied.lock();
+        // One `last_applied` acquisition pinned across BOTH the replicated row
+        // read and the index that becomes `SnapshotMeta::last_log_id`. OpenRaft
+        // runs this builder on its own task, and `apply` advances
+        // `last_applied` only after the command SQL has committed, so reading
+        // the index separately let a command applied in between land in the
+        // payload while `last_log_id` stayed behind it — the snapshot was then
+        // not a consistent prefix of the log. Holding the lock across the read
+        // also makes the recorded index provably no newer than the rows (the
+        // conservative direction: a follower re-applies idempotently rather
+        // than skipping an entry).
+        let (data, last_applied) = {
+            let applied = self.last_applied.lock();
+            let data = self
+                .build_app_snapshot(*applied)
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
+                })?;
+            (data, *applied)
+        };
         let last_membership = self.last_membership.lock().clone();
-        let data = self.build_app_snapshot().map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
-        })?;
         let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_state_machine(&e),
         })?;
