@@ -34,6 +34,12 @@ pub enum StateEffect {
 pub struct SqliteStateMachine {
     db: Arc<Db>,
     last_applied: Arc<Mutex<Option<LogId<u64>>>>,
+    /// Serializes a command's database writes plus its `last_applied` update
+    /// against [`Self::build_snapshot`]'s row read. OpenRaft moves the snapshot
+    /// builder onto its own task and returns to the apply queue immediately
+    /// (`sm::worker::build_snapshot`), so without this the snapshot can capture
+    /// a command's rows while both indices still name the log entry before it.
+    apply_lock: Arc<Mutex<()>>,
     last_membership: Arc<Mutex<StoredMembership<u64, openraft::BasicNode>>>,
     current_snapshot: Arc<Mutex<Option<StoredSnapshot>>>,
     snapshot_idx: Arc<AtomicU64>,
@@ -53,6 +59,7 @@ impl SqliteStateMachine {
         Ok(Self {
             db,
             last_applied: Arc::new(Mutex::new(last_applied)),
+            apply_lock: Arc::new(Mutex::new(())),
             last_membership: Arc::new(Mutex::new(last_membership)),
             current_snapshot: Arc::new(Mutex::new(None)),
             snapshot_idx: Arc::new(AtomicU64::new(0)),
@@ -725,16 +732,18 @@ impl SqliteStateMachine {
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         // One `last_applied` acquisition pinned across BOTH the replicated row
-        // read and the index that becomes `SnapshotMeta::last_log_id`. OpenRaft
-        // runs this builder on its own task, and `apply` advances
-        // `last_applied` only after the command SQL has committed, so reading
-        // the index separately let a command applied in between land in the
-        // payload while `last_log_id` stayed behind it — the snapshot was then
-        // not a consistent prefix of the log. Holding the lock across the read
-        // also makes the recorded index provably no newer than the rows (the
-        // conservative direction: a follower re-applies idempotently rather
-        // than skipping an entry).
+        // read and the index that becomes `SnapshotMeta::last_log_id`, and one
+        // `apply_lock` held across both plus every command's own writes — so
+        // no command can commit while it is captured. OpenRaft runs this
+        // builder on its own task and resumes applying while it runs, so
+        // without that lock a command applied in between would land in the
+        // payload while both indices stayed behind it: the snapshot would
+        // carry state the recorded log prefix does not cover. Holding the two
+        // together makes the payload and both indices a consistent prefix of
+        // the log. (The conservative direction, a follower re-applying
+        // idempotently, is preserved: an index is never newer than the rows.)
         let (data, last_applied) = {
+            let _apply = self.apply_lock.lock();
             let applied = self.last_applied.lock();
             let data = self
                 .build_app_snapshot(*applied)
@@ -815,6 +824,10 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     responses.push(ClusterResponse::Ok);
                 }
                 EntryPayload::Normal(ref cmd) => {
+                    // `apply_lock` spans the commit and the index update together so a
+                    // concurrent `build_snapshot` (OpenRaft runs it on its own task)
+                    // can never read this command's rows under a stale index.
+                    let _apply = self.apply_lock.lock();
                     let resp = match cmd {
                         ClusterCommand::AcquireStreamOwner {
                             stream_id,
