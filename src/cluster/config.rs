@@ -182,6 +182,25 @@ impl ClusterConfig {
                     }
                     Ok(())
                 }
+                // An explicit ratio wins over a retained absolute, exactly as in
+                // `apply_env_overrides_from`: without dropping the absolute here
+                // the normalize below would re-derive the ratio from it and undo
+                // the override. Only a value that parses may clear it, so an
+                // invalid one cannot discard the file target normalize needs.
+                "CLUSTER_DRAIN_THRESHOLD" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        drain_at_mbps = None;
+                        cfg.drain_threshold = v;
+                    }
+                    Ok(())
+                }
+                "CLUSTER_RESUME_THRESHOLD" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        resume_at_mbps = None;
+                        cfg.resume_threshold = v;
+                    }
+                    Ok(())
+                }
                 _ => apply_cluster_kv(&mut cfg, key, val),
             }
         };
