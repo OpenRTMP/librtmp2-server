@@ -182,6 +182,25 @@ impl ClusterConfig {
                     }
                     Ok(())
                 }
+                // An explicit ratio wins over a retained absolute, exactly as in
+                // `apply_env_overrides_from`: without dropping the absolute here
+                // the normalize below would re-derive the ratio from it and undo
+                // the override. Only a value that parses may clear it, so an
+                // invalid one cannot discard the file target normalize needs.
+                "CLUSTER_DRAIN_THRESHOLD" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        drain_at_mbps = None;
+                        cfg.drain_threshold = v;
+                    }
+                    Ok(())
+                }
+                "CLUSTER_RESUME_THRESHOLD" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        resume_at_mbps = None;
+                        cfg.resume_threshold = v;
+                    }
+                    Ok(())
+                }
                 _ => apply_cluster_kv(&mut cfg, key, val),
             }
         };
@@ -385,10 +404,12 @@ const CLUSTER_FILE_KEYS: &[&str] = &[
     "CLUSTER_NODE_TIMEOUT_MS",
     "CLUSTER_CAPACITY",
     "CLUSTER_CAPACITY_MBPS",
-    "CLUSTER_DRAIN_THRESHOLD",
+    // Keep absolute targets before ratio thresholds: load_from_kv's threshold
+    // handlers clear the matching absolute so an explicit ratio wins.
     "CLUSTER_DRAIN_AT_MBPS",
-    "CLUSTER_RESUME_THRESHOLD",
+    "CLUSTER_DRAIN_THRESHOLD",
     "CLUSTER_RESUME_AT_MBPS",
+    "CLUSTER_RESUME_THRESHOLD",
     "CLUSTER_BANDWIDTH_INTERFACE",
     "CLUSTER_BANDWIDTH_MODE",
     "CLUSTER_BANDWIDTH_MAX_MBPS",
@@ -421,13 +442,17 @@ const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
     ("LRTMP2_CLUSTER_NODE_TIMEOUT_MS", "CLUSTER_NODE_TIMEOUT_MS"),
     ("LRTMP2_CLUSTER_CAPACITY", "CLUSTER_CAPACITY"),
     ("LRTMP2_CLUSTER_CAPACITY_MBPS", "CLUSTER_CAPACITY_MBPS"),
-    ("LRTMP2_CLUSTER_DRAIN_THRESHOLD", "CLUSTER_DRAIN_THRESHOLD"),
+    // Order matters: each `_THRESHOLD` arm clears the matching `_AT_MBPS`
+    // absolute, and the trailing normalize re-derives the ratio from a
+    // surviving absolute. The threshold keys must therefore be applied last,
+    // so an explicit ratio in the environment beats a retained file absolute.
     ("LRTMP2_CLUSTER_DRAIN_AT_MBPS", "CLUSTER_DRAIN_AT_MBPS"),
+    ("LRTMP2_CLUSTER_DRAIN_THRESHOLD", "CLUSTER_DRAIN_THRESHOLD"),
+    ("LRTMP2_CLUSTER_RESUME_AT_MBPS", "CLUSTER_RESUME_AT_MBPS"),
     (
         "LRTMP2_CLUSTER_RESUME_THRESHOLD",
         "CLUSTER_RESUME_THRESHOLD",
     ),
-    ("LRTMP2_CLUSTER_RESUME_AT_MBPS", "CLUSTER_RESUME_AT_MBPS"),
     (
         "LRTMP2_CLUSTER_BANDWIDTH_INTERFACE",
         "CLUSTER_BANDWIDTH_INTERFACE",
@@ -756,5 +781,45 @@ mod tests {
         assert!((cfg.bandwidth_max_mbps - 2000.0).abs() < f64::EPSILON);
         assert!((cfg.drain_threshold - 0.4).abs() < f64::EPSILON);
         assert!((cfg.resume_threshold - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn file_ratio_threshold_beats_absolute_in_load_from_kv() {
+        let map = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("CLUSTER_DRAIN_AT_MBPS", "800"),
+            ("CLUSTER_RESUME_AT_MBPS", "500"),
+            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
+            ("CLUSTER_DRAIN_THRESHOLD", "0.91"),
+            ("CLUSTER_RESUME_THRESHOLD", "0.42"),
+        ]);
+        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!((cfg.drain_threshold - 0.91).abs() < f64::EPSILON);
+        assert!((cfg.resume_threshold - 0.42).abs() < f64::EPSILON);
+        assert_eq!(cfg.drain_at_mbps, None);
+        assert_eq!(cfg.resume_at_mbps, None);
+    }
+
+    #[test]
+    fn invalid_file_ratio_threshold_keeps_absolute_for_normalize() {
+        let map = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("CLUSTER_DRAIN_AT_MBPS", "800"),
+            ("CLUSTER_RESUME_AT_MBPS", "500"),
+            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
+            ("CLUSTER_DRAIN_THRESHOLD", "not-a-ratio"),
+            ("CLUSTER_RESUME_THRESHOLD", "also-bad"),
+        ]);
+        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert_eq!(cfg.drain_at_mbps, Some(800.0));
+        assert_eq!(cfg.resume_at_mbps, Some(500.0));
+        assert!((cfg.drain_threshold - 0.8).abs() < f64::EPSILON);
+        assert!((cfg.resume_threshold - 0.5).abs() < f64::EPSILON);
     }
 }

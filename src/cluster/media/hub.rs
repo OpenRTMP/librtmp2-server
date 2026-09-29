@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -36,6 +36,16 @@ const SUBSCRIBE_GATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SUBSCRIBE_NACK_RETRY: Duration = Duration::from_millis(200);
 const SUBSCRIBE_NACK_MAX: u8 = 3;
 const SUBSCRIBE_NACK_SEND_RETRIES: u8 = 3;
+/// Bounded retries, and the delay between them, for the InitCache enqueue that
+/// registers an inbound Subscribe. The wire has no Subscribe ACK, so a
+/// registration dropped on momentary queue pressure is never retried by the
+/// subscriber.
+const SUBSCRIBE_ENQUEUE_ATTEMPTS: u8 = 3;
+const SUBSCRIBE_ENQUEUE_RETRY_DELAY: Duration = Duration::from_millis(50);
+/// Soft cap on retained `subscribe_gens` entries. Generations only fence
+/// in-flight NACK retries, so entries whose subscription is gone are dead
+/// weight; the map is otherwise insert-only and grows for the process life.
+const MAX_SUB_GENS: usize = 4096;
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Handles a failed media-plane `accept`: logs it and backs off, returning
@@ -144,6 +154,17 @@ impl InjectQueue {
 
     pub fn try_send(&self, frame: InjectedFrame) -> Result<(), ()> {
         let size = frame.payload.len().saturating_add(64);
+        // Reject an oversized frame before the eviction loop: draining the
+        // whole backlog would destroy every other stream's frames for a frame
+        // that was never going to fit anyway.
+        if size > self.max_bytes {
+            tracing::warn!(
+                app = %frame.app,
+                stream = %frame.stream,
+                "inbound media inject queue full — dropping frame"
+            );
+            return Err(());
+        }
         let mut st = self.state.lock();
         while st.1.saturating_add(size) > self.max_bytes && !st.0.is_empty() {
             if let Some(dropped) = st.0.pop_front() {
@@ -196,6 +217,16 @@ impl ExportQueue {
 
     pub fn push(&self, frame: ExportedFrame) {
         let size = frame.payload.len().saturating_add(64);
+        // Drop-oldest only applies to a frame that can eventually fit; an
+        // oversized frame must not empty the backlog of every other stream.
+        if size > self.max_bytes {
+            tracing::warn!(
+                app = %frame.app,
+                stream = %frame.stream,
+                "export media queue full — dropping oversized frame"
+            );
+            return;
+        }
         let mut st = self.state.lock();
         while st.1.saturating_add(size) > self.max_bytes {
             let Some(old) = st.0.pop_front() else {
@@ -261,6 +292,11 @@ pub struct MediaHub {
     /// Generation per owner+stream so delayed NACK retries cannot fire after
     /// unsubscribe/resubscribe and double the owner's Subscribe refcount.
     subscribe_gens: Mutex<HashMap<(NodeId, String, String), u64>>,
+    /// Source for `subscribe_gens` values. One shared counter, never reused
+    /// and never handing out 0, so a key pruned while a retry sleeps (reading
+    /// back as the 0 sentinel) and a key re-created later (reading back as a
+    /// fresh value) can never collide with the generation a retry captured.
+    next_sub_gen: AtomicU64,
     /// Serializes `subs.add` + peer (re)creation + resubscribe snapshot so a
     /// concurrent `subscribe_remote` cannot slip a new stream into the
     /// snapshot and have it sent twice (once by the fresh-peer resubscribe,
@@ -308,6 +344,9 @@ impl MediaHub {
             inbound_sinks: Mutex::new(HashMap::new()),
             subscribe_nacks: Mutex::new(HashMap::new()),
             subscribe_gens: Mutex::new(HashMap::new()),
+            // Starts at 1: 0 is the "no generation recorded" sentinel on the
+            // wire and must never be handed out as a real generation.
+            next_sub_gen: AtomicU64::new(1),
             subscribe_lock: Mutex::new(()),
             subs: SubscriptionTable::new(),
             cache: InitCacheStore::new(),
@@ -378,7 +417,7 @@ impl MediaHub {
             }
             for ((owner, _, _), generation) in gens.iter_mut() {
                 if *owner == peer_id {
-                    *generation = generation.wrapping_add(1);
+                    *generation = self.alloc_sub_gen();
                 }
             }
         }
@@ -389,6 +428,14 @@ impl MediaHub {
         (peer_id, app.to_string(), stream.to_string())
     }
 
+    /// Allocate a generation no other owner+stream has ever held. A per-key
+    /// counter handed out the same small values again once a key was pruned
+    /// and re-created, so a retry still sleeping across that prune matched the
+    /// recycled value and re-sent a `Subscribe` the owner had already counted.
+    fn alloc_sub_gen(&self) -> u64 {
+        self.next_sub_gen.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) -> u64 {
         self.subscribe_gens
             .lock()
@@ -397,10 +444,29 @@ impl MediaHub {
             .unwrap_or(0)
     }
 
-    fn bump_sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) {
+    /// Allocate a generation no other owner+stream has ever held and record it
+    /// for `peer_id`'s `app`/`stream`; returns the value stored, so a caller
+    /// that fences on it never re-reads the map and can never capture the 0 an
+    /// absent key reads back as.
+    fn bump_sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) -> u64 {
         let mut gens = self.subscribe_gens.lock();
-        let e = gens.entry(Self::sub_key(peer_id, app, stream)).or_insert(0);
-        *e = e.wrapping_add(1);
+        let generation = self.alloc_sub_gen();
+        *gens.entry(Self::sub_key(peer_id, app, stream)).or_default() = generation;
+        if gens.len() > MAX_SUB_GENS {
+            // Keep only the generations that still fence something: a live
+            // subscription, or a NACK chain whose `schedule_subscribe_retry`
+            // task may still be in flight. The bumping peer's own inactive
+            // entries must go too — keeping them is what let one peer that
+            // churns distinct streams grow the map past the cap for good.
+            // A pruned key reads back as generation 0, which no stored
+            // generation can equal, so a pruned key is a dead fence.
+            let nacks = self.subscribe_nacks.lock();
+            gens.retain(|key, _| {
+                nacks.contains_key(key)
+                    || self.subs.peers_for_stream(&key.1, &key.2).contains(&key.0)
+            });
+        }
+        generation
     }
 
     fn clear_subscribe_nacks(&self, peer_id: NodeId, app: &str, stream: &str) {
@@ -622,26 +688,45 @@ impl MediaHub {
                         };
                         // Enqueue InitCache (if any) under the subscription lock
                         // so fan-out cannot observe the new ref until headers
-                        // are first in this sink's FIFO.
-                        if self
-                            .subs
-                            .add_with(peer_id, &app, &stream, || {
+                        // are first in this sink's FIFO. A momentarily full
+                        // sink is retried a bounded number of times instead of
+                        // abandoned: the peer gets no ACK and nothing tells it
+                        // to resubscribe, so a registration dropped here leaves
+                        // its refcount pointing at an owner that never fans out
+                        // to it again.
+                        let mut registered: Result<bool, ()> = Ok(false);
+                        for attempt in 0..=SUBSCRIBE_ENQUEUE_ATTEMPTS {
+                            if attempt > 0 {
+                                tokio::time::sleep(SUBSCRIBE_ENQUEUE_RETRY_DELAY).await;
+                            }
+                            registered = self.subs.add_with(peer_id, &app, &stream, || {
                                 if sink.is_closed() {
                                     return Err(());
                                 }
-                                if let Some(msg) = init_msg {
-                                    sink.try_send(msg)
-                                } else {
-                                    Ok(())
+                                match &init_msg {
+                                    Some(msg) => sink.try_send(msg.clone()),
+                                    None => Ok(()),
                                 }
-                            })
-                            .is_err()
-                        {
+                            });
+                            if registered.is_ok() {
+                                break;
+                            }
+                        }
+                        if registered.is_err() {
                             if sink.is_closed() {
                                 return Err(std::io::Error::other("inbound media sink closed"));
                             }
-                            let _ =
-                                sink.try_send(subscribe_denied_error(&app, &stream, generation));
+                            // The InitCache enqueue is still failing for a
+                            // non-fatal reason after the bounded retries: this
+                            // sink's byte budget or its bounded channel stays
+                            // full. SUBSCRIBE_DENIED here would read as an
+                            // authorization denial — the peer retries, then
+                            // calls subs.clear_entry, dropping the refcount
+                            // shared by every local player on that node, turning
+                            // a stall into permanent loss of a live stream. The
+                            // wire has no Subscribe ACK, so silence is the same
+                            // signal success gives; the peer keeps its ref and a
+                            // later resubscribe re-offers this Subscribe.
                             continue;
                         }
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
@@ -811,6 +896,13 @@ impl MediaHub {
                 if req_gen != 0 && req_gen != generation {
                     return;
                 }
+                // Register the NACK before allocating the generation the retry
+                // captures. The prune in `bump_sub_gen` keeps every NACKed key,
+                // so allocation can no longer drop this key in the gap: an
+                // `unsubscribe_remote` landing there would otherwise leave the
+                // retry holding the 0 an absent key reads back as — which a
+                // resubscribe before the retry wakes also reads as — and the
+                // duplicate Subscribe would leave a phantom owner refcount.
                 let n = {
                     let mut nacks = self.subscribe_nacks.lock();
                     let e = nacks
@@ -818,6 +910,11 @@ impl MediaHub {
                         .or_insert(0);
                     *e = e.saturating_add(1);
                     *e
+                };
+                let generation = if generation == 0 {
+                    self.bump_sub_gen(peer_id, &app, &stream)
+                } else {
+                    generation
                 };
                 if n > SUBSCRIBE_NACK_MAX {
                     self.clear_subscribe_nacks(peer_id, &app, &stream);
@@ -1437,10 +1534,13 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(q.drain().is_empty());
 
-        // A frame larger than the whole budget is refused.
+        // A frame larger than the whole budget is refused without evicting
+        // the frames already queued.
         q.try_send(injected(10)).unwrap();
         assert!(q.try_send(injected(2 * 1024 * KB)).is_err());
-        assert!(q.drain().is_empty(), "overflow eviction empties the queue");
+        let kept = q.drain();
+        assert_eq!(kept.len(), 1, "an oversized frame must not flush the queue");
+        assert_eq!(kept[0].payload.len(), 10);
     }
 
     #[tokio::test]
@@ -1465,10 +1565,12 @@ mod tests {
             "drop-oldest keeps FIFO order of the survivors"
         );
 
-        // Oversized: every queued frame is evicted and the new one dropped.
+        // Oversized: the new frame is dropped and the queued frames are kept.
         q.push(exported(1, 4, &[1]));
         q.push(exported(1, 5, &vec![0; 2 * 1024 * KB]));
-        assert!(q.drain().is_empty());
+        let kept = q.drain();
+        assert_eq!(kept.len(), 1, "an oversized frame must not flush the queue");
+        assert_eq!(kept[0].timestamp, 4);
         // Frames already queued are returned immediately.
         q.push(exported(1, 6, &[1]));
         assert_eq!(q.wait_and_drain().await.len(), 1);
@@ -1994,11 +2096,16 @@ mod tests {
         n.hub.handle_inbound(2, denied(99));
         assert!(n.hub.subscribe_nacks.lock().is_empty());
 
-        // A matching NACK schedules a retry that re-sends Subscribe.
+        // A matching NACK schedules a retry that re-sends Subscribe. The retry
+        // captured a freshly allocated generation (never the 0 an unrecorded
+        // key reads back as), so it can never match a pruned or re-created key.
         let generation = n.hub.sub_gen(2, "live", "s");
         n.hub.handle_inbound(2, denied(generation));
         match next(&mut s).await {
-            MediaMessage::Subscribe { generation: g, .. } => assert_eq!(g, generation),
+            MediaMessage::Subscribe { generation: g, .. } => {
+                assert_ne!(g, 0, "a retry must not capture the prunable generation 0");
+                assert_eq!(g, n.hub.sub_gen(2, "live", "s"));
+            }
             other => panic!("unexpected {other:?}"),
         }
 
@@ -2161,8 +2268,14 @@ mod tests {
         assert!(sink.is_closed());
         assert!(n.hub.subscribe_nacks.lock().is_empty());
         assert_eq!(n.hub.subscription_count(), 0);
-        assert_eq!(n.hub.sub_gen(2, "live", "s"), 1);
-        assert_eq!(n.hub.sub_gen(2, "live", "nacked"), 1);
+        // Generations come from one never-reused counter, so the two fenced
+        // keys hold distinct non-zero values: a sleeping retry holding either
+        // one can never match the other key or a pruned/re-created one.
+        let s_gen = n.hub.sub_gen(2, "live", "s");
+        let nacked_gen = n.hub.sub_gen(2, "live", "nacked");
+        assert_ne!(s_gen, 0);
+        assert_ne!(nacked_gen, 0);
+        assert_ne!(s_gen, nacked_gen);
         // Unknown peers are a no-op.
         n.hub.disconnect_peer(42);
         n.hub.shutdown();

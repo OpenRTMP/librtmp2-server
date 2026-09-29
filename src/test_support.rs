@@ -46,6 +46,15 @@ pub struct TestServer {
 impl TestServer {
     /// Start HTTP + RTMP on loopback using an in-memory database.
     pub fn start(rtmp_port: u16, api_token: &str) -> Self {
+        Self::start_with_config(rtmp_port, api_token, ServerConfig::default())
+    }
+
+    /// [`Self::start`] from a caller-supplied base config, for callers that
+    /// need to override defaults the harness would otherwise impose (the
+    /// criterion benchmark issues far more requests per minute than the
+    /// production per-peer limits allow). The two fields the harness owns --
+    /// the API token and the RTMP bind -- always come from the arguments.
+    pub fn start_with_config(rtmp_port: u16, api_token: &str, config: ServerConfig) -> Self {
         logger::init(0, "");
 
         let db = Arc::new(Db::open(":memory:").unwrap());
@@ -60,7 +69,7 @@ impl TestServer {
         let config = ServerConfig {
             api_token: api_token.to_string(),
             rtmp_bind: format!("127.0.0.1:{rtmp_port}"),
-            ..Default::default()
+            ..config
         };
 
         let coordinator = Arc::new(crate::state::StateCoordinator::standalone(Arc::clone(&db)));

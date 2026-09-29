@@ -31,10 +31,8 @@ impl OwnershipTracker {
         self.owners
             .lock()
             .insert(stream_id.to_string(), (node_id, epoch));
-        if epoch >= self.next_epoch.load(Ordering::Relaxed) {
-            self.next_epoch
-                .store(epoch.saturating_add(1), Ordering::Relaxed);
-        }
+        self.next_epoch
+            .fetch_max(epoch.saturating_add(1), Ordering::Relaxed);
     }
 
     pub fn clear(&self, stream_id: &str) {
@@ -55,11 +53,8 @@ impl OwnershipTracker {
             max_epoch = max_epoch.max(o.epoch);
         }
         drop(g);
-        let cur = self.next_epoch.load(Ordering::Relaxed);
-        if max_epoch >= cur {
-            self.next_epoch
-                .store(max_epoch.saturating_add(1), Ordering::Relaxed);
-        }
+        self.next_epoch
+            .fetch_max(max_epoch.saturating_add(1), Ordering::Relaxed);
     }
 
     /// Sync from DB list; returns (stream_id, previous (node, epoch)) for every
@@ -91,21 +86,15 @@ impl OwnershipTracker {
         }
         *g = next;
         drop(g);
-        let cur = self.next_epoch.load(Ordering::Relaxed);
-        if max_epoch >= cur {
-            self.next_epoch
-                .store(max_epoch.saturating_add(1), Ordering::Relaxed);
-        }
+        self.next_epoch
+            .fetch_max(max_epoch.saturating_add(1), Ordering::Relaxed);
         changed
     }
 
     /// Ensure local counter is past `epoch` (e.g. after Raft-assigned log index).
     pub fn advance_past(&self, epoch: u64) {
-        let cur = self.next_epoch.load(Ordering::Relaxed);
-        if epoch >= cur {
-            self.next_epoch
-                .store(epoch.saturating_add(1), Ordering::Relaxed);
-        }
+        self.next_epoch
+            .fetch_max(epoch.saturating_add(1), Ordering::Relaxed);
     }
 
     pub fn get(&self, stream_id: &str) -> Option<(u64, u64)> {

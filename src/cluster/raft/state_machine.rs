@@ -34,6 +34,12 @@ pub enum StateEffect {
 pub struct SqliteStateMachine {
     db: Arc<Db>,
     last_applied: Arc<Mutex<Option<LogId<u64>>>>,
+    /// Serializes a command's database writes plus its `last_applied` update
+    /// against [`Self::build_snapshot`]'s row read. OpenRaft moves the snapshot
+    /// builder onto its own task and returns to the apply queue immediately
+    /// (`sm::worker::build_snapshot`), so without this the snapshot can capture
+    /// a command's rows while both indices still name the log entry before it.
+    apply_lock: Arc<Mutex<()>>,
     last_membership: Arc<Mutex<StoredMembership<u64, openraft::BasicNode>>>,
     current_snapshot: Arc<Mutex<Option<StoredSnapshot>>>,
     snapshot_idx: Arc<AtomicU64>,
@@ -53,6 +59,7 @@ impl SqliteStateMachine {
         Ok(Self {
             db,
             last_applied: Arc::new(Mutex::new(last_applied)),
+            apply_lock: Arc::new(Mutex::new(())),
             last_membership: Arc::new(Mutex::new(last_membership)),
             current_snapshot: Arc::new(Mutex::new(None)),
             snapshot_idx: Arc::new(AtomicU64::new(0)),
@@ -347,7 +354,10 @@ impl SqliteStateMachine {
         }
     }
 
-    fn build_app_snapshot(&self) -> Result<AppSnapshot, String> {
+    /// `last_applied` is passed in rather than read here so the caller can pin
+    /// one `last_applied` acquisition across both this row read and the index
+    /// it records as `last_applied_index`; see `build_snapshot`.
+    fn build_app_snapshot(&self, last_applied: Option<LogId<u64>>) -> Result<AppSnapshot, String> {
         let (streams, viewers, owners, api_token, cluster_id, pending_delete_stream_ids) =
             self.db.read_replicated_snapshot()?;
         Ok(AppSnapshot {
@@ -356,7 +366,7 @@ impl SqliteStateMachine {
             owners,
             api_token,
             cluster_id,
-            last_applied_index: self.last_applied.lock().map(|l| l.index),
+            last_applied_index: last_applied.map(|l| l.index),
             pending_delete_stream_ids,
         })
     }
@@ -721,11 +731,28 @@ impl SqliteStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let last_applied = *self.last_applied.lock();
+        // One `last_applied` acquisition pinned across BOTH the replicated row
+        // read and the index that becomes `SnapshotMeta::last_log_id`, and one
+        // `apply_lock` held across both plus every command's own writes — so
+        // no command can commit while it is captured. OpenRaft runs this
+        // builder on its own task and resumes applying while it runs, so
+        // without that lock a command applied in between would land in the
+        // payload while both indices stayed behind it: the snapshot would
+        // carry state the recorded log prefix does not cover. Holding the two
+        // together makes the payload and both indices a consistent prefix of
+        // the log. (The conservative direction, a follower re-applying
+        // idempotently, is preserved: an index is never newer than the rows.)
+        let (data, last_applied) = {
+            let _apply = self.apply_lock.lock();
+            let applied = self.last_applied.lock();
+            let data = self
+                .build_app_snapshot(*applied)
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
+                })?;
+            (data, *applied)
+        };
         let last_membership = self.last_membership.lock().clone();
-        let data = self.build_app_snapshot().map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
-        })?;
         let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_state_machine(&e),
         })?;
@@ -797,6 +824,10 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     responses.push(ClusterResponse::Ok);
                 }
                 EntryPayload::Normal(ref cmd) => {
+                    // `apply_lock` spans the commit and the index update together so a
+                    // concurrent `build_snapshot` (OpenRaft runs it on its own task)
+                    // can never read this command's rows under a stale index.
+                    let _apply = self.apply_lock.lock();
                     let resp = match cmd {
                         ClusterCommand::AcquireStreamOwner {
                             stream_id,

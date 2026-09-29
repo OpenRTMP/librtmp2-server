@@ -36,6 +36,12 @@ pub(crate) static AUTH_COMPLETIONS_RX: StdMutex<Option<std::sync::mpsc::Receiver
 /// shards stop so queued authorization and close jobs are applied while the
 /// cluster manager is still running; see [`drain_auth_worker_for_shutdown`].
 static AUTH_WORKER_THREAD: StdMutex<Option<std::thread::JoinHandle<()>>> = StdMutex::new(None);
+/// How long shutdown waits for the auth worker to apply its queued jobs
+/// before leaving the rest to the next start. Generous for a healthy cluster
+/// (a release is a single Raft round trip, and `Db::open` plus
+/// `ClusterManager::start` recover whatever a deadline leaves behind), but
+/// bounded because each release can burn its own two-second write timeout.
+const AUTH_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 static PUBLISH_GENERATIONS: LazyLock<StdMutex<HashMap<u64, u64>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -855,6 +861,19 @@ fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
 /// ownership through the coordinator/Raft — so they must run while the
 /// cluster manager is still alive. Completion receivers are dropped first so
 /// the worker can never block on a full completion channel nobody drains.
+///
+/// The wait is bounded because the closes are processed serially and each
+/// ownership release is its own Raft write with its own two-second timeout
+/// (see `ClusterManager::block_on_write`): with quorum gone, a full
+/// `RTMP_MAX_CONNECTIONS` worth of publisher closes would take minutes here,
+/// against a cluster manager that is about to be torn down. Closes are left
+/// in submission order for the worker; the caller does not run them itself,
+/// which would jump ahead of jobs already queued. What a deadline leaves
+/// unapplied is recovered on the next start instead — `Db::open` clears the
+/// `publishers.active` flags and `ClusterManager::start` releases any
+/// `stream_owners` row still naming this node — so the cutoff cannot leave a
+/// durable block behind the way an unapplied release after
+/// `shutdown_blocking()` would.
 fn drain_auth_worker_for_shutdown() {
     if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
         guard.take();
@@ -877,14 +896,13 @@ fn drain_auth_worker_for_shutdown() {
             let _ = done_tx.send(());
         });
     let timed_out = match spawned {
-        Ok(_) => done_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .is_err(),
+        Ok(_) => done_rx.recv_timeout(AUTH_DRAIN_TIMEOUT).is_err(),
         Err(_) => true,
     };
     if timed_out {
         crate::log_warn!(
-            "RTMP auth worker did not drain within 10s; shutting down without waiting for it"
+            "RTMP auth worker did not drain within {AUTH_DRAIN_TIMEOUT:?}; \
+             unreleased stream ownership is dropped on the next start"
         );
     }
 }
@@ -2308,7 +2326,7 @@ fn run_rtmp_shard(shared: Arc<ShardShared>, spec: ShardSpec) {
 
     // Notify the bridge about connections that never got an explicit close event.
     for conn_id in shard.tracked.keys().copied().collect::<Vec<_>>() {
-        shard.shared.bridge.on_close(conn_id);
+        close_conn_off_poll_thread(&shard.shared.bridge, conn_id);
         clear_publish_generation(conn_id);
     }
 

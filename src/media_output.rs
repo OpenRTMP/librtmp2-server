@@ -30,8 +30,15 @@ use tokio_util::io::ReaderStream;
 const DEFAULT_QUEUE_MB: usize = 32;
 const SINK_QUEUE_MESSAGES: usize = 512;
 const RETIRED_SESSION_QUEUE: usize = 16;
+/// Minimum gap between two same-connection republish restarts on one publisher
+/// connection. Each restart rebuilds every media sink (an FFmpeg child plus
+/// sink/monitor threads), so a publisher that walks its RTMP timestamps
+/// backwards by more than 1s on every frame must not be able to force one
+/// restart per frame.
+const REPUBLISH_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_FLV_PAYLOAD: usize = 0x00ff_ffff;
 static HLS_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RECORDING_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_HLS_PLAYLIST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,8 +400,21 @@ impl MediaOutputManager {
         let timestamp_reset = self
             .sessions
             .get(&frame.publisher_conn_id)
-            .and_then(|session| session.last_timestamp)
-            .is_some_and(|last| {
+            .is_some_and(|session| {
+                // Debounce: a republish restart is rate-limited per publisher
+                // connection (see REPUBLISH_RESTART_MIN_INTERVAL). The publisher
+                // controls `frame.timestamp`, so a strictly-decreasing sequence
+                // would otherwise retire and re-create the session — FFmpeg
+                // child, sink worker and monitor thread — on every frame.
+                if session
+                    .restarted_at
+                    .is_some_and(|at| at.elapsed() < REPUBLISH_RESTART_MIN_INTERVAL)
+                {
+                    return false;
+                }
+                let Some(last) = session.last_timestamp else {
+                    return false;
+                };
                 // A backward jump of more than 1s marks a same-connection
                 // republish boundary. A "backward" delta that is really a u32
                 // millisecond wraparound (~49.7 days) is a continuation, not a
@@ -408,6 +428,9 @@ impl MediaOutputManager {
                 self.retire(old);
             }
             self.start_session(frame.publisher_conn_id, stream_id, generation);
+            if let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) {
+                session.restarted_at = Some(Instant::now());
+            }
         }
 
         let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) else {
@@ -465,6 +488,9 @@ struct MediaSession {
     recording_file: Option<PathBuf>,
     hls_playlist: Option<PathBuf>,
     last_timestamp: Option<u32>,
+    /// When this session was created by a republish restart, so the next one
+    /// can be rate-limited per publisher connection.
+    restarted_at: Option<Instant>,
 }
 
 fn setup_recording_sink(
@@ -478,7 +504,15 @@ fn setup_recording_sink(
     }
 
     let dir = config.recording_path.join(safe_id);
-    let path = dir.join(format!("{}.flv", unix_millis()));
+    // The `<millis>` stem alone is not unique: a same-connection republish
+    // restart retires the old session and starts a new one in the same call,
+    // and retirement is asynchronous, so two sessions can resolve to the same
+    // path — the new worker then truncates the retired worker's still-open
+    // recording and both tag streams interleave into one file. The monotonic
+    // sequence keeps every session on its own file, exactly as
+    // `hls_session_dir_name` does for HLS.
+    let sequence = RECORDING_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{}-{sequence:020}.flv", unix_millis()));
     sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
     Some(path)
 }
@@ -615,6 +649,7 @@ impl MediaSession {
             recording_file,
             hls_playlist,
             last_timestamp: None,
+            restarted_at: None,
         }
     }
 

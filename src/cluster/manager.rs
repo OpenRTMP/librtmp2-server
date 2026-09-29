@@ -51,6 +51,10 @@ const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 /// Bounded retry budget for re-learning peer media addresses after a restart.
 const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
 const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
+/// Bound on the wait for a freshly added learner to reach line-rate. Kept
+/// under `network`'s 8s control round trip so a slow catch-up surfaces as
+/// this error on the joiner instead of a client-side round-trip timeout.
+const JOIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -558,6 +562,35 @@ impl ClusterManager {
             }
         }
 
+        // A restart owns no publisher until the RTMP shards bind, so any
+        // `stream_owners` row still naming this node is stale -- including
+        // the ones whose `on_close` a shutdown drain left unapplied when it
+        // hit its deadline (`server::drain_auth_worker_for_shutdown`).
+        // `Db::open` already cleared their `publishers.active` flag, but the
+        // ownership row is what blocks a publisher routed here from another
+        // node, and the leader's failure sweep never fires for a node that
+        // is UP rather than DOWN. Releasing them through Raft replays those
+        // closes on this boot: the streams stay in the cluster and any node
+        // can take them again. This runs before `ServerApp::run_until`
+        // spawns the shards, so a publisher cannot have acquired one in
+        // between.
+        let stale_owners = db
+            .stream_owner_list()
+            .iter()
+            .filter(|o| o.owner_node_id == config.node_id)
+            .count();
+        if stale_owners > 0 {
+            match mgr.release_owners_for_node(config.node_id) {
+                Ok(()) => crate::log_info!(
+                    "Cluster: released {stale_owners} stream ownership row(s) left by a previous run"
+                ),
+                Err(e) => crate::log_warn!(
+                    "Cluster: releasing {stale_owners} stale stream ownership row(s) failed ({e:?}); \
+                     they stay blocked for other nodes until this node is fenced DOWN"
+                ),
+            }
+        }
+
         let bg = Arc::clone(&mgr);
         tokio::spawn(async move { bg.metrics_loop().await });
         let bg = Arc::clone(&mgr);
@@ -862,6 +895,31 @@ impl ClusterManager {
         ))
         .await
         .map_err(|e| format!("remove node: {e}"))?;
+        // `RemoveVoters` only unlinks ids that appear in a voter config, so a
+        // node still registered as a learner (the normal state after
+        // `accept_join` -> `add_learner`, since promotion is an explicit
+        // operator POST) survives it and keeps receiving log replication.
+        // `RemoveNodes` drops it from the membership's node map; it is a no-op
+        // for a voter `RemoveVoters` already unlinked.
+        //
+        // Best-effort on purpose: when the caller removes *itself*, the first
+        // write has already dropped it from membership, so the control-plane
+        // handler on the leader rejects the forwarded second write ("peer not
+        // in membership") and openraft cannot re-propose it locally either.
+        // The voter removal is committed at that point, so failing here would
+        // report a removal that did happen as an error and skip the cleanup
+        // below — leaving ownership rows and media/topology state behind.
+        if let Err(e) = self
+            .change_membership_forwarded(ChangeMembers::RemoveNodes(
+                std::collections::BTreeSet::from([node_id]),
+            ))
+            .await
+        {
+            crate::log_warn!(
+                "Cluster: node {node_id} removed as a voter but unlinking it from the \
+                 membership node map failed ({e}); it may keep receiving log replication"
+            );
+        }
         if let Err(e) = self.release_owners_for_node(node_id) {
             crate::log_warn!(
                 "Cluster: node {node_id} removed from membership but releasing its stream \
@@ -1165,24 +1223,68 @@ impl ClusterManager {
                 Err(e) => return Err(format!("SetNodes for rejoined node {node_id}: {e}")),
             }
         } else {
-            match self
-                .raft
-                .add_learner(
+            // `blocking: true` waits for the new learner to become line-rate
+            // before returning, and the join response is what lets the joiner's
+            // `ClusterManager::start` return and bind HTTP/RTMP. Returning as
+            // soon as the membership change commits (openraft's `false`) would
+            // let the joiner serve plays off an unreplicated stream/auth state
+            // — and forever, when its advertised address is unreachable. The
+            // openraft wait is itself unbounded (`wait(None)`), which would park
+            // this control-connection task forever in exactly that case, so the
+            // whole call is bounded: past the budget the join is reported as
+            // failed and the joiner never starts.
+            let added = tokio::time::timeout(
+                JOIN_CATCHUP_TIMEOUT,
+                self.raft.add_learner(
                     node_id,
                     BasicNode {
                         addr: control_addr.clone(),
                     },
                     true,
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                ),
+            )
+            .await;
+            match added {
+                Ok(Ok(_)) => {}
+                Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl)))) => {
                     return self
                         .forward_join_to_leader(ftl, node_id, control_addr, media_addr, proof)
                         .await;
                 }
-                Err(e) => return Err(format!("add_learner: {e}")),
+                Ok(Err(e)) => return Err(format!("add_learner: {e}")),
+                Err(_) => {
+                    // Dropping the future above does not undo what blocking
+                    // `add_learner` already committed: the membership change
+                    // lands first, and only the catch-up wait is left hanging.
+                    // So the id stays registered as a learner while
+                    // `record_joined_peer_addresses`/`note_peer` below never
+                    // run, and the retry takes the rejoin branch -- where
+                    // `active_member_blocks_rejoin` cannot find the peer in
+                    // `peers_snapshot()` and takes its "in membership but never
+                    // heard from" arm, refusing the join until an operator
+                    // removes the id. `sweep_stale` never fences it either: it
+                    // only walks peers that are already tracked. Unlink the
+                    // half-added learner so the joiner can retry cleanly.
+                    // Best-effort like the unlink in `remove_peer` -- a
+                    // rollback that cannot commit is logged, and the join is
+                    // reported failed either way.
+                    if let Err(e) = self
+                        .change_membership_forwarded(ChangeMembers::RemoveNodes(
+                            std::collections::BTreeSet::from([node_id]),
+                        ))
+                        .await
+                    {
+                        crate::log_warn!(
+                            "Cluster: node {node_id} did not catch up within {JOIN_CATCHUP_TIMEOUT:?} \
+                             and unlinking it from the membership node map failed ({e}); it stays \
+                             registered as a learner and every retry is refused until an operator \
+                             removes it"
+                        );
+                    }
+                    return Err(format!(
+                        "add_learner: node {node_id} did not catch up within {JOIN_CATCHUP_TIMEOUT:?}"
+                    ));
+                }
             }
         }
 
@@ -2547,7 +2649,22 @@ impl ClusterManager {
                 });
             }
             if let Some(new_owner) = new_owner {
-                let Some((_, media_addr)) = self.meta.get(new_owner) else {
+                let Some((_, media_addr)) = self.meta.get(new_owner).filter(|(_, m)| !m.is_empty())
+                else {
+                    // The owner's media address is not known yet — either absent
+                    // from `meta`, or the empty string
+                    // `restore_topology_from_membership` seeds for a peer whose
+                    // address has not been learned since the restart (which it
+                    // marks Ready all the same). `subscribe_remote` takes an
+                    // empty address without erroring — it keeps the refcount and
+                    // skips the dial — so treating it as known would strand the
+                    // replica. `standby_subs` was already advanced to the
+                    // intended owner above, which would make the unchanged key a
+                    // no-op on every later tick — drop the key again so the next
+                    // tick re-emits the subscribe once the address is known.
+                    self.standby_subs
+                        .lock()
+                        .remove(&(app.clone(), stream_id.clone()));
                     continue;
                 };
                 let epoch = self

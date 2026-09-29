@@ -378,7 +378,6 @@ CREATE TABLE IF NOT EXISTS stream_viewers (
 );
 CREATE INDEX IF NOT EXISTS idx_viewer_stream ON stream_viewers(stream_id);
 CREATE INDEX IF NOT EXISTS idx_viewer_play_key ON stream_viewers(play_key);
-CREATE INDEX IF NOT EXISTS idx_player_viewer ON players(viewer_id);
 CREATE TABLE IF NOT EXISTS stream_owners (
   stream_id TEXT PRIMARY KEY REFERENCES streams(id) ON DELETE CASCADE,
   owner_node_id INTEGER NOT NULL,
@@ -404,17 +403,27 @@ CREATE TABLE IF NOT EXISTS raft_snapshots (
 );
 ";
 
+/// The on-disk file SQLite actually opened for the connection, or `None` when
+/// the database has no backing file to restrict. [`Connection::path`] reports
+/// what SQLite resolved the [`Db::open`] `path` to, so a percent-encoded
+/// `file:` URI names the real file and an on-disk name that merely contains
+/// `mode=memory` is still an on-disk database. It is `Some("")` for a
+/// temporary or in-memory database.
+fn on_disk_db_path(resolved: Option<&str>) -> Option<&str> {
+    resolved.filter(|file| !file.is_empty())
+}
+
 /// WAL mode creates sibling `-wal`/`-shm` files; restrict all three so stream
 /// keys stored in SQLite are not world-readable on multi-user hosts.
 #[cfg(unix)]
-fn restrict_db_file_permissions(path: &str) {
+fn restrict_db_file_permissions(resolved: Option<&str>) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    // In-memory and URI-style databases have no backing file to restrict.
-    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+    // In-memory databases have no backing file to restrict.
+    let Some(path) = on_disk_db_path(resolved) else {
         return;
-    }
+    };
 
     let mode = fs::Permissions::from_mode(0o600);
     for candidate in [path, &format!("{path}-wal"), &format!("{path}-shm")] {
@@ -428,13 +437,13 @@ fn restrict_db_file_permissions(path: &str) {
 }
 
 #[cfg(windows)]
-fn restrict_db_file_permissions(path: &str) {
+fn restrict_db_file_permissions(resolved: Option<&str>) {
     use std::path::Path;
     use std::process::Command;
 
-    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+    let Some(path) = on_disk_db_path(resolved) else {
         return;
-    }
+    };
 
     let username = std::env::var("USERNAME").unwrap_or_default();
     if username.is_empty() {
@@ -519,6 +528,7 @@ impl Db {
         for sql in [
             "ALTER TABLE publishers ADD COLUMN audio_sample_rate INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE publishers ADD COLUMN audio_channels INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE players ADD COLUMN viewer_id TEXT NOT NULL DEFAULT ''",
         ] {
             match conn.execute(sql, []) {
                 Ok(_) => {}
@@ -526,6 +536,15 @@ impl Db {
                 Err(e) => return Err(e),
             }
         }
+        // `idx_player_viewer` is deliberately created here rather than in the
+        // SCHEMA batch above: SCHEMA runs before these ALTERs, and on a database
+        // created before `viewer_id` existed the `CREATE INDEX ... ON
+        // players(viewer_id)` statement would abort the whole batch with
+        // "no such column: viewer_id" before the migration below could run.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_player_viewer ON players(viewer_id)",
+            [],
+        )?;
         let stale = conn
             .execute("UPDATE publishers SET active=0 WHERE active=1", [])
             .unwrap_or(0)
@@ -536,7 +555,10 @@ impl Db {
             crate::log_info!("Cleared {stale} stale active publisher/player row(s) from prior run");
         }
         let _ = Self::audit_cross_stream_key_collisions(&conn);
-        restrict_db_file_permissions(path);
+        // Restrict the file SQLite resolved `path` to, not `path` itself: a
+        // percent-encoded `file:` URI names a different on-disk file than the
+        // literal text carries.
+        restrict_db_file_permissions(conn.path());
         crate::log_info!("Database opened: {path}");
         Ok(Db {
             conn: ReentrantMutex::new(conn),
@@ -2042,18 +2064,28 @@ impl Db {
     /// the UPDATE to `WHERE id=? AND active=1` makes the late flush a no-op.
     pub fn publisher_update_stats(&self, id: &str, p: &Publisher) -> bool {
         let conn = self.conn.lock();
-        Self::write_publisher_stats(&conn, id, p)
+        Self::write_publisher_stats(&conn, id, p).is_ok_and(|rows| rows > 0)
     }
 
-    fn write_publisher_stats(conn: &Connection, id: &str, p: &Publisher) -> bool {
+    /// Rows affected: `0` is the documented `AND active=1` no-op (the row was
+    /// released or removed after the stats were queued), `Err` is a failed
+    /// write that must not be committed. Reported separately so a queued
+    /// flush can tell the two apart and keep a dequeued row.
+    fn write_publisher_stats(
+        conn: &Connection,
+        id: &str,
+        p: &Publisher,
+    ) -> rusqlite::Result<usize> {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
             crate::log_error!(
                 "publisher_update_stats: bytes_in {} overflows i64",
                 p.bytes_in
             );
-            return false;
+            // Permanent for this row, so it is dropped like a no-op rather than
+            // re-queued for every later flush.
+            return Ok(0);
         };
-        match conn
+        let rows = conn
             .prepare_cached(
                 "UPDATE publishers SET \
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
@@ -2074,14 +2106,8 @@ impl Db {
                     p.rtt_ms,
                     id
                 ])
-            }) {
-            Ok(rows) if rows > 0 => true,
-            Ok(_) => false,
-            Err(e) => {
-                crate::log_error!("publisher_update_stats error for {id}: {e}");
-                false
-            }
-        }
+            });
+        rows.inspect_err(|e| crate::log_error!("publisher_update_stats error for {id}: {e}"))
     }
 
     /// Queue a stats-only update for publisher `id` (same semantics as
@@ -2109,7 +2135,9 @@ impl Db {
     /// `publisher_update`/`player_update` drops any queued stats for its row
     /// under the same `conn` lock, so a late flush can neither resurrect a
     /// released row nor carry a previous session's numbers into a
-    /// reactivated one. Returns the number of queued rows processed.
+    /// reactivated one. Returns the number of queued rows processed; `0` is
+    /// returned when nothing was queued and when a flush failed — a failed
+    /// flush re-queues its rows for the next tick rather than dropping them.
     pub fn flush_pending_stats(&self) -> usize {
         let conn = self.conn.lock();
         let pending = std::mem::take(&mut *self.pending_stats.lock());
@@ -2120,21 +2148,58 @@ impl Db {
         let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
-                crate::log_error!("flush_pending_stats: begin failed: {e}");
+                crate::log_error!(
+                    "flush_pending_stats: begin failed for {count} row(s), re-queued: {e}"
+                );
+                self.requeue_pending_stats(pending);
                 return 0;
             }
         };
-        for (id, p) in &pending.publishers {
-            Self::write_publisher_stats(&tx, id, p);
-        }
-        for (id, p) in &pending.players {
-            Self::write_player_stats(&tx, id, p);
+        // A write that failed must not be committed: `tx` drops below, rolling
+        // the partial transaction back, and every drained row is re-queued. A
+        // 0-row UPDATE is the `AND active=1` no-op (the row was released or
+        // removed after it was queued), not a failure, so it commits as before.
+        let writes = pending
+            .publishers
+            .iter()
+            .map(|(id, p)| Self::write_publisher_stats(&tx, id, p))
+            .chain(
+                pending
+                    .players
+                    .iter()
+                    .map(|(id, p)| Self::write_player_stats(&tx, id, p)),
+            )
+            .collect::<rusqlite::Result<Vec<usize>>>();
+        if let Err(e) = writes {
+            crate::log_error!(
+                "flush_pending_stats: write failed for {count} row(s), re-queued: {e}"
+            );
+            self.requeue_pending_stats(pending);
+            return 0;
         }
         if let Err(e) = tx.commit() {
-            crate::log_error!("flush_pending_stats: commit failed: {e}");
+            crate::log_error!(
+                "flush_pending_stats: commit failed for {count} row(s), re-queued: {e}"
+            );
+            self.requeue_pending_stats(pending);
             return 0;
         }
         count
+    }
+
+    /// Put rows drained by a failed [`Self::flush_pending_stats`] back into the
+    /// queue. A row queued while the transaction was failing is newer and wins,
+    /// matching the "latest queue per row wins" contract of
+    /// [`Self::queue_publisher_stats`]. Called with `conn` held, so the
+    /// documented `conn`-before-`pending_stats` lock order still holds.
+    fn requeue_pending_stats(&self, pending: PendingStats) {
+        let mut queued = self.pending_stats.lock();
+        for (id, p) in pending.publishers {
+            queued.publishers.entry(id).or_insert(p);
+        }
+        for (id, p) in pending.players {
+            queued.players.entry(id).or_insert(p);
+        }
     }
 
     #[allow(dead_code)]
@@ -2454,31 +2519,25 @@ impl Db {
     /// cannot resurrect a deactivated player after `release_player`.
     pub fn player_update_stats(&self, id: &str, p: &Player) -> bool {
         let conn = self.conn.lock();
-        Self::write_player_stats(&conn, id, p)
+        Self::write_player_stats(&conn, id, p).is_ok_and(|rows| rows > 0)
     }
 
-    fn write_player_stats(conn: &Connection, id: &str, p: &Player) -> bool {
+    /// Rows affected; see [`Self::write_publisher_stats`].
+    fn write_player_stats(conn: &Connection, id: &str, p: &Player) -> rusqlite::Result<usize> {
         let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
             crate::log_error!(
                 "player_update_stats: bytes_out {} overflows i64",
                 p.bytes_out
             );
-            return false;
+            return Ok(0);
         };
-        match conn
+        let rows = conn
             .prepare_cached(
                 "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
              WHERE id=? AND active=1",
             )
-            .and_then(|mut stmt| stmt.execute(params![bytes_out, p.bitrate_kbps, p.rtt_ms, id]))
-        {
-            Ok(rows) if rows > 0 => true,
-            Ok(_) => false,
-            Err(e) => {
-                crate::log_error!("player_update_stats error for {id}: {e}");
-                false
-            }
-        }
+            .and_then(|mut stmt| stmt.execute(params![bytes_out, p.bitrate_kbps, p.rtt_ms, id]));
+        rows.inspect_err(|e| crate::log_error!("player_update_stats error for {id}: {e}"))
     }
 
     #[allow(dead_code)]
@@ -2634,6 +2693,65 @@ mod tests {
 
         let mode = std::fs::metadata(path_str).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "database must not be world-readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_file_permissions_use_sqlite_resolved_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolved.db");
+        let uri = format!("file:{}", path.to_str().unwrap());
+        let _db = Db::open(&uri).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "permissions must apply to the resolved on-disk file, not the URI text"
+        );
+    }
+
+    #[test]
+    fn open_creates_player_viewer_index_after_viewer_id_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-viewer-id.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE streams (
+                  id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL DEFAULT '',
+                  app TEXT NOT NULL DEFAULT 'live',
+                  publish_key TEXT UNIQUE NOT NULL,
+                  play_key TEXT UNIQUE NOT NULL,
+                  stats_key TEXT UNIQUE NOT NULL,
+                  enabled INTEGER NOT NULL DEFAULT 1,
+                  created_at INTEGER NOT NULL
+                );
+                CREATE TABLE players (
+                  id TEXT PRIMARY KEY,
+                  stream_id TEXT NOT NULL,
+                  app TEXT NOT NULL DEFAULT '',
+                  stream_name TEXT NOT NULL DEFAULT '',
+                  bytes_out INTEGER NOT NULL DEFAULT 0,
+                  bitrate_kbps REAL NOT NULL DEFAULT 0,
+                  rtt_ms REAL NOT NULL DEFAULT 0,
+                  connected_at INTEGER NOT NULL,
+                  active INTEGER NOT NULL DEFAULT 1
+                );",
+            )
+            .unwrap();
+        }
+        let db = Db::open(path.to_str().unwrap()).expect("legacy db must migrate");
+        let index_exists = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_player_viewer'",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+        });
+        assert_eq!(index_exists, Ok(1));
     }
 
     #[cfg(unix)]
@@ -3681,6 +3799,44 @@ mod tests {
         assert_eq!(listed[0].bytes_out, 200);
         assert_eq!(listed[0].rtt_ms, 5.0);
         assert_eq!(db.flush_pending_stats(), 0);
+    }
+
+    #[test]
+    fn flush_pending_stats_requeues_and_retries_after_commit_failure() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+        let row = Publisher {
+            id: "pub0".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&row));
+        let mut stats = row.clone();
+        stats.bytes_in = 1234;
+        db.queue_publisher_stats("pub0", &stats);
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER block_stats_flush BEFORE UPDATE OF bytes_in ON publishers
+                 BEGIN SELECT RAISE(ROLLBACK, 'blocked'); END;",
+            )
+        })
+        .unwrap();
+
+        assert_eq!(db.flush_pending_stats(), 0);
+        assert_eq!(db.publisher_list(Some("stream1"))[0].bytes_in, 0);
+
+        db.with_conn(|conn| conn.execute("DROP TRIGGER block_stats_flush", []))
+            .unwrap();
+        assert_eq!(db.flush_pending_stats(), 1);
+        assert_eq!(db.publisher_list(Some("stream1"))[0].bytes_in, 1234);
     }
 
     #[test]
