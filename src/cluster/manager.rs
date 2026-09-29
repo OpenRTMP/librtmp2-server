@@ -1183,7 +1183,18 @@ impl ClusterManager {
                     BasicNode {
                         addr: control_addr.clone(),
                     },
-                    true,
+                    // Non-blocking: openraft's blocking form waits in
+                    // `wait(None)` — a ~100 year deadline — for the new learner
+                    // to become line-rate, and `accept_join` runs inline on the
+                    // control-connection task that holds a
+                    // CONTROL_CONN_INFLIGHT slot. A join whose advertised
+                    // control address is unreachable would park that slot for
+                    // ~100 years. `call_core` has already committed the
+                    // membership change when this returns, so Raft's own
+                    // replication engine sets up and completes catch-up in the
+                    // background; nothing after this point reads the learner's
+                    // replicated state.
+                    false,
                 )
                 .await
             {
