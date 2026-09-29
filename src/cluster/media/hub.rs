@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -292,6 +292,11 @@ pub struct MediaHub {
     /// Generation per owner+stream so delayed NACK retries cannot fire after
     /// unsubscribe/resubscribe and double the owner's Subscribe refcount.
     subscribe_gens: Mutex<HashMap<(NodeId, String, String), u64>>,
+    /// Source for `subscribe_gens` values. One shared counter, never reused
+    /// and never handing out 0, so a key pruned while a retry sleeps (reading
+    /// back as the 0 sentinel) and a key re-created later (reading back as a
+    /// fresh value) can never collide with the generation a retry captured.
+    next_sub_gen: AtomicU64,
     /// Serializes `subs.add` + peer (re)creation + resubscribe snapshot so a
     /// concurrent `subscribe_remote` cannot slip a new stream into the
     /// snapshot and have it sent twice (once by the fresh-peer resubscribe,
@@ -339,6 +344,9 @@ impl MediaHub {
             inbound_sinks: Mutex::new(HashMap::new()),
             subscribe_nacks: Mutex::new(HashMap::new()),
             subscribe_gens: Mutex::new(HashMap::new()),
+            // Starts at 1: 0 is the "no generation recorded" sentinel on the
+            // wire and must never be handed out as a real generation.
+            next_sub_gen: AtomicU64::new(1),
             subscribe_lock: Mutex::new(()),
             subs: SubscriptionTable::new(),
             cache: InitCacheStore::new(),
@@ -409,7 +417,7 @@ impl MediaHub {
             }
             for ((owner, _, _), generation) in gens.iter_mut() {
                 if *owner == peer_id {
-                    *generation = generation.wrapping_add(1);
+                    *generation = self.alloc_sub_gen();
                 }
             }
         }
@@ -418,6 +426,14 @@ impl MediaHub {
 
     fn sub_key(peer_id: NodeId, app: &str, stream: &str) -> (NodeId, String, String) {
         (peer_id, app.to_string(), stream.to_string())
+    }
+
+    /// Allocate a generation no other owner+stream has ever held. A per-key
+    /// counter handed out the same small values again once a key was pruned
+    /// and re-created, so a retry still sleeping across that prune matched the
+    /// recycled value and re-sent a `Subscribe` the owner had already counted.
+    fn alloc_sub_gen(&self) -> u64 {
+        self.next_sub_gen.fetch_add(1, Ordering::Relaxed)
     }
 
     fn sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) -> u64 {
@@ -430,16 +446,15 @@ impl MediaHub {
 
     fn bump_sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) {
         let mut gens = self.subscribe_gens.lock();
-        let e = gens.entry(Self::sub_key(peer_id, app, stream)).or_insert(0);
-        *e = e.wrapping_add(1);
+        *gens.entry(Self::sub_key(peer_id, app, stream)).or_default() = self.alloc_sub_gen();
         if gens.len() > MAX_SUB_GENS {
             // Keep only the generations that still fence something: a live
             // subscription, or a NACK chain whose `schedule_subscribe_retry`
             // task may still be in flight. The bumping peer's own inactive
             // entries must go too — keeping them is what let one peer that
             // churns distinct streams grow the map past the cap for good.
-            // A pruned key reads back as generation 0, which a delayed retry
-            // can only act on while `peers_for_stream` still holds the peer.
+            // A pruned key reads back as generation 0; no retry can hold 0
+            // (every capture allocates), so a pruned key is a dead fence.
             let nacks = self.subscribe_nacks.lock();
             gens.retain(|key, _| {
                 nacks.contains_key(key)
@@ -875,6 +890,17 @@ impl MediaHub {
                 if req_gen != 0 && req_gen != generation {
                     return;
                 }
+                // The retry below captures this generation. An absent key reads
+                // back as 0, and a 0 capture would match a key pruned while the
+                // task sleeps (also 0) or re-created before it wakes — firing a
+                // second Subscribe the owner counts again. Allocate one: the
+                // NACK entry below keeps it out of the prune.
+                let generation = if generation == 0 {
+                    self.bump_sub_gen(peer_id, &app, &stream);
+                    self.sub_gen(peer_id, &app, &stream)
+                } else {
+                    generation
+                };
                 let n = {
                     let mut nacks = self.subscribe_nacks.lock();
                     let e = nacks
@@ -2063,11 +2089,16 @@ mod tests {
         n.hub.handle_inbound(2, denied(99));
         assert!(n.hub.subscribe_nacks.lock().is_empty());
 
-        // A matching NACK schedules a retry that re-sends Subscribe.
+        // A matching NACK schedules a retry that re-sends Subscribe. The retry
+        // captured a freshly allocated generation (never the 0 an unrecorded
+        // key reads back as), so it can never match a pruned or re-created key.
         let generation = n.hub.sub_gen(2, "live", "s");
         n.hub.handle_inbound(2, denied(generation));
         match next(&mut s).await {
-            MediaMessage::Subscribe { generation: g, .. } => assert_eq!(g, generation),
+            MediaMessage::Subscribe { generation: g, .. } => {
+                assert_ne!(g, 0, "a retry must not capture the prunable generation 0");
+                assert_eq!(g, n.hub.sub_gen(2, "live", "s"));
+            }
             other => panic!("unexpected {other:?}"),
         }
 
@@ -2230,8 +2261,14 @@ mod tests {
         assert!(sink.is_closed());
         assert!(n.hub.subscribe_nacks.lock().is_empty());
         assert_eq!(n.hub.subscription_count(), 0);
-        assert_eq!(n.hub.sub_gen(2, "live", "s"), 1);
-        assert_eq!(n.hub.sub_gen(2, "live", "nacked"), 1);
+        // Generations come from one never-reused counter, so the two fenced
+        // keys hold distinct non-zero values: a sleeping retry holding either
+        // one can never match the other key or a pruned/re-created one.
+        let s_gen = n.hub.sub_gen(2, "live", "s");
+        let nacked_gen = n.hub.sub_gen(2, "live", "nacked");
+        assert_ne!(s_gen, 0);
+        assert_ne!(nacked_gen, 0);
+        assert_ne!(s_gen, nacked_gen);
         // Unknown peers are a no-op.
         n.hub.disconnect_peer(42);
         n.hub.shutdown();
