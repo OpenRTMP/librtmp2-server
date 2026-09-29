@@ -421,13 +421,17 @@ const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
     ("LRTMP2_CLUSTER_NODE_TIMEOUT_MS", "CLUSTER_NODE_TIMEOUT_MS"),
     ("LRTMP2_CLUSTER_CAPACITY", "CLUSTER_CAPACITY"),
     ("LRTMP2_CLUSTER_CAPACITY_MBPS", "CLUSTER_CAPACITY_MBPS"),
-    ("LRTMP2_CLUSTER_DRAIN_THRESHOLD", "CLUSTER_DRAIN_THRESHOLD"),
+    // Order matters: each `_THRESHOLD` arm clears the matching `_AT_MBPS`
+    // absolute, and the trailing normalize re-derives the ratio from a
+    // surviving absolute. The threshold keys must therefore be applied last,
+    // so an explicit ratio in the environment beats a retained file absolute.
     ("LRTMP2_CLUSTER_DRAIN_AT_MBPS", "CLUSTER_DRAIN_AT_MBPS"),
+    ("LRTMP2_CLUSTER_DRAIN_THRESHOLD", "CLUSTER_DRAIN_THRESHOLD"),
+    ("LRTMP2_CLUSTER_RESUME_AT_MBPS", "CLUSTER_RESUME_AT_MBPS"),
     (
         "LRTMP2_CLUSTER_RESUME_THRESHOLD",
         "CLUSTER_RESUME_THRESHOLD",
     ),
-    ("LRTMP2_CLUSTER_RESUME_AT_MBPS", "CLUSTER_RESUME_AT_MBPS"),
     (
         "LRTMP2_CLUSTER_BANDWIDTH_INTERFACE",
         "CLUSTER_BANDWIDTH_INTERFACE",
