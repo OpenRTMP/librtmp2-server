@@ -148,6 +148,17 @@ impl InjectQueue {
 
     pub fn try_send(&self, frame: InjectedFrame) -> Result<(), ()> {
         let size = frame.payload.len().saturating_add(64);
+        // Reject an oversized frame before the eviction loop: draining the
+        // whole backlog would destroy every other stream's frames for a frame
+        // that was never going to fit anyway.
+        if size > self.max_bytes {
+            tracing::warn!(
+                app = %frame.app,
+                stream = %frame.stream,
+                "inbound media inject queue full — dropping frame"
+            );
+            return Err(());
+        }
         let mut st = self.state.lock();
         while st.1.saturating_add(size) > self.max_bytes && !st.0.is_empty() {
             if let Some(dropped) = st.0.pop_front() {
@@ -200,6 +211,16 @@ impl ExportQueue {
 
     pub fn push(&self, frame: ExportedFrame) {
         let size = frame.payload.len().saturating_add(64);
+        // Drop-oldest only applies to a frame that can eventually fit; an
+        // oversized frame must not empty the backlog of every other stream.
+        if size > self.max_bytes {
+            tracing::warn!(
+                app = %frame.app,
+                stream = %frame.stream,
+                "export media queue full — dropping oversized frame"
+            );
+            return;
+        }
         let mut st = self.state.lock();
         while st.1.saturating_add(size) > self.max_bytes {
             let Some(old) = st.0.pop_front() else {
@@ -1450,10 +1471,13 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(q.drain().is_empty());
 
-        // A frame larger than the whole budget is refused.
+        // A frame larger than the whole budget is refused without evicting
+        // the frames already queued.
         q.try_send(injected(10)).unwrap();
         assert!(q.try_send(injected(2 * 1024 * KB)).is_err());
-        assert!(q.drain().is_empty(), "overflow eviction empties the queue");
+        let kept = q.drain();
+        assert_eq!(kept.len(), 1, "an oversized frame must not flush the queue");
+        assert_eq!(kept[0].payload.len(), 10);
     }
 
     #[tokio::test]
@@ -1478,10 +1502,12 @@ mod tests {
             "drop-oldest keeps FIFO order of the survivors"
         );
 
-        // Oversized: every queued frame is evicted and the new one dropped.
+        // Oversized: the new frame is dropped and the queued frames are kept.
         q.push(exported(1, 4, &[1]));
         q.push(exported(1, 5, &vec![0; 2 * 1024 * KB]));
-        assert!(q.drain().is_empty());
+        let kept = q.drain();
+        assert_eq!(kept.len(), 1, "an oversized frame must not flush the queue");
+        assert_eq!(kept[0].timestamp, 4);
         // Frames already queued are returned immediately.
         q.push(exported(1, 6, &[1]));
         assert_eq!(q.wait_and_drain().await.len(), 1);
