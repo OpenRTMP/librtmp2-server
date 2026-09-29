@@ -143,6 +143,26 @@ impl ClusterConfig {
                     }
                     Ok(())
                 }
+                // An explicit ratio wins over a retained absolute, exactly as in
+                // `load_from_kv` and `apply_env_overrides_from`: without dropping
+                // the absolute here the normalize below would re-derive the ratio
+                // from it and undo the override. Only a value that parses may
+                // clear it, so an invalid one cannot discard the file target
+                // normalize needs.
+                "CLUSTER_DRAIN_THRESHOLD" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        drain_at_mbps = None;
+                        cfg.drain_threshold = v;
+                    }
+                    Ok(())
+                }
+                "CLUSTER_RESUME_THRESHOLD" => {
+                    if let Ok(v) = val.parse::<f64>() {
+                        resume_at_mbps = None;
+                        cfg.resume_threshold = v;
+                    }
+                    Ok(())
+                }
                 _ => apply_cluster_kv(&mut cfg, key, val),
             }
         };
@@ -797,6 +817,27 @@ mod tests {
             ("CLUSTER_RESUME_THRESHOLD", "0.42"),
         ]);
         let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!((cfg.drain_threshold - 0.91).abs() < f64::EPSILON);
+        assert!((cfg.resume_threshold - 0.42).abs() < f64::EPSILON);
+        assert_eq!(cfg.drain_at_mbps, None);
+        assert_eq!(cfg.resume_at_mbps, None);
+    }
+
+    #[test]
+    fn file_ratio_threshold_beats_absolute_in_load_file_only_from_kv() {
+        let map = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("CLUSTER_DRAIN_AT_MBPS", "800"),
+            ("CLUSTER_RESUME_AT_MBPS", "500"),
+            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
+            ("CLUSTER_DRAIN_THRESHOLD", "0.91"),
+            ("CLUSTER_RESUME_THRESHOLD", "0.42"),
+        ]);
+        let cfg = ClusterConfig::load_file_only_from_kv(|k| map.get(k).map(|s| (*s).to_string()))
+            .unwrap();
         assert!((cfg.drain_threshold - 0.91).abs() < f64::EPSILON);
         assert!((cfg.resume_threshold - 0.42).abs() < f64::EPSILON);
         assert_eq!(cfg.drain_at_mbps, None);
