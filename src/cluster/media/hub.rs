@@ -670,8 +670,16 @@ impl MediaHub {
                             if sink.is_closed() {
                                 return Err(std::io::Error::other("inbound media sink closed"));
                             }
-                            let _ =
-                                sink.try_send(subscribe_denied_error(&app, &stream, generation));
+                            // The InitCache enqueue failed for a non-fatal reason:
+                            // this sink's byte budget or its bounded channel is
+                            // momentarily full. SUBSCRIBE_DENIED here would read
+                            // as an authorization denial — the peer retries, then
+                            // calls subs.clear_entry, dropping the refcount shared
+                            // by every local player on that node, turning a
+                            // momentary stall into permanent loss of a live stream.
+                            // The wire has no Subscribe ACK, so silence is the same
+                            // signal success gives; the peer keeps its ref and a
+                            // later resubscribe re-offers this Subscribe.
                             continue;
                         }
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
