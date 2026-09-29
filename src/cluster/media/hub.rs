@@ -444,23 +444,29 @@ impl MediaHub {
             .unwrap_or(0)
     }
 
-    fn bump_sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) {
+    /// Allocate a generation no other owner+stream has ever held and record it
+    /// for `peer_id`'s `app`/`stream`; returns the value stored, so a caller
+    /// that fences on it never re-reads the map and can never capture the 0 an
+    /// absent key reads back as.
+    fn bump_sub_gen(&self, peer_id: NodeId, app: &str, stream: &str) -> u64 {
         let mut gens = self.subscribe_gens.lock();
-        *gens.entry(Self::sub_key(peer_id, app, stream)).or_default() = self.alloc_sub_gen();
+        let generation = self.alloc_sub_gen();
+        *gens.entry(Self::sub_key(peer_id, app, stream)).or_default() = generation;
         if gens.len() > MAX_SUB_GENS {
             // Keep only the generations that still fence something: a live
             // subscription, or a NACK chain whose `schedule_subscribe_retry`
             // task may still be in flight. The bumping peer's own inactive
             // entries must go too — keeping them is what let one peer that
             // churns distinct streams grow the map past the cap for good.
-            // A pruned key reads back as generation 0; no retry can hold 0
-            // (every capture allocates), so a pruned key is a dead fence.
+            // A pruned key reads back as generation 0, which no stored
+            // generation can equal, so a pruned key is a dead fence.
             let nacks = self.subscribe_nacks.lock();
             gens.retain(|key, _| {
                 nacks.contains_key(key)
                     || self.subs.peers_for_stream(&key.1, &key.2).contains(&key.0)
             });
         }
+        generation
     }
 
     fn clear_subscribe_nacks(&self, peer_id: NodeId, app: &str, stream: &str) {
@@ -890,17 +896,13 @@ impl MediaHub {
                 if req_gen != 0 && req_gen != generation {
                     return;
                 }
-                // The retry below captures this generation. An absent key reads
-                // back as 0, and a 0 capture would match a key pruned while the
-                // task sleeps (also 0) or re-created before it wakes — firing a
-                // second Subscribe the owner counts again. Allocate one: the
-                // NACK entry below keeps it out of the prune.
-                let generation = if generation == 0 {
-                    self.bump_sub_gen(peer_id, &app, &stream);
-                    self.sub_gen(peer_id, &app, &stream)
-                } else {
-                    generation
-                };
+                // Register the NACK before allocating the generation the retry
+                // captures. The prune in `bump_sub_gen` keeps every NACKed key,
+                // so allocation can no longer drop this key in the gap: an
+                // `unsubscribe_remote` landing there would otherwise leave the
+                // retry holding the 0 an absent key reads back as — which a
+                // resubscribe before the retry wakes also reads as — and the
+                // duplicate Subscribe would leave a phantom owner refcount.
                 let n = {
                     let mut nacks = self.subscribe_nacks.lock();
                     let e = nacks
@@ -908,6 +910,11 @@ impl MediaHub {
                         .or_insert(0);
                     *e = e.saturating_add(1);
                     *e
+                };
+                let generation = if generation == 0 {
+                    self.bump_sub_gen(peer_id, &app, &stream)
+                } else {
+                    generation
                 };
                 if n > SUBSCRIBE_NACK_MAX {
                     self.clear_subscribe_nacks(peer_id, &app, &stream);
