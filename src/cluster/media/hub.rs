@@ -36,6 +36,10 @@ const SUBSCRIBE_GATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SUBSCRIBE_NACK_RETRY: Duration = Duration::from_millis(200);
 const SUBSCRIBE_NACK_MAX: u8 = 3;
 const SUBSCRIBE_NACK_SEND_RETRIES: u8 = 3;
+/// Soft cap on retained `subscribe_gens` entries. Generations only fence
+/// in-flight NACK retries, so entries whose subscription is gone are dead
+/// weight; the map is otherwise insert-only and grows for the process life.
+const MAX_SUB_GENS: usize = 4096;
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Handles a failed media-plane `accept`: logs it and backs off, returning
@@ -401,6 +405,15 @@ impl MediaHub {
         let mut gens = self.subscribe_gens.lock();
         let e = gens.entry(Self::sub_key(peer_id, app, stream)).or_insert(0);
         *e = e.wrapping_add(1);
+        if gens.len() > MAX_SUB_GENS {
+            gens.retain(|key @ (owner, _, _), _| {
+                *owner == peer_id
+                    || self
+                        .subs
+                        .peers_for_stream(&key.1, &key.2)
+                        .contains(owner)
+            });
+        }
     }
 
     fn clear_subscribe_nacks(&self, peer_id: NodeId, app: &str, stream: &str) {
