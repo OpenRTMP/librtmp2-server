@@ -2064,18 +2064,28 @@ impl Db {
     /// the UPDATE to `WHERE id=? AND active=1` makes the late flush a no-op.
     pub fn publisher_update_stats(&self, id: &str, p: &Publisher) -> bool {
         let conn = self.conn.lock();
-        Self::write_publisher_stats(&conn, id, p)
+        Self::write_publisher_stats(&conn, id, p).is_ok_and(|rows| rows > 0)
     }
 
-    fn write_publisher_stats(conn: &Connection, id: &str, p: &Publisher) -> bool {
+    /// Rows affected: `0` is the documented `AND active=1` no-op (the row was
+    /// released or removed after the stats were queued), `Err` is a failed
+    /// write that must not be committed. Reported separately so a queued
+    /// flush can tell the two apart and keep a dequeued row.
+    fn write_publisher_stats(
+        conn: &Connection,
+        id: &str,
+        p: &Publisher,
+    ) -> rusqlite::Result<usize> {
         let Ok(bytes_in) = i64::try_from(p.bytes_in) else {
             crate::log_error!(
                 "publisher_update_stats: bytes_in {} overflows i64",
                 p.bytes_in
             );
-            return false;
+            // Permanent for this row, so it is dropped like a no-op rather than
+            // re-queued for every later flush.
+            return Ok(0);
         };
-        match conn
+        let rows = conn
             .prepare_cached(
                 "UPDATE publishers SET \
              video_codec=?,audio_codec=?,video_width=?,video_height=?,fps=?,\
@@ -2096,14 +2106,8 @@ impl Db {
                     p.rtt_ms,
                     id
                 ])
-            }) {
-            Ok(rows) if rows > 0 => true,
-            Ok(_) => false,
-            Err(e) => {
-                crate::log_error!("publisher_update_stats error for {id}: {e}");
-                false
-            }
-        }
+            });
+        rows.inspect_err(|e| crate::log_error!("publisher_update_stats error for {id}: {e}"))
     }
 
     /// Queue a stats-only update for publisher `id` (same semantics as
@@ -2151,11 +2155,27 @@ impl Db {
                 return 0;
             }
         };
-        for (id, p) in &pending.publishers {
-            Self::write_publisher_stats(&tx, id, p);
-        }
-        for (id, p) in &pending.players {
-            Self::write_player_stats(&tx, id, p);
+        // A write that failed must not be committed: `tx` drops below, rolling
+        // the partial transaction back, and every drained row is re-queued. A
+        // 0-row UPDATE is the `AND active=1` no-op (the row was released or
+        // removed after it was queued), not a failure, so it commits as before.
+        let writes = pending
+            .publishers
+            .iter()
+            .map(|(id, p)| Self::write_publisher_stats(&tx, id, p))
+            .chain(
+                pending
+                    .players
+                    .iter()
+                    .map(|(id, p)| Self::write_player_stats(&tx, id, p)),
+            )
+            .collect::<rusqlite::Result<Vec<usize>>>();
+        if let Err(e) = writes {
+            crate::log_error!(
+                "flush_pending_stats: write failed for {count} row(s), re-queued: {e}"
+            );
+            self.requeue_pending_stats(pending);
+            return 0;
         }
         if let Err(e) = tx.commit() {
             crate::log_error!(
@@ -2499,31 +2519,25 @@ impl Db {
     /// cannot resurrect a deactivated player after `release_player`.
     pub fn player_update_stats(&self, id: &str, p: &Player) -> bool {
         let conn = self.conn.lock();
-        Self::write_player_stats(&conn, id, p)
+        Self::write_player_stats(&conn, id, p).is_ok_and(|rows| rows > 0)
     }
 
-    fn write_player_stats(conn: &Connection, id: &str, p: &Player) -> bool {
+    /// Rows affected; see [`Self::write_publisher_stats`].
+    fn write_player_stats(conn: &Connection, id: &str, p: &Player) -> rusqlite::Result<usize> {
         let Ok(bytes_out) = i64::try_from(p.bytes_out) else {
             crate::log_error!(
                 "player_update_stats: bytes_out {} overflows i64",
                 p.bytes_out
             );
-            return false;
+            return Ok(0);
         };
-        match conn
+        let rows = conn
             .prepare_cached(
                 "UPDATE players SET bytes_out=?,bitrate_kbps=?,rtt_ms=? \
              WHERE id=? AND active=1",
             )
-            .and_then(|mut stmt| stmt.execute(params![bytes_out, p.bitrate_kbps, p.rtt_ms, id]))
-        {
-            Ok(rows) if rows > 0 => true,
-            Ok(_) => false,
-            Err(e) => {
-                crate::log_error!("player_update_stats error for {id}: {e}");
-                false
-            }
-        }
+            .and_then(|mut stmt| stmt.execute(params![bytes_out, p.bitrate_kbps, p.rtt_ms, id]));
+        rows.inspect_err(|e| crate::log_error!("player_update_stats error for {id}: {e}"))
     }
 
     #[allow(dead_code)]
