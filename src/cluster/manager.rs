@@ -872,11 +872,25 @@ impl ClusterManager {
         // operator POST) survives it and keeps receiving log replication.
         // `RemoveNodes` drops it from the membership's node map; it is a no-op
         // for a voter `RemoveVoters` already unlinked.
-        self.change_membership_forwarded(ChangeMembers::RemoveNodes(
-            std::collections::BTreeSet::from([node_id]),
-        ))
-        .await
-        .map_err(|e| format!("remove node: {e}"))?;
+        //
+        // Best-effort on purpose: when the caller removes *itself*, the first
+        // write has already dropped it from membership, so the control-plane
+        // handler on the leader rejects the forwarded second write ("peer not
+        // in membership") and openraft cannot re-propose it locally either.
+        // The voter removal is committed at that point, so failing here would
+        // report a removal that did happen as an error and skip the cleanup
+        // below — leaving ownership rows and media/topology state behind.
+        if let Err(e) = self
+            .change_membership_forwarded(ChangeMembers::RemoveNodes(
+                std::collections::BTreeSet::from([node_id]),
+            ))
+            .await
+        {
+            crate::log_warn!(
+                "Cluster: node {node_id} removed as a voter but unlinking it from the \
+                 membership node map failed ({e}); it may keep receiving log replication"
+            );
+        }
         if let Err(e) = self.release_owners_for_node(node_id) {
             crate::log_warn!(
                 "Cluster: node {node_id} removed from membership but releasing its stream \
