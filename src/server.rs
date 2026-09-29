@@ -2308,7 +2308,7 @@ fn run_rtmp_shard(shared: Arc<ShardShared>, spec: ShardSpec) {
 
     // Notify the bridge about connections that never got an explicit close event.
     for conn_id in shard.tracked.keys().copied().collect::<Vec<_>>() {
-        shard.shared.bridge.on_close(conn_id);
+        close_conn_off_poll_thread(&shard.shared.bridge, conn_id);
         clear_publish_generation(conn_id);
     }
 
