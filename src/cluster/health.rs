@@ -106,7 +106,13 @@ impl HealthTracker {
         entry.state = state;
         entry.load = load;
         entry.last_seen = Instant::now();
-        if state != NodeHealthState::Down {
+        if state == NodeHealthState::Down {
+            // A peer that advertises itself DOWN must be armed here too:
+            // `sweep_stale` skips peers that are already Down, so this is the
+            // only place `down_since` can be set for it -- and
+            // `peers_ready_for_ownership_release` reads nothing else.
+            self.down_since.lock().entry(id).or_insert(Instant::now());
+        } else {
             self.down_since.lock().remove(&id);
             self.ownership_released.lock().remove(&id);
         }
