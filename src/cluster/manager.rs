@@ -1224,6 +1224,34 @@ impl ClusterManager {
                 }
                 Ok(Err(e)) => return Err(format!("add_learner: {e}")),
                 Err(_) => {
+                    // Dropping the future above does not undo what blocking
+                    // `add_learner` already committed: the membership change
+                    // lands first, and only the catch-up wait is left hanging.
+                    // So the id stays registered as a learner while
+                    // `record_joined_peer_addresses`/`note_peer` below never
+                    // run, and the retry takes the rejoin branch -- where
+                    // `active_member_blocks_rejoin` cannot find the peer in
+                    // `peers_snapshot()` and takes its "in membership but never
+                    // heard from" arm, refusing the join until an operator
+                    // removes the id. `sweep_stale` never fences it either: it
+                    // only walks peers that are already tracked. Unlink the
+                    // half-added learner so the joiner can retry cleanly.
+                    // Best-effort like the unlink in `remove_peer` -- a
+                    // rollback that cannot commit is logged, and the join is
+                    // reported failed either way.
+                    if let Err(e) = self
+                        .change_membership_forwarded(ChangeMembers::RemoveNodes(
+                            std::collections::BTreeSet::from([node_id]),
+                        ))
+                        .await
+                    {
+                        crate::log_warn!(
+                            "Cluster: node {node_id} did not catch up within {JOIN_CATCHUP_TIMEOUT:?} \
+                             and unlinking it from the membership node map failed ({e}); it stays \
+                             registered as a learner and every retry is refused until an operator \
+                             removes it"
+                        );
+                    }
                     return Err(format!(
                         "add_learner: node {node_id} did not catch up within {JOIN_CATCHUP_TIMEOUT:?}"
                     ));
