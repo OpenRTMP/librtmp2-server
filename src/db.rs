@@ -2683,6 +2683,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn db_file_permissions_use_sqlite_resolved_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolved.db");
+        let uri = format!("file:{}", path.to_str().unwrap());
+        let _db = Db::open(&uri).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "permissions must apply to the resolved on-disk file, not the URI text"
+        );
+    }
+
+    #[test]
+    fn open_creates_player_viewer_index_after_viewer_id_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-viewer-id.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE streams (
+                  id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL DEFAULT '',
+                  app TEXT NOT NULL DEFAULT 'live',
+                  publish_key TEXT UNIQUE NOT NULL,
+                  play_key TEXT UNIQUE NOT NULL,
+                  stats_key TEXT UNIQUE NOT NULL,
+                  enabled INTEGER NOT NULL DEFAULT 1,
+                  created_at INTEGER NOT NULL
+                );
+                CREATE TABLE players (
+                  id TEXT PRIMARY KEY,
+                  stream_id TEXT NOT NULL,
+                  app TEXT NOT NULL DEFAULT '',
+                  stream_name TEXT NOT NULL DEFAULT '',
+                  bytes_out INTEGER NOT NULL DEFAULT 0,
+                  bitrate_kbps REAL NOT NULL DEFAULT 0,
+                  rtt_ms REAL NOT NULL DEFAULT 0,
+                  connected_at INTEGER NOT NULL,
+                  active INTEGER NOT NULL DEFAULT 1
+                );",
+            )
+            .unwrap();
+        }
+        let db = Db::open(path.to_str().unwrap()).expect("legacy db must migrate");
+        let index_exists = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_player_viewer'",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+        });
+        assert_eq!(index_exists, Ok(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn open_rejects_symlink_database_path() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real.db");
@@ -3726,6 +3785,44 @@ mod tests {
         assert_eq!(listed[0].bytes_out, 200);
         assert_eq!(listed[0].rtt_ms, 5.0);
         assert_eq!(db.flush_pending_stats(), 0);
+    }
+
+    #[test]
+    fn flush_pending_stats_requeues_and_retries_after_commit_failure() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+        let row = Publisher {
+            id: "pub0".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(db.publisher_try_acquire(&row));
+        let mut stats = row.clone();
+        stats.bytes_in = 1234;
+        db.queue_publisher_stats("pub0", &stats);
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER block_stats_flush BEFORE UPDATE OF bytes_in ON publishers
+                 BEGIN SELECT RAISE(FAIL, 'blocked'); END;",
+            )
+        })
+        .unwrap();
+
+        assert_eq!(db.flush_pending_stats(), 0);
+        assert_eq!(db.publisher_list(Some("stream1"))[0].bytes_in, 0);
+
+        db.with_conn(|conn| conn.execute("DROP TRIGGER block_stats_flush", []))
+            .unwrap();
+        assert_eq!(db.flush_pending_stats(), 1);
+        assert_eq!(db.publisher_list(Some("stream1"))[0].bytes_in, 1234);
     }
 
     #[test]

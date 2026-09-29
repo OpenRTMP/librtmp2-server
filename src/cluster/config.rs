@@ -780,4 +780,44 @@ mod tests {
         assert!((cfg.drain_threshold - 0.4).abs() < f64::EPSILON);
         assert!((cfg.resume_threshold - 0.25).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn file_ratio_threshold_beats_absolute_in_load_from_kv() {
+        let map = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("CLUSTER_DRAIN_AT_MBPS", "800"),
+            ("CLUSTER_RESUME_AT_MBPS", "500"),
+            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
+            ("CLUSTER_DRAIN_THRESHOLD", "0.91"),
+            ("CLUSTER_RESUME_THRESHOLD", "0.42"),
+        ]);
+        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!((cfg.drain_threshold - 0.91).abs() < f64::EPSILON);
+        assert!((cfg.resume_threshold - 0.42).abs() < f64::EPSILON);
+        assert_eq!(cfg.drain_at_mbps, None);
+        assert_eq!(cfg.resume_at_mbps, None);
+    }
+
+    #[test]
+    fn invalid_file_ratio_threshold_keeps_absolute_for_normalize() {
+        let map = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("CLUSTER_DRAIN_AT_MBPS", "800"),
+            ("CLUSTER_RESUME_AT_MBPS", "500"),
+            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
+            ("CLUSTER_DRAIN_THRESHOLD", "not-a-ratio"),
+            ("CLUSTER_RESUME_THRESHOLD", "also-bad"),
+        ]);
+        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert_eq!(cfg.drain_at_mbps, Some(800.0));
+        assert_eq!(cfg.resume_at_mbps, Some(500.0));
+        assert!((cfg.drain_threshold - 0.8).abs() < f64::EPSILON);
+        assert!((cfg.resume_threshold - 0.5).abs() < f64::EPSILON);
+    }
 }
