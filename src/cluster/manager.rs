@@ -51,6 +51,10 @@ const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 /// Bounded retry budget for re-learning peer media addresses after a restart.
 const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
 const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
+/// Bound on the wait for a freshly added learner to reach line-rate. Kept
+/// under `network`'s 8s control round trip so a slow catch-up surfaces as
+/// this error on the joiner instead of a client-side round-trip timeout.
+const JOIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -1176,35 +1180,40 @@ impl ClusterManager {
                 Err(e) => return Err(format!("SetNodes for rejoined node {node_id}: {e}")),
             }
         } else {
-            match self
-                .raft
-                .add_learner(
+            // `blocking: true` waits for the new learner to become line-rate
+            // before returning, and the join response is what lets the joiner's
+            // `ClusterManager::start` return and bind HTTP/RTMP. Returning as
+            // soon as the membership change commits (openraft's `false`) would
+            // let the joiner serve plays off an unreplicated stream/auth state
+            // — and forever, when its advertised address is unreachable. The
+            // openraft wait is itself unbounded (`wait(None)`), which would park
+            // this control-connection task forever in exactly that case, so the
+            // whole call is bounded: past the budget the join is reported as
+            // failed and the joiner never starts.
+            let added = tokio::time::timeout(
+                JOIN_CATCHUP_TIMEOUT,
+                self.raft.add_learner(
                     node_id,
                     BasicNode {
                         addr: control_addr.clone(),
                     },
-                    // Non-blocking: openraft's blocking form waits in
-                    // `wait(None)` — a ~100 year deadline — for the new learner
-                    // to become line-rate, and `accept_join` runs inline on the
-                    // control-connection task that holds a
-                    // CONTROL_CONN_INFLIGHT slot. A join whose advertised
-                    // control address is unreachable would park that slot for
-                    // ~100 years. `call_core` has already committed the
-                    // membership change when this returns, so Raft's own
-                    // replication engine sets up and completes catch-up in the
-                    // background; nothing after this point reads the learner's
-                    // replicated state.
-                    false,
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                    true,
+                ),
+            )
+            .await;
+            match added {
+                Ok(Ok(_)) => {}
+                Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl)))) => {
                     return self
                         .forward_join_to_leader(ftl, node_id, control_addr, media_addr, proof)
                         .await;
                 }
-                Err(e) => return Err(format!("add_learner: {e}")),
+                Ok(Err(e)) => return Err(format!("add_learner: {e}")),
+                Err(_) => {
+                    return Err(format!(
+                        "add_learner: node {node_id} did not catch up within {JOIN_CATCHUP_TIMEOUT:?}"
+                    ));
+                }
             }
         }
 
