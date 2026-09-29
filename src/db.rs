@@ -2146,7 +2146,9 @@ impl Db {
     /// `publisher_update`/`player_update` drops any queued stats for its row
     /// under the same `conn` lock, so a late flush can neither resurrect a
     /// released row nor carry a previous session's numbers into a
-    /// reactivated one. Returns the number of queued rows processed.
+    /// reactivated one. Returns the number of queued rows processed; `0` is
+    /// returned when nothing was queued and when a flush failed — a failed
+    /// flush re-queues its rows for the next tick rather than dropping them.
     pub fn flush_pending_stats(&self) -> usize {
         let conn = self.conn.lock();
         let pending = std::mem::take(&mut *self.pending_stats.lock());
@@ -2157,7 +2159,10 @@ impl Db {
         let tx = match DbTx::begin(&conn) {
             Ok(tx) => tx,
             Err(e) => {
-                crate::log_error!("flush_pending_stats: begin failed: {e}");
+                crate::log_error!(
+                    "flush_pending_stats: begin failed for {count} row(s), re-queued: {e}"
+                );
+                self.requeue_pending_stats(pending);
                 return 0;
             }
         };
@@ -2168,10 +2173,28 @@ impl Db {
             Self::write_player_stats(&tx, id, p);
         }
         if let Err(e) = tx.commit() {
-            crate::log_error!("flush_pending_stats: commit failed: {e}");
+            crate::log_error!(
+                "flush_pending_stats: commit failed for {count} row(s), re-queued: {e}"
+            );
+            self.requeue_pending_stats(pending);
             return 0;
         }
         count
+    }
+
+    /// Put rows drained by a failed [`Self::flush_pending_stats`] back into the
+    /// queue. A row queued while the transaction was failing is newer and wins,
+    /// matching the "latest queue per row wins" contract of
+    /// [`Self::queue_publisher_stats`]. Called with `conn` held, so the
+    /// documented `conn`-before-`pending_stats` lock order still holds.
+    fn requeue_pending_stats(&self, pending: PendingStats) {
+        let mut queued = self.pending_stats.lock();
+        for (id, p) in pending.publishers {
+            queued.publishers.entry(id).or_insert(p);
+        }
+        for (id, p) in pending.players {
+            queued.players.entry(id).or_insert(p);
+        }
     }
 
     #[allow(dead_code)]
