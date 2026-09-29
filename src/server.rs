@@ -849,12 +849,18 @@ fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
     }
 }
 
-/// Stops accepting new authorization work and waits (bounded) for the auth
-/// worker to apply everything already queued. Shards queue their final
-/// connection closes while shutting down, and those closes release publisher
-/// ownership through the coordinator/Raft — so they must run while the
-/// cluster manager is still alive. Completion receivers are dropped first so
-/// the worker can never block on a full completion channel nobody drains.
+/// Stops accepting new authorization work and waits for the auth worker to
+/// apply everything already queued. Shards queue their final connection closes
+/// while shutting down, and those closes release publisher ownership through
+/// the coordinator/Raft — so they must run while the cluster manager is still
+/// alive. Completion receivers are dropped first so the worker can never block
+/// on a full completion channel nobody drains.
+///
+/// The wait is unbounded: the shard threads that queued those closes were
+/// already joined without a timeout, and every queued close is for a
+/// connection this process owned. Giving up early would only let the releases
+/// run after `shutdown_blocking()` and leave their durable ownership rows
+/// behind.
 fn drain_auth_worker_for_shutdown() {
     if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
         guard.take();
@@ -866,26 +872,8 @@ fn drain_auth_worker_for_shutdown() {
         .lock()
         .ok()
         .and_then(|mut guard| guard.take());
-    let Some(join) = join else {
-        return;
-    };
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let spawned = std::thread::Builder::new()
-        .name("rtmp-auth-drain".to_string())
-        .spawn(move || {
-            let _ = join.join();
-            let _ = done_tx.send(());
-        });
-    let timed_out = match spawned {
-        Ok(_) => done_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .is_err(),
-        Err(_) => true,
-    };
-    if timed_out {
-        crate::log_warn!(
-            "RTMP auth worker did not drain within 10s; shutting down without waiting for it"
-        );
+    if let Some(join) = join {
+        let _ = join.join();
     }
 }
 
