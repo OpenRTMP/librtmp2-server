@@ -36,6 +36,12 @@ const SUBSCRIBE_GATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SUBSCRIBE_NACK_RETRY: Duration = Duration::from_millis(200);
 const SUBSCRIBE_NACK_MAX: u8 = 3;
 const SUBSCRIBE_NACK_SEND_RETRIES: u8 = 3;
+/// Bounded retries, and the delay between them, for the InitCache enqueue that
+/// registers an inbound Subscribe. The wire has no Subscribe ACK, so a
+/// registration dropped on momentary queue pressure is never retried by the
+/// subscriber.
+const SUBSCRIBE_ENQUEUE_ATTEMPTS: u8 = 3;
+const SUBSCRIBE_ENQUEUE_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// Soft cap on retained `subscribe_gens` entries. Generations only fence
 /// in-flight NACK retries, so entries whose subscription is gone are dead
 /// weight; the map is otherwise insert-only and grows for the process life.
@@ -661,32 +667,43 @@ impl MediaHub {
                         };
                         // Enqueue InitCache (if any) under the subscription lock
                         // so fan-out cannot observe the new ref until headers
-                        // are first in this sink's FIFO.
-                        if self
-                            .subs
-                            .add_with(peer_id, &app, &stream, || {
+                        // are first in this sink's FIFO. A momentarily full
+                        // sink is retried a bounded number of times instead of
+                        // abandoned: the peer gets no ACK and nothing tells it
+                        // to resubscribe, so a registration dropped here leaves
+                        // its refcount pointing at an owner that never fans out
+                        // to it again.
+                        let mut registered: Result<bool, ()> = Ok(false);
+                        for attempt in 0..=SUBSCRIBE_ENQUEUE_ATTEMPTS {
+                            if attempt > 0 {
+                                tokio::time::sleep(SUBSCRIBE_ENQUEUE_RETRY_DELAY).await;
+                            }
+                            registered = self.subs.add_with(peer_id, &app, &stream, || {
                                 if sink.is_closed() {
                                     return Err(());
                                 }
-                                if let Some(msg) = init_msg {
-                                    sink.try_send(msg)
-                                } else {
-                                    Ok(())
+                                match &init_msg {
+                                    Some(msg) => sink.try_send(msg.clone()),
+                                    None => Ok(()),
                                 }
-                            })
-                            .is_err()
-                        {
+                            });
+                            if registered.is_ok() {
+                                break;
+                            }
+                        }
+                        if registered.is_err() {
                             if sink.is_closed() {
                                 return Err(std::io::Error::other("inbound media sink closed"));
                             }
-                            // The InitCache enqueue failed for a non-fatal reason:
-                            // this sink's byte budget or its bounded channel is
-                            // momentarily full. SUBSCRIBE_DENIED here would read
-                            // as an authorization denial — the peer retries, then
-                            // calls subs.clear_entry, dropping the refcount shared
-                            // by every local player on that node, turning a
-                            // momentary stall into permanent loss of a live stream.
-                            // The wire has no Subscribe ACK, so silence is the same
+                            // The InitCache enqueue is still failing for a
+                            // non-fatal reason after the bounded retries: this
+                            // sink's byte budget or its bounded channel stays
+                            // full. SUBSCRIBE_DENIED here would read as an
+                            // authorization denial — the peer retries, then
+                            // calls subs.clear_entry, dropping the refcount
+                            // shared by every local player on that node, turning
+                            // a stall into permanent loss of a live stream. The
+                            // wire has no Subscribe ACK, so silence is the same
                             // signal success gives; the peer keeps its ref and a
                             // later resubscribe re-offers this Subscribe.
                             continue;
