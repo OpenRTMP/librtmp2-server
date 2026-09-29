@@ -403,43 +403,25 @@ CREATE TABLE IF NOT EXISTS raft_snapshots (
 );
 ";
 
-/// The on-disk file a [`Db::open`] `path` names, or `None` when the database
-/// has no backing file to restrict: an empty path, `:memory:`, or a `file:`
-/// URI in memory mode. `on_disk_db_open_flags` enables `SQLITE_OPEN_URI`, so a
-/// `file:` URI *without* `mode=memory` is an ordinary on-disk
-/// read/write/create database and must be restricted like any other path. The
-/// name is derived the way `sqlite3ParseUri` derives it: drop the `file:`
-/// scheme, a `//authority` component, and the `?query`/`#fragment` tail. A
-/// percent-encoded name is not decoded, so such a path is simply not found and
-/// `restrict_db_file_permissions` logs it.
-fn on_disk_db_path(path: &str) -> Option<&str> {
-    if path.is_empty() || path == ":memory:" {
-        return None;
-    }
-    let Some(uri) = path.strip_prefix("file:") else {
-        return Some(path);
-    };
-    let file = uri.split(['?', '#']).next().unwrap_or(uri);
-    if file == ":memory:" || uri.contains("mode=memory") {
-        return None;
-    }
-    let file = file.strip_prefix("//").map_or(file, |rest| {
-        // `file://[authority]/path`: SQLite accepts only an empty authority or
-        // `localhost`; anything else is rejected, so skip to the path.
-        rest.find('/').map_or("", |slash| &rest[slash..])
-    });
-    (!file.is_empty()).then_some(file)
+/// The on-disk file SQLite actually opened for the connection, or `None` when
+/// the database has no backing file to restrict. [`Connection::path`] reports
+/// what SQLite resolved the [`Db::open`] `path` to, so a percent-encoded
+/// `file:` URI names the real file and an on-disk name that merely contains
+/// `mode=memory` is still an on-disk database. It is `Some("")` for a
+/// temporary or in-memory database.
+fn on_disk_db_path(resolved: Option<&str>) -> Option<&str> {
+    resolved.filter(|file| !file.is_empty())
 }
 
 /// WAL mode creates sibling `-wal`/`-shm` files; restrict all three so stream
 /// keys stored in SQLite are not world-readable on multi-user hosts.
 #[cfg(unix)]
-fn restrict_db_file_permissions(path: &str) {
+fn restrict_db_file_permissions(resolved: Option<&str>) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     // In-memory databases have no backing file to restrict.
-    let Some(path) = on_disk_db_path(path) else {
+    let Some(path) = on_disk_db_path(resolved) else {
         return;
     };
 
@@ -455,11 +437,11 @@ fn restrict_db_file_permissions(path: &str) {
 }
 
 #[cfg(windows)]
-fn restrict_db_file_permissions(path: &str) {
+fn restrict_db_file_permissions(resolved: Option<&str>) {
     use std::path::Path;
     use std::process::Command;
 
-    let Some(path) = on_disk_db_path(path) else {
+    let Some(path) = on_disk_db_path(resolved) else {
         return;
     };
 
@@ -573,7 +555,10 @@ impl Db {
             crate::log_info!("Cleared {stale} stale active publisher/player row(s) from prior run");
         }
         let _ = Self::audit_cross_stream_key_collisions(&conn);
-        restrict_db_file_permissions(path);
+        // Restrict the file SQLite resolved `path` to, not `path` itself: a
+        // percent-encoded `file:` URI names a different on-disk file than the
+        // literal text carries.
+        restrict_db_file_permissions(conn.path());
         crate::log_info!("Database opened: {path}");
         Ok(Db {
             conn: ReentrantMutex::new(conn),
