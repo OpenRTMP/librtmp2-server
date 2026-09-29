@@ -336,10 +336,21 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
             let mut prefix = [0u8; PEEK];
             let prefix_len = (len as usize).min(PEEK);
             r.read_exact(&mut prefix[..prefix_len]).await?;
-            let snapshot_prefix = prefix[..prefix_len]
+            const SNAPSHOT_TAG: &[u8] = b"{\"RaftSnapshot";
+            let snapshot_prefix = match prefix[..prefix_len]
                 .iter()
                 .position(|b| !b.is_ascii_whitespace())
-                .is_some_and(|i| prefix[i..].starts_with(b"{\"RaftSnapshot"));
+            {
+                Some(i) if i + SNAPSHOT_TAG.len() <= prefix_len => {
+                    prefix[i..].starts_with(SNAPSHOT_TAG)
+                }
+                // The peek is inconclusive: every byte so far is JSON
+                // whitespace, or the tag could straddle the window edge. Legal
+                // leading whitespace can push the tag past PEEK, so classify
+                // as snapshot rather than letting it slip the
+                // MAX_SNAPSHOT_FRAME cap and charge the control budget.
+                _ => true,
+            };
             if snapshot_prefix && len > MAX_SNAPSHOT_FRAME {
                 return Err(std::io::Error::other("snapshot frame too large"));
             }
@@ -1602,6 +1613,38 @@ mod tests {
 
         let err = match read_budgeted_frame(&mut reader, false).await {
             Ok(_) => panic!("oversized snapshot frames must be capped"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("snapshot frame too large"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_snapshot_frame_beyond_peek_window_is_still_capped() {
+        // The 14-byte tag cannot fit once it starts at index 19 of a 32-byte
+        // peek window, so the peek cannot prove the frame is not a snapshot
+        // even though its first 13 bytes are visible. Such a frame must still
+        // be recognised as one, so MAX_SNAPSHOT_FRAME applies instead of the
+        // frame being charged to the control budget.
+        const TAG: &[u8] = b"{\"RaftSnapshot";
+        const PEEK: usize = 32;
+        let tag_offset = PEEK - (TAG.len() - 1);
+        assert!(
+            tag_offset + TAG.len() > PEEK,
+            "the tag must straddle the peek window"
+        );
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::MAX_FRAME.to_be_bytes());
+        let mut prefix = [b' '; PEEK];
+        prefix[tag_offset..].copy_from_slice(&TAG[..PEEK - tag_offset]);
+        bytes.extend_from_slice(&prefix);
+        let mut reader: &[u8] = &bytes;
+
+        let err = match read_budgeted_frame(&mut reader, false).await {
+            Ok(_) => panic!("oversized snapshot frames must be capped past the peek window"),
             Err(e) => e,
         };
         assert!(
