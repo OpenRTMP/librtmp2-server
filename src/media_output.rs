@@ -38,6 +38,7 @@ const RETIRED_SESSION_QUEUE: usize = 16;
 const REPUBLISH_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_FLV_PAYLOAD: usize = 0x00ff_ffff;
 static HLS_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RECORDING_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_HLS_PLAYLIST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,7 +504,15 @@ fn setup_recording_sink(
     }
 
     let dir = config.recording_path.join(safe_id);
-    let path = dir.join(format!("{}.flv", unix_millis()));
+    // The `<millis>` stem alone is not unique: a same-connection republish
+    // restart retires the old session and starts a new one in the same call,
+    // and retirement is asynchronous, so two sessions can resolve to the same
+    // path — the new worker then truncates the retired worker's still-open
+    // recording and both tag streams interleave into one file. The monotonic
+    // sequence keeps every session on its own file, exactly as
+    // `hls_session_dir_name` does for HLS.
+    let sequence = RECORDING_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{}-{sequence:020}.flv", unix_millis()));
     sinks.push(spawn_recording_sink(path.clone(), max_queue_bytes));
     Some(path)
 }
