@@ -803,9 +803,10 @@ mod tests {
         assert!((cfg.resume_threshold - 0.25).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn file_ratio_threshold_beats_absolute_in_load_from_kv() {
-        let map = HashMap::from([
+    /// A config file that sets both an absolute bandwidth target and the
+    /// ratio that should win over it.
+    fn ratio_beats_absolute_map() -> HashMap<&'static str, &'static str> {
+        HashMap::from([
             ("CLUSTER_ENABLED", "true"),
             ("CLUSTER_NODE_ID", "1"),
             ("CLUSTER_BOOTSTRAP", "true"),
@@ -815,8 +816,10 @@ mod tests {
             ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
             ("CLUSTER_DRAIN_THRESHOLD", "0.91"),
             ("CLUSTER_RESUME_THRESHOLD", "0.42"),
-        ]);
-        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        ])
+    }
+
+    fn assert_explicit_ratios_kept(cfg: &ClusterConfig) {
         assert!((cfg.drain_threshold - 0.91).abs() < f64::EPSILON);
         assert!((cfg.resume_threshold - 0.42).abs() < f64::EPSILON);
         assert_eq!(cfg.drain_at_mbps, None);
@@ -824,24 +827,20 @@ mod tests {
     }
 
     #[test]
+    fn file_ratio_threshold_beats_absolute_in_load_from_kv() {
+        let map = ratio_beats_absolute_map();
+        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert_explicit_ratios_kept(&cfg);
+    }
+
+    #[test]
     fn file_ratio_threshold_beats_absolute_in_load_file_only_from_kv() {
-        let map = HashMap::from([
-            ("CLUSTER_ENABLED", "true"),
-            ("CLUSTER_NODE_ID", "1"),
-            ("CLUSTER_BOOTSTRAP", "true"),
-            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
-            ("CLUSTER_DRAIN_AT_MBPS", "800"),
-            ("CLUSTER_RESUME_AT_MBPS", "500"),
-            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
-            ("CLUSTER_DRAIN_THRESHOLD", "0.91"),
-            ("CLUSTER_RESUME_THRESHOLD", "0.42"),
-        ]);
+        // load_file_only_from_kv is the loader production actually uses, so it
+        // must apply the same precedence as load_from_kv.
+        let map = ratio_beats_absolute_map();
         let cfg = ClusterConfig::load_file_only_from_kv(|k| map.get(k).map(|s| (*s).to_string()))
             .unwrap();
-        assert!((cfg.drain_threshold - 0.91).abs() < f64::EPSILON);
-        assert!((cfg.resume_threshold - 0.42).abs() < f64::EPSILON);
-        assert_eq!(cfg.drain_at_mbps, None);
-        assert_eq!(cfg.resume_at_mbps, None);
+        assert_explicit_ratios_kept(&cfg);
     }
 
     #[test]
