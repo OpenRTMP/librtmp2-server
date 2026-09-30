@@ -845,17 +845,10 @@ mod tests {
 
     #[test]
     fn invalid_file_ratio_threshold_keeps_absolute_for_normalize() {
-        let map = HashMap::from([
-            ("CLUSTER_ENABLED", "true"),
-            ("CLUSTER_NODE_ID", "1"),
-            ("CLUSTER_BOOTSTRAP", "true"),
-            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
-            ("CLUSTER_DRAIN_AT_MBPS", "800"),
-            ("CLUSTER_RESUME_AT_MBPS", "500"),
-            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
-            ("CLUSTER_DRAIN_THRESHOLD", "not-a-ratio"),
-            ("CLUSTER_RESUME_THRESHOLD", "also-bad"),
-        ]);
+        let mut map = ratio_beats_absolute_map();
+        // An unparsable ratio must not clear the absolute normalize needs.
+        map.insert("CLUSTER_DRAIN_THRESHOLD", "not-a-ratio");
+        map.insert("CLUSTER_RESUME_THRESHOLD", "also-bad");
         let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
         assert_eq!(cfg.drain_at_mbps, Some(800.0));
         assert_eq!(cfg.resume_at_mbps, Some(500.0));
