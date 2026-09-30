@@ -150,17 +150,11 @@ impl ClusterConfig {
                 // clear it, so an invalid one cannot discard the file target
                 // normalize needs.
                 "CLUSTER_DRAIN_THRESHOLD" => {
-                    if let Ok(v) = val.parse::<f64>() {
-                        drain_at_mbps = None;
-                        cfg.drain_threshold = v;
-                    }
+                    apply_ratio_threshold(&mut cfg, &mut drain_at_mbps, val, true);
                     Ok(())
                 }
                 "CLUSTER_RESUME_THRESHOLD" => {
-                    if let Ok(v) = val.parse::<f64>() {
-                        resume_at_mbps = None;
-                        cfg.resume_threshold = v;
-                    }
+                    apply_ratio_threshold(&mut cfg, &mut resume_at_mbps, val, false);
                     Ok(())
                 }
                 _ => apply_cluster_kv(&mut cfg, key, val),
@@ -208,17 +202,11 @@ impl ClusterConfig {
                 // the override. Only a value that parses may clear it, so an
                 // invalid one cannot discard the file target normalize needs.
                 "CLUSTER_DRAIN_THRESHOLD" => {
-                    if let Ok(v) = val.parse::<f64>() {
-                        drain_at_mbps = None;
-                        cfg.drain_threshold = v;
-                    }
+                    apply_ratio_threshold(&mut cfg, &mut drain_at_mbps, val, true);
                     Ok(())
                 }
                 "CLUSTER_RESUME_THRESHOLD" => {
-                    if let Ok(v) = val.parse::<f64>() {
-                        resume_at_mbps = None;
-                        cfg.resume_threshold = v;
-                    }
+                    apply_ratio_threshold(&mut cfg, &mut resume_at_mbps, val, false);
                     Ok(())
                 }
                 _ => apply_cluster_kv(&mut cfg, key, val),
@@ -635,6 +623,31 @@ fn parse_bool_strict(val: &str, key: &str) -> Result<bool, String> {
         other => Err(format!(
             "invalid boolean for {key}: '{other}' (expected true/false/1/0/yes/no)"
         )),
+    }
+}
+
+/// Apply an explicit `CLUSTER_DRAIN_THRESHOLD` / `CLUSTER_RESUME_THRESHOLD`
+/// ratio, clearing the absolute target it overrides.
+///
+/// An explicit ratio must beat a retained absolute: `normalize_absolute_bandwidth_thresholds`
+/// would otherwise re-derive the ratio from the absolute and silently undo the
+/// override, so a config file and the environment would configure different
+/// admission thresholds for the same keys. Only a value that parses may clear
+/// the absolute, so an invalid one cannot discard the target normalize needs.
+/// `is_drain` selects which of the pair is being set.
+fn apply_ratio_threshold(
+    cfg: &mut ClusterConfig,
+    absolute: &mut Option<f64>,
+    val: &str,
+    is_drain: bool,
+) {
+    if let Ok(v) = val.parse::<f64>() {
+        *absolute = None;
+        if is_drain {
+            cfg.drain_threshold = v;
+        } else {
+            cfg.resume_threshold = v;
+        }
     }
 }
 
