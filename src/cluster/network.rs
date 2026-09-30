@@ -1648,33 +1648,33 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn oversized_snapshot_frame_past_the_peek_window_is_capped_after_decode() {
-        // The 14-byte tag only becomes inconclusive at 19+ bytes of leading
-        // JSON whitespace (19 + 14 > 32), so the pre-decode peek sees nothing
-        // but whitespace and cannot classify the frame. The snapshot cap must
-        // still be applied once the frame is decoded and the variant is known
-        // for certain, otherwise a padded tag escapes MAX_SNAPSHOT_FRAME.
+    /// Build a length-prefixed frame whose body is `json` preceded by enough
+    /// JSON whitespace that the variant tag lands past the 32-byte peek, so the
+    /// pre-decode classification is inconclusive.
+    fn padded_frame_beyond_peek(json: &str, filler: usize) -> Vec<u8> {
         const LEAD: usize = 40;
         assert!(
             LEAD + 14 > 32,
-            "the peek must be inconclusive for this test to be meaningful"
+            "the peek must be inconclusive for this helper to be meaningful"
         );
-        let meta = "{\"RaftSnapshot\":{\"meta\":{\"last_log_id\":{\"term\":1,\"index\":0},\
-                    \"last_applied\":null,\"last_applied_log_id\":null,\"snapshot_meta\":null,\
-                    \"pending_request\":null,\"membership\":null}}}";
-        let body = format!(
-            "{}{meta}{}",
-            " ".repeat(LEAD),
-            " ".repeat(super::MAX_SNAPSHOT_FRAME as usize)
-        );
+        let body = format!("{}{json}{}", " ".repeat(LEAD), " ".repeat(filler));
         let payload = body.as_bytes();
         assert!(payload.len() as u32 > super::MAX_SNAPSHOT_FRAME);
-
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         bytes.extend_from_slice(payload);
-        let mut reader: &[u8] = &bytes;
+        bytes
+    }
+
+    #[tokio::test]
+    async fn oversized_snapshot_frame_past_the_peek_window_is_capped_after_decode() {
+        // A padded tag escapes the pre-decode peek, so the snapshot cap must
+        // still be applied once the frame is decoded and the variant is known
+        // for certain, otherwise the tag dodges MAX_SNAPSHOT_FRAME entirely.
+        let json = "{\"RaftSnapshot\":{\"meta\":{\"last_log_id\":{\"term\":1,\"index\":0},\
+                    \"last_applied\":null,\"last_applied_log_id\":null,\"snapshot_meta\":null,\
+                    \"pending_request\":null,\"membership\":null}}}";
+        let mut reader: &[u8] = &padded_frame_beyond_peek(json, super::MAX_SNAPSHOT_FRAME as usize);
 
         let err = match read_budgeted_frame(&mut reader, false).await {
             Ok(_) => panic!("an oversized snapshot must be capped past the peek window"),
@@ -1692,22 +1692,11 @@ mod tests {
         // StatsProxyResp up to MAX_FRAME. An inconclusive peek must not be
         // treated as proof of a snapshot, or such a response is rejected before
         // allow_large_non_snapshot is ever consulted.
-        const LEAD: usize = 40;
-        assert!(
-            LEAD + 14 > 32,
-            "the peek must be inconclusive for this test to be meaningful"
+        let json = format!(
+            "{{\"StatsProxyResp\":{{\"body\":\"{}\"}}}}",
+            "x".repeat(super::MAX_SNAPSHOT_FRAME as usize)
         );
-        let mut body = format!("{}{{\"StatsProxyResp\":{{\"body\":\"", " ".repeat(LEAD));
-        body.push_str(&"x".repeat(super::MAX_SNAPSHOT_FRAME as usize));
-        body.push_str("\"}}");
-        let payload = body.as_bytes();
-        assert!(payload.len() as u32 > super::MAX_SNAPSHOT_FRAME);
-        assert!(payload.len() as u32 > super::MAX_CONTROL_FRAME);
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(payload);
-        let mut reader: &[u8] = &bytes;
+        let mut reader: &[u8] = &padded_frame_beyond_peek(&json, 0);
 
         let (decoded, _budget) = read_budgeted_frame(&mut reader, true)
             .await
