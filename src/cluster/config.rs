@@ -130,21 +130,10 @@ impl ClusterConfig {
         let mut resume_at_mbps: Option<f64> = None;
 
         let mut apply = |key: &str, val: &str| -> Result<(), String> {
-            match key {
-                "CLUSTER_DRAIN_AT_MBPS" => {
-                    if let Ok(mbps) = val.parse::<f64>() {
-                        drain_at_mbps = Some(mbps);
-                    }
-                    Ok(())
-                }
-                "CLUSTER_RESUME_AT_MBPS" => {
-                    if let Ok(mbps) = val.parse::<f64>() {
-                        resume_at_mbps = Some(mbps);
-                    }
-                    Ok(())
-                }
-                _ => apply_cluster_kv(&mut cfg, key, val),
+            if apply_bandwidth_kv(&mut cfg, key, val, &mut drain_at_mbps, &mut resume_at_mbps) {
+                return Ok(());
             }
+            apply_cluster_kv(&mut cfg, key, val)
         };
 
         for key in CLUSTER_FILE_KEYS {
@@ -169,40 +158,10 @@ impl ClusterConfig {
         let mut resume_at_mbps: Option<f64> = None;
 
         let mut apply = |key: &str, val: &str| -> Result<(), String> {
-            match key {
-                "CLUSTER_DRAIN_AT_MBPS" => {
-                    if let Ok(mbps) = val.parse::<f64>() {
-                        drain_at_mbps = Some(mbps);
-                    }
-                    Ok(())
-                }
-                "CLUSTER_RESUME_AT_MBPS" => {
-                    if let Ok(mbps) = val.parse::<f64>() {
-                        resume_at_mbps = Some(mbps);
-                    }
-                    Ok(())
-                }
-                // An explicit ratio wins over a retained absolute, exactly as in
-                // `apply_env_overrides_from`: without dropping the absolute here
-                // the normalize below would re-derive the ratio from it and undo
-                // the override. Only a value that parses may clear it, so an
-                // invalid one cannot discard the file target normalize needs.
-                "CLUSTER_DRAIN_THRESHOLD" => {
-                    if let Ok(v) = val.parse::<f64>() {
-                        drain_at_mbps = None;
-                        cfg.drain_threshold = v;
-                    }
-                    Ok(())
-                }
-                "CLUSTER_RESUME_THRESHOLD" => {
-                    if let Ok(v) = val.parse::<f64>() {
-                        resume_at_mbps = None;
-                        cfg.resume_threshold = v;
-                    }
-                    Ok(())
-                }
-                _ => apply_cluster_kv(&mut cfg, key, val),
+            if apply_bandwidth_kv(&mut cfg, key, val, &mut drain_at_mbps, &mut resume_at_mbps) {
+                return Ok(());
             }
+            apply_cluster_kv(&mut cfg, key, val)
         };
 
         for key in CLUSTER_FILE_KEYS {
@@ -239,35 +198,15 @@ impl ClusterConfig {
     {
         for (env_key, file_key) in CLUSTER_ENV_OVERRIDES {
             if let Some(val) = get(env_key).filter(|v| !v.is_empty()) {
-                match *file_key {
-                    "CLUSTER_DRAIN_AT_MBPS" => {
-                        if let Ok(mbps) = val.parse::<f64>() {
-                            self.drain_at_mbps = Some(mbps);
-                        }
-                    }
-                    "CLUSTER_RESUME_AT_MBPS" => {
-                        if let Ok(mbps) = val.parse::<f64>() {
-                            self.resume_at_mbps = Some(mbps);
-                        }
-                    }
-                    // An explicit env threshold override wins over a retained
-                    // file absolute: drop the absolute only when the override
-                    // parses, so an invalid value cannot discard the file
-                    // target that re-normalization may still need.
-                    "CLUSTER_DRAIN_THRESHOLD" => {
-                        if let Ok(v) = val.parse::<f64>() {
-                            self.drain_at_mbps = None;
-                            self.drain_threshold = v;
-                        }
-                    }
-                    "CLUSTER_RESUME_THRESHOLD" => {
-                        if let Ok(v) = val.parse::<f64>() {
-                            self.resume_at_mbps = None;
-                            self.resume_threshold = v;
-                        }
-                    }
-                    _ => apply_cluster_kv(self, file_key, &val)?,
+                // `apply_bandwidth_kv` needs `&mut self` plus the two absolute
+                // fields, so move them out for the call and write them back.
+                let (mut abs_drain, mut abs_resume) = (self.drain_at_mbps, self.resume_at_mbps);
+                if apply_bandwidth_kv(self, file_key, &val, &mut abs_drain, &mut abs_resume) {
+                    self.drain_at_mbps = abs_drain;
+                    self.resume_at_mbps = abs_resume;
+                    continue;
                 }
+                apply_cluster_kv(self, file_key, &val)?;
             }
         }
         // Re-ratio retained absolute Mbps targets whenever capacity (or the
@@ -618,6 +557,67 @@ fn parse_bool_strict(val: &str, key: &str) -> Result<bool, String> {
     }
 }
 
+/// Apply one of the four cluster bandwidth keys, returning `true` when the key
+/// was handled. `abs_drain` / `abs_resume` track the absolute targets so that
+/// an explicit ratio can clear the one it overrides (see
+/// [`apply_ratio_threshold`]) instead of being re-derived away.
+fn apply_bandwidth_kv(
+    cfg: &mut ClusterConfig,
+    key: &str,
+    val: &str,
+    abs_drain: &mut Option<f64>,
+    abs_resume: &mut Option<f64>,
+) -> bool {
+    match key {
+        "CLUSTER_DRAIN_AT_MBPS" => {
+            if let Ok(mbps) = val.parse::<f64>() {
+                *abs_drain = Some(mbps);
+            }
+            true
+        }
+        "CLUSTER_RESUME_AT_MBPS" => {
+            if let Ok(mbps) = val.parse::<f64>() {
+                *abs_resume = Some(mbps);
+            }
+            true
+        }
+        "CLUSTER_DRAIN_THRESHOLD" => {
+            apply_ratio_threshold(cfg, abs_drain, val, true);
+            true
+        }
+        "CLUSTER_RESUME_THRESHOLD" => {
+            apply_ratio_threshold(cfg, abs_resume, val, false);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Apply an explicit `CLUSTER_DRAIN_THRESHOLD` / `CLUSTER_RESUME_THRESHOLD`
+/// ratio, clearing the absolute target it overrides.
+///
+/// An explicit ratio must beat a retained absolute: `normalize_absolute_bandwidth_thresholds`
+/// would otherwise re-derive the ratio from the absolute and silently undo the
+/// override, so a config file and the environment would configure different
+/// admission thresholds for the same keys. Only a value that parses may clear
+/// the absolute, so an invalid one cannot discard the target normalize needs.
+/// `is_drain` selects which of the pair is being set.
+fn apply_ratio_threshold(
+    cfg: &mut ClusterConfig,
+    absolute: &mut Option<f64>,
+    val: &str,
+    is_drain: bool,
+) {
+    if let Ok(v) = val.parse::<f64>() {
+        *absolute = None;
+        if is_drain {
+            cfg.drain_threshold = v;
+        } else {
+            cfg.resume_threshold = v;
+        }
+    }
+}
+
 /// Convert absolute Mbps thresholds once `bandwidth_max_mbps` is finalized.
 fn normalize_absolute_bandwidth_thresholds(
     cfg: &mut ClusterConfig,
@@ -783,9 +783,10 @@ mod tests {
         assert!((cfg.resume_threshold - 0.25).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn file_ratio_threshold_beats_absolute_in_load_from_kv() {
-        let map = HashMap::from([
+    /// A config file that sets both an absolute bandwidth target and the
+    /// ratio that should win over it.
+    fn ratio_beats_absolute_map() -> HashMap<&'static str, &'static str> {
+        HashMap::from([
             ("CLUSTER_ENABLED", "true"),
             ("CLUSTER_NODE_ID", "1"),
             ("CLUSTER_BOOTSTRAP", "true"),
@@ -795,8 +796,10 @@ mod tests {
             ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
             ("CLUSTER_DRAIN_THRESHOLD", "0.91"),
             ("CLUSTER_RESUME_THRESHOLD", "0.42"),
-        ]);
-        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        ])
+    }
+
+    fn assert_explicit_ratios_kept(cfg: &ClusterConfig) {
         assert!((cfg.drain_threshold - 0.91).abs() < f64::EPSILON);
         assert!((cfg.resume_threshold - 0.42).abs() < f64::EPSILON);
         assert_eq!(cfg.drain_at_mbps, None);
@@ -804,18 +807,28 @@ mod tests {
     }
 
     #[test]
+    fn file_ratio_threshold_beats_absolute_in_load_from_kv() {
+        let map = ratio_beats_absolute_map();
+        let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
+        assert_explicit_ratios_kept(&cfg);
+    }
+
+    #[test]
+    fn file_ratio_threshold_beats_absolute_in_load_file_only_from_kv() {
+        // load_file_only_from_kv is the loader production actually uses, so it
+        // must apply the same precedence as load_from_kv.
+        let map = ratio_beats_absolute_map();
+        let cfg = ClusterConfig::load_file_only_from_kv(|k| map.get(k).map(|s| (*s).to_string()))
+            .unwrap();
+        assert_explicit_ratios_kept(&cfg);
+    }
+
+    #[test]
     fn invalid_file_ratio_threshold_keeps_absolute_for_normalize() {
-        let map = HashMap::from([
-            ("CLUSTER_ENABLED", "true"),
-            ("CLUSTER_NODE_ID", "1"),
-            ("CLUSTER_BOOTSTRAP", "true"),
-            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
-            ("CLUSTER_DRAIN_AT_MBPS", "800"),
-            ("CLUSTER_RESUME_AT_MBPS", "500"),
-            ("CLUSTER_BANDWIDTH_MAX_MBPS", "1000"),
-            ("CLUSTER_DRAIN_THRESHOLD", "not-a-ratio"),
-            ("CLUSTER_RESUME_THRESHOLD", "also-bad"),
-        ]);
+        let mut map = ratio_beats_absolute_map();
+        // An unparsable ratio must not clear the absolute normalize needs.
+        map.insert("CLUSTER_DRAIN_THRESHOLD", "not-a-ratio");
+        map.insert("CLUSTER_RESUME_THRESHOLD", "also-bad");
         let cfg = ClusterConfig::load_from_kv(|k| map.get(k).map(|s| (*s).to_string())).unwrap();
         assert_eq!(cfg.drain_at_mbps, Some(800.0));
         assert_eq!(cfg.resume_at_mbps, Some(500.0));

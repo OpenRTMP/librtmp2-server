@@ -294,6 +294,25 @@ async fn read_control_frame<R: AsyncReadExt + Unpin>(
     read_budgeted_frame(r, false).await
 }
 
+/// Classify a peeked frame prefix as a Raft snapshot.
+///
+/// Returns `Some(true)` only when the `{"RaftSnapshot` tag is positively
+/// identified, `Some(false)` when the peek positively identifies a different
+/// variant, and `None` when the peek is inconclusive — the prefix is all
+/// whitespace, or the tag could straddle the peek window. An inconclusive peek
+/// must never be treated as proof of a snapshot: `read_frame` legitimately
+/// accepts large non-snapshot responses (`StatsProxyResp`) that only
+/// `allow_large_non_snapshot` admits, so a guess would reject valid traffic.
+fn classify_snapshot_prefix(prefix: &[u8]) -> Option<bool> {
+    const SNAPSHOT_TAG: &[u8] = b"{\"RaftSnapshot";
+    match prefix.iter().position(|b| !b.is_ascii_whitespace()) {
+        Some(i) if i + SNAPSHOT_TAG.len() <= prefix.len() => {
+            Some(prefix[i..].starts_with(SNAPSHOT_TAG))
+        }
+        _ => None,
+    }
+}
+
 /// Read one length-prefixed JSON control frame and reserve it against the
 /// matching in-flight byte budget.
 ///
@@ -323,30 +342,42 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
     // transport already allow for a chunk transfer. A fixed 30 s body
     // timeout would abort chunks the sender is still allowed to deliver.
     const PEEK: usize = 32;
-    let (len, prefix, prefix_len, snapshot_prefix) =
-        tokio::time::timeout(CONTROL_READ_TIMEOUT, async {
-            let len = r.read_u32().await?;
-            if len > MAX_FRAME {
-                return Err(std::io::Error::other("frame too large"));
-            }
-            // Peek the variant tag before allocating/reserving so the budget
-            // class matches the actual message type. serde_json skips leading
-            // JSON whitespace before dispatching on the variant tag, so trim it
-            // first or a pretty-printed frame is misclassified as a control.
-            let mut prefix = [0u8; PEEK];
-            let prefix_len = (len as usize).min(PEEK);
-            r.read_exact(&mut prefix[..prefix_len]).await?;
-            let snapshot_prefix = prefix[..prefix_len]
-                .iter()
-                .position(|b| !b.is_ascii_whitespace())
-                .is_some_and(|i| prefix[i..].starts_with(b"{\"RaftSnapshot"));
-            if snapshot_prefix && len > MAX_SNAPSHOT_FRAME {
-                return Err(std::io::Error::other("snapshot frame too large"));
-            }
-            Ok::<_, std::io::Error>((len, prefix, prefix_len, snapshot_prefix))
-        })
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))??;
+    let (len, prefix, prefix_len) = tokio::time::timeout(CONTROL_READ_TIMEOUT, async {
+        let len = r.read_u32().await?;
+        if len > MAX_FRAME {
+            return Err(std::io::Error::other("frame too large"));
+        }
+        // Peek the variant tag before allocating/reserving so the budget
+        // class matches the actual message type. serde externally-tagged
+        // enums serialize as `{"Variant":...}`, so a non-snapshot frame
+        // cannot charge the shared snapshot budget merely by advertising a
+        // snapshot-sized length. serde_json skips leading JSON whitespace
+        // before dispatching on the variant tag, so trim it first or a
+        // pretty-printed frame is misclassified as a control.
+        let mut prefix = [0u8; PEEK];
+        let prefix_len = (len as usize).min(PEEK);
+        r.read_exact(&mut prefix[..prefix_len]).await?;
+        // Early reject only on a positively identified snapshot tag: an
+        // inconclusive peek proves nothing, and `read_frame` accepts large
+        // non-snapshot responses that `allow_large_non_snapshot` permits.
+        // The authoritative snapshot cap is re-checked after decode below,
+        // where the variant is known for certain.
+        if classify_snapshot_prefix(&prefix[..prefix_len]) == Some(true) && len > MAX_SNAPSHOT_FRAME
+        {
+            return Err(std::io::Error::other("snapshot frame too large"));
+        }
+        Ok::<_, std::io::Error>((len, prefix, prefix_len))
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control read timeout"))??;
+
+    // `write_frame` emits compact JSON with no leading whitespace, so every
+    // frame this codebase produces classifies conclusively here. An
+    // inconclusive peek therefore means a hand-crafted padded frame, and the
+    // safe direction is the *stricter* control budget: a padded snapshot must
+    // not be able to reach the larger snapshot allowance. The snapshot cap
+    // itself is enforced authoritatively after decode, below.
+    let snapshot_prefix = classify_snapshot_prefix(&prefix[..prefix_len]) == Some(true);
 
     let read_budget = if len <= MAX_UNBUDGETED_CONTROL_FRAME {
         None
@@ -384,11 +415,18 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
         }
         let msg: ControlMessage =
             serde_json::from_slice(&buf).map_err(|e| std::io::Error::other(e))?;
-        let allow_large = matches!(
+        let is_snapshot = matches!(
             msg,
             ControlMessage::RaftSnapshot(_) | ControlMessage::RaftSnapshotResp(_)
-        ) || allow_large_non_snapshot;
-        if !allow_large && len > MAX_CONTROL_FRAME {
+        );
+        // Authoritative snapshot cap, applied now that the variant is known.
+        // The pre-decode peek can be inconclusive (a padded tag that straddles
+        // the window), so this is what actually bounds a snapshot frame at
+        // MAX_SNAPSHOT_FRAME regardless of how the variant was spelled.
+        if is_snapshot && len > MAX_SNAPSHOT_FRAME {
+            return Err(std::io::Error::other("snapshot frame too large"));
+        }
+        if !is_snapshot && !allow_large_non_snapshot && len > MAX_CONTROL_FRAME {
             return Err(std::io::Error::other("frame too large"));
         }
         Ok((msg, read_budget))
@@ -1608,6 +1646,62 @@ mod tests {
             err.to_string().contains("snapshot frame too large"),
             "{err}"
         );
+    }
+
+    /// Build a length-prefixed frame whose body is `json` preceded by enough
+    /// JSON whitespace that the variant tag lands past the 32-byte peek, so the
+    /// pre-decode classification is inconclusive.
+    fn padded_frame_beyond_peek(json: &str, filler: usize) -> Vec<u8> {
+        const LEAD: usize = 40;
+        assert!(
+            LEAD + 14 > 32,
+            "the peek must be inconclusive for this helper to be meaningful"
+        );
+        let body = format!("{}{json}{}", " ".repeat(LEAD), " ".repeat(filler));
+        let payload = body.as_bytes();
+        assert!(payload.len() as u32 > super::MAX_SNAPSHOT_FRAME);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn oversized_snapshot_frame_past_the_peek_window_is_capped_after_decode() {
+        // A padded tag escapes the pre-decode peek, so the snapshot cap must
+        // still be applied once the frame is decoded and the variant is known
+        // for certain, otherwise the tag dodges MAX_SNAPSHOT_FRAME entirely.
+        let json = "{\"RaftSnapshot\":{\"meta\":{\"last_log_id\":{\"term\":1,\"index\":0},\
+                    \"last_applied\":null,\"last_applied_log_id\":null,\"snapshot_meta\":null,\
+                    \"pending_request\":null,\"membership\":null}}}";
+        let mut reader: &[u8] = &padded_frame_beyond_peek(json, super::MAX_SNAPSHOT_FRAME as usize);
+
+        let err = match read_budgeted_frame(&mut reader, false).await {
+            Ok(_) => panic!("an oversized snapshot must be capped past the peek window"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("snapshot frame too large"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_non_snapshot_response_past_the_peek_window_is_still_accepted() {
+        // read_frame passes allow_large_non_snapshot = true so a peer may send a
+        // StatsProxyResp up to MAX_FRAME. An inconclusive peek must not be
+        // treated as proof of a snapshot, or such a response is rejected before
+        // allow_large_non_snapshot is ever consulted.
+        let json = format!(
+            "{{\"StatsProxyResp\":{{\"body\":\"{}\"}}}}",
+            "x".repeat(super::MAX_SNAPSHOT_FRAME as usize)
+        );
+        let mut reader: &[u8] = &padded_frame_beyond_peek(&json, 0);
+
+        let (decoded, _budget) = read_budgeted_frame(&mut reader, true)
+            .await
+            .expect("a whitespace-padded large non-snapshot response must be accepted");
+        assert!(matches!(decoded, ControlMessage::StatsProxyResp { .. }));
     }
 
     #[test]
