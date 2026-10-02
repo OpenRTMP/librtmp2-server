@@ -2447,6 +2447,7 @@ fn send_to_shard(
 fn cluster_export_frame(
     bridge: &DbRtmpBridge,
     frame: librtmp2::RelayFrame,
+    hint: librtmp2::DeliveryHint,
     before: &HashMap<u64, u64>,
 ) -> Option<crate::cluster::ExportedFrame> {
     use crate::cluster::media::protocol::MediaMessage;
@@ -2475,6 +2476,7 @@ fn cluster_export_frame(
         epoch,
         frame_type: MediaMessage::frame_type_from_librtmp2(frame.frame_type),
         timestamp: frame.timestamp,
+        hint,
         payload: frame.payload,
     })
 }
@@ -2554,11 +2556,15 @@ impl ShardLoop {
             self.shared.bridge.retry_pending_ownership_releases();
         }
 
-        let exported_frames = if self.shared.relay_export_bytes > 0 {
-            server.drain_exported_relay_frames()
-        } else {
-            Vec::new()
-        };
+        let (exported_frames, export_hints): (Vec<_>, Vec<_>) =
+            if self.shared.relay_export_bytes > 0 {
+                server
+                    .drain_exported_relay_frames_with_hints()
+                    .into_iter()
+                    .unzip()
+            } else {
+                (Vec::new(), Vec::new())
+            };
         self.feed_media_outputs(&exported_frames, &generations_before);
         self.relay_to_other_shards(server, &exported_frames);
         // Frames injected here are only fanned out to this shard's viewers
@@ -2566,7 +2572,9 @@ impl ShardLoop {
         // rather than holding them for a tick.
         let injected_relay = self.inject_from_other_shards(server);
         #[cfg(feature = "cluster")]
-        self.exchange_cluster_media(server, exported_frames, &generations_before);
+        self.exchange_cluster_media(server, exported_frames, export_hints, &generations_before);
+        #[cfg(not(feature = "cluster"))]
+        drop(export_hints);
 
         self.close_vanished_conns(&current_ids);
         self.prune_markers_if_due();
@@ -2737,6 +2745,7 @@ impl ShardLoop {
         &self,
         server: &mut librtmp2::server::Server,
         frames: Vec<librtmp2::RelayFrame>,
+        hints: Vec<librtmp2::DeliveryHint>,
         generations_before: &HashMap<u64, u64>,
     ) {
         use crate::cluster::media::protocol::MediaMessage;
@@ -2747,9 +2756,9 @@ impl ShardLoop {
         let Some(mgr) = self.shared.bridge.cluster_manager() else {
             return;
         };
-        for frame in frames {
+        for (frame, hint) in frames.into_iter().zip(hints) {
             if let Some(exported) =
-                cluster_export_frame(&self.shared.bridge, frame, generations_before)
+                cluster_export_frame(&self.shared.bridge, frame, hint, generations_before)
             {
                 mgr.enqueue_export(exported);
             }

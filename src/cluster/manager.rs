@@ -267,7 +267,8 @@ impl ClusterManager {
             tls_client.clone(),
             is_peer_allowed,
         );
-        // Byte-bounded ordered export (drop-oldest on overload) — see ExportQueue.
+        media.set_media_max_age_ms(config.media_max_age_ms);
+        // Byte-bounded ordered export (class-aware eviction on overload) — see ExportQueue.
         let export_q = ExportQueue::new(config.media_queue_mb);
         {
             let media_export = Arc::clone(&media);
@@ -2436,7 +2437,26 @@ impl ClusterManager {
                 "admission": if self.admission.should_accept_new_publish() { "ready" } else { "draining" }
             },
             "owned_streams": m.owned_streams,
+            "media": self.media_status_json(),
         })
+    }
+
+    /// Media-plane backpressure view: per-peer live-media queue depth, age,
+    /// drops by class, resyncs and connection counters, plus the local
+    /// export/inject queues.
+    pub fn media_status_json(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self.media.media_stats()).unwrap_or_default();
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "export_queue".into(),
+                serde_json::to_value(self.export_q.stats()).unwrap_or_default(),
+            );
+            obj.insert(
+                "inject_queue".into(),
+                serde_json::to_value(self.inject.stats()).unwrap_or_default(),
+            );
+        }
+        v
     }
 
     pub fn health_cluster_block(&self) -> serde_json::Value {
@@ -3118,6 +3138,7 @@ mod tests {
             epoch: 1,
             frame_type: 9,
             timestamp: 0,
+            hint: librtmp2::DeliveryHint::Droppable,
             payload: vec![0x17, 0x01],
         });
         assert!(m.drain_injects().is_empty());

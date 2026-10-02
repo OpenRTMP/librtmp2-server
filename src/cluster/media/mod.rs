@@ -6,11 +6,13 @@ use crate::cluster::NodeId;
 
 pub mod cache;
 pub mod hub;
+pub mod live_queue;
 pub mod ownership;
 pub mod peer;
 pub mod protocol;
 pub mod subscription;
 pub mod timeline;
+pub mod wire;
 
 pub type MediaMembershipFn = Arc<dyn Fn(NodeId) -> bool + Send + Sync>;
 
@@ -27,4 +29,4 @@ pub type InboundSubscribeGateFn = Arc<
 
 pub use hub::MediaHub;
 pub use ownership::OwnershipTracker;
-pub use protocol::{MEDIA_PROTOCOL_VERSION, MediaMessage};
+pub use protocol::{MEDIA_PROTOCOL_MIN_VERSION, MEDIA_PROTOCOL_VERSION, MediaMessage};
