@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crate::cluster::security::try_reserve_inflight_bytes;
 use std::time::{Duration, Instant};
@@ -11,18 +11,22 @@ use bytes::BytesMut;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cluster::NodeId;
 use crate::cluster::media::MediaMembershipFn;
-use crate::cluster::media::protocol::MediaMessage;
+use crate::cluster::media::live_queue::{LiveMediaQueue, LiveQueueConfig, LiveQueueSnapshot};
+use crate::cluster::media::protocol::{
+    MEDIA_PROTOCOL_MIN_VERSION, MEDIA_PROTOCOL_VERSION, MediaMessage,
+};
+use crate::cluster::media::wire;
+pub use crate::cluster::media::wire::MAX_FRAME;
 use crate::cluster::security::{
     auth_nonce, auth_response, clear_cluster_auth_failures, cluster_auth_rate_limited,
     node_id_from_peer_certs, record_cluster_auth_failure, secrets_equal, verify_tls_node_identity,
 };
 
-const MAX_FRAME: u32 = 32 * 1024 * 1024;
 /// Cap aggregate resident memory for concurrent authenticated media reads.
 const MAX_MEDIA_READ_BYTES_INFLIGHT: usize = 128 * 1024 * 1024;
 static MEDIA_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -35,68 +39,110 @@ const MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// reading (backpressure with no consumer) leaves the write stuck forever —
 /// the task and socket never clean up, and heartbeat-driven peer replacement
 /// just keeps adding more of them.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(8);
+const WRITE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(800)
+} else {
+    Duration::from_secs(8)
+};
+/// After a peer rejected the newest protocol version, dial it with
+/// [`MEDIA_PROTOCOL_MIN_VERSION`] for this long before trying again (the
+/// peer may have been upgraded meanwhile).
+const VERSION_FALLBACK_TTL: Duration = Duration::from_secs(60);
 
 pub(crate) trait MediaIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> MediaIo for T {}
 
+/// Write one v1 (JSON) frame: authentication, `Hello` and `Error{VERSION}`
+/// are always v1, see [`wire`].
 pub async fn write_media_frame<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     msg: &MediaMessage,
 ) -> Result<(), std::io::Error> {
-    let bytes = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
-    if bytes.len() > MAX_FRAME as usize {
-        return Err(std::io::Error::other("media frame too large"));
-    }
-    w.write_u32(bytes.len() as u32).await?;
-    w.write_all(&bytes).await?;
-    Ok(())
+    wire::write_frame(w, msg, MEDIA_PROTOCOL_MIN_VERSION).await
 }
 
+/// Read one v1 (JSON) frame.
 pub async fn read_media_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<MediaMessage, std::io::Error> {
-    tokio::time::timeout(MEDIA_READ_TIMEOUT, read_media_frame_max(r, MAX_FRAME))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "media frame read timeout")
-        })?
+    read_media_frame_v(r, MEDIA_PROTOCOL_MIN_VERSION).await
+}
+
+/// Read one frame of the session's negotiated protocol `version`.
+pub async fn read_media_frame_v<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    version: u16,
+) -> Result<MediaMessage, std::io::Error> {
+    tokio::time::timeout(
+        MEDIA_READ_TIMEOUT,
+        read_media_frame_max(r, version, MAX_FRAME),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "media frame read timeout"))?
 }
 
 async fn read_media_frame_max<R: AsyncReadExt + Unpin>(
     r: &mut R,
+    version: u16,
     max: u32,
 ) -> Result<MediaMessage, std::io::Error> {
-    let len = r.read_u32().await?;
-    if len > max {
-        return Err(std::io::Error::other("media frame too large"));
-    }
-    let _read_budget = try_reserve_inflight_bytes(
-        &MEDIA_READ_BYTES_INFLIGHT,
-        MAX_MEDIA_READ_BYTES_INFLIGHT,
-        len as usize,
-    )
-    .map_err(|_| std::io::Error::other("media read memory budget exceeded"))?;
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).await?;
-    serde_json::from_slice(&buf).map_err(std::io::Error::other)
+    wire::read_frame(r, version, max, |len| {
+        try_reserve_inflight_bytes(
+            &MEDIA_READ_BYTES_INFLIGHT,
+            MAX_MEDIA_READ_BYTES_INFLIGHT,
+            len,
+        )
+        .map_err(|_| std::io::Error::other("media read memory budget exceeded"))
+    })
+    .await
 }
 
 async fn read_auth_media_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<MediaMessage, std::io::Error> {
-    tokio::time::timeout(AUTH_TIMEOUT, read_media_frame_max(r, MAX_AUTH_FRAME))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "media auth timeout"))?
+    tokio::time::timeout(
+        AUTH_TIMEOUT,
+        read_media_frame_max(r, MEDIA_PROTOCOL_MIN_VERSION, MAX_AUTH_FRAME),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "media auth timeout"))?
 }
 
-/// Multiplexed long-lived peer with bounded outbound queue.
+/// Connection-level counters of one media connection endpoint.
+#[derive(Default)]
+pub struct PeerCounters {
+    pub connects: AtomicU64,
+    pub reconnects: AtomicU64,
+    pub write_timeouts: AtomicU64,
+    pub write_errors: AtomicU64,
+    pub version_fallbacks: AtomicU64,
+    /// Protocol version of the current/last session (0 = never connected).
+    pub protocol_version: AtomicU16,
+}
+
+/// Per-peer status for the cluster status endpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerMediaStats {
+    pub peer_id: NodeId,
+    /// `"outbound"` (we dialed) or `"inbound"` (the peer dialed us).
+    pub direction: &'static str,
+    pub protocol_version: u16,
+    pub connects: u64,
+    pub reconnects: u64,
+    pub write_timeouts: u64,
+    pub write_errors: u64,
+    pub version_fallbacks: u64,
+    #[serde(flatten)]
+    pub queue: LiveQueueSnapshot,
+}
+
+/// Multiplexed long-lived peer with a bounded, live-media-aware outbound
+/// queue (see [`LiveMediaQueue`]).
 pub struct MediaPeer {
     pub peer_id: NodeId,
     pub addr: String,
-    tx: mpsc::Sender<MediaMessage>,
-    queue_bytes: Arc<AtomicUsize>,
-    max_queue_bytes: usize,
+    queue: Arc<LiveMediaQueue>,
+    counters: Arc<PeerCounters>,
     closed: Arc<AtomicBool>,
 }
 
@@ -106,44 +152,68 @@ impl MediaPeer {
         addr: String,
         secret: String,
         local_id: NodeId,
-        max_queue_mb: u32,
+        queue_cfg: impl Into<LiveQueueConfig>,
         inbound: mpsc::Sender<(NodeId, MediaMessage)>,
         tls_client: Option<Arc<ClientConfig>>,
         on_reconnected: mpsc::UnboundedSender<NodeId>,
     ) -> Self {
-        let max_queue_bytes = (max_queue_mb as usize)
-            .saturating_mul(1024 * 1024)
-            .max(1024 * 1024);
-        let (tx, mut rx) = mpsc::channel::<MediaMessage>(256);
-        let queue_bytes = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(LiveMediaQueue::new(queue_cfg.into()));
+        let counters = Arc::new(PeerCounters::default());
         let closed = Arc::new(AtomicBool::new(false));
-        let qb = Arc::clone(&queue_bytes);
+        let q = Arc::clone(&queue);
+        let ctr = Arc::clone(&counters);
         let cl = Arc::clone(&closed);
         let addr_c = addr.clone();
         let on_reconnected = on_reconnected.clone();
 
         tokio::spawn(async move {
             let mut backoff_ms = 500u64;
+            let mut fallback_until: Option<Instant> = None;
+            let mut first = true;
             loop {
                 if cl.load(Ordering::Relaxed) {
                     break;
                 }
+                if !first {
+                    ctr.reconnects.fetch_add(1, Ordering::Relaxed);
+                    // Whatever was queued for the dead connection is stale;
+                    // live media resumes at the next resync point.
+                    q.on_connection_reset();
+                }
+                first = false;
+                let version = match fallback_until {
+                    Some(until) if Instant::now() < until => MEDIA_PROTOCOL_MIN_VERSION,
+                    _ => MEDIA_PROTOCOL_VERSION,
+                };
                 let attempt_started = Instant::now();
                 match connect_and_run(
                     &addr_c,
                     &secret,
                     local_id,
                     peer_id,
-                    &mut rx,
+                    version,
+                    &q,
+                    &ctr,
                     &inbound,
-                    &qb,
-                    max_queue_bytes,
                     &cl,
                     tls_client.clone(),
                 )
                 .await
                 {
                     Ok(ConnectEnd::Shutdown) => break,
+                    Ok(ConnectEnd::VersionRejected) => {
+                        tracing::info!(
+                            peer = peer_id,
+                            "media peer does not speak protocol v{version}; falling back to v{MEDIA_PROTOCOL_MIN_VERSION}"
+                        );
+                        ctr.version_fallbacks.fetch_add(1, Ordering::Relaxed);
+                        fallback_until = Some(Instant::now() + VERSION_FALLBACK_TTL);
+                        // Retry at once with the older version. No resubscribe
+                        // notification: the rejection came before the writer
+                        // popped anything, so the queued `Subscribe`s are
+                        // still there and a second copy would double the
+                        // owner's per-connection refcount.
+                    }
                     Ok(ConnectEnd::Transient) => {
                         tracing::debug!(peer = peer_id, "media peer reconnect after disconnect");
                         // A session that stayed up for a while is evidence of a
@@ -164,14 +234,14 @@ impl MediaPeer {
                 }
             }
             cl.store(true, Ordering::Relaxed);
+            q.close();
         });
 
         Self {
             peer_id,
             addr,
-            tx,
-            queue_bytes,
-            max_queue_bytes,
+            queue,
+            counters,
             closed,
         }
     }
@@ -180,14 +250,30 @@ impl MediaPeer {
         if self.closed.load(Ordering::Relaxed) {
             return Err(());
         }
-        let approx = approx_size(&msg);
-        if try_reserve_queue_bytes(&self.queue_bytes, self.max_queue_bytes, approx).is_err() {
-            tracing::warn!(peer = self.peer_id, "media queue full — dropping frame");
-            return Err(());
+        if self.queue.push(msg).is_queued() {
+            Ok(())
+        } else {
+            Err(())
         }
-        self.tx.try_send(msg).map_err(|_| {
-            self.queue_bytes.fetch_sub(approx, Ordering::Relaxed);
-        })
+    }
+
+    /// See [`LiveMediaQueue::take_reinit`].
+    pub fn take_reinit(&self, app: &str, stream: &str) -> bool {
+        self.queue.take_reinit(app, stream)
+    }
+
+    pub fn mark_reinit(&self, app: &str, stream: &str) {
+        self.queue.mark_reinit(app, stream);
+    }
+
+    pub fn stats(&self) -> PeerMediaStats {
+        peer_stats(self.peer_id, "outbound", &self.queue, &self.counters)
+    }
+
+    /// Take the queued messages without a connection (tests).
+    #[cfg(test)]
+    pub(crate) fn drain_queue_for_test(&self) -> Vec<MediaMessage> {
+        std::iter::from_fn(|| self.queue.pop_at(Instant::now())).collect()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -196,48 +282,39 @@ impl MediaPeer {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+        self.queue.close();
     }
 }
 
-fn try_reserve_queue_bytes(
-    queue_bytes: &AtomicUsize,
-    max_queue_bytes: usize,
-    approx: usize,
-) -> Result<(), ()> {
-    loop {
-        let cur = queue_bytes.load(Ordering::Acquire);
-        let Some(new) = cur.checked_add(approx) else {
-            return Err(());
-        };
-        if new > max_queue_bytes {
-            return Err(());
-        }
-        if queue_bytes
-            .compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Ok(());
-        }
+impl Drop for MediaPeer {
+    /// Dropping the last handle ends the dial/write task.
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
-fn approx_size(msg: &MediaMessage) -> usize {
-    match msg {
-        MediaMessage::MediaFrame { payload, .. } => payload.len() + 64,
-        MediaMessage::InitCache {
-            metadata,
-            avc_header,
-            aac_header,
-            keyframe,
-            ..
-        } => {
-            metadata.as_ref().map(|v| v.len()).unwrap_or(0)
-                + avc_header.as_ref().map(|v| v.len()).unwrap_or(0)
-                + aac_header.as_ref().map(|v| v.len()).unwrap_or(0)
-                + keyframe.as_ref().map(|(_, p)| p.len()).unwrap_or(0)
-                + 64
-        }
-        _ => 128,
+impl Drop for InboundMediaSink {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn peer_stats(
+    peer_id: NodeId,
+    direction: &'static str,
+    queue: &LiveMediaQueue,
+    c: &PeerCounters,
+) -> PeerMediaStats {
+    PeerMediaStats {
+        peer_id,
+        direction,
+        protocol_version: c.protocol_version.load(Ordering::Relaxed),
+        connects: c.connects.load(Ordering::Relaxed),
+        reconnects: c.reconnects.load(Ordering::Relaxed),
+        write_timeouts: c.write_timeouts.load(Ordering::Relaxed),
+        write_errors: c.write_errors.load(Ordering::Relaxed),
+        version_fallbacks: c.version_fallbacks.load(Ordering::Relaxed),
+        queue: queue.snapshot(),
     }
 }
 
@@ -246,6 +323,9 @@ enum ConnectEnd {
     Shutdown,
     /// Peer disconnected; outer loop should reconnect.
     Transient,
+    /// The peer answered our newer protocol version with v1 framing, i.e.
+    /// it only speaks v1: reconnect with the older version.
+    VersionRejected,
 }
 
 async fn connect_and_run(
@@ -253,10 +333,10 @@ async fn connect_and_run(
     secret: &str,
     local_id: NodeId,
     peer_id: NodeId,
-    outbound: &mut mpsc::Receiver<MediaMessage>,
+    version: u16,
+    queue: &LiveMediaQueue,
+    counters: &PeerCounters,
     inbound: &mpsc::Sender<(NodeId, MediaMessage)>,
-    queue_bytes: &AtomicUsize,
-    _max_queue: usize,
     closed: &AtomicBool,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<ConnectEnd, std::io::Error> {
@@ -276,14 +356,21 @@ async fn connect_and_run(
     };
 
     client_media_auth(&mut stream, secret, local_id).await?;
+    // `Hello` is a v1 frame whatever version it announces; the announced
+    // version frames everything after it, in both directions.
     write_media_frame(
         &mut stream,
         &MediaMessage::Hello {
-            version: crate::cluster::media::MEDIA_PROTOCOL_VERSION,
+            version,
             node_id: local_id,
         },
     )
     .await?;
+    if version > MEDIA_PROTOCOL_MIN_VERSION && !read_hello_ack(&mut stream, version).await {
+        return Ok(ConnectEnd::VersionRejected);
+    }
+    counters.connects.fetch_add(1, Ordering::Relaxed);
+    counters.protocol_version.store(version, Ordering::Relaxed);
 
     let (mut rh, mut wh) = tokio::io::split(stream);
     let read_closed = Arc::new(AtomicBool::new(false));
@@ -291,7 +378,7 @@ async fn connect_and_run(
     let inbound_c = inbound.clone();
     let reader = tokio::spawn(async move {
         while !rc.load(Ordering::Relaxed) {
-            match read_media_frame(&mut rh).await {
+            match read_media_frame_v(&mut rh, version).await {
                 Ok(msg) => {
                     // Stamp the authenticated remote node so the hub can apply
                     // the same accepts_owner fence as direct inbound accepts.
@@ -308,22 +395,21 @@ async fn connect_and_run(
     let mut end = ConnectEnd::Transient;
     while !closed.load(Ordering::Relaxed) {
         tokio::select! {
-            msg = outbound.recv() => {
+            msg = queue.pop() => {
                 let Some(msg) = msg else {
                     end = ConnectEnd::Shutdown;
                     break;
                 };
-                let size = approx_size(&msg);
-                // Account for this message being off the queue whether the
-                // write succeeds or the socket fails — a failed write still
-                // exits this loop and reconnects, and it must not leave
-                // queue_bytes permanently inflated by every message dropped
-                // this way (which would eventually make try_send() report
-                // the queue full even though the real channel is empty).
-                queue_bytes.fetch_sub(size.min(queue_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
-                match tokio::time::timeout(WRITE_TIMEOUT, write_media_frame(&mut wh, &msg)).await {
+                match tokio::time::timeout(WRITE_TIMEOUT, wire::write_frame(&mut wh, &msg, version)).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(_)) | Err(_) => break,
+                    Ok(Err(_)) => {
+                        counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(_) => {
+                        counters.write_timeouts.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -346,6 +432,29 @@ async fn connect_and_run(
     let _ = BytesMut::new(); // keep bytes dep used
     Ok(end)
 }
+
+/// Read the acceptor's answer to a `Hello` announcing a version newer than
+/// [`MEDIA_PROTOCOL_MIN_VERSION`]: an acceptor that speaks it confirms with
+/// its own v1-framed `Hello`; a legacy one sends `Error{VERSION}` or just
+/// hangs up. Returns `false` when the peer does not speak `version`. A peer
+/// that stays silent is not a legacy peer (it would have closed), so a
+/// timeout is not a rejection.
+async fn read_hello_ack<S: AsyncRead + Unpin>(stream: &mut S, version: u16) -> bool {
+    match tokio::time::timeout(
+        AUTH_TIMEOUT,
+        read_media_frame_max(stream, MEDIA_PROTOCOL_MIN_VERSION, MAX_AUTH_FRAME),
+    )
+    .await
+    {
+        Ok(Ok(MediaMessage::Hello { version: v, .. })) => v == version,
+        Ok(_) => false,
+        Err(_) => true,
+    }
+}
+
+/// `Error.code` an acceptor sends when it does not speak the announced
+/// protocol version.
+pub const VERSION_ERROR_CODE: &str = "VERSION";
 
 async fn client_media_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
@@ -380,6 +489,21 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     tls_required: bool,
     cert_node_id: Option<u64>,
 ) -> Result<NodeId, std::io::Error> {
+    accept_auth_negotiated(stream, peer, secret, local_id, tls_required, cert_node_id)
+        .await
+        .map(|(node_id, _)| node_id)
+}
+
+/// [`accept_auth`], also returning the protocol version the dialer announced
+/// in `Hello` (supported by this build) for the rest of the connection.
+pub async fn accept_auth_negotiated<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    peer: IpAddr,
+    secret: &str,
+    local_id: NodeId,
+    tls_required: bool,
+    cert_node_id: Option<u64>,
+) -> Result<(NodeId, u16), std::io::Error> {
     if cluster_auth_rate_limited(peer) {
         write_media_frame(stream, &MediaMessage::AuthFail).await?;
         return Err(std::io::Error::other("auth rate limited"));
@@ -406,7 +530,6 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     }
     verify_tls_node_identity(tls_required, cert_node_id, node_id)?;
     clear_cluster_auth_failures(peer);
-    let _ = local_id;
     write_media_frame(stream, &MediaMessage::AuthOk).await?;
 
     let hello = read_media_frame(stream).await?;
@@ -417,11 +540,11 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     else {
         return Err(std::io::Error::other("expected HELLO"));
     };
-    if version != crate::cluster::media::MEDIA_PROTOCOL_VERSION {
+    if !wire::is_supported_version(version) {
         write_media_frame(
             stream,
             &MediaMessage::Error {
-                code: "VERSION".into(),
+                code: VERSION_ERROR_CODE.into(),
                 message: "unsupported media protocol".into(),
                 generation: 0,
             },
@@ -432,7 +555,19 @@ pub async fn accept_auth<S: AsyncRead + AsyncWrite + Unpin>(
     if hello_id != node_id {
         return Err(std::io::Error::other("hello node_id mismatch"));
     }
-    Ok(node_id)
+    if version > MEDIA_PROTOCOL_MIN_VERSION {
+        // Confirm the version (v1-framed like `Hello`), so a dialer can tell
+        // an acceptor that speaks it from a legacy one that hangs up.
+        write_media_frame(
+            stream,
+            &MediaMessage::Hello {
+                version,
+                node_id: local_id,
+            },
+        )
+        .await?;
+    }
+    Ok((node_id, version))
 }
 
 /// Wrap an accepted TCP stream with optional mTLS, then run `accept_auth`.
@@ -443,7 +578,7 @@ pub(crate) async fn accept_tls_then_auth(
     local_id: NodeId,
     tls_server: Option<Arc<ServerConfig>>,
     is_peer_allowed: MediaMembershipFn,
-) -> Result<(NodeId, Box<dyn MediaIo>), std::io::Error> {
+) -> Result<(NodeId, u16, Box<dyn MediaIo>), std::io::Error> {
     let tls_required = tls_server.is_some();
     let mut io: Box<dyn MediaIo> = if let Some(cfg) = tls_server {
         let acceptor = TlsAcceptor::from(cfg);
@@ -458,7 +593,7 @@ pub(crate) async fn accept_tls_then_auth(
             .peer_certificates()
             .and_then(node_id_from_peer_certs);
         let mut boxed: Box<dyn MediaIo> = Box::new(tls);
-        let peer_id = accept_auth(
+        let (peer_id, version) = accept_auth_negotiated(
             &mut boxed,
             peer,
             secret,
@@ -472,17 +607,18 @@ pub(crate) async fn accept_tls_then_auth(
                 "media peer not in cluster membership",
             ));
         }
-        return Ok((peer_id, boxed));
+        return Ok((peer_id, version, boxed));
     } else {
         Box::new(stream)
     };
-    let peer_id = accept_auth(&mut io, peer, secret, local_id, tls_required, None).await?;
+    let (peer_id, version) =
+        accept_auth_negotiated(&mut io, peer, secret, local_id, tls_required, None).await?;
     if !(is_peer_allowed)(peer_id) {
         return Err(std::io::Error::other(
             "media peer not in cluster membership",
         ));
     }
-    Ok((peer_id, io))
+    Ok((peer_id, version, io))
 }
 
 /// Write pump for an accepted inbound media session.
@@ -492,70 +628,62 @@ pub(crate) async fn accept_tls_then_auth(
 /// plaintext clustering never dials from heartbeats).
 pub struct InboundMediaSink {
     pub peer_id: NodeId,
-    tx: mpsc::Sender<MediaMessage>,
-    queue_bytes: Arc<AtomicUsize>,
-    max_queue_bytes: usize,
+    queue: Arc<LiveMediaQueue>,
+    counters: Arc<PeerCounters>,
     closed: Arc<AtomicBool>,
-    close_notify: Arc<Notify>,
 }
 
 impl InboundMediaSink {
-    pub fn spawn<W>(peer_id: NodeId, max_queue_mb: u32, mut wh: W) -> Self
+    pub fn spawn<W>(
+        peer_id: NodeId,
+        queue_cfg: impl Into<LiveQueueConfig>,
+        version: u16,
+        mut wh: W,
+    ) -> Self
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let max_queue_bytes = (max_queue_mb as usize)
-            .saturating_mul(1024 * 1024)
-            .max(1024 * 1024);
-        let (tx, mut rx) = mpsc::channel::<MediaMessage>(256);
-        let queue_bytes = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(LiveMediaQueue::new(queue_cfg.into()));
+        let counters = Arc::new(PeerCounters::default());
+        counters.connects.store(1, Ordering::Relaxed);
+        counters.protocol_version.store(version, Ordering::Relaxed);
         let closed = Arc::new(AtomicBool::new(false));
-        let close_notify = Arc::new(Notify::new());
-        let qb = Arc::clone(&queue_bytes);
+        let q = Arc::clone(&queue);
+        let ctr = Arc::clone(&counters);
         let cl = Arc::clone(&closed);
-        let notify = Arc::clone(&close_notify);
         tokio::spawn(async move {
             loop {
                 if cl.load(Ordering::Relaxed) {
                     break;
                 }
-                tokio::select! {
-                    biased;
-                    _ = notify.notified() => {
-                        if cl.load(Ordering::Relaxed) {
-                            break;
-                        }
+                let Some(msg) = q.pop().await else {
+                    break;
+                };
+                if cl.load(Ordering::Relaxed) {
+                    break;
+                }
+                match tokio::time::timeout(WRITE_TIMEOUT, wire::write_frame(&mut wh, &msg, version))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        ctr.write_errors.fetch_add(1, Ordering::Relaxed);
+                        break;
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        if cl.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    msg = rx.recv() => {
-                        let Some(msg) = msg else {
-                            break;
-                        };
-                        if cl.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let size = approx_size(&msg);
-                        qb.fetch_sub(size.min(qb.load(Ordering::Relaxed)), Ordering::Relaxed);
-                        match tokio::time::timeout(WRITE_TIMEOUT, write_media_frame(&mut wh, &msg)).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) | Err(_) => break,
-                        }
+                    Err(_) => {
+                        ctr.write_timeouts.fetch_add(1, Ordering::Relaxed);
+                        break;
                     }
                 }
             }
             cl.store(true, Ordering::Relaxed);
+            q.close();
         });
         Self {
             peer_id,
-            tx,
-            queue_bytes,
-            max_queue_bytes,
+            queue,
+            counters,
             closed,
-            close_notify,
         }
     }
 
@@ -563,37 +691,28 @@ impl InboundMediaSink {
         if self.closed.load(Ordering::Relaxed) {
             return Err(());
         }
-        let approx = approx_size(&msg);
-        if try_reserve_queue_bytes(&self.queue_bytes, self.max_queue_bytes, approx).is_err() {
-            tracing::warn!(
-                peer = self.peer_id,
-                "inbound media queue full — dropping frame"
-            );
-            return Err(());
+        if self.queue.push(msg).is_queued() {
+            Ok(())
+        } else {
+            Err(())
         }
-        self.tx.try_send(msg).map_err(|_| {
-            self.queue_bytes.fetch_sub(approx, Ordering::Relaxed);
-        })
     }
 
     pub async fn send(&self, msg: MediaMessage) -> Result<(), ()> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(());
-        }
-        let approx = approx_size(&msg);
-        if try_reserve_queue_bytes(&self.queue_bytes, self.max_queue_bytes, approx).is_err() {
-            tracing::warn!(
-                peer = self.peer_id,
-                "inbound media queue full — dropping frame"
-            );
-            return Err(());
-        }
-        self.tx.send(msg).await.map_err(|_| {
-            self.queue_bytes.fetch_sub(
-                approx.min(self.queue_bytes.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
-        })
+        self.try_send(msg)
+    }
+
+    /// See [`LiveMediaQueue::take_reinit`].
+    pub fn take_reinit(&self, app: &str, stream: &str) -> bool {
+        self.queue.take_reinit(app, stream)
+    }
+
+    pub fn mark_reinit(&self, app: &str, stream: &str) {
+        self.queue.mark_reinit(app, stream);
+    }
+
+    pub fn stats(&self) -> PeerMediaStats {
+        peer_stats(self.peer_id, "inbound", &self.queue, &self.counters)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -602,13 +721,15 @@ impl InboundMediaSink {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        self.close_notify.notify_waiters();
+        self.queue.close();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::media::live_queue::approx_size;
+    use librtmp2::DeliveryHint;
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
     use tokio::net::TcpListener;
@@ -647,6 +768,7 @@ mod tests {
             frame_type: 1,
             timestamp: 0,
             timeline_ts: 0,
+            hint: DeliveryHint::Droppable,
             payload: vec![0u8; payload_len],
         }
     }
@@ -753,17 +875,6 @@ mod tests {
         assert_eq!(approx_size(&MediaMessage::AuthOk), 128);
     }
 
-    #[test]
-    fn queue_byte_reservation_is_bounded() {
-        let q = AtomicUsize::new(0);
-        assert!(try_reserve_queue_bytes(&q, 100, 60).is_ok());
-        assert!(try_reserve_queue_bytes(&q, 100, 60).is_err());
-        assert!(try_reserve_queue_bytes(&q, 100, 40).is_ok());
-        assert_eq!(q.load(Ordering::Relaxed), 100);
-        let q = AtomicUsize::new(usize::MAX);
-        assert!(try_reserve_queue_bytes(&q, usize::MAX, 1).is_err());
-    }
-
     #[tokio::test]
     async fn client_media_auth_success_and_failures() {
         // Success.
@@ -795,9 +906,14 @@ mod tests {
 
         // Server rejects the response.
         let (mut c, mut s) = tokio::io::duplex(1 << 16);
-        write_media_frame(&mut s, &MediaMessage::AuthChallenge { nonce: vec![1; 16] })
-            .await
-            .unwrap();
+        write_media_frame(
+            &mut s,
+            &MediaMessage::AuthChallenge {
+                nonce: auth_nonce(),
+            },
+        )
+        .await
+        .unwrap();
         write_media_frame(&mut s, &MediaMessage::AuthFail)
             .await
             .unwrap();
@@ -957,6 +1073,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(matches!(
+            read_media_frame(&mut io).await.unwrap(),
+            MediaMessage::Hello { .. }
+        ));
         io
     }
 
@@ -967,7 +1087,7 @@ mod tests {
 
         let client = tokio::spawn(dial_and_hello(addr, None, 7));
         let (s, peer) = listener.accept().await.unwrap();
-        let (id, _io) = accept_tls_then_auth(s, peer.ip(), SECRET, 1, None, allow_all())
+        let (id, _version, _io) = accept_tls_then_auth(s, peer.ip(), SECRET, 1, None, allow_all())
             .await
             .unwrap();
         assert_eq!(id, 7);
@@ -993,7 +1113,7 @@ mod tests {
 
         let client = tokio::spawn(dial_and_hello(addr, Some(Arc::clone(&client_cfg)), 1));
         let (s, peer) = listener.accept().await.unwrap();
-        let (id, mut io) = accept_tls_then_auth(
+        let (id, _version, mut io) = accept_tls_then_auth(
             s,
             peer.ip(),
             SECRET,
@@ -1053,14 +1173,20 @@ mod tests {
             .unwrap();
         assert_eq!(id, 1);
         assert!(matches!(
-            read_media_frame(&mut s).await.unwrap(),
+            read_media_frame_v(&mut s, MEDIA_PROTOCOL_VERSION)
+                .await
+                .unwrap(),
             MediaMessage::Subscribe { .. }
         ));
 
         // Two frames back-to-back: the first is stamped with the peer id, the
         // second overflows the capacity-1 inbound queue and is dropped.
-        write_media_frame(&mut s, &frame(3)).await.unwrap();
-        write_media_frame(&mut s, &frame(4)).await.unwrap();
+        wire::write_frame(&mut s, &frame(3), MEDIA_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        wire::write_frame(&mut s, &frame(4), MEDIA_PROTOCOL_VERSION)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         let (from, msg) = recv_timeout(&mut in_rx).await;
         assert_eq!(from, 2);
@@ -1089,7 +1215,9 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            read_media_frame(&mut s).await.unwrap(),
+            read_media_frame_v(&mut s, MEDIA_PROTOCOL_VERSION)
+                .await
+                .unwrap(),
             MediaMessage::InitCache { .. }
         ));
 
@@ -1146,12 +1274,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let (id, mut io) =
+        let (id, _version, mut io) =
             accept_tls_then_auth(s, ip.ip(), SECRET, 2, Some(server_cfg), allow_all())
                 .await
                 .unwrap();
         assert_eq!(id, 1);
-        write_media_frame(&mut io, &frame(5)).await.unwrap();
+        wire::write_frame(&mut io, &frame(5), MEDIA_PROTOCOL_VERSION)
+            .await
+            .unwrap();
         let (from, _) = recv_timeout(&mut in_rx).await;
         assert_eq!(from, 2);
         peer.close();
@@ -1168,15 +1298,23 @@ mod tests {
         let (rc_tx, _rc_rx) = mpsc::unbounded_channel();
         let peer = MediaPeer::spawn(2, addr.to_string(), SECRET.into(), 1, 0, in_tx, None, rc_tx);
 
-        // Byte budget (1 MiB minimum) rejects a frame larger than the queue.
+        // A frame above half the (1 MiB minimum) byte bound is refused.
         assert!(peer.try_send(frame(2 * 1024 * 1024)).is_err());
-        // Message-count bound (256) rejects the 257th small message and
-        // returns its reserved bytes.
-        for _ in 0..256 {
-            peer.try_send(frame(1)).unwrap();
+        assert_eq!(peer.stats().queue.oversized_frames_dropped, 1);
+        // Control messages are never evicted, so the message bound rejects
+        // the one past it.
+        let sub = || MediaMessage::Unsubscribe {
+            app: "live".into(),
+            stream: "s".into(),
+        };
+        for _ in 0..crate::cluster::media::live_queue::DEFAULT_MAX_MESSAGES {
+            peer.try_send(sub()).unwrap();
         }
-        assert!(peer.try_send(frame(1)).is_err());
-        assert_eq!(peer.queue_bytes.load(Ordering::Relaxed), 256 * 65);
+        assert!(peer.try_send(sub()).is_err());
+        assert_eq!(
+            peer.stats().queue.queue_messages,
+            crate::cluster::media::live_queue::DEFAULT_MAX_MESSAGES
+        );
 
         // Let at least one failed dial + backoff happen, then close.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1184,10 +1322,101 @@ mod tests {
         assert!(peer.is_closed());
     }
 
+    /// Test H: a peer that stops reading cannot wedge the writer. The write
+    /// times out, the peer reconnects, the media queued for the dead
+    /// connection is discarded and live delivery resumes at the next
+    /// resync point.
+    #[tokio::test]
+    async fn stalled_peer_times_out_reconnects_and_drops_stale_media() {
+        use crate::cluster::media::live_queue::LiveQueueConfig;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (in_tx, _in_rx) = mpsc::channel(4);
+        let (rc_tx, mut rc_rx) = mpsc::unbounded_channel();
+        let cfg = LiveQueueConfig::new(64, 0);
+        let peer = MediaPeer::spawn(
+            2,
+            addr.to_string(),
+            SECRET.into(),
+            1,
+            cfg,
+            in_tx,
+            None,
+            rc_tx,
+        );
+
+        // First connection: authenticate, then never read again.
+        let (mut stalled, _) = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        accept_auth_negotiated(&mut stalled, addr.ip(), SECRET, 2, false, None)
+            .await
+            .unwrap();
+        let media = |hint, tag: u8, len| MediaMessage::MediaFrame {
+            app: "live".into(),
+            stream: "s".into(),
+            epoch: 1,
+            frame_type: 1,
+            timestamp: u32::from(tag),
+            timeline_ts: u32::from(tag),
+            hint,
+            payload: vec![tag; len],
+        };
+        // Far more than the socket buffers hold: the write blocks.
+        peer.try_send(media(DeliveryHint::ResyncPoint, 1, 256 * 1024))
+            .unwrap();
+        for i in 2..80u8 {
+            let _ = peer.try_send(media(DeliveryHint::Droppable, i, 256 * 1024));
+        }
+        let timed_out = tokio::time::timeout(WAIT, async {
+            while peer.stats().write_timeouts == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(timed_out.is_ok(), "stalled write must hit WRITE_TIMEOUT");
+        assert_eq!(rc_rx.recv().await, Some(2), "peer must report a reconnect");
+
+        // The peer redials; whatever was queued for the old connection is
+        // stale and must not be replayed.
+        let (mut fresh, _) = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        accept_auth_negotiated(&mut fresh, addr.ip(), SECRET, 2, false, None)
+            .await
+            .unwrap();
+        drop(stalled);
+        let keyframe = media(DeliveryHint::ResyncPoint, 200, 1000);
+        // Pushed once the reset has run (the redial implies it).
+        assert!(peer.try_send(keyframe).is_ok());
+        let first =
+            tokio::time::timeout(WAIT, read_media_frame_v(&mut fresh, MEDIA_PROTOCOL_VERSION))
+                .await
+                .unwrap()
+                .unwrap();
+        match first {
+            MediaMessage::MediaFrame { payload, hint, .. } => {
+                assert_eq!(payload[0], 200, "backlog must not be replayed");
+                assert_eq!(hint, DeliveryHint::ResyncPoint);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let stats = peer.stats();
+        assert!(stats.reconnects >= 1);
+        assert!(stats.queue.dropped_stale_frames > 0, "{stats:?}");
+        assert!(
+            stats.queue.queue_bytes < 1024 * 1024,
+            "queue state cleaned: {stats:?}"
+        );
+        peer.close();
+    }
+
     #[tokio::test]
     async fn inbound_sink_writes_in_order_and_enforces_limits() {
         let (w, mut r) = tokio::io::duplex(1 << 20);
-        let sink = InboundMediaSink::spawn(5, 1, w);
+        let sink = InboundMediaSink::spawn(5, 1, MEDIA_PROTOCOL_VERSION, w);
         assert_eq!(sink.peer_id, 5);
         sink.try_send(MediaMessage::Unsubscribe {
             app: "live".into(),
@@ -1196,11 +1425,15 @@ mod tests {
         .unwrap();
         sink.send(frame(8)).await.unwrap();
         assert!(matches!(
-            read_media_frame(&mut r).await.unwrap(),
+            read_media_frame_v(&mut r, MEDIA_PROTOCOL_VERSION)
+                .await
+                .unwrap(),
             MediaMessage::Unsubscribe { .. }
         ));
         assert!(matches!(
-            read_media_frame(&mut r).await.unwrap(),
+            read_media_frame_v(&mut r, MEDIA_PROTOCOL_VERSION)
+                .await
+                .unwrap(),
             MediaMessage::MediaFrame { .. }
         ));
 
@@ -1213,7 +1446,7 @@ mod tests {
         assert!(sink.try_send(frame(1)).is_err());
         assert!(sink.send(frame(1)).await.is_err());
         // The write pump exits and drops the writer, so the reader sees EOF.
-        let eof = tokio::time::timeout(WAIT, read_media_frame(&mut r))
+        let eof = tokio::time::timeout(WAIT, read_media_frame_v(&mut r, MEDIA_PROTOCOL_VERSION))
             .await
             .unwrap();
         assert!(eof.is_err());
@@ -1224,14 +1457,18 @@ mod tests {
         // A tiny, never-read pipe blocks the pump on its first write so the
         // 256-slot channel fills up.
         let (w, r) = tokio::io::duplex(16);
-        let sink = InboundMediaSink::spawn(6, 64, w);
+        let sink = InboundMediaSink::spawn(6, 64, MEDIA_PROTOCOL_VERSION, w);
         let mut accepted = 0;
-        for _ in 0..300 {
-            if sink.try_send(frame(1)).is_ok() {
+        for _ in 0..2000 {
+            let unsub = MediaMessage::Unsubscribe {
+                app: "live".into(),
+                stream: "s".into(),
+            };
+            if sink.try_send(unsub).is_ok() {
                 accepted += 1;
             }
         }
-        assert!(accepted < 300, "channel capacity must bound the queue");
+        assert!(accepted < 2000, "message bound must bound the queue");
 
         // Dropping the reader turns the blocked write into an error; the pump
         // then marks the sink closed.
@@ -1248,7 +1485,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_sink_idle_tick_observes_close() {
         let (w, _r) = tokio::io::duplex(1024);
-        let sink = InboundMediaSink::spawn(7, 1, w);
+        let sink = InboundMediaSink::spawn(7, 1, MEDIA_PROTOCOL_VERSION, w);
         // Let the pump sit through at least one idle tick first.
         tokio::time::sleep(Duration::from_millis(150)).await;
         sink.closed.store(true, Ordering::Relaxed);

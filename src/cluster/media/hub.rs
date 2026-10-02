@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use librtmp2::DeliveryHint;
 use parking_lot::Mutex;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::net::TcpListener;
@@ -13,9 +14,10 @@ use tokio::sync::mpsc;
 
 use crate::cluster::NodeId;
 use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
+use crate::cluster::media::live_queue::{LiveQueueConfig, LiveQueueSnapshot};
 use crate::cluster::media::ownership::OwnershipTracker;
-use crate::cluster::media::peer::{self, InboundMediaSink, MediaPeer};
-use crate::cluster::media::protocol::{MediaMessage, SUBSCRIBE_DENIED};
+use crate::cluster::media::peer::{self, InboundMediaSink, MediaPeer, PeerMediaStats};
+use crate::cluster::media::protocol::{MEDIA_PROTOCOL_VERSION, MediaMessage, SUBSCRIBE_DENIED};
 use crate::cluster::media::subscription::SubscriptionTable;
 use crate::cluster::media::timeline::TimelineRemapper;
 use crate::cluster::media::{InboundSubscribeGateFn, MediaMembershipFn};
@@ -121,6 +123,8 @@ pub struct ExportedFrame {
     pub epoch: u64,
     pub frame_type: u8,
     pub timestamp: u32,
+    /// Congestion class assigned by librtmp2 at export.
+    pub hint: DeliveryHint,
     pub payload: Vec<u8>,
 }
 
@@ -132,13 +136,194 @@ pub struct InjectedFrame {
     pub epoch: u64,
     pub frame_type: u8,
     pub timestamp: u32,
+    /// Congestion class the sending node attached.
+    pub hint: DeliveryHint,
     pub payload: Vec<u8>,
 }
 
-/// Byte-bounded queue for remote→local media injection (reject-new on overflow).
+/// Media-plane status: aggregate and per-peer queue statistics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MediaPlaneStats {
+    pub protocol_version: u16,
+    #[serde(flatten)]
+    pub queue: LiveQueueSnapshot,
+    pub write_timeouts: u64,
+    pub reconnects: u64,
+    pub peers: Vec<PeerMediaStats>,
+}
+
+/// A queued media frame as seen by the shared eviction policy of
+/// [`ExportQueue`] and [`InjectQueue`].
+trait QueuedMedia {
+    fn names(&self) -> (&str, &str);
+    fn hint(&self) -> DeliveryHint;
+    fn size(&self) -> usize;
+}
+
+impl QueuedMedia for ExportedFrame {
+    fn names(&self) -> (&str, &str) {
+        (&self.app, &self.stream)
+    }
+    fn hint(&self) -> DeliveryHint {
+        self.hint
+    }
+    fn size(&self) -> usize {
+        self.payload.len().saturating_add(64)
+    }
+}
+
+impl QueuedMedia for InjectedFrame {
+    fn names(&self) -> (&str, &str) {
+        (&self.app, &self.stream)
+    }
+    fn hint(&self) -> DeliveryHint {
+        self.hint
+    }
+    fn size(&self) -> usize {
+        self.payload.len().saturating_add(64)
+    }
+}
+
+/// Counters of an [`ExportQueue`] / [`InjectQueue`], by evicted class.
+#[derive(Default)]
+struct EvictionCounters {
+    droppable: AtomicU64,
+    resync_point: AtomicU64,
+    critical: AtomicU64,
+    oversized: AtomicU64,
+}
+
+/// Snapshot of [`EvictionCounters`].
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct EvictionStats {
+    pub queue_messages: usize,
+    pub queue_bytes: usize,
+    pub evicted_droppable_frames: u64,
+    pub evicted_resync_point_frames: u64,
+    pub evicted_critical_frames: u64,
+    pub oversized_frames_dropped: u64,
+}
+
+impl EvictionCounters {
+    fn count(&self, hint: DeliveryHint) {
+        match hint {
+            DeliveryHint::Droppable => &self.droppable,
+            DeliveryHint::ResyncPoint => &self.resync_point,
+            DeliveryHint::Critical => &self.critical,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, queue_messages: usize, queue_bytes: usize) -> EvictionStats {
+        EvictionStats {
+            queue_messages,
+            queue_bytes,
+            evicted_droppable_frames: self.droppable.load(Ordering::Relaxed),
+            evicted_resync_point_frames: self.resync_point.load(Ordering::Relaxed),
+            evicted_critical_frames: self.critical.load(Ordering::Relaxed),
+            oversized_frames_dropped: self.oversized.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Make room for `need` more bytes in a byte-bounded frame queue.
+///
+/// Shared eviction policy of the export and inject queues (they stay
+/// separate types because their consumers differ): frames are evicted from
+/// the stream that currently holds the most queued bytes (ties: smaller
+/// `(app, stream)`), so one overloaded stream does not eat the frames of
+/// the others; within that stream the oldest `Droppable` frame goes first,
+/// then the oldest `ResyncPoint`, and a `Critical` frame only when nothing
+/// else of the stream is left. Evicting a single frame can leave a gap that
+/// only the next resync point repairs; the per-peer [`LiveMediaQueue`]
+/// does the stream-wide resync accounting, these queues only decide *what*
+/// to give up first. Returns `false` when `need` cannot fit even in an
+/// empty queue.
+fn evict_for_room<T: QueuedMedia>(
+    frames: &mut std::collections::VecDeque<T>,
+    bytes: &mut usize,
+    need: usize,
+    max_bytes: usize,
+    counters: &EvictionCounters,
+) -> bool {
+    if need > max_bytes {
+        return false;
+    }
+    // One scan per call: per-stream byte totals and per-class frame counts,
+    // kept up to date incrementally while evicting.
+    type Totals = ([usize; 3], usize);
+    let class_idx = |h: DeliveryHint| match h {
+        DeliveryHint::Droppable => 0,
+        DeliveryHint::ResyncPoint => 1,
+        DeliveryHint::Critical => 2,
+    };
+    const CLASSES: [DeliveryHint; 3] = [
+        DeliveryHint::Droppable,
+        DeliveryHint::ResyncPoint,
+        DeliveryHint::Critical,
+    ];
+    let mut per_stream: HashMap<(String, String), Totals> = HashMap::new();
+    let mut class_count = [0usize; 3];
+    if bytes.saturating_add(need) > max_bytes {
+        let mut scan: HashMap<(&str, &str), Totals> = HashMap::new();
+        for f in frames.iter() {
+            let e = scan.entry(f.names()).or_default();
+            e.0[class_idx(f.hint())] += 1;
+            e.1 += f.size();
+            class_count[class_idx(f.hint())] += 1;
+        }
+        per_stream = scan
+            .into_iter()
+            .map(|((a, s), t)| ((a.to_string(), s.to_string()), t))
+            .collect();
+    }
+    let mut evicted = 0usize;
+    while bytes.saturating_add(need) > max_bytes {
+        // Cheapest class first, across all streams; fairness (heaviest
+        // stream) only decides *within* that class.
+        let Some(class) = (0..3).find(|c| class_count[*c] > 0) else {
+            return false;
+        };
+        let Some(((app, stream), _)) = per_stream
+            .iter()
+            .filter(|(_, t)| t.0[class] > 0)
+            .max_by(|a, b| a.1.1.cmp(&b.1.1).then_with(|| b.0.cmp(a.0)))
+        else {
+            return false;
+        };
+        let (app, stream) = (app.clone(), stream.clone());
+        let Some(idx) = frames.iter().position(|f| {
+            f.names() == (app.as_str(), stream.as_str()) && f.hint() == CLASSES[class]
+        }) else {
+            return false;
+        };
+        if let Some(old) = frames.remove(idx) {
+            *bytes = bytes.saturating_sub(old.size());
+            counters.count(old.hint());
+            class_count[class] -= 1;
+            if let Some(t) = per_stream.get_mut(&(app, stream)) {
+                t.0[class] -= 1;
+                t.1 = t.1.saturating_sub(old.size());
+            }
+            evicted += 1;
+        }
+    }
+    if evicted > 0 {
+        tracing::debug!(evicted, "media queue full — evicted frames");
+    }
+    true
+}
+
+/// Byte-bounded queue for remote→local media injection.
+///
+/// Overload policy: **evict, don't reject** — room for a new frame is made
+/// by the shared eviction policy (see [`evict_for_room`]); only a single
+/// frame larger than the whole queue is refused, without touching the
+/// backlog.
 pub struct InjectQueue {
     state: Mutex<(std::collections::VecDeque<InjectedFrame>, usize)>,
     max_bytes: usize,
+    counters: EvictionCounters,
 }
 
 impl InjectQueue {
@@ -149,39 +334,28 @@ impl InjectQueue {
         Arc::new(Self {
             state: Mutex::new((std::collections::VecDeque::new(), 0)),
             max_bytes,
+            counters: EvictionCounters::default(),
         })
     }
 
     pub fn try_send(&self, frame: InjectedFrame) -> Result<(), ()> {
-        let size = frame.payload.len().saturating_add(64);
-        // Reject an oversized frame before the eviction loop: draining the
-        // whole backlog would destroy every other stream's frames for a frame
-        // that was never going to fit anyway.
-        if size > self.max_bytes {
-            tracing::warn!(
-                app = %frame.app,
-                stream = %frame.stream,
-                "inbound media inject queue full — dropping frame"
-            );
-            return Err(());
-        }
+        let size = frame.size();
         let mut st = self.state.lock();
-        while st.1.saturating_add(size) > self.max_bytes && !st.0.is_empty() {
-            if let Some(dropped) = st.0.pop_front() {
-                st.1 =
-                    st.1.saturating_sub(dropped.payload.len().saturating_add(64));
-            }
-        }
-        if st.1.saturating_add(size) > self.max_bytes {
+        let (frames, bytes) = &mut *st;
+        // Refuses an oversized frame before any eviction: draining the
+        // whole backlog would destroy every other stream's frames for a
+        // frame that was never going to fit anyway.
+        if !evict_for_room(frames, bytes, size, self.max_bytes, &self.counters) {
+            self.counters.oversized.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 app = %frame.app,
                 stream = %frame.stream,
-                "inbound media inject queue full — dropping frame"
+                "inbound media inject queue cannot take frame — dropping it"
             );
             return Err(());
         }
-        st.1 = st.1.saturating_add(size);
-        st.0.push_back(frame);
+        *bytes = bytes.saturating_add(size);
+        frames.push_back(frame);
         Ok(())
     }
 
@@ -190,17 +364,24 @@ impl InjectQueue {
         st.1 = 0;
         st.0.drain(..).collect()
     }
+
+    pub fn stats(&self) -> EvictionStats {
+        let st = self.state.lock();
+        self.counters.snapshot(st.0.len(), st.1)
+    }
 }
 
 /// Byte-bounded ordered export queue (local librtmp2 → mesh fan-out).
 ///
-/// Overload policy: **drop-oldest** until the new frame fits (or drop the new
-/// frame if it alone exceeds capacity). Matches live-media preference for
-/// freshest frames while preserving FIFO order for frames that remain.
+/// Overload policy: **evict by class from the heaviest stream** (see
+/// [`evict_for_room`]) until the new frame fits, or refuse a frame that
+/// exceeds the whole queue without touching the backlog. FIFO order is kept
+/// for the frames that remain.
 pub struct ExportQueue {
     state: Mutex<(std::collections::VecDeque<ExportedFrame>, usize)>,
     max_bytes: usize,
     notify: tokio::sync::Notify,
+    counters: EvictionCounters,
 }
 
 impl ExportQueue {
@@ -212,34 +393,16 @@ impl ExportQueue {
             state: Mutex::new((std::collections::VecDeque::new(), 0)),
             max_bytes,
             notify: tokio::sync::Notify::new(),
+            counters: EvictionCounters::default(),
         })
     }
 
     pub fn push(&self, frame: ExportedFrame) {
-        let size = frame.payload.len().saturating_add(64);
-        // Drop-oldest only applies to a frame that can eventually fit; an
-        // oversized frame must not empty the backlog of every other stream.
-        if size > self.max_bytes {
-            tracing::warn!(
-                app = %frame.app,
-                stream = %frame.stream,
-                "export media queue full — dropping oversized frame"
-            );
-            return;
-        }
+        let size = frame.size();
         let mut st = self.state.lock();
-        while st.1.saturating_add(size) > self.max_bytes {
-            let Some(old) = st.0.pop_front() else {
-                break;
-            };
-            st.1 = st.1.saturating_sub(old.payload.len().saturating_add(64));
-            tracing::warn!(
-                app = %old.app,
-                stream = %old.stream,
-                "export media queue full — dropping oldest frame"
-            );
-        }
-        if st.1.saturating_add(size) > self.max_bytes {
+        let (frames, bytes) = &mut *st;
+        if !evict_for_room(frames, bytes, size, self.max_bytes, &self.counters) {
+            self.counters.oversized.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 app = %frame.app,
                 stream = %frame.stream,
@@ -247,8 +410,8 @@ impl ExportQueue {
             );
             return;
         }
-        st.1 = st.1.saturating_add(size);
-        st.0.push_back(frame);
+        *bytes = bytes.saturating_add(size);
+        frames.push_back(frame);
         drop(st);
         self.notify.notify_one();
     }
@@ -257,6 +420,11 @@ impl ExportQueue {
         let mut st = self.state.lock();
         st.1 = 0;
         st.0.drain(..).collect()
+    }
+
+    pub fn stats(&self) -> EvictionStats {
+        let st = self.state.lock();
+        self.counters.snapshot(st.0.len(), st.1)
     }
 
     /// Wait until at least one frame is queued, then drain (no lost wakeups).
@@ -279,6 +447,8 @@ pub struct MediaHub {
     local_id: NodeId,
     secret: String,
     queue_mb: u32,
+    /// Age bound of the per-peer live-media queues in ms (`0` = default).
+    media_max_age_ms: AtomicU32,
     /// Configured standby replica slots (cluster inventory); MediaFrame fanout
     /// is subscriber-only so this is unused for continuous media push.
     #[allow(dead_code)]
@@ -338,6 +508,7 @@ impl MediaHub {
             local_id,
             secret,
             queue_mb,
+            media_max_age_ms: AtomicU32::new(0),
             replicas,
             ownership,
             peers: Mutex::new(HashMap::new()),
@@ -612,7 +783,7 @@ impl MediaHub {
                 .await;
                 drop(preauth);
                 match auth_result {
-                    Ok((peer_id, io)) => {
+                    Ok((peer_id, version, io)) => {
                         if MEDIA_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel)
                             >= MAX_MEDIA_CONN_INFLIGHT
                         {
@@ -624,7 +795,7 @@ impl MediaHub {
                             return;
                         }
                         let _inflight = MediaInflightGuard;
-                        if let Err(e) = hub.run_inbound_media_session(peer_id, io).await {
+                        if let Err(e) = hub.run_inbound_media_session(peer_id, version, io).await {
                             tracing::debug!(error=%e, "media inbound closed");
                         }
                     }
@@ -640,6 +811,7 @@ impl MediaHub {
     async fn run_inbound_media_session(
         self: Arc<Self>,
         peer_id: NodeId,
+        version: u16,
         io: Box<dyn peer::MediaIo>,
     ) -> Result<(), std::io::Error> {
         // Track Subscribe messages on this connection so a drop without Unsubscribe
@@ -647,13 +819,18 @@ impl MediaHub {
         let mut conn_subs: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
         let (mut rh, wh) = tokio::io::split(io);
-        let sink = Arc::new(InboundMediaSink::spawn(peer_id, self.queue_mb, wh));
+        let sink = Arc::new(InboundMediaSink::spawn(
+            peer_id,
+            self.queue_cfg(),
+            version,
+            wh,
+        ));
         if let Some(old) = self.inbound_sinks.lock().insert(peer_id, Arc::clone(&sink)) {
             old.close();
         }
         let result = async {
             loop {
-                let msg = peer::read_media_frame(&mut rh).await?;
+                let msg = peer::read_media_frame_v(&mut rh, version).await?;
                 match msg {
                     MediaMessage::Subscribe {
                         app,
@@ -746,6 +923,7 @@ impl MediaHub {
                         epoch,
                         frame_type,
                         timeline_ts,
+                        hint,
                         payload,
                         ..
                     } => {
@@ -765,6 +943,7 @@ impl MediaHub {
                                 epoch,
                                 frame_type,
                                 timestamp,
+                                hint,
                                 payload,
                             });
                         }
@@ -825,6 +1004,7 @@ impl MediaHub {
                 epoch,
                 frame_type,
                 timeline_ts,
+                hint,
                 payload,
                 ..
             } => {
@@ -846,6 +1026,7 @@ impl MediaHub {
                     epoch,
                     frame_type,
                     timestamp,
+                    hint,
                     payload,
                 });
             }
@@ -974,6 +1155,7 @@ impl MediaHub {
                 epoch,
                 frame_type: 2,
                 timestamp: inject_ts,
+                hint: DeliveryHint::Critical,
                 payload: md,
             });
         }
@@ -984,6 +1166,7 @@ impl MediaHub {
                 epoch,
                 frame_type: 1,
                 timestamp: inject_ts,
+                hint: DeliveryHint::Critical,
                 payload: h,
             });
         }
@@ -994,6 +1177,7 @@ impl MediaHub {
                 epoch,
                 frame_type: 0,
                 timestamp: inject_ts,
+                hint: DeliveryHint::Critical,
                 payload: h,
             });
         }
@@ -1004,6 +1188,7 @@ impl MediaHub {
                 epoch,
                 frame_type: 1,
                 timestamp: inject_ts,
+                hint: DeliveryHint::ResyncPoint,
                 payload: kf,
             });
         }
@@ -1037,7 +1222,7 @@ impl MediaHub {
                 addr.to_string(),
                 self.secret.clone(),
                 self.local_id,
-                self.queue_mb,
+                self.queue_cfg(),
                 self.inbound_tx.clone(),
                 self.tls_client.clone(),
                 self.peer_reconnect_tx.clone(),
@@ -1152,6 +1337,7 @@ impl MediaHub {
             &frame.payload,
         );
 
+        let hint = frame.hint;
         let msg = MediaMessage::MediaFrame {
             app: frame.app.clone(),
             stream: frame.stream.clone(),
@@ -1159,6 +1345,7 @@ impl MediaHub {
             frame_type: frame.frame_type,
             timestamp: frame.timestamp,
             timeline_ts,
+            hint,
             payload: frame.payload.clone(),
         };
 
@@ -1166,17 +1353,92 @@ impl MediaHub {
         let peers = self.peers.lock().clone();
         self.subs
             .for_each_peer(&frame.app, &frame.stream, |peer_id| {
-                if let Some(sink) = sinks.get(&peer_id) {
-                    if !sink.is_closed() && sink.try_send(msg.clone()).is_ok() {
-                        return;
-                    }
+                let sink = sinks.get(&peer_id).filter(|s| !s.is_closed());
+                let peer = peers.get(&peer_id).filter(|p| !p.is_closed());
+                // A critical frame was evicted for this peer earlier: its
+                // codec headers may be missing, so send the init cache
+                // ahead of the resync point that restarts the stream — on
+                // the same connection, since two TCP sessions have no
+                // ordering between them.
+                let reinit = hint == DeliveryHint::ResyncPoint
+                    && (sink
+                        .map(|s| s.take_reinit(&frame.app, &frame.stream))
+                        .unwrap_or(false)
+                        | peer
+                            .map(|p| p.take_reinit(&frame.app, &frame.stream))
+                            .unwrap_or(false));
+                let init = reinit
+                    .then(|| self.init_cache_message(&frame.app, &frame.stream))
+                    .flatten();
+                let send = |try_send: &dyn Fn(MediaMessage) -> bool| {
+                    init.as_ref().is_none_or(|i| try_send(i.clone())) && try_send(msg.clone())
+                };
+                if let Some(sink) = sink
+                    && send(&|m| sink.try_send(m).is_ok())
+                {
+                    return;
                 }
-                if let Some(peer) = peers.get(&peer_id) {
-                    if !peer.is_closed() {
-                        let _ = peer.try_send(msg.clone());
+                if let Some(peer) = peer
+                    && send(&|m| peer.try_send(m).is_ok())
+                {
+                    return;
+                }
+                if reinit {
+                    if let Some(s) = sink {
+                        s.mark_reinit(&frame.app, &frame.stream);
+                    }
+                    if let Some(p) = peer {
+                        p.mark_reinit(&frame.app, &frame.stream);
                     }
                 }
             });
+    }
+
+    /// The cached init data of a stream as a message, if any.
+    fn init_cache_message(&self, app: &str, stream: &str) -> Option<MediaMessage> {
+        let cache = self.cache.get(app, stream)?;
+        Some(MediaMessage::InitCache {
+            app: app.to_string(),
+            stream: stream.to_string(),
+            epoch: cache.epoch,
+            metadata: cache.metadata,
+            avc_header: cache.avc_header,
+            aac_header: cache.aac_header,
+            keyframe: cache.keyframe,
+        })
+    }
+
+    fn queue_cfg(&self) -> LiveQueueConfig {
+        LiveQueueConfig::new(self.queue_mb, self.media_max_age_ms.load(Ordering::Relaxed))
+    }
+
+    /// Set the age bound of the per-peer live-media queues (`0` = default).
+    /// Applies to connections created afterwards.
+    pub fn set_media_max_age_ms(&self, ms: u32) {
+        self.media_max_age_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Queue depth, age, drop and resync statistics of every media peer.
+    pub fn media_stats(&self) -> MediaPlaneStats {
+        let mut peers: Vec<PeerMediaStats> = self
+            .peers
+            .lock()
+            .values()
+            .map(|p| p.stats())
+            .chain(self.inbound_sinks.lock().values().map(|s| s.stats()))
+            .collect();
+        peers.sort_by_key(|p| (p.peer_id, p.direction));
+        let mut total = LiveQueueSnapshot::default();
+        for p in &peers {
+            total.merge(&p.queue);
+        }
+        MediaPlaneStats {
+            protocol_version: MEDIA_PROTOCOL_VERSION,
+            queue: total,
+            write_timeouts: peers.iter().map(|p| p.write_timeouts).sum(),
+            reconnects: peers.iter().map(|p| p.reconnects).sum(),
+            peers,
+        }
     }
 
     /// Update local init cache from librtmp2 snapshot (optional).
@@ -1252,6 +1514,7 @@ fn parse_subscribe_denied(message: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::media::wire;
 
     fn free_local_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1397,10 +1660,22 @@ mod tests {
         addr
     }
 
-    /// Dial a hub's media plane as `node_id` (client auth + Hello).
+    /// Dial a hub's media plane as `node_id` (client auth + Hello) speaking
+    /// the newest protocol version.
     async fn dial_hub(addr: SocketAddr, node_id: NodeId) -> tokio::net::TcpStream {
+        dial_hub_with_version(addr, node_id, MEDIA_PROTOCOL_VERSION).await
+    }
+
+    /// As [`dial_hub`], announcing `version` in `Hello`. Authentication and
+    /// `Hello` are v1 frames whatever the version.
+    async fn dial_hub_with_version(
+        addr: SocketAddr,
+        node_id: NodeId,
+        version: u16,
+    ) -> tokio::net::TcpStream {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let MediaMessage::AuthChallenge { nonce } = next(&mut s).await else {
+        let MediaMessage::AuthChallenge { nonce } = peer::read_media_frame(&mut s).await.unwrap()
+        else {
             panic!("expected challenge");
         };
         peer::write_media_frame(
@@ -1412,15 +1687,20 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(next(&mut s).await, MediaMessage::AuthOk));
-        send(
-            &mut s,
-            MediaMessage::Hello {
-                version: crate::cluster::media::MEDIA_PROTOCOL_VERSION,
-                node_id,
-            },
-        )
-        .await;
+        assert!(matches!(
+            peer::read_media_frame(&mut s).await.unwrap(),
+            MediaMessage::AuthOk
+        ));
+        peer::write_media_frame(&mut s, &MediaMessage::Hello { version, node_id })
+            .await
+            .unwrap();
+        if (2..=MEDIA_PROTOCOL_VERSION).contains(&version) {
+            // A hub that speaks the version confirms it.
+            assert!(matches!(
+                peer::read_media_frame(&mut s).await.unwrap(),
+                MediaMessage::Hello { version: v, .. } if v == version
+            ));
+        }
         s
     }
 
@@ -1437,14 +1717,16 @@ mod tests {
     }
 
     async fn next<R: tokio::io::AsyncReadExt + Unpin>(s: &mut R) -> MediaMessage {
-        tokio::time::timeout(WAIT, peer::read_media_frame(s))
+        tokio::time::timeout(WAIT, peer::read_media_frame_v(s, MEDIA_PROTOCOL_VERSION))
             .await
             .expect("timed out waiting for a media frame")
             .expect("media read failed")
     }
 
     async fn send<W: tokio::io::AsyncWriteExt + Unpin>(s: &mut W, msg: MediaMessage) {
-        peer::write_media_frame(s, &msg).await.unwrap();
+        wire::write_frame(s, &msg, MEDIA_PROTOCOL_VERSION)
+            .await
+            .unwrap();
     }
 
     async fn eventually(mut f: impl FnMut() -> bool) -> bool {
@@ -1480,6 +1762,7 @@ mod tests {
             frame_type: 1,
             timestamp: ts,
             timeline_ts: ts,
+            hint: DeliveryHint::Droppable,
             payload: payload.to_vec(),
         }
     }
@@ -1504,6 +1787,7 @@ mod tests {
             epoch: 1,
             frame_type: 1,
             timestamp: 0,
+            hint: DeliveryHint::Droppable,
             payload: vec![0; payload_len],
         }
     }
@@ -1515,11 +1799,33 @@ mod tests {
             epoch,
             frame_type: 1,
             timestamp: ts,
+            hint: DeliveryHint::Droppable,
             payload: payload.to_vec(),
         }
     }
 
     const KB: usize = 1024;
+
+    #[test]
+    fn eviction_prefers_droppable_of_any_stream_over_critical_of_the_heaviest() {
+        let q = ExportQueue::new(0); // clamps to 1 MiB
+        let f = |stream: &str, ts: u32, hint: DeliveryHint, len: usize| {
+            let mut e = exported(1, ts, &vec![0; len]);
+            e.stream = stream.into();
+            e.hint = hint;
+            q.push(e);
+        };
+        // Stream A is the heaviest but holds only critical frames.
+        f("a", 1, DeliveryHint::Critical, 500 * KB);
+        f("a", 2, DeliveryHint::Critical, 300 * KB);
+        f("b", 3, DeliveryHint::Droppable, 100 * KB);
+        f("b", 4, DeliveryHint::Droppable, 100 * KB);
+        // Needs room: the droppable frames of B go first.
+        f("b", 5, DeliveryHint::Droppable, 100 * KB);
+        let kept: Vec<u32> = q.drain().iter().map(|x| x.timestamp).collect();
+        assert!(kept.contains(&1) && kept.contains(&2), "kept: {kept:?}");
+        assert!(!kept.contains(&3), "kept: {kept:?}");
+    }
 
     // ---- queues and slot accounting -------------------------------------
 
@@ -1642,7 +1948,7 @@ mod tests {
         }
         let mut s = connected.expect("serve must accept connections");
         assert!(matches!(
-            next(&mut s).await,
+            peer::read_media_frame(&mut s).await.unwrap(),
             MediaMessage::AuthChallenge { .. }
         ));
     }
@@ -1865,29 +2171,38 @@ mod tests {
 
         // Non-member authenticates but is rejected by the membership gate.
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let MediaMessage::AuthChallenge { nonce } = next(&mut s).await else {
+        let MediaMessage::AuthChallenge { nonce } = peer::read_media_frame(&mut s).await.unwrap()
+        else {
             panic!()
         };
-        send(
+        peer::write_media_frame(
             &mut s,
-            MediaMessage::Auth {
+            &MediaMessage::Auth {
                 node_id: 9,
                 response: crate::cluster::security::auth_response(SECRET, 9, &nonce),
             },
         )
-        .await;
-        assert!(matches!(next(&mut s).await, MediaMessage::AuthOk));
-        send(
+        .await
+        .unwrap();
+        assert!(matches!(
+            peer::read_media_frame(&mut s).await.unwrap(),
+            MediaMessage::AuthOk
+        ));
+        peer::write_media_frame(
             &mut s,
-            MediaMessage::Hello {
+            &MediaMessage::Hello {
                 version: crate::cluster::media::MEDIA_PROTOCOL_VERSION,
                 node_id: 9,
             },
         )
-        .await;
-        let closed = tokio::time::timeout(WAIT, peer::read_media_frame(&mut s))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
+        let closed = tokio::time::timeout(
+            WAIT,
+            peer::read_media_frame_v(&mut s, MEDIA_PROTOCOL_VERSION),
+        )
+        .await
+        .unwrap();
         assert!(closed.is_err(), "non-member connection must be closed");
         assert!(owner.hub.inbound_sinks.lock().is_empty());
         owner.hub.shutdown();
@@ -1924,10 +2239,13 @@ mod tests {
             },
         )
         .await;
-        let reply = tokio::time::timeout(Duration::from_secs(5), peer::read_media_frame(&mut c))
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            peer::read_media_frame_v(&mut c, MEDIA_PROTOCOL_VERSION),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         match reply {
             MediaMessage::Error {
                 code,
@@ -2302,6 +2620,210 @@ mod tests {
             Some(AVC_SEQ)
         );
         assert!(Arc::ptr_eq(n.hub.ownership(), &n.ownership));
+        n.hub.shutdown();
+    }
+
+    fn hinted(epoch: u64, ts: u32, hint: DeliveryHint, payload: &[u8]) -> ExportedFrame {
+        ExportedFrame {
+            hint,
+            ..exported(epoch, ts, payload)
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_carries_the_delivery_hint_over_a_v2_wire() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        n.hub.connect_peer(2, &addr).await.unwrap();
+        let mut s = accept_from_hub(&listener, 2).await;
+        n.hub.subs.add(2, "live", "s");
+        n.hub
+            .fanout_local_frame(hinted(1, 0, DeliveryHint::ResyncPoint, AVC_KEY))
+            .await;
+        match next(&mut s).await {
+            MediaMessage::MediaFrame { hint, payload, .. } => {
+                assert_eq!(hint, DeliveryHint::ResyncPoint);
+                assert_eq!(payload, AVC_KEY);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let stats = n.hub.media_stats();
+        assert_eq!(stats.protocol_version, MEDIA_PROTOCOL_VERSION);
+        assert_eq!(stats.peers.len(), 1);
+        assert_eq!(stats.peers[0].protocol_version, MEDIA_PROTOCOL_VERSION);
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn v1_client_gets_v1_framing_from_a_v2_hub() {
+        let owner = node(1);
+        let addr = listen(&owner.hub).await;
+        let mut c = dial_hub_with_version(addr, 2, 1).await;
+        peer::write_media_frame(&mut c, &subscribe(0))
+            .await
+            .unwrap();
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![2]).await);
+        owner.ownership.set("s", 1, 1);
+        owner
+            .hub
+            .fanout_local_frame(hinted(1, 5, DeliveryHint::ResyncPoint, AVC_KEY))
+            .await;
+        // Plain JSON frames, readable by a v1-only node.
+        let msg = tokio::time::timeout(WAIT, peer::read_media_frame(&mut c))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, MediaMessage::MediaFrame { ref payload, .. } if payload == AVC_KEY));
+        assert_eq!(owner.hub.media_stats().peers[0].protocol_version, 1);
+        owner.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unsupported_hello_versions_get_a_version_error() {
+        let owner = node(1);
+        let addr = listen(&owner.hub).await;
+        for version in [0u16, 3, u16::MAX] {
+            let mut c = dial_hub_with_version(addr, 2, version).await;
+            match tokio::time::timeout(WAIT, peer::read_media_frame(&mut c))
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                MediaMessage::Error { code, .. } => assert_eq!(code, "VERSION"),
+                other => panic!("unexpected {other:?}"),
+            }
+            let eof = tokio::time::timeout(WAIT, peer::read_media_frame(&mut c))
+                .await
+                .unwrap();
+            assert!(eof.is_err(), "connection must close after a VERSION error");
+        }
+        assert!(owner.hub.inbound_sinks.lock().is_empty());
+        owner.hub.shutdown();
+    }
+
+    /// Rolling upgrade: a v2 node dials a node that only speaks v1, which
+    /// answers the v2 `Hello` with a v1 `Error{VERSION}` and hangs up. The
+    /// dialer then reconnects speaking v1 and the subscription arrives.
+    #[tokio::test]
+    async fn v2_peer_falls_back_to_v1_for_a_legacy_acceptor() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        n.hub.subscribe_remote(&addr, 2, "live", "s", 0).await;
+
+        // A legacy acceptor: same auth, but only knows protocol 1.
+        async fn legacy_accept(listener: &TcpListener) -> (tokio::net::TcpStream, u16) {
+            let (mut s, a) = tokio::time::timeout(WAIT, listener.accept())
+                .await
+                .expect("hub never dialed")
+                .unwrap();
+            let nonce = crate::cluster::security::auth_nonce();
+            peer::write_media_frame(
+                &mut s,
+                &MediaMessage::AuthChallenge {
+                    nonce: nonce.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let MediaMessage::Auth { node_id, response } =
+                peer::read_media_frame(&mut s).await.unwrap()
+            else {
+                panic!("expected Auth");
+            };
+            assert_eq!(
+                response,
+                crate::cluster::security::auth_response(SECRET, node_id, &nonce)
+            );
+            let _ = a;
+            peer::write_media_frame(&mut s, &MediaMessage::AuthOk)
+                .await
+                .unwrap();
+            let MediaMessage::Hello { version, .. } = peer::read_media_frame(&mut s).await.unwrap()
+            else {
+                panic!("expected Hello");
+            };
+            if version != 1 {
+                peer::write_media_frame(
+                    &mut s,
+                    &MediaMessage::Error {
+                        code: "VERSION".into(),
+                        message: "unsupported media protocol".into(),
+                        generation: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            (s, version)
+        }
+
+        let (s1, v1) = legacy_accept(&listener).await;
+        assert_eq!(v1, 2, "first attempt announces the newest version");
+        drop(s1);
+        let (mut s2, v2) = legacy_accept(&listener).await;
+        assert_eq!(v2, 1, "fallback announces the legacy version");
+        // The resubscribe after the fallback arrives as a plain v1 frame.
+        let msg = tokio::time::timeout(WAIT, peer::read_media_frame(&mut s2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, MediaMessage::Subscribe { ref stream, .. } if stream == "s"));
+        let stats = n.hub.media_stats();
+        assert_eq!(stats.peers[0].version_fallbacks, 1);
+        assert_eq!(stats.peers[0].protocol_version, 1);
+        n.hub.shutdown();
+    }
+
+    /// A critical frame lost to the byte bound must not leave the peer
+    /// without codec headers: the init cache goes out ahead of the next
+    /// resync point.
+    #[tokio::test]
+    async fn evicted_critical_frame_resends_init_cache_before_the_next_keyframe() {
+        let n = node(1);
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        n.hub.connect_peer(2, &dead).await.unwrap();
+        n.hub.subs.add(2, "live", "s");
+        let big = vec![0u8; 1024 * KB];
+        // Header-class frames from a misbehaving publisher exceed the 8 MiB
+        // queue: the oldest critical frame is evicted.
+        for i in 0..12u32 {
+            n.hub
+                .fanout_local_frame(hinted(1, i, DeliveryHint::Critical, &big))
+                .await;
+        }
+        let peer = n.hub.peers.lock().get(&2).cloned().unwrap();
+        assert!(peer.stats().queue.dropped_critical_frames > 0);
+        n.hub
+            .fanout_local_frame(hinted(1, 100, DeliveryHint::ResyncPoint, AVC_KEY))
+            .await;
+        let mut kinds = Vec::new();
+        for msg in peer.drain_queue_for_test() {
+            kinds.push(match msg {
+                MediaMessage::InitCache { .. } => "init",
+                MediaMessage::MediaFrame {
+                    hint: DeliveryHint::ResyncPoint,
+                    ..
+                } => "key",
+                _ => "other",
+            });
+        }
+        let init = kinds
+            .iter()
+            .position(|k| *k == "init")
+            .expect("init resent");
+        let key = kinds
+            .iter()
+            .position(|k| *k == "key")
+            .expect("keyframe queued");
+        assert!(
+            init < key,
+            "init cache must precede the keyframe: {kinds:?}"
+        );
         n.hub.shutdown();
     }
 

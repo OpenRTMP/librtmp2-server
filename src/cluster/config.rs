@@ -71,6 +71,10 @@ pub struct ClusterConfig {
     pub resume_at_mbps: Option<f64>,
     pub media_replicas: u32,
     pub media_queue_mb: u32,
+    /// Queued media older than this (ms) makes the per-peer live-media queue
+    /// drop the stream's stale frames and wait for a resync point. `0` =
+    /// built-in default (3000 ms, experimental).
+    pub media_max_age_ms: u32,
     pub advertise_addr: Option<String>,
     pub media_advertise_addr: Option<String>,
     /// When false (default), join/control/media peer addresses must not target
@@ -104,6 +108,7 @@ impl Default for ClusterConfig {
             resume_at_mbps: None,
             media_replicas: 0,
             media_queue_mb: 64,
+            media_max_age_ms: 0,
             advertise_addr: None,
             media_advertise_addr: None,
             allow_loopback_peer_addrs: false,
@@ -300,6 +305,9 @@ impl ClusterConfig {
         if self.media_queue_mb == 0 || self.media_queue_mb > 1024 {
             return Err("CLUSTER_MEDIA_QUEUE_MB must be 1–1024".into());
         }
+        if self.media_max_age_ms != 0 && !(100..=600_000).contains(&self.media_max_age_ms) {
+            return Err("CLUSTER_MEDIA_MAX_AGE_MS must be 0 (default) or 100–600000".into());
+        }
         Ok(())
     }
 
@@ -354,6 +362,7 @@ const CLUSTER_FILE_KEYS: &[&str] = &[
     "CLUSTER_BANDWIDTH_MAX_MBPS",
     "CLUSTER_MEDIA_REPLICAS",
     "CLUSTER_MEDIA_QUEUE_MB",
+    "CLUSTER_MEDIA_MAX_AGE_MS",
     "CLUSTER_ADVERTISE_ADDR",
     "CLUSTER_MEDIA_ADVERTISE_ADDR",
     "CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS",
@@ -403,6 +412,10 @@ const CLUSTER_ENV_OVERRIDES: &[(&str, &str)] = &[
     ),
     ("LRTMP2_CLUSTER_MEDIA_REPLICAS", "CLUSTER_MEDIA_REPLICAS"),
     ("LRTMP2_CLUSTER_MEDIA_QUEUE_MB", "CLUSTER_MEDIA_QUEUE_MB"),
+    (
+        "LRTMP2_CLUSTER_MEDIA_MAX_AGE_MS",
+        "CLUSTER_MEDIA_MAX_AGE_MS",
+    ),
     ("LRTMP2_CLUSTER_ADVERTISE_ADDR", "CLUSTER_ADVERTISE_ADDR"),
     (
         "LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR",
@@ -443,6 +456,7 @@ pub const CLUSTER_ENV_OVERRIDE_KEYS: &[&str] = &[
     "LRTMP2_CLUSTER_BANDWIDTH_MAX_MBPS",
     "LRTMP2_CLUSTER_MEDIA_REPLICAS",
     "LRTMP2_CLUSTER_MEDIA_QUEUE_MB",
+    "LRTMP2_CLUSTER_MEDIA_MAX_AGE_MS",
     "LRTMP2_CLUSTER_ADVERTISE_ADDR",
     "LRTMP2_CLUSTER_MEDIA_ADVERTISE_ADDR",
     "LRTMP2_CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS",
@@ -535,6 +549,11 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(),
         "CLUSTER_MEDIA_QUEUE_MB" => {
             if let Ok(v) = val.parse::<u32>() {
                 cfg.media_queue_mb = v;
+            }
+        }
+        "CLUSTER_MEDIA_MAX_AGE_MS" => {
+            if let Ok(v) = val.parse::<u32>() {
+                cfg.media_max_age_ms = v;
             }
         }
         "CLUSTER_ADVERTISE_ADDR" => cfg.advertise_addr = Some(val.to_string()),

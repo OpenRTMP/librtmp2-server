@@ -1,8 +1,19 @@
-//! Versioned media-plane messages (length-prefixed JSON + binary payloads).
+//! Versioned media-plane messages.
+//!
+//! The message *types* are version-independent; how they are framed on the
+//! wire is chosen per session by the protocol version in `Hello` (see
+//! [`super::wire`]): v1 frames every message as JSON, v2 sends `MediaFrame`
+//! and `InitCache` as compact binary records and everything else as JSON.
 
+use librtmp2::DeliveryHint;
 use serde::{Deserialize, Serialize};
 
-pub const MEDIA_PROTOCOL_VERSION: u16 = 1;
+/// Newest media protocol this build speaks (see [`super::wire`] for the
+/// per-version framing and the v1 fallback).
+pub const MEDIA_PROTOCOL_VERSION: u16 = 2;
+/// Oldest media protocol this build still accepts and can fall back to for a
+/// rolling upgrade.
+pub const MEDIA_PROTOCOL_MIN_VERSION: u16 = 1;
 /// `Error.code` when an inbound `Subscribe` is rejected after the gate window.
 pub const SUBSCRIBE_DENIED: &str = "subscribe_denied";
 
@@ -63,6 +74,10 @@ pub enum MediaMessage {
         timestamp: u32,
         /// Wire timeline timestamp after [`super::timeline`] remapping.
         timeline_ts: u32,
+        /// Codec-neutral congestion class assigned by librtmp2 at export.
+        /// Absent in v1 JSON from older nodes, which reads as `Droppable`.
+        #[serde(default = "default_hint", with = "hint_serde")]
+        hint: DeliveryHint,
         payload: Vec<u8>,
     },
     Error {
@@ -79,6 +94,25 @@ pub enum MediaMessage {
         stream_id: String,
         body: serde_json::Value,
     },
+}
+
+fn default_hint() -> DeliveryHint {
+    DeliveryHint::Droppable
+}
+
+/// `DeliveryHint` travels as its one-byte wire code in JSON too.
+mod hint_serde {
+    use super::DeliveryHint;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(hint: &DeliveryHint, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u8(hint.to_u8())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DeliveryHint, D::Error> {
+        let code = u8::deserialize(d)?;
+        DeliveryHint::from_u8(code).ok_or_else(|| serde::de::Error::custom("unknown delivery hint"))
+    }
 }
 
 impl MediaMessage {
