@@ -742,7 +742,7 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
         // together makes the payload and both indices a consistent prefix of
         // the log. (The conservative direction, a follower re-applying
         // idempotently, is preserved: an index is never newer than the rows.)
-        let (data, last_applied) = {
+        let (data, last_applied, last_membership) = {
             let _apply = self.apply_lock.lock();
             let applied = self.last_applied.lock();
             let data = self
@@ -750,9 +750,12 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
                 })?;
-            (data, *applied)
+            // Membership must be pinned under the same `apply_lock` as the rows
+            // and index: `install_snapshot` writes membership under that lock,
+            // so reading it after releasing would let a builder pair a
+            // pre-install payload/index with a post-install membership.
+            (data, *applied, self.last_membership.lock().clone())
         };
-        let last_membership = self.last_membership.lock().clone();
         let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_state_machine(&e),
         })?;
@@ -899,6 +902,12 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
+        // Same single-writer lock as `apply` and `build_snapshot`: OpenRaft
+        // runs the snapshot builder on its own task while this installs, so
+        // without it the builder could read the post-install rows while
+        // recording the pre-install index and persist a snapshot whose
+        // payload is ahead of its own log boundary.
+        let _apply = self.apply_lock.lock();
         let data = snapshot.into_inner();
         let app: AppSnapshot = serde_json::from_slice(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_snapshot(Some(meta.signature()), &e),
@@ -1822,6 +1831,43 @@ mod tests {
         assert_eq!(loaded.snapshot.get_ref(), snap.snapshot.get_ref());
         // Second call is served from the cache populated by the first.
         assert!(reopened.get_current_snapshot().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_serializes_with_apply_lock() {
+        let (sm, _rx) = sm_with_effects();
+        let snap = sm
+            .clone()
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let meta = snap.meta.clone();
+        let data = snap.snapshot.get_ref().clone();
+
+        let guard = sm.apply_lock.lock();
+        let mut installer = sm.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt
+                .block_on(installer.install_snapshot(&meta, Box::new(std::io::Cursor::new(data))));
+            tx.send(result.is_ok()).unwrap();
+        });
+
+        // While the lock is held by another writer, install must not complete.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            rx.try_recv().is_err(),
+            "install_snapshot must wait for apply_lock"
+        );
+        drop(guard);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        handle.join().unwrap();
     }
 
     #[tokio::test]
