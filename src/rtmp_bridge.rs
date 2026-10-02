@@ -137,6 +137,10 @@ struct ConnState {
 pub struct DbRtmpBridge {
     db: Arc<Db>,
     conns: Mutex<HashMap<ConnId, ConnState>>,
+    /// Bumped whenever any connection arms `player_stats_reset_pending`, so the
+    /// poll loop can throttle `update_player_stats` to its once-per-second
+    /// debounce without ever delaying a rebase (see `player_stats_generation`).
+    player_stats_generation: std::sync::atomic::AtomicU64,
     deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Failed publish/play auth attempts keyed by client IP (not `ConnId`) so
     /// reconnecting on a fresh TCP connection does not reset the window —
@@ -223,6 +227,7 @@ impl DbRtmpBridge {
         DbRtmpBridge {
             db,
             conns: Mutex::new(HashMap::new()),
+            player_stats_generation: std::sync::atomic::AtomicU64::new(0),
             deleted_streams,
             auth_failures: Mutex::new(HashMap::new()),
             coordinator: Mutex::new(None),
@@ -614,6 +619,8 @@ impl DbRtmpBridge {
                     cs.player_bytes_base = 0;
                     cs.player_bytes_at_last_stats = 0;
                     cs.player_stats_reset_pending = true;
+                    self.player_stats_generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
                     abandoned_any_play = true;
                 }
                 if drop_pub || drop_play {
@@ -768,6 +775,8 @@ impl DbRtmpBridge {
         // See release_publisher: arm the rebase for the next play
         // session on this connection.
         cs.player_stats_reset_pending = true;
+        self.player_stats_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Update publisher stats (media bytes_in, bitrate, codec) in the DB.
@@ -841,6 +850,14 @@ impl DbRtmpBridge {
 
         // Stats-only write: must not touch `active` (TOCTOU vs release_publisher).
         self.db.queue_publisher_stats(&pub_id, &pub_row_clone);
+    }
+
+    /// Changes whenever some connection's player stats must be rebased on its
+    /// next `update_player_stats` call. A caller that throttles that call
+    /// must make it immediately once this value differs from the one it saw.
+    pub fn player_stats_generation(&self) -> u64 {
+        self.player_stats_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Update player stats (media bytes_out, bitrate) in the DB.
@@ -1299,6 +1316,8 @@ impl DbRtmpBridge {
                 cs.player_last_stats_at = None;
                 cs.player_bytes_at_last_stats = 0;
                 cs.player_stats_reset_pending = true;
+                self.player_stats_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }
 
@@ -2422,6 +2441,24 @@ mod tests {
         let players = db.player_list(Some("s1"));
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].bytes_out, 4096);
+    }
+
+    /// A caller that throttles `update_player_stats` relies on the generation
+    /// changing whenever a rebase is armed: releasing a player does.
+    #[test]
+    fn player_stats_generation_changes_when_a_rebase_is_armed() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
+        bridge.update_player_stats(1, 1000);
+        let before = bridge.player_stats_generation();
+        // No rebase armed: the value is stable across stats calls.
+        bridge.update_player_stats(1, 2000);
+        assert_eq!(bridge.player_stats_generation(), before);
+        bridge.release_player(1);
+        assert_ne!(bridge.player_stats_generation(), before);
     }
 
     #[test]

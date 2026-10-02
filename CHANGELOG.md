@@ -36,6 +36,14 @@ begin at `1.0.0`.
   and optional `perf stat` / `perf record` / `strace -c` sampling.
 
 ### Changed
+- The RTMP poll loop no longer takes the bridge's shared connection-map lock
+  several times per connection and tick for work that has no effect: stream
+  delete handling and play-key revocation are skipped when nothing was
+  deleted or revoked this poll, the session lookup is skipped for connections
+  already tracked as publishing/playing, and RTT and player stats are handed
+  to the bridge at its own once-per-second cadence (player stats immediately
+  when a rebase is armed). 7-14 % less server CPU at 500-2000 viewers on the
+  same load, unchanged memory and join latency; see `BENCHMARKS.md`.
 - `ExportQueue` and `InjectQueue` share one class-aware eviction policy
   (heaviest stream first, `Droppable` before `ResyncPoint` before `Critical`);
   the documentation now matches the behaviour (the inject queue always

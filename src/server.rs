@@ -1090,7 +1090,21 @@ pub(crate) struct TrackedConn {
     /// the viewer's perspective, even though its RTMP session already says
     /// `playing`. Cleared after FIRST_FRAME_GRACE_MS even if no media arrives.
     awaiting_first_frame: Option<(u64, Instant)>,
+    /// When the poll loop last handed this connection's RTT to the bridge
+    /// while it held a publish/play role. The bridge persists RTT at most
+    /// once per second, so calling it (and taking its shared connection-map
+    /// lock) on every poll tick in between is wasted work.
+    last_rtt_call: Option<Instant>,
+    /// Last `update_player_stats` hand-off and the bridge's
+    /// `player_stats_generation` at that time (same once-per-second cadence).
+    last_stats_call: Option<(Instant, u64)>,
 }
+
+/// How often the poll loop forwards a connection's RTT to the bridge; matches
+/// the bridge's own once-per-second debounce.
+const RTT_FORWARD_INTERVAL: Duration = Duration::from_secs(1);
+/// Same for player stats (the bridge's debounce is one second as well).
+const STATS_FORWARD_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Stream id used for delete kicks and `deleted_streams` retention. Prefer the
 /// bridge (authoritative for live publisher/player rows); fall back to the
@@ -1147,6 +1161,12 @@ fn drain_deleted_stream_roles(
     conn_id: u64,
     deleted_now: &HashSet<String>,
 ) -> bool {
+    // Nothing was deleted this poll (the steady state): no role can be hit
+    // and the tracker-id fallback below needs `deleted_now` to contain it, so
+    // the three bridge lookups (each a lock plus string clones) are moot.
+    if deleted_now.is_empty() {
+        return false;
+    }
     let pub_sid = rtmp_bridge.publisher_stream_id_for_conn(conn_id);
     let play_sid = rtmp_bridge.player_stream_id_for_conn(conn_id);
     let pub_hit = pub_sid
@@ -1283,12 +1303,22 @@ pub(crate) fn process_server_connections(
         }
         let conn_id = conn.conn_id;
         current_ids.insert(conn_id);
-        // Folded into this per-connection pass (was a separate full second
-        // scan below) so a poll tick locks `rtmp_bridge`'s shared connection
-        // map once per connection instead of twice; `update_rtt` debounces
-        // internally to at most once per second per connection regardless.
-        rtmp_bridge.update_rtt(conn_id, conn.rtt_ms);
         let entry = tracked.entry(conn_id).or_default();
+        // `update_rtt` debounces to once per second per connection inside the
+        // bridge; once the connection holds a role (so the bridge would
+        // really persist it) forward at the same cadence instead of locking
+        // the shared connection map on every tick. Connections without a
+        // role yet are still forwarded every tick, as before.
+        let rtt_due = !(entry.publishing || entry.playing)
+            || entry
+                .last_rtt_call
+                .is_none_or(|t| t.elapsed() >= RTT_FORWARD_INTERVAL);
+        if rtt_due {
+            rtmp_bridge.update_rtt(conn_id, conn.rtt_ms);
+            if entry.publishing || entry.playing {
+                entry.last_rtt_call = Some(Instant::now());
+            }
+        }
         if !entry.connected {
             // A publish/play callback may have already run `on_connect` via
             // `ensure_conn_registered_for_auth` earlier this same poll tick;
@@ -1302,7 +1332,11 @@ pub(crate) fn process_server_connections(
             entry.first_seen_at = Some(Instant::now());
         }
 
-        let has_authorized_session = rtmp_bridge.has_authorized_session(conn_id);
+        // `should_evict_idle_conn` never evicts a connection the tracker
+        // already knows as publishing/playing, so only the others need the
+        // bridge lookup.
+        let has_authorized_session =
+            (entry.publishing || entry.playing) || rtmp_bridge.has_authorized_session(conn_id);
         if should_evict_idle_conn(entry, has_authorized_session, Instant::now(), idle_timeout) {
             crate::log_info!(
                 "RTMP: closing idle conn={conn_id} from {} (no publish/play within {}s)",
@@ -1426,6 +1460,7 @@ pub(crate) fn process_server_connections(
                 conn.remote_addr
             );
             entry.playing = true;
+            entry.last_stats_call = None;
             entry.stream_id = stream_id;
             entry.awaiting_first_frame = Some((conn.media_bytes_sent, Instant::now()));
             conn.relay_key = entry.stream_id.clone();
@@ -1445,14 +1480,16 @@ pub(crate) fn process_server_connections(
             continue;
         }
 
-        let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
-        if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
-            crate::log_info!(
-                "RTMP: kicking conn={conn_id} from {} — play key '{viewer_id}' was revoked",
-                conn.remote_addr
-            );
-            reject_indices.push(idx);
-            continue;
+        if !revoked_now.is_empty() {
+            let viewer_id = rtmp_bridge.viewer_id_for_conn(conn_id);
+            if !viewer_id.is_empty() && revoked_now.contains(&viewer_id) {
+                crate::log_info!(
+                    "RTMP: kicking conn={conn_id} from {} — play key '{viewer_id}' was revoked",
+                    conn.remote_addr
+                );
+                reject_indices.push(idx);
+                continue;
+            }
         }
 
         // Publisher stats: media bytes only (excludes RTMP control overhead).
@@ -1500,7 +1537,17 @@ pub(crate) fn process_server_connections(
             {
                 entry.awaiting_first_frame = None;
             }
-            rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
+            // The bridge ignores calls within a second of its last update
+            // unless a rebase is pending, so only take its lock when one of
+            // those holds.
+            let generation = rtmp_bridge.player_stats_generation();
+            let stats_due = entry.last_stats_call.is_none_or(|(at, seen)| {
+                seen != generation || at.elapsed() >= STATS_FORWARD_INTERVAL
+            });
+            if stats_due {
+                rtmp_bridge.update_player_stats(conn_id, conn.media_bytes_sent);
+                entry.last_stats_call = Some((Instant::now(), generation));
+            }
         }
     }
 

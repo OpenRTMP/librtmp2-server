@@ -360,6 +360,47 @@ than in the earlier session (about 39 % vs. 35 % at 500 viewers for the same
 0.10.2 build), which is host variance between sessions and the reason these
 tables compare builds only within one session.
 
+**Per-connection bookkeeping in the poll loop** (the "next lever" above).
+Every poll tick the server called into `DbRtmpBridge` several times per
+connection, each time taking the one connection-map lock shared by all poll
+shards and cloning strings: `update_rtt`, `has_authorized_session`,
+`stream_ids_for_conn`/`publisher_stream_id_for_conn`/`player_stream_id_for_conn`
+(for stream-delete handling), `viewer_id_for_conn` (for play-key revocation)
+and `update_player_stats`, even though the bridge itself only acts on the
+first, last and anything changed. The poll loop now skips what provably has
+no effect: the delete handling when no stream was deleted this poll, the
+revocation lookup when no key was revoked, the session lookup for connections
+it already tracks as publishing/playing, and it hands RTT and player stats to
+the bridge at the bridge's own once-per-second cadence (stats immediately when
+a rebase is armed, via a generation counter). Behaviour is unchanged; the same
+tests pass.
+
+Same-session A/B against the previous build (server on librtmp2 0.11.0),
+builds alternated per round (500/1000: 4 rounds, 2000: 8 rounds,
+1/25/100-player join: 3 rounds), every viewer received every frame in all of
+them (1098 frames per viewer in the window at 500/1000, ~2558 at 2000):
+
+| Viewers | CPU % before → after | CPU/Gbit | join avg ms | join p95 ms | join p99 ms | peak RSS MiB |
+|---|---|---|---|---|---|---|
+| 500 | 36.3 → 31.6 (-13 %) | 0.662 → 0.577 | 32.9 → 31.0 | 77.6 → 70.4 | 85.8 → 75.0 | 21.6 → 21.6 |
+| 1000 | 68.4 → 59.1 (-14 %) | 0.624 → 0.539 | 35.0 → 33.7 | 91.3 → 83.8 | 107.8 → 100.3 | 31.3 → 31.2 |
+| 2000 | 91.6 → 85.6 (-7 %) | 0.42 → 0.39 | 103 → 100 | 249 → 232 | 287 → 272 | 51.5 → 51.3 |
+
+| Join latency (3 rounds, mean) | before | after |
+|---|---|---|
+| 25 players, avg / p95 | 2.1 / 4.3 ms | 2.0 / 3.5 ms |
+| 100 players, avg / p95 / p99 | 5.2 / 10.5 / 11.7 ms | 2.6 / 5.6 / 6.4 ms |
+
+CPU is lower at every step, memory and throughput are unchanged, and join
+latency is the same or better in the means. Individual rounds still scatter
+widely (at 2000 viewers the after-build p95 ranged 132-315 ms, the before-build
+204-286 ms), so read the join columns as "no regression", not as a
+speed-up. A fresh `perf record` at 1000 viewers shows what moved:
+`update_rtt` 1.8 % → 0.04 %, `has_authorized_session` 0.7 % → 0,
+`viewer_id_for_conn` 0.5 % → 0, `stream_ids_for_conn` 0.7 % → 0.2 %,
+contended `lock_slow` 1.6 % → 1.1 % (profile taken before the player-stats
+throttle, which is not separately profiled).
+
 **5000 viewers are not measurable on this host.** `bench_relay` runs one
 thread per viewer on the same 4 vCPUs as the server; at 5000 the benchmark
 client, not the server, is the bottleneck (the server uses ~67 % of one core
