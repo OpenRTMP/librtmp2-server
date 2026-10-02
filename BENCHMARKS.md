@@ -72,7 +72,7 @@ tables above** and the numbers are not directly comparable with them:
 
 | | this run | earlier tables |
 |---|---|---|
-| librtmp2-server | this branch (librtmp2 0.11.0, poll-loop lock reductions) | 0.6.1 / librtmp2 0.10.2 |
+| librtmp2-server | 0.6.2 / librtmp2 0.11.0 | 0.6.1 / librtmp2 0.10.2 |
 | nginx-rtmp | Ubuntu nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2, `worker_processes 1` | nginx 1.31.6 + nginx-rtmp-module `master` |
 | MediaMTX | v1.21.1 built from the Go module (same release; `VERSION` file added and an empty `hls.min.js` stub because HLS is off) | v1.21.1 release binary |
 | SRS | **7.0.89** (gitee mirror `846bc13`, built with `--rtc=off --srt=off --gb28181=off --https=off --sanitizer=off --debug=off`; its default dev build enables AddressSanitizer, which would have distorted the run) | **8.0** (`v8.0-d0`) |
