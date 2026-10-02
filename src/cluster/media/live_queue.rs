@@ -265,6 +265,9 @@ struct Inner {
     bytes: usize,
     streams: HashMap<String, HashMap<String, StreamState>>,
     closed: bool,
+    /// A critical frame of some stream was evicted since the owner last
+    /// published `reinit_pending`.
+    reinit_dirty: bool,
 }
 
 impl Inner {
@@ -500,6 +503,7 @@ impl Inner {
                 if let Some((app, stream)) = entry.names() {
                     let (app, stream) = (app.to_string(), stream.to_string());
                     self.state_mut(&app, &stream).needs_reinit = true;
+                    self.reinit_dirty = true;
                 }
                 self.account_removed(&entry);
             }
@@ -551,6 +555,7 @@ impl LiveMediaQueue {
                 bytes: 0,
                 streams: HashMap::new(),
                 closed: false,
+                reinit_dirty: false,
             }),
             notify: Notify::new(),
             cfg,
@@ -574,7 +579,14 @@ impl LiveMediaQueue {
         if g.closed {
             return PushResult::Dropped(DropCause::Closed);
         }
-        if size > self.cfg.max_bytes / 2 {
+        // Media frames above half the bound are refused so one frame cannot
+        // empty the queue; control messages (e.g. an `InitCache` carrying a
+        // keyframe) may use the whole bound.
+        let limit = match kind {
+            Kind::Media(_) => self.cfg.max_bytes / 2,
+            Kind::Control => self.cfg.max_bytes,
+        };
+        if size > limit {
             self.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
             self.stats.oversized_dropped.fetch_add(1, Ordering::Relaxed);
             return PushResult::Dropped(DropCause::Oversized);
@@ -610,6 +622,10 @@ impl LiveMediaQueue {
                 Inner::count_drop(&self.stats, kind, Reason::Pressure);
             }
             return PushResult::Dropped(DropCause::Full);
+        }
+        // A critical frame of any stream may have been evicted to make room.
+        if std::mem::take(&mut g.reinit_dirty) {
+            self.reinit_pending.store(true, Ordering::Release);
         }
         // Making room may have put the incoming stream itself into
         // AwaitingResync (it was the heaviest).
@@ -1085,6 +1101,56 @@ mod tests {
         assert!(!q.take_reinit("live", "a"), "flag is consumed");
         let tags: Vec<u8> = drain(&q, t).iter().map(tag).collect();
         assert_eq!(tags, vec![201, 202, 210]);
+    }
+
+    /// Evicting stream A's critical frame for a message of stream B must
+    /// still flag A for an init-cache resend.
+    #[test]
+    fn critical_eviction_for_another_stream_flags_the_evicted_stream() {
+        let q = LiveMediaQueue::new(cfg(100 * KB, 10_000, 3000));
+        let t = Instant::now();
+        for i in 0..3 {
+            q.push_at(frame("a", Critical, 200 + i, 30 * KB), t);
+        }
+        assert!(q.push_at(frame("b", Critical, 9, 30 * KB), t).is_queued());
+        assert_eq!(q.snapshot_at(t).dropped_critical_frames, 1);
+        assert!(q.take_reinit("live", "a"));
+        assert!(!q.take_reinit("live", "b"));
+    }
+
+    /// An init cache above half the bound but within it must be accepted;
+    /// only media frames are limited to half.
+    #[test]
+    fn large_control_messages_may_use_the_whole_bound() {
+        let q = LiveMediaQueue::new(cfg(100 * KB, 10_000, 3000));
+        let t = Instant::now();
+        let init = MediaMessage::InitCache {
+            app: "live".into(),
+            stream: "a".into(),
+            epoch: 1,
+            metadata: None,
+            avc_header: None,
+            aac_header: None,
+            keyframe: Some((0, vec![0; 60 * KB])),
+        };
+        assert!(q.push_at(init, t).is_queued());
+        assert_eq!(
+            q.push_at(frame("a", ResyncPoint, 1, 60 * KB), t),
+            PushResult::Dropped(DropCause::Oversized)
+        );
+        let too_big = MediaMessage::InitCache {
+            app: "live".into(),
+            stream: "a".into(),
+            epoch: 1,
+            metadata: None,
+            avc_header: None,
+            aac_header: None,
+            keyframe: Some((0, vec![0; 200 * KB])),
+        };
+        assert_eq!(
+            q.push_at(too_big, t),
+            PushResult::Dropped(DropCause::Oversized)
+        );
     }
 
     #[test]

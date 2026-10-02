@@ -208,8 +208,11 @@ impl MediaPeer {
                         );
                         ctr.version_fallbacks.fetch_add(1, Ordering::Relaxed);
                         fallback_until = Some(Instant::now() + VERSION_FALLBACK_TTL);
-                        let _ = on_reconnected.send(peer_id);
-                        // Retry at once with the older version.
+                        // Retry at once with the older version. No resubscribe
+                        // notification: the rejection came before the writer
+                        // popped anything, so the queued `Subscribe`s are
+                        // still there and a second copy would double the
+                        // owner's per-connection refcount.
                     }
                     Ok(ConnectEnd::Transient) => {
                         tracing::debug!(peer = peer_id, "media peer reconnect after disconnect");
