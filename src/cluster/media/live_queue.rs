@@ -621,6 +621,11 @@ impl LiveMediaQueue {
             if let Kind::Media(_) = kind {
                 Inner::count_drop(&self.stats, kind, Reason::Pressure);
             }
+            // Critical frames evicted on the way to a failed attempt are
+            // gone all the same: publish the reinit request.
+            if std::mem::take(&mut g.reinit_dirty) {
+                self.reinit_pending.store(true, Ordering::Release);
+            }
             return PushResult::Dropped(DropCause::Full);
         }
         // A critical frame of any stream may have been evicted to make room.

@@ -102,6 +102,13 @@ STRACE_SAMPLE="${STRACE_SAMPLE:-0}"
 STRACE_SECS="${STRACE_SECS:-5}"
 BENCH_SERVERS="${BENCH_SERVERS:-lrtmp2-server nginx mediamtx srs liveforge}"
 BENCH_PHASES="${BENCH_PHASES:-handshake relay play load}"
+for _n in $LOAD_VIEWERS; do
+  [[ "$_n" =~ ^[0-9]+$ ]] && ((_n > 0)) || { echo "error: invalid LOAD_VIEWERS entry: $_n" >&2; exit 2; }
+done
+for _v in LOAD_RUN_SECS LOAD_WARMUP_MS LOAD_MEASURE_DELAY LOAD_MEASURE_SECS STRACE_SECS; do
+  [[ "${!_v}" =~ ^[0-9]+$ ]] || { echo "error: $_v must be a non-negative integer" >&2; exit 2; }
+done
+((LOAD_MEASURE_SECS > 0)) || { echo "error: LOAD_MEASURE_SECS must be > 0" >&2; exit 2; }
 want_server() { [[ " $BENCH_SERVERS " == *" $1 "* ]]; }
 want_phase() { [[ " $BENCH_PHASES " == *" $1 "* ]]; }
 # Largest load step, to size connection limits and viewer key pools.

@@ -440,7 +440,12 @@ async fn connect_and_run(
 /// that stays silent is not a legacy peer (it would have closed), so a
 /// timeout is not a rejection.
 async fn read_hello_ack<S: AsyncRead + Unpin>(stream: &mut S, version: u16) -> bool {
-    match tokio::time::timeout(AUTH_TIMEOUT, read_auth_media_frame(stream)).await {
+    match tokio::time::timeout(
+        AUTH_TIMEOUT,
+        read_media_frame_max(stream, MEDIA_PROTOCOL_MIN_VERSION, MAX_AUTH_FRAME),
+    )
+    .await
+    {
         Ok(Ok(MediaMessage::Hello { version: v, .. })) => v == version,
         Ok(_) => false,
         Err(_) => true,

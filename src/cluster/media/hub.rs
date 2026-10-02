@@ -249,42 +249,67 @@ fn evict_for_room<T: QueuedMedia>(
     if need > max_bytes {
         return false;
     }
-    while bytes.saturating_add(need) > max_bytes {
-        let mut per_stream: HashMap<(&str, &str), usize> = HashMap::new();
+    // One scan per call: per-stream byte totals and per-class frame counts,
+    // kept up to date incrementally while evicting.
+    type Totals = ([usize; 3], usize);
+    let class_idx = |h: DeliveryHint| match h {
+        DeliveryHint::Droppable => 0,
+        DeliveryHint::ResyncPoint => 1,
+        DeliveryHint::Critical => 2,
+    };
+    const CLASSES: [DeliveryHint; 3] = [
+        DeliveryHint::Droppable,
+        DeliveryHint::ResyncPoint,
+        DeliveryHint::Critical,
+    ];
+    let mut per_stream: HashMap<(String, String), Totals> = HashMap::new();
+    let mut class_count = [0usize; 3];
+    if bytes.saturating_add(need) > max_bytes {
+        let mut scan: HashMap<(&str, &str), Totals> = HashMap::new();
         for f in frames.iter() {
-            *per_stream.entry(f.names()).or_default() += f.size();
+            let e = scan.entry(f.names()).or_default();
+            e.0[class_idx(f.hint())] += 1;
+            e.1 += f.size();
+            class_count[class_idx(f.hint())] += 1;
         }
-        let Some(((app, stream), _)) = per_stream
+        per_stream = scan
             .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            .map(|((a, s), t)| ((a.to_string(), s.to_string()), t))
+            .collect();
+    }
+    let mut evicted = 0usize;
+    while bytes.saturating_add(need) > max_bytes {
+        // Cheapest class first, across all streams; fairness (heaviest
+        // stream) only decides *within* that class.
+        let Some(class) = (0..3).find(|c| class_count[*c] > 0) else {
+            return false;
+        };
+        let Some(((app, stream), _)) = per_stream
+            .iter()
+            .filter(|(_, t)| t.0[class] > 0)
+            .max_by(|a, b| a.1.1.cmp(&b.1.1).then_with(|| b.0.cmp(a.0)))
         else {
             return false;
         };
-        let (app, stream) = (app.to_string(), stream.to_string());
-        let victim = [
-            DeliveryHint::Droppable,
-            DeliveryHint::ResyncPoint,
-            DeliveryHint::Critical,
-        ]
-        .into_iter()
-        .find_map(|class| {
-            frames
-                .iter()
-                .position(|f| f.names() == (app.as_str(), stream.as_str()) && f.hint() == class)
-        });
-        let Some(idx) = victim else {
+        let (app, stream) = (app.clone(), stream.clone());
+        let Some(idx) = frames.iter().position(|f| {
+            f.names() == (app.as_str(), stream.as_str()) && f.hint() == CLASSES[class]
+        }) else {
             return false;
         };
         if let Some(old) = frames.remove(idx) {
             *bytes = bytes.saturating_sub(old.size());
             counters.count(old.hint());
-            tracing::warn!(
-                app = %old.names().0,
-                stream = %old.names().1,
-                hint = ?old.hint(),
-                "media queue full — evicting frame of the heaviest stream"
-            );
+            class_count[class] -= 1;
+            if let Some(t) = per_stream.get_mut(&(app, stream)) {
+                t.0[class] -= 1;
+                t.1 = t.1.saturating_sub(old.size());
+            }
+            evicted += 1;
         }
+    }
+    if evicted > 0 {
+        tracing::debug!(evicted, "media queue full — evicted frames");
     }
     true
 }
@@ -1332,42 +1357,47 @@ impl MediaHub {
                 let peer = peers.get(&peer_id).filter(|p| !p.is_closed());
                 // A critical frame was evicted for this peer earlier: its
                 // codec headers may be missing, so send the init cache
-                // ahead of the resync point that restarts the stream.
-                if hint == DeliveryHint::ResyncPoint {
-                    let reinit = sink
+                // ahead of the resync point that restarts the stream — on
+                // the same connection, since two TCP sessions have no
+                // ordering between them.
+                let reinit = hint == DeliveryHint::ResyncPoint
+                    && (sink
                         .map(|s| s.take_reinit(&frame.app, &frame.stream))
                         .unwrap_or(false)
-                        || peer
+                        | peer
                             .map(|p| p.take_reinit(&frame.app, &frame.stream))
-                            .unwrap_or(false);
-                    if reinit {
-                        self.resend_init_cache(sink, peer, &frame.app, &frame.stream);
-                    }
-                }
+                            .unwrap_or(false));
+                let init = reinit
+                    .then(|| self.init_cache_message(&frame.app, &frame.stream))
+                    .flatten();
+                let send = |try_send: &dyn Fn(MediaMessage) -> bool| {
+                    init.as_ref().is_none_or(|i| try_send(i.clone())) && try_send(msg.clone())
+                };
                 if let Some(sink) = sink
-                    && sink.try_send(msg.clone()).is_ok()
+                    && send(&|m| sink.try_send(m).is_ok())
                 {
                     return;
                 }
-                if let Some(peer) = peer {
-                    let _ = peer.try_send(msg.clone());
+                if let Some(peer) = peer
+                    && send(&|m| peer.try_send(m).is_ok())
+                {
+                    return;
+                }
+                if reinit {
+                    if let Some(s) = sink {
+                        s.mark_reinit(&frame.app, &frame.stream);
+                    }
+                    if let Some(p) = peer {
+                        p.mark_reinit(&frame.app, &frame.stream);
+                    }
                 }
             });
     }
 
-    /// Queue the cached init data of a stream for one peer (best effort;
-    /// flags the peer again when it cannot be queued).
-    fn resend_init_cache(
-        &self,
-        sink: Option<&Arc<InboundMediaSink>>,
-        peer: Option<&Arc<MediaPeer>>,
-        app: &str,
-        stream: &str,
-    ) {
-        let Some(cache) = self.cache.get(app, stream) else {
-            return;
-        };
-        let init = MediaMessage::InitCache {
+    /// The cached init data of a stream as a message, if any.
+    fn init_cache_message(&self, app: &str, stream: &str) -> Option<MediaMessage> {
+        let cache = self.cache.get(app, stream)?;
+        Some(MediaMessage::InitCache {
             app: app.to_string(),
             stream: stream.to_string(),
             epoch: cache.epoch,
@@ -1375,19 +1405,7 @@ impl MediaHub {
             avc_header: cache.avc_header,
             aac_header: cache.aac_header,
             keyframe: cache.keyframe,
-        };
-        if sink.is_some_and(|s| s.try_send(init.clone()).is_ok()) {
-            return;
-        }
-        if peer.is_some_and(|p| p.try_send(init).is_ok()) {
-            return;
-        }
-        if let Some(s) = sink {
-            s.mark_reinit(app, stream);
-        }
-        if let Some(p) = peer {
-            p.mark_reinit(app, stream);
-        }
+        })
     }
 
     fn queue_cfg(&self) -> LiveQueueConfig {
@@ -1787,6 +1805,27 @@ mod tests {
     }
 
     const KB: usize = 1024;
+
+    #[test]
+    fn eviction_prefers_droppable_of_any_stream_over_critical_of_the_heaviest() {
+        let q = ExportQueue::new(0); // clamps to 1 MiB
+        let mut f = |stream: &str, ts: u32, hint: DeliveryHint, len: usize| {
+            let mut e = exported(1, ts, &vec![0; len]);
+            e.stream = stream.into();
+            e.hint = hint;
+            q.push(e);
+        };
+        // Stream A is the heaviest but holds only critical frames.
+        f("a", 1, DeliveryHint::Critical, 500 * KB);
+        f("a", 2, DeliveryHint::Critical, 300 * KB);
+        f("b", 3, DeliveryHint::Droppable, 100 * KB);
+        f("b", 4, DeliveryHint::Droppable, 100 * KB);
+        // Needs room: the droppable frames of B go first.
+        f("b", 5, DeliveryHint::Droppable, 100 * KB);
+        let kept: Vec<u32> = q.drain().iter().map(|x| x.timestamp).collect();
+        assert!(kept.contains(&1) && kept.contains(&2), "kept: {kept:?}");
+        assert!(!kept.contains(&3), "kept: {kept:?}");
+    }
 
     // ---- queues and slot accounting -------------------------------------
 
