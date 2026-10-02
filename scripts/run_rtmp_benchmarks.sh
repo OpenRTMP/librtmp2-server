@@ -23,6 +23,58 @@
 #
 # Usage: scripts/run_rtmp_benchmarks.sh [work_dir]
 #
+# Optional environment knobs (defaults reproduce the historic behaviour, so
+# existing results keep their meaning):
+#   BENCH_SERVERS   servers to run, space separated, from
+#                   "lrtmp2-server nginx mediamtx srs liveforge"
+#                   (default: all that are available).
+#   BENCH_PHASES    phases to run, from "handshake relay play load"
+#                   (default: all). `BENCH_PHASES=load` is the quick way to
+#                   iterate on fan-out CPU.
+#   LOAD_VIEWERS    viewer counts of the many-viewer load test (default
+#                   "500 1000"; e.g. "500 1000 2000 5000"). Higher steps need
+#                   more RAM/threads: bench_relay uses one thread per viewer
+#                   and shares the host with the server under test.
+#   LOAD_RUN_SECS / LOAD_WARMUP_MS   bench_relay --run-secs/--warmup-ms of the
+#                   load test (default 20 / 5000).
+#   LOAD_MEASURE_DELAY / LOAD_MEASURE_SECS   the server CPU/RSS window starts
+#                   LOAD_MEASURE_DELAY s after the viewers were launched
+#                   (default 8) and lasts LOAD_MEASURE_SECS s (default 10);
+#                   raise the delay when many viewers need longer to join, and
+#                   keep delay + measure <= run-secs.
+#   PERF_STAT=auto|1|0   wrap the measurement window in `perf stat -p <server>`
+#                   (task-clock, cycles, instructions, branches, branch-misses,
+#                   context-switches, cpu-migrations, page-faults). `auto`
+#                   (default) uses perf only if installed and permitted;
+#                   hardware counters that the host (e.g. a VM) does not
+#                   expose are reported as "<not supported>".
+#   PERF_RECORD=1   additionally record a CPU profile of the librtmp2-server
+#                   during the same window (`perf record -g`); writes
+#                   <work_dir>/perf/load-<N>.data. Turn it into a flamegraph
+#                   with e.g. `perf script -i ... | stackcollapse-perf.pl |
+#                   flamegraph.pl > out.svg` (FlameGraph scripts are NOT a
+#                   dependency of this repository). On hosts without hardware
+#                   counters set PERF_RECORD_EVENT=cpu-clock.
+#   STRACE_SAMPLE=1   after the timed window, attach `strace -c -f` for
+#                   STRACE_SECS (default 5) s to count sendmsg/write syscalls
+#                   and derive bytes per send syscall. strace slows the
+#                   server, so this is a separate, untimed sample.
+#   PERF_BIN        path of the perf binary (default: perf from PATH).
+#   SERVER_BIN      librtmp2-server binary to benchmark (default:
+#                   ./target/release/librtmp2-server), e.g. to A/B two builds.
+#
+# What is measured (load test): only the server process under test (and its
+# children, for nginx) -- never the ffmpeg publisher or bench_relay. The
+# publisher is a real ffmpeg 1280x720@30 testsrc + sine, libx264 veryfast
+# zerolatency 2500k video, GOP 60 frames (2 s), AAC 128k. CPU measurement
+# begins LOAD_MEASURE_DELAY s after the viewers are launched (the first
+# bench_relay warmup, LOAD_WARMUP_MS, is a per-viewer window relative to its
+# first frame) and lasts LOAD_MEASURE_SECS s. The printed "load-summary" line
+# carries: viewers, cpu_pct (of one core), cpu_seconds, peak_rss_mib,
+# delivered_gbps / frames_per_viewer (from bench_relay's steady window) and
+# core_s_per_gbit = (cpu_pct/100) / delivered_gbps, i.e. CPU core-seconds
+# spent per delivered Gbit.
+#
 # This starts and stops its own nginx/MediaMTX/SRS/LiveForge/librtmp2-server
 # instances on non-default ports (1935-1939) so it doesn't collide with
 # anything already running; it does not touch system nginx config.
@@ -38,6 +90,23 @@ SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-}"
 SRS_BIN="${SRS_BIN:-}"
 LIVEFORGE_BIN="${LIVEFORGE_BIN:-}"
+LOAD_VIEWERS="${LOAD_VIEWERS:-500 1000}"
+LOAD_RUN_SECS="${LOAD_RUN_SECS:-20}"
+LOAD_WARMUP_MS="${LOAD_WARMUP_MS:-5000}"
+LOAD_MEASURE_DELAY="${LOAD_MEASURE_DELAY:-8}"
+LOAD_MEASURE_SECS="${LOAD_MEASURE_SECS:-10}"
+PERF_STAT="${PERF_STAT:-auto}"
+PERF_RECORD="${PERF_RECORD:-0}"
+PERF_RECORD_EVENT="${PERF_RECORD_EVENT:-}"
+STRACE_SAMPLE="${STRACE_SAMPLE:-0}"
+STRACE_SECS="${STRACE_SECS:-5}"
+BENCH_SERVERS="${BENCH_SERVERS:-lrtmp2-server nginx mediamtx srs liveforge}"
+BENCH_PHASES="${BENCH_PHASES:-handshake relay play load}"
+want_server() { [[ " $BENCH_SERVERS " == *" $1 "* ]]; }
+want_phase() { [[ " $BENCH_PHASES " == *" $1 "* ]]; }
+# Largest load step, to size connection limits and viewer key pools.
+MAX_LOAD_VIEWERS=0
+for _n in $LOAD_VIEWERS; do ((_n > MAX_LOAD_VIEWERS)) && MAX_LOAD_VIEWERS=$_n; done
 # nginx and its RTMP module: the system package by default, or a source build
 # (e.g. the latest nginx release with nginx-rtmp-module as a dynamic module).
 NGINX_BIN="${NGINX_BIN:-nginx}"
@@ -56,7 +125,7 @@ done
 BENCH_HANDSHAKE="$LIBRTMP2_DIR/target/release/examples/bench_handshake"
 BENCH_RELAY="$LIBRTMP2_DIR/target/release/examples/bench_relay"
 
-mkdir -p "$WORK_DIR"/{logs,lrtmp2-server,nginx,mediamtx,srs,liveforge}
+mkdir -p "$WORK_DIR"/{logs,lrtmp2-server,nginx,mediamtx,srs,liveforge,perf}
 echo "Work dir: $WORK_DIR"
 
 for bin in "$BENCH_HANDSHAKE" "$BENCH_RELAY"; do
@@ -180,29 +249,54 @@ proc_tree_usage() {
   echo "$ticks $rss"
 }
 
-# Many-viewer load: 500 and 1000 players on one live stream. Reports the
-# usual bench_relay join/throughput lines plus the server's average CPU (in
-# percent of one core) and peak resident memory over the steady-state window.
+# Many-viewer load: one live stream, LOAD_VIEWERS players (default 500 and
+# 1000). Reports the usual bench_relay join/throughput lines plus the server's
+# average CPU (in percent of one core), CPU seconds and peak resident memory
+# over the steady-state window, and a one-line "load-summary" (see the header
+# comment for the exact definitions). The first lines keep their historic
+# format: "server resources: cpu_pct=.. peak_rss_mib=..".
+perf_usable() {
+  PERF="${PERF_BIN:-perf}"
+  command -v "$PERF" >/dev/null 2>&1 && "$PERF" stat -e task-clock -- true >/dev/null 2>&1
+}
+
 load_test() {
   local label="$1" server_pid_file="$2" pub_url="$3" play_arg_kind="$4" play_arg="$5"
   local hz server_pid n pid bench_pid t0 t1 ticks0 ticks1 rss peak_rss
+  local relay_out perf_pid="" rec_pid="" use_perf=0 gbps fpv cpu_pct cpu_s peak_mib
   hz="$(getconf CLK_TCK)"
   server_pid="$(cat "$server_pid_file")"
-  for n in 500 1000; do
+  if [[ "$PERF_STAT" = "1" ]] || { [[ "$PERF_STAT" = "auto" ]] && perf_usable; }; then
+    use_perf=1
+  fi
+  for n in $LOAD_VIEWERS; do
     echo "=== $label load, players=$n ==="
     publish "$pub_url" "$WORK_DIR/logs/pub-$label-load-$n.log"
     pid=$PUBLISH_PID
     sleep 3
+    relay_out="$WORK_DIR/logs/relay-$label-load-$n.out"
     if [[ "$play_arg_kind" = "list" ]]; then
-      "$BENCH_RELAY" --url-list "$play_arg" --players "$n" --run-secs 20 --warmup-ms 5000 &
+      "$BENCH_RELAY" --url-list "$play_arg" --players "$n" --run-secs "$LOAD_RUN_SECS" --warmup-ms "$LOAD_WARMUP_MS" >"$relay_out" &
     else
-      "$BENCH_RELAY" "$play_arg" --players "$n" --run-secs 20 --warmup-ms 5000 &
+      "$BENCH_RELAY" "$play_arg" --players "$n" --run-secs "$LOAD_RUN_SECS" --warmup-ms "$LOAD_WARMUP_MS" >"$relay_out" &
     fi
     bench_pid=$!
-    sleep 8
+    sleep "$LOAD_MEASURE_DELAY"
     read -r ticks0 peak_rss < <(proc_tree_usage "$server_pid")
+    if ((use_perf)); then
+      "${PERF:-perf}" stat -x, -o "$WORK_DIR/logs/perfstat-$label-load-$n.csv" \
+        -e task-clock,cycles,instructions,branches,branch-misses,context-switches,cpu-migrations,page-faults \
+        -p "$server_pid" -- sleep "$LOAD_MEASURE_SECS" >/dev/null 2>&1 &
+      perf_pid=$!
+    fi
+    if [[ "$PERF_RECORD" = "1" ]] && perf_usable; then
+      "${PERF:-perf}" record -g ${PERF_RECORD_EVENT:+-e "$PERF_RECORD_EVENT"} \
+        -o "$WORK_DIR/perf/load-$n.data" -p "$server_pid" -- sleep "$LOAD_MEASURE_SECS" \
+        >"$WORK_DIR/logs/perfrecord-$n.log" 2>&1 &
+      rec_pid=$!
+    fi
     t0="$(date +%s.%N)"
-    for _ in $(seq 1 10); do
+    for _ in $(seq 1 "$LOAD_MEASURE_SECS"); do
       sleep 1
       read -r _ rss < <(proc_tree_usage "$server_pid")
       ((rss > peak_rss)) && peak_rss=$rss
@@ -210,9 +304,33 @@ load_test() {
     read -r ticks1 rss < <(proc_tree_usage "$server_pid")
     t1="$(date +%s.%N)"
     ((rss > peak_rss)) && peak_rss=$rss
+    [[ -n "$perf_pid" ]] && { wait "$perf_pid" 2>/dev/null || true; perf_pid=""; }
+    [[ -n "$rec_pid" ]] && { wait "$rec_pid" 2>/dev/null || true; rec_pid=""; }
+    if [[ "$STRACE_SAMPLE" = "1" ]] && command -v strace >/dev/null; then
+      # Untimed, separate sample: strace slows the server noticeably.
+      timeout "$STRACE_SECS" strace -c -f -p "$server_pid" \
+        -e trace=sendmsg,sendto,write,writev,send -o "$WORK_DIR/logs/strace-$label-load-$n.txt" || true
+    fi
     wait "$bench_pid" || true
-    awk -v d="$((ticks1 - ticks0))" -v hz="$hz" -v t0="$t0" -v t1="$t1" -v rss="$peak_rss" \
-      'BEGIN { printf "server resources: cpu_pct=%.1f peak_rss_mib=%.1f\n", 100 * d / hz / (t1 - t0), rss / 1024 }'
+    cat "$relay_out"
+    cpu_pct="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", 100 * d / hz / (t1 - t0) }')"
+    cpu_s="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" 'BEGIN { printf "%.2f", d / hz }')"
+    peak_mib="$(awk -v rss="$peak_rss" 'BEGIN { printf "%.1f", rss / 1024 }')"
+    echo "server resources: cpu_pct=$cpu_pct peak_rss_mib=$peak_mib"
+    gbps="$(sed -n 's/^delivered:.*aggregate_gbps=\([0-9.]*\).*/\1/p' "$relay_out")"
+    fpv="$(sed -n 's/^delivered:.*steady_frames_per_viewer=\([0-9.]*\).*/\1/p' "$relay_out")"
+    awk -v n="$n" -v pct="$cpu_pct" -v cs="$cpu_s" -v rss="$peak_mib" -v g="${gbps:-0}" -v f="${fpv:-0}" \
+      -v win="$LOAD_MEASURE_SECS" 'BEGIN {
+        printf "load-summary: viewers=%d cpu_pct=%s cpu_seconds=%s (window %ss) peak_rss_mib=%s delivered_gbps=%s frames_per_viewer=%s core_s_per_gbit=%s\n",
+          n, pct, cs, win, rss, g, f, (g > 0 ? sprintf("%.3f", pct / 100 / g) : "n/a") }'
+    if [[ -s "$WORK_DIR/logs/perfstat-$label-load-$n.csv" ]]; then
+      echo "perf stat (server pid $server_pid, ${LOAD_MEASURE_SECS}s window, value,unit,event):"
+      grep -v '^#' "$WORK_DIR/logs/perfstat-$label-load-$n.csv" | cut -d, -f1-3 | sed 's/^/  /'
+    fi
+    if [[ -s "$WORK_DIR/logs/strace-$label-load-$n.txt" ]]; then
+      echo "strace -c sample (${STRACE_SECS}s, slows the server):"
+      sed 's/^/  /' "$WORK_DIR/logs/strace-$label-load-$n.txt"
+    fi
     kill "$pid" >/dev/null 2>&1 || true
     wait "$pid" 2>/dev/null || true
     sleep 3
@@ -220,14 +338,15 @@ load_test() {
 }
 
 ### 1. librtmp2-server ###
+if want_server lrtmp2-server; then
 echo "--- starting librtmp2-server on :1935 (HTTP :8080) ---"
 (
   cd "$SERVER_DIR" || exit 1
   LRTMP2_DB="$WORK_DIR/lrtmp2-server/server.db" \
   LRTMP2_RTMP_BIND=127.0.0.1:1935 LRTMP2_HTTP_BIND=127.0.0.1:8080 \
-  LRTMP2_RTMP_MAX_CONNECTIONS=1200 LRTMP2_LOG_LEVEL=1 \
+  LRTMP2_RTMP_MAX_CONNECTIONS=$((MAX_LOAD_VIEWERS + 200 > 1200 ? MAX_LOAD_VIEWERS + 200 : 1200)) LRTMP2_LOG_LEVEL=1 \
   LRTMP2_HTTP_RATE_LIMIT_API=10000 LRTMP2_HTTP_RATE_LIMIT_DEFAULT=10000 \
-  exec ./target/release/librtmp2-server
+  exec "${SERVER_BIN:-./target/release/librtmp2-server}"
 ) >"$WORK_DIR/logs/lrtmp2-server.log" 2>&1 &
 echo $! > "$WORK_DIR/lrtmp2-server.pid"
 PIDS+=("$(cat "$WORK_DIR/lrtmp2-server.pid")")
@@ -251,6 +370,7 @@ for i in $(seq 1 24); do
   python3 -c "import json,sys;print('rtmp://127.0.0.1:1935/live/'+json.load(sys.stdin)['play_key'])" <<<"$RESP" >> "$PLAY_URLS"
 done
 
+if want_phase handshake; then
 echo "=== librtmp2-server handshake (count=120, concurrency=30) ==="
 HS_URLS="$WORK_DIR/lrtmp2-server-handshake-urls.txt"
 > "$HS_URLS"
@@ -261,25 +381,32 @@ for i in $(seq 1 120); do
   python3 -c "import json,sys;print('rtmp://127.0.0.1:1935/live/'+json.load(sys.stdin)['publish_key'])" <<<"$RESP" >> "$HS_URLS" || true
 done
 "$BENCH_HANDSHAKE" --url-list "$HS_URLS" --count 120 --concurrency 30
+fi
 
-relay_sweep "lrtmp2-server" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$PLAY_URLS"
-play_handshake "lrtmp2-server" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$PLAY_URLS"
+want_phase relay && relay_sweep "lrtmp2-server" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$PLAY_URLS"
+want_phase play && play_handshake "lrtmp2-server" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$PLAY_URLS"
 
-# 1000 viewers at up to 5 per play_key need 200 keys: the 25 above plus 175.
+# N viewers at up to 5 per play_key need ceil(N/5) keys (200 for 1000
+# viewers, 1000 for 5000): the 25 above plus the rest.
 LOAD_URLS="$WORK_DIR/lrtmp2-server-load-urls.txt"
 cp "$PLAY_URLS" "$LOAD_URLS"
-for i in $(seq 25 199); do
+LOAD_KEYS=$(((MAX_LOAD_VIEWERS + 4) / 5))
+((LOAD_KEYS < 200)) && LOAD_KEYS=200
+if want_phase load; then
+for i in $(seq 25 $((LOAD_KEYS - 1))); do
   RESP=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/streams/bench/players" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d "{\"name\":\"Viewer $i\"}")
   python3 -c "import json,sys;print('rtmp://127.0.0.1:1935/live/'+json.load(sys.stdin)['play_key'])" <<<"$RESP" >> "$LOAD_URLS"
 done
 load_test "lrtmp2-server" "$WORK_DIR/lrtmp2-server.pid" "rtmp://127.0.0.1:1935/live/$PUBLISH_KEY" list "$LOAD_URLS"
+fi
 
 stop_server "$WORK_DIR/lrtmp2-server.pid"
+fi
 
 ### 2. nginx-rtmp ###
-if command -v "$NGINX_BIN" >/dev/null && [[ -e "$NGINX_RTMP_MODULE" ]]; then
+if want_server nginx && command -v "$NGINX_BIN" >/dev/null && [[ -e "$NGINX_RTMP_MODULE" ]]; then
   echo "--- starting nginx-rtmp on :1936 ---"
   cat > "$WORK_DIR/nginx/nginx.conf" <<EOF
 load_module $NGINX_RTMP_MODULE;
@@ -297,18 +424,20 @@ rtmp {
 EOF
   "$NGINX_BIN" -c "$WORK_DIR/nginx/nginx.conf"
   wait_port 1936 "$WORK_DIR/logs/nginx-error.log"
+  if want_phase handshake; then
   echo "=== nginx-rtmp handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1936/live/hsbench --count 120 --concurrency 30
-  relay_sweep "nginx" "rtmp://127.0.0.1:1936/live/bench" prefix "rtmp://127.0.0.1:1936/live/bench"
-  play_handshake "nginx" "rtmp://127.0.0.1:1936/live/playbench" prefix "rtmp://127.0.0.1:1936/live/playbench"
-  load_test "nginx" "$WORK_DIR/nginx/nginx.pid" "rtmp://127.0.0.1:1936/live/loadbench" prefix "rtmp://127.0.0.1:1936/live/loadbench"
+  fi
+  want_phase relay && relay_sweep "nginx" "rtmp://127.0.0.1:1936/live/bench" prefix "rtmp://127.0.0.1:1936/live/bench"
+  want_phase play && play_handshake "nginx" "rtmp://127.0.0.1:1936/live/playbench" prefix "rtmp://127.0.0.1:1936/live/playbench"
+  want_phase load && load_test "nginx" "$WORK_DIR/nginx/nginx.pid" "rtmp://127.0.0.1:1936/live/loadbench" prefix "rtmp://127.0.0.1:1936/live/loadbench"
   "$NGINX_BIN" -c "$WORK_DIR/nginx/nginx.conf" -s stop || true
 else
   echo "skipping nginx-rtmp: $NGINX_BIN or $NGINX_RTMP_MODULE not found"
 fi
 
 ### 3. MediaMTX ###
-if [[ -n "$MEDIAMTX_BIN" ]] && [[ -x "$MEDIAMTX_BIN" ]]; then
+if want_server mediamtx && [[ -n "$MEDIAMTX_BIN" ]] && [[ -x "$MEDIAMTX_BIN" ]]; then
   echo "--- starting MediaMTX on :1937 ---"
   cat > "$WORK_DIR/mediamtx/mediamtx.yml" <<EOF
 logLevel: info
@@ -333,18 +462,20 @@ EOF
   echo $! > "$WORK_DIR/mediamtx.pid"
   PIDS+=("$(cat "$WORK_DIR/mediamtx.pid")")
   wait_port 1937 "$WORK_DIR/logs/mediamtx.log"
+  if want_phase handshake; then
   echo "=== MediaMTX handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1937/live/hsbench --count 120 --concurrency 30
-  relay_sweep "mediamtx" "rtmp://127.0.0.1:1937/live/bench" prefix "rtmp://127.0.0.1:1937/live/bench"
-  play_handshake "mediamtx" "rtmp://127.0.0.1:1937/live/playbench" prefix "rtmp://127.0.0.1:1937/live/playbench"
-  load_test "mediamtx" "$WORK_DIR/mediamtx.pid" "rtmp://127.0.0.1:1937/live/loadbench" prefix "rtmp://127.0.0.1:1937/live/loadbench"
+  fi
+  want_phase relay && relay_sweep "mediamtx" "rtmp://127.0.0.1:1937/live/bench" prefix "rtmp://127.0.0.1:1937/live/bench"
+  want_phase play && play_handshake "mediamtx" "rtmp://127.0.0.1:1937/live/playbench" prefix "rtmp://127.0.0.1:1937/live/playbench"
+  want_phase load && load_test "mediamtx" "$WORK_DIR/mediamtx.pid" "rtmp://127.0.0.1:1937/live/loadbench" prefix "rtmp://127.0.0.1:1937/live/loadbench"
   stop_server "$WORK_DIR/mediamtx.pid"
 else
   echo "skipping MediaMTX: set MEDIAMTX_BIN to a built binary to include it"
 fi
 
 ### 4. SRS ###
-if [[ -n "$SRS_BIN" ]] && [[ -x "$SRS_BIN" ]]; then
+if want_server srs && [[ -n "$SRS_BIN" ]] && [[ -x "$SRS_BIN" ]]; then
   echo "--- starting SRS on :1938 ---"
   cat > "$WORK_DIR/srs/srs.conf" <<EOF
 max_connections     2000;
@@ -369,18 +500,20 @@ EOF
   echo $! > "$WORK_DIR/srs.pid"
   PIDS+=("$(cat "$WORK_DIR/srs.pid")")
   wait_port 1938 "$WORK_DIR/logs/srs-stdout.log"
+  if want_phase handshake; then
   echo "=== SRS handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1938/live/hsbench --count 120 --concurrency 30
-  relay_sweep "srs" "rtmp://127.0.0.1:1938/live/bench" prefix "rtmp://127.0.0.1:1938/live/bench"
-  play_handshake "srs" "rtmp://127.0.0.1:1938/live/playbench" prefix "rtmp://127.0.0.1:1938/live/playbench"
-  load_test "srs" "$WORK_DIR/srs.pid" "rtmp://127.0.0.1:1938/live/loadbench" prefix "rtmp://127.0.0.1:1938/live/loadbench"
+  fi
+  want_phase relay && relay_sweep "srs" "rtmp://127.0.0.1:1938/live/bench" prefix "rtmp://127.0.0.1:1938/live/bench"
+  want_phase play && play_handshake "srs" "rtmp://127.0.0.1:1938/live/playbench" prefix "rtmp://127.0.0.1:1938/live/playbench"
+  want_phase load && load_test "srs" "$WORK_DIR/srs.pid" "rtmp://127.0.0.1:1938/live/loadbench" prefix "rtmp://127.0.0.1:1938/live/loadbench"
   stop_server "$WORK_DIR/srs.pid"
 else
   echo "skipping SRS: set SRS_BIN to a built binary to include it"
 fi
 
 ### 5. LiveForge ###
-if [[ -n "$LIVEFORGE_BIN" ]] && [[ -x "$LIVEFORGE_BIN" ]]; then
+if want_server liveforge && [[ -n "$LIVEFORGE_BIN" ]] && [[ -x "$LIVEFORGE_BIN" ]]; then
   echo "--- starting LiveForge on :1939 ---"
   # RTMP only, like the other servers here: every other protocol listener,
   # the admin API and recording (on in LiveForge's sample config) are off.
@@ -421,11 +554,13 @@ EOF
   echo $! > "$WORK_DIR/liveforge.pid"
   PIDS+=("$(cat "$WORK_DIR/liveforge.pid")")
   wait_port 1939 "$WORK_DIR/logs/liveforge.log"
+  if want_phase handshake; then
   echo "=== LiveForge handshake (count=120, concurrency=30) ==="
   "$BENCH_HANDSHAKE" rtmp://127.0.0.1:1939/live/hsbench --count 120 --concurrency 30
-  relay_sweep "liveforge" "rtmp://127.0.0.1:1939/live/bench" prefix "rtmp://127.0.0.1:1939/live/bench"
-  play_handshake "liveforge" "rtmp://127.0.0.1:1939/live/playbench" prefix "rtmp://127.0.0.1:1939/live/playbench"
-  load_test "liveforge" "$WORK_DIR/liveforge.pid" "rtmp://127.0.0.1:1939/live/loadbench" prefix "rtmp://127.0.0.1:1939/live/loadbench"
+  fi
+  want_phase relay && relay_sweep "liveforge" "rtmp://127.0.0.1:1939/live/bench" prefix "rtmp://127.0.0.1:1939/live/bench"
+  want_phase play && play_handshake "liveforge" "rtmp://127.0.0.1:1939/live/playbench" prefix "rtmp://127.0.0.1:1939/live/playbench"
+  want_phase load && load_test "liveforge" "$WORK_DIR/liveforge.pid" "rtmp://127.0.0.1:1939/live/loadbench" prefix "rtmp://127.0.0.1:1939/live/loadbench"
   stop_server "$WORK_DIR/liveforge.pid"
 else
   echo "skipping LiveForge: set LIVEFORGE_BIN to a built binary to include it"
