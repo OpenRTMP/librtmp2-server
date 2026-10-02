@@ -1206,29 +1206,46 @@ mod tests {
         assert!(end.is_none());
     }
 
-    /// Reproducible overload scenario behind the numbers in
-    /// `docs/clustering.md` (run with `--nocapture` to print the report):
-    /// two streams share one connection, stream "a" is 30 fps video with a
-    /// 2 s GOP plus audio, "b" a small audio-only stream, and the writer is
-    /// blocked from t=10 s to t=18 s. Compares the live-media queue with a
-    /// plain FIFO that keeps everything up to the same byte bound.
-    #[test]
-    fn overload_report_stall_with_two_second_gop() {
-        let start = Instant::now();
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let q = LiveMediaQueue::new(cfg(64 * MB, 100_000, 3000));
-        let mut fifo: VecDeque<(u64, usize)> = VecDeque::new();
-        let mut fifo_bytes = 0usize;
-        let (stall_from, stall_to, end) = (10_000u64, 18_000u64, 30_000u64);
-        // (tag, hint, len) schedule per millisecond tick
-        let mut max_lag_after_stall = 0u64;
-        let mut fifo_max_lag_after_stall = 0u64;
-        let mut first_after_stall: Option<(u64, bool)> = None;
-        let mut delivered_after_stall = 0u32;
-        let mut fifo_delivered_after_stall = 0u32;
-        let mut seq = 0u32;
-        for ms in 0..=end {
-            // Producer.
+    /// Two-stream stall simulation: stream "a" is 30 fps video with a 2 s
+    /// GOP plus audio, "b" a small audio-only stream, compared against a
+    /// plain FIFO with the same input.
+    struct Sim {
+        start: Instant,
+        q: LiveMediaQueue,
+        fifo: VecDeque<(u64, usize)>,
+        seq: u32,
+        stall: std::ops::Range<u64>,
+        first_after_stall: Option<(u64, bool)>,
+        delivered_after_stall: u32,
+        fifo_delivered_after_stall: u32,
+        fifo_max_lag_after_stall: u64,
+    }
+
+    impl Sim {
+        fn new(stall: std::ops::Range<u64>) -> Self {
+            Self {
+                start: Instant::now(),
+                q: LiveMediaQueue::new(cfg(64 * MB, 100_000, 3000)),
+                fifo: VecDeque::new(),
+                seq: 0,
+                stall,
+                first_after_stall: None,
+                delivered_after_stall: 0,
+                fifo_delivered_after_stall: 0,
+                fifo_max_lag_after_stall: 0,
+            }
+        }
+
+        fn at(&self, ms: u64) -> Instant {
+            self.start + Duration::from_millis(ms)
+        }
+
+        fn produce(&mut self, stream: &str, ms: u64, hint: DeliveryHint, tag: u8, len: usize) {
+            self.q.push_at(frame(stream, hint, tag, len), self.at(ms));
+            self.fifo.push_back((ms, len));
+        }
+
+        fn produce_tick(&mut self, ms: u64) {
             if ms % 33 == 0 {
                 let key = (ms / 33) % 60 == 0;
                 let (hint, len) = if key {
@@ -1236,85 +1253,108 @@ mod tests {
                 } else {
                     (Droppable, 8 * KB)
                 };
-                q.push_at(frame("a", hint, (seq % 250) as u8, len), at(ms));
-                fifo.push_back((ms, len));
-                fifo_bytes += len;
-                seq += 1;
+                self.produce("a", ms, hint, (self.seq % 250) as u8, len);
+                self.seq += 1;
             }
             if ms % 23 == 0 {
-                q.push_at(frame("a", Droppable, 1, KB), at(ms));
-                fifo.push_back((ms, KB));
-                fifo_bytes += KB;
+                self.produce("a", ms, Droppable, 1, KB);
             }
             if ms % 20 == 0 {
-                q.push_at(frame("b", ResyncPoint, 2, 300), at(ms));
-                fifo.push_back((ms, 300));
-                fifo_bytes += 300;
-            }
-            // Writer: fast link outside the stall.
-            if !(stall_from..stall_to).contains(&ms) {
-                while let Some(msg) = q.pop_at(at(ms)) {
-                    if ms >= stall_to
-                        && let MediaMessage::MediaFrame { stream, hint, .. } = &msg
-                        && stream == "a"
-                    {
-                        delivered_after_stall += 1;
-                        if first_after_stall.is_none() {
-                            first_after_stall = Some((ms, *hint == ResyncPoint));
-                        }
-                    }
-                }
-                while let Some((t, len)) = fifo.pop_front() {
-                    fifo_bytes -= len;
-                    if ms >= stall_to {
-                        fifo_delivered_after_stall += 1;
-                        fifo_max_lag_after_stall = fifo_max_lag_after_stall.max(ms - t);
-                    }
-                }
-            }
-            if ms >= stall_to && ms < stall_to + 1 {
-                max_lag_after_stall = q.snapshot_at(at(ms)).max_oldest_queue_age_ms_seen;
+                self.produce("b", ms, ResyncPoint, 2, 300);
             }
         }
-        let snap = q.snapshot_at(at(end));
-        println!(
-            "--- cluster media overload report (stall {stall_from}-{stall_to} ms, GOP 2 s) ---"
-        );
-        println!(
-            "max queue bytes      : {} (bound 64 MiB)",
-            snap.max_queue_bytes_seen
-        );
-        println!(
-            "max queue age (ms)   : {}",
-            snap.max_oldest_queue_age_ms_seen
-        );
-        println!(
-            "dropped total/droppable/stale/critical/oversized: {}/{}/{}/{}/{}",
-            snap.dropped_frames_total,
-            snap.dropped_droppable_frames,
-            snap.dropped_stale_frames,
-            snap.dropped_critical_frames,
-            snap.oversized_frames_dropped
-        );
-        println!("resync count         : {}", snap.resync_count);
-        println!(
-            "first stream-a frame after the stall: +{} ms, resync point: {}",
-            first_after_stall.map_or(0, |(t, _)| t - stall_to),
-            first_after_stall.is_some_and(|(_, k)| k)
-        );
-        println!(
-            "stream-a frames delivered after the stall: live-queue {delivered_after_stall}, \
-             plain FIFO would replay {fifo_delivered_after_stall} frames up to {fifo_max_lag_after_stall} ms old"
-        );
-        let _ = (max_lag_after_stall, fifo_bytes);
+
+        fn note_delivery(&mut self, ms: u64, msg: &MediaMessage) {
+            let MediaMessage::MediaFrame { stream, hint, .. } = msg else {
+                return;
+            };
+            if stream != "a" {
+                return;
+            }
+            self.delivered_after_stall += 1;
+            if self.first_after_stall.is_none() {
+                self.first_after_stall = Some((ms, *hint == ResyncPoint));
+            }
+        }
+
+        /// Writer on a fast link outside the stall.
+        fn write_tick(&mut self, ms: u64) {
+            if self.stall.contains(&ms) {
+                return;
+            }
+            let after_stall = ms >= self.stall.end;
+            while let Some(msg) = self.q.pop_at(self.at(ms)) {
+                if after_stall {
+                    self.note_delivery(ms, &msg);
+                }
+            }
+            while let Some((t, _)) = self.fifo.pop_front() {
+                if after_stall {
+                    self.fifo_delivered_after_stall += 1;
+                    self.fifo_max_lag_after_stall = self.fifo_max_lag_after_stall.max(ms - t);
+                }
+            }
+        }
+
+        fn print_report(&self, snap: &LiveQueueSnapshot) {
+            println!(
+                "--- cluster media overload report (stall {:?} ms, GOP 2 s) ---",
+                self.stall
+            );
+            println!(
+                "max queue bytes      : {} (bound 64 MiB)",
+                snap.max_queue_bytes_seen
+            );
+            println!(
+                "max queue age (ms)   : {}",
+                snap.max_oldest_queue_age_ms_seen
+            );
+            println!(
+                "dropped total/droppable/stale/critical/oversized: {}/{}/{}/{}/{}",
+                snap.dropped_frames_total,
+                snap.dropped_droppable_frames,
+                snap.dropped_stale_frames,
+                snap.dropped_critical_frames,
+                snap.oversized_frames_dropped
+            );
+            println!("resync count         : {}", snap.resync_count);
+            println!(
+                "first stream-a frame after the stall: +{} ms, resync point: {}",
+                self.first_after_stall
+                    .map_or(0, |(t, _)| t - self.stall.end),
+                self.first_after_stall.is_some_and(|(_, k)| k)
+            );
+            println!(
+                "stream-a frames delivered after the stall: live-queue {}, plain FIFO would \
+                 replay {} frames up to {} ms old",
+                self.delivered_after_stall,
+                self.fifo_delivered_after_stall,
+                self.fifo_max_lag_after_stall
+            );
+        }
+    }
+
+    /// Reproducible overload scenario behind the numbers in
+    /// `docs/clustering.md` (run with `--nocapture` to print the report): the
+    /// writer is blocked from t=10 s to t=18 s.
+    #[test]
+    fn overload_report_stall_with_two_second_gop() {
+        let end = 30_000u64;
+        let mut sim = Sim::new(10_000..18_000);
+        for ms in 0..=end {
+            sim.produce_tick(ms);
+            sim.write_tick(ms);
+        }
+        let snap = sim.q.snapshot_at(sim.at(end));
+        sim.print_report(&snap);
         // The backlog never exceeded the age bound by more than one GOP...
         assert!(snap.max_oldest_queue_age_ms_seen <= 3000 + 1000, "{snap:?}");
         // ...nothing protected was lost, and delivery restarted on a keyframe.
         assert_eq!(snap.dropped_critical_frames, 0);
-        assert!(first_after_stall.is_some_and(|(_, key)| key));
+        assert!(sim.first_after_stall.is_some_and(|(_, key)| key));
         // The FIFO replays the full 8 s stall; the live queue far less.
-        assert!(fifo_max_lag_after_stall >= 7_000);
-        assert!(delivered_after_stall < fifo_delivered_after_stall / 2);
+        assert!(sim.fifo_max_lag_after_stall >= 7_000);
+        assert!(sim.delivered_after_stall < sim.fifo_delivered_after_stall / 2);
         assert!(snap.resync_count >= 1);
     }
 
