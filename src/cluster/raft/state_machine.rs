@@ -731,29 +731,26 @@ impl SqliteStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        // One `last_applied` acquisition pinned across BOTH the replicated row
-        // read and the index that becomes `SnapshotMeta::last_log_id`, and one
-        // `apply_lock` held across both plus every command's own writes — so
-        // no command can commit while it is captured. OpenRaft runs this
-        // builder on its own task and resumes applying while it runs, so
-        // without that lock a command applied in between would land in the
-        // payload while both indices stayed behind it: the snapshot would
-        // carry state the recorded log prefix does not cover. Holding the two
-        // together makes the payload and both indices a consistent prefix of
-        // the log. (The conservative direction, a follower re-applying
-        // idempotently, is preserved: an index is never newer than the rows.)
+        // One `apply_lock` held across the entire build: the replicated row
+        // read, the `last_applied`/`last_membership` capture, and the
+        // publication of the resulting snapshot to `current_snapshot` and the
+        // `raft_snapshots` row. OpenRaft runs this builder on its own task
+        // while `apply` and `install_snapshot` run on the worker loop, so:
+        // - releasing after the capture would let a command land in the
+        //   payload while the recorded indices stayed behind it, and
+        // - releasing before publication would let a fully installed newer
+        //   snapshot be overwritten by this builder's older one while
+        //   `last_applied` already points at the newer boundary.
+        // Holding it end-to-end makes the payload, both indices, the in-memory
+        // copy and the persisted copy a consistent, never-regressing snapshot.
+        let _apply = self.apply_lock.lock();
         let (data, last_applied, last_membership) = {
-            let _apply = self.apply_lock.lock();
             let applied = self.last_applied.lock();
             let data = self
                 .build_app_snapshot(*applied)
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
                 })?;
-            // Membership must be pinned under the same `apply_lock` as the rows
-            // and index: `install_snapshot` writes membership under that lock,
-            // so reading it after releasing would let a builder pair a
-            // pre-install payload/index with a post-install membership.
             (data, *applied, self.last_membership.lock().clone())
         };
         let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
@@ -878,6 +875,13 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     responses.push(resp);
                 }
                 EntryPayload::Membership(ref mem) => {
+                    // Same lock as `apply`/`build_snapshot`/`install_snapshot`:
+                    // without it a concurrent builder could observe the new
+                    // membership log ID (persisted by `persist_applied_tx`)
+                    // while still cloning the previous membership, recording a
+                    // snapshot that restores the wrong voter set once that
+                    // entry is compacted.
+                    let _apply = self.apply_lock.lock();
                     let stored = StoredMembership::new(Some(entry.log_id), mem.clone());
                     let json = serde_json::to_string(&stored).map_err(|e| StorageError::IO {
                         source: StorageIOError::<u64>::write_state_machine(&e),
