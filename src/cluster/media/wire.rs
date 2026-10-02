@@ -208,6 +208,22 @@ fn check_names(app: &str, stream: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Enforce the wire name caps on every JSON-decoded (v1 frame or v2 control)
+/// name-bearing message. The v2 binary decoders check the declared lengths
+/// before reading; the JSON paths must apply the same caps so a v1/v2 peer
+/// cannot persist unbounded `app`/`stream` names in the subscription tables.
+fn check_message_names(msg: &MediaMessage) -> Result<(), Error> {
+    match msg {
+        MediaMessage::Subscribe { app, stream, .. }
+        | MediaMessage::Unsubscribe { app, stream }
+        | MediaMessage::StreamStart { app, stream, .. }
+        | MediaMessage::StreamStop { app, stream, .. }
+        | MediaMessage::InitCache { app, stream, .. }
+        | MediaMessage::MediaFrame { app, stream, .. } => check_names(app, stream),
+        _ => Ok(()),
+    }
+}
+
 fn frame_len(len: usize) -> Result<u32, Error> {
     if len > MAX_FRAME as usize {
         return Err(Error::other("media frame too large"));
@@ -237,7 +253,9 @@ where
         read_body_v2(r, len as usize).await
     } else {
         let buf = read_vec(r, len as usize).await?;
-        serde_json::from_slice(&buf).map_err(Error::other)
+        let msg: MediaMessage = serde_json::from_slice(&buf).map_err(Error::other)?;
+        check_message_names(&msg)?;
+        Ok(msg)
     }
 }
 
@@ -259,6 +277,7 @@ async fn read_body_v2<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<Med
             ) {
                 return Err(invalid("media message sent as control in v2"));
             }
+            check_message_names(&msg)?;
             Ok(msg)
         }
         KIND_MEDIA_FRAME => read_media_frame_v2(r, rest).await,
@@ -536,6 +555,45 @@ mod tests {
             decode(&bytes, 2).await.unwrap(),
             MediaMessage::Subscribe { generation: 4, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_control_names_are_rejected() {
+        let long_app = MediaMessage::Subscribe {
+            app: "a".repeat(MAX_APP_LEN + 1),
+            stream: "s".into(),
+            epoch: 1,
+            generation: 0,
+        };
+        for version in [1, 2] {
+            let bytes = encode(&long_app, version).await;
+            assert!(
+                decode(&bytes, version).await.is_err(),
+                "oversized app must be rejected in v{version}"
+            );
+        }
+        let long_stream = MediaMessage::Unsubscribe {
+            app: "a".into(),
+            stream: "s".repeat(MAX_STREAM_LEN + 1),
+        };
+        for version in [1, 2] {
+            let bytes = encode(&long_stream, version).await;
+            assert!(
+                decode(&bytes, version).await.is_err(),
+                "oversized stream must be rejected in v{version}"
+            );
+        }
+        // At the caps the messages still round-trip.
+        let ok = MediaMessage::Subscribe {
+            app: "a".repeat(MAX_APP_LEN),
+            stream: "s".repeat(MAX_STREAM_LEN),
+            epoch: 1,
+            generation: 0,
+        };
+        for version in [1, 2] {
+            let bytes = encode(&ok, version).await;
+            assert!(decode(&bytes, version).await.is_ok(), "v{version}");
+        }
     }
 
     #[tokio::test]
