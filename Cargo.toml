@@ -94,9 +94,3 @@ required-features = ["cluster"]
 
 [profile.release]
 opt-level = 3
-
-# TEMPORARY: DeliveryHint / drain_exported_relay_frames_with_hints are not in a
-# published librtmp2 yet. Remove this patch once a librtmp2 release carries them
-# and bump the `librtmp2` version requirement above.
-[patch.crates-io]
-librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", branch = "claude/practical-brown-mhh8zc" }

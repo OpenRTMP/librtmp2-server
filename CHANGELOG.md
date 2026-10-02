@@ -41,7 +41,7 @@ begin at `1.0.0`.
   the documentation now matches the behaviour (the inject queue always
   evicted, it never rejected new frames).
 - `CLUSTER_MEDIA_QUEUE_MB` is documented with its real default (64).
-- Needs a librtmp2 with `DeliveryHint` /
+- Depends on librtmp2 `0.11.0` (`DeliveryHint` /
   `Server::drain_exported_relay_frames_with_hints`.
 
 ## [0.6.1] — 2026-09-28
