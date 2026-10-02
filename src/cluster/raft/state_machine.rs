@@ -731,20 +731,18 @@ impl SqliteStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        // One `apply_lock` held across the entire build: the replicated row
-        // read, the `last_applied`/`last_membership` capture, and the
-        // publication of the resulting snapshot to `current_snapshot` and the
-        // `raft_snapshots` row. OpenRaft runs this builder on its own task
-        // while `apply` and `install_snapshot` run on the worker loop, so:
-        // - releasing after the capture would let a command land in the
-        //   payload while the recorded indices stayed behind it, and
-        // - releasing before publication would let a fully installed newer
-        //   snapshot be overwritten by this builder's older one while
-        //   `last_applied` already points at the newer boundary.
-        // Holding it end-to-end makes the payload, both indices, the in-memory
-        // copy and the persisted copy a consistent, never-regressing snapshot.
-        let _apply = self.apply_lock.lock();
+        // `apply_lock` serializes this builder with `apply` and
+        // `install_snapshot`, but it is held only around state access, not
+        // around the size-dependent serialization of the snapshot payload:
+        // - the capture reads the rows, `last_applied` and `last_membership`
+        //   under the lock, so the payload and its indices are a consistent
+        //   prefix of the log, and
+        // - the publication reacquires it and refuses to overwrite a snapshot
+        //   an installation (or a newer build) has since superseded, so a
+        //   builder that paused after its capture cannot regress the stored
+        //   snapshot below `last_applied`.
         let (data, last_applied, last_membership) = {
+            let _apply = self.apply_lock.lock();
             let applied = self.last_applied.lock();
             let data = self
                 .build_app_snapshot(*applied)
@@ -766,6 +764,18 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
             last_membership,
             snapshot_id,
         };
+        let _apply = self.apply_lock.lock();
+        if let Some(existing) = self.current_snapshot.lock().clone() {
+            if existing.meta.last_log_id > meta.last_log_id {
+                // An install (or a newer build) superseded this snapshot while
+                // it was being serialized. Return the newer one instead of
+                // regressing the stored copies.
+                return Ok(Snapshot {
+                    meta: existing.meta,
+                    snapshot: Box::new(Cursor::new(existing.data)),
+                });
+            }
+        }
         *self.current_snapshot.lock() = Some(StoredSnapshot {
             meta: meta.clone(),
             data: bytes.clone(),
