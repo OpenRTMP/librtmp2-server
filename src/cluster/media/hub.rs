@@ -2679,7 +2679,7 @@ mod tests {
                 .await
                 .expect("hub never dialed")
                 .unwrap();
-            let nonce = vec![7u8; 16];
+            let nonce = crate::cluster::security::auth_nonce();
             peer::write_media_frame(
                 &mut s,
                 &MediaMessage::AuthChallenge {
