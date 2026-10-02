@@ -42,7 +42,7 @@ begin at `1.0.0`.
   evicted, it never rejected new frames).
 - `CLUSTER_MEDIA_QUEUE_MB` is documented with its real default (64).
 - Depends on librtmp2 `0.11.0` (`DeliveryHint` /
-  `Server::drain_exported_relay_frames_with_hints`.
+  `Server::drain_exported_relay_frames_with_hints`).
 
 ## [0.6.1] — 2026-09-28
 
