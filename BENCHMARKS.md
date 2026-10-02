@@ -340,6 +340,26 @@ difference. The join-latency columns are noisier still (single-run p95 at
 1000 viewers ranged 52–177 ms for the *same* build), so no latency claim is
 made either way.
 
+**Re-run against the published librtmp2 0.11.0** (server built from this
+branch with `librtmp2 = "0.11.0"` from crates.io vs. the same server on
+librtmp2 0.10.2; two interleaved rounds at 500/1000, one run at 2000, same
+script and host as above, run later the same day):
+
+| Viewers | CPU % 0.10.2 → 0.11.0 | CPU/Gbit | Gbit/s | join p95 ms | join p99 ms | peak RSS MiB |
+|---|---|---|---|---|---|---|
+| 500 | 38.9 → 37.5 | 0.705 → 0.684 | 0.55 | 54.5 → 77.5 | 61.4 → 88.8 | 21.2 → 21.6 |
+| 1000 | 70.4 → 70.5 | 0.643 → 0.643 | 1.10 | 98.7 → 75.5 | 113.6 → 93.0 | 30.8 → 31.2 |
+| 2000 (1 run) | 94.5 → 94.6 | 0.432 → 0.432 | 2.19 | 248 → 384 | 276 → 426 | 50.2 → 50.9 |
+
+This confirms the earlier conclusion: **CPU and memory are unchanged** at all
+three steps and every viewer still gets every frame. The join-latency
+columns move in both directions between steps (better at 1000, worse at 500
+and 2000) and single-run tails vary by 2-3x on this VM, so they show no
+effect of the release either way. The absolute CPU is a few points higher
+than in the earlier session (about 39 % vs. 35 % at 500 viewers for the same
+0.10.2 build), which is host variance between sessions and the reason these
+tables compare builds only within one session.
+
 **5000 viewers are not measurable on this host.** `bench_relay` runs one
 thread per viewer on the same 4 vCPUs as the server; at 5000 the benchmark
 client, not the server, is the bottleneck (the server uses ~67 % of one core
