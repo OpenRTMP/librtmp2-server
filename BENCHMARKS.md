@@ -309,6 +309,98 @@ sharding runs showed no gain because a shard only noticed relayed frames on
 its next poll tick; the receiving shard is now woken through its `eventfd`.
 Set `LRTMP2_RTMP_SHARDS=1` to get the single-thread loop back.
 
+## Cross-server re-run (2026-10-02, one sweep, 500/1000/2000 viewers)
+
+A new run of `scripts/run_rtmp_benchmarks.sh` with all five servers, **plus a
+2000-viewer step**, on the same 4-vCPU VM and with the same ffmpeg publisher
+(1280x720@30, libx264 veryfast/zerolatency 2500k, GOP 60 = 2 s, AAC 128k) and
+the same `bench_handshake`/`bench_relay` client as above. This session
+could not reach GitHub, so **the competitor builds are not the ones in the
+tables above** and the numbers are not directly comparable with them:
+
+| | this run | earlier tables |
+|---|---|---|
+| librtmp2-server | this branch (librtmp2 0.11.0, poll-loop lock reductions) | 0.6.1 / librtmp2 0.10.2 |
+| nginx-rtmp | Ubuntu nginx 1.24.0 + `libnginx-mod-rtmp` 1.2.2, `worker_processes 1` | nginx 1.31.6 + nginx-rtmp-module `master` |
+| MediaMTX | v1.21.1 built from the Go module (same release; `VERSION` file added and an empty `hls.min.js` stub because HLS is off) | v1.21.1 release binary |
+| SRS | **7.0.89** (gitee mirror `846bc13`, built with `--rtc=off --srt=off --gb28181=off --https=off --sanitizer=off --debug=off`; its default dev build enables AddressSanitizer, which would have distorted the run) | **8.0** (`v8.0-d0`) |
+| LiveForge | `4e70fb3` (same commit, Go 1.26.8) | `4e70fb3` |
+
+It is **one sweep per step**, not a mean of three, and the 2000-viewer step
+ran separately with `LOAD_RUN_SECS=40 LOAD_MEASURE_DELAY=20` (the 500/1000
+steps keep the original 20 s / 8 s). Single-run join tails on this VM vary by
+2-3x (see above), so small differences between servers are not meaningful.
+"fps/viewer" is the steady-state frame rate each viewer received; the source
+is ~73 tags/s, so anything below that means frames were not delivered.
+
+**Connect + publish / connect + play handshake** (count=120, concurrency=30):
+
+| Server | publish /s | avg | p95 | p99 | play /s | avg | p95 | p99 |
+|---|---|---|---|---|---|---|---|---|
+| librtmp2-server | **5850** | **3.87 ms** | 9.54 | 10.71 | **5764** | **3.67 ms** | 8.45 | 10.99 |
+| nginx-rtmp | 642 | 45.07 | 48.59 | 49.34 | 335 | 88.40 | 91.64 | 91.91 |
+| MediaMTX | 4916 | 4.68 | 7.54 | 9.71 | 4521 | 5.50 | 8.24 | 10.23 |
+| SRS 7.0.89 | 512 | 54.73 | 63.55 | 65.48 | 540 | 52.44 | 58.11 | 59.50 |
+| LiveForge | 4662 | 5.29 | 10.57 | 13.31 | 4970 | 4.42 | 9.25 | 11.28 |
+
+All servers completed every handshake (120/120).
+
+**Join latency, 1 / 25 / 100 viewers** (avg / p95 ms; every viewer got ~73 fps,
+SRS 72):
+
+| Server | 1 | 25 | 100 |
+|---|---|---|---|
+| librtmp2-server | 0.88 | 2.05 / 3.84 | 3.97 / 9.12 |
+| nginx-rtmp | 87.7 | 86.8 / 87.8 | 93.0 / 100.6 |
+| MediaMTX | 1.35 | 3.18 / 5.14 | 5.68 / 10.98 |
+| SRS 7.0.89 | 43.9 | 55.9 / 71.6 | 64.8 / 78.5 |
+| LiveForge | 1.27 | 4.09 / 6.86 | 11.50 / 23.05 |
+
+**500 / 1000 / 2000 viewers** (server process only; CPU in % of one core,
+CPU/Gbit = core-seconds per delivered Gbit):
+
+| Viewers | Server | join avg / p95 / p99 ms | CPU % | CPU/Gbit | peak RSS MiB | fps/viewer |
+|---|---|---|---|---|---|---|
+| 500 | librtmp2-server | 32.5 / 69.7 / 85.5 | 31.5 | 0.575 | 21.8 | 73.2 |
+| 500 | nginx-rtmp | 96.9 / 108.5 / 110.7 | 47.8 | 0.873 | 13.9 | 73.1 |
+| 500 | MediaMTX | 45.6 / 87.7 / 90.3 | 75.6 | 1.381 | 100.7 | 73.1 |
+| 500 | SRS 7.0.89 | 246 / 296 / 303 | 7.6 | 0.138 | 97.7 | 73.4 |
+| 500 | LiveForge | 55.6 / 99.8 / 110.5 | 48.5 | 0.885 | 90.1 | 73.1 |
+| 1000 | librtmp2-server | 20.2 / 60.4 / 70.9 | 57.3 | 0.523 | 31.4 | 73.1 |
+| 1000 | nginx-rtmp | 99.5 / 114.0 / 124.6 | 83.3 | 0.760 | 19.8 | 73.1 |
+| 1000 | MediaMTX | 81.8 / 160.6 / 176.7 | 155.5 | 1.419 | 144.5 | 73.1 |
+| 1000 | SRS 7.0.89 | 463 / 603 / 620 | 14.7 | 0.134 | 146.2 | 73.3 |
+| 1000 | LiveForge | 186 / 331 / 363 | 95.0 | 0.867 | 155.1 | 73.1 |
+| 2000 | librtmp2-server | 109.7 / 216.5 / 262.0 | 85.1 | 0.389 | 50.6 | 73.1 |
+| 2000 | nginx-rtmp | 115.6 / 211.4 / 232.2 | 70.4 | 0.542 | 31.5 | **43.1** |
+| 2000 | MediaMTX | 272.9 / 877.4 / 960.2 | 158.4 | 1.359 | 268.3 | **39.0** |
+| 2000 | SRS 7.0.89 | 1076 / 1642 / 1737 | 30.6 | 0.139 | 133.5 | 73.2 |
+| 2000 | LiveForge | 883 / 2034 / 2103 | 131.2 | 0.597 | 285.7 | 73.3 |
+
+What the run shows, and what it does not:
+
+- **Join latency:** librtmp2-server is lowest at 1, 25, 100, 500 and 1000
+  viewers and, at 2000, second only to nginx-rtmp on p95/p99 (216 vs 211 ms),
+  which however delivers only 59 % of the frames there. MediaMTX and
+  LiveForge are close at small counts but degrade markedly from 1000 viewers
+  (LiveForge: 331 ms p95 at 1000, 2 s at 2000); SRS and nginx-rtmp keep their
+  fixed ~45-90 ms floor at small counts and SRS reaches 1.6 s p95 at 2000.
+- **CPU:** SRS uses by far the least (14.7 % at 1000 viewers, 0.13 core-s/Gbit)
+  and librtmp2-server is second at 500/1000 (0.52-0.58 core-s/Gbit), about
+  as efficient as nginx-rtmp at 2000. SRS's low CPU goes together with its
+  much higher join latency (merged writes). MediaMTX is the most CPU-hungry
+  (1.4 core-s/Gbit, 1.5 cores at 1000 viewers). The gap to SRS is real and was
+  not closed by the poll-loop changes (they bring librtmp2-server from ~0.62
+  to ~0.54 core-s/Gbit at 1000 viewers).
+- **Memory:** nginx-rtmp (14-32 MiB) and librtmp2-server (22-51 MiB) are
+  smallest; MediaMTX, SRS and LiveForge use 90-290 MiB.
+- **2000 viewers is a saturated host** (the benchmark client's 2000 threads
+  share the four vCPUs with the server). nginx-rtmp (one worker, one core)
+  and MediaMTX stopped delivering the full frame rate (43 and 39 fps instead
+  of 73), so their CPU and latency at that step describe a server that is
+  dropping/lagging, not one that kept up; the other three delivered every
+  frame. Treat the 2000 row as a stress indicator, not a capacity number.
+
 ## Fan-out CPU profile: where the time goes, and what the allocation/sort work changed
 
 These numbers come from a **separate, later session** than the five-server

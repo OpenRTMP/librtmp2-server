@@ -478,7 +478,7 @@ fi
 if want_server srs && [[ -n "$SRS_BIN" ]] && [[ -x "$SRS_BIN" ]]; then
   echo "--- starting SRS on :1938 ---"
   cat > "$WORK_DIR/srs/srs.conf" <<EOF
-max_connections     2000;
+max_connections     $((MAX_LOAD_VIEWERS + 500 > 2000 ? MAX_LOAD_VIEWERS + 500 : 2000));
 daemon              off;
 pid                 $WORK_DIR/srs/srs.pid;
 srs_log_tank        file;
