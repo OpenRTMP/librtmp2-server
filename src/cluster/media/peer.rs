@@ -898,9 +898,14 @@ mod tests {
 
         // Server rejects the response.
         let (mut c, mut s) = tokio::io::duplex(1 << 16);
-        write_media_frame(&mut s, &MediaMessage::AuthChallenge { nonce: vec![1; 16] })
-            .await
-            .unwrap();
+        write_media_frame(
+            &mut s,
+            &MediaMessage::AuthChallenge {
+                nonce: auth_nonce(),
+            },
+        )
+        .await
+        .unwrap();
         write_media_frame(&mut s, &MediaMessage::AuthFail)
             .await
             .unwrap();
