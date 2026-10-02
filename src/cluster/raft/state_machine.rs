@@ -1852,7 +1852,7 @@ mod tests {
 
         let guard = sm.apply_lock.lock();
         let mut installer = sm.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1860,17 +1860,21 @@ mod tests {
                 .unwrap();
             let result = rt
                 .block_on(installer.install_snapshot(&meta, Box::new(std::io::Cursor::new(data))));
-            tx.send(result.is_ok()).unwrap();
+            tx.blocking_send(result.is_ok()).unwrap();
         });
 
         // While the lock is held by another writer, install must not complete.
-        std::thread::sleep(std::time::Duration::from_millis(150));
         assert!(
-            rx.try_recv().is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv())
+                .await
+                .is_err(),
             "install_snapshot must wait for apply_lock"
         );
         drop(guard);
-        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("install_snapshot must complete once apply_lock is released");
+        assert!(completed.unwrap());
         handle.join().unwrap();
     }
 
