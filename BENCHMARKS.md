@@ -309,6 +309,81 @@ sharding runs showed no gain because a shard only noticed relayed frames on
 its next poll tick; the receiving shard is now woken through its `eventfd`.
 Set `LRTMP2_RTMP_SHARDS=1` to get the single-thread loop back.
 
+## Fan-out CPU profile: where the time goes, and what the allocation/sort work changed
+
+These numbers come from a **separate, later session** than the five-server
+tables above (same 4-vCPU shared VM, kernel 6.18, same ffmpeg publisher:
+1280x720@30, libx264 veryfast/zerolatency 2500k, GOP 60 frames = 2 s, AAC
+128k), measuring only `librtmp2-server` with `BENCH_PHASES=load
+BENCH_SERVERS=lrtmp2-server`. They do not redefine the older tables. The
+measurement window is the 10 s starting 8 s after the viewers were launched
+(20 s for 2000/5000, see below); CPU is `utime+stime` of the server process
+only (never ffmpeg or `bench_relay`). "CPU/Gbit" is core-seconds per
+delivered Gbit = `cpu_pct/100 / delivered_gbps`.
+
+**A/B of the librtmp2 fan-out changes** (vectored sends from a stack iovec
+array instead of two `Vec`s per player and `sendmsg`; per-connection message
+lists instead of sorting `frames x players` messages), two interleaved
+rounds, `SERVER_BIN` = before/after build of the same server:
+
+| Viewers | CPU % before → after | CPU/Gbit before → after | Gbit/s | join p95 ms before → after | join p99 ms before → after | peak RSS MiB |
+|---|---|---|---|---|---|---|
+| 500 | 35.0 → 34.8 | 0.640 → 0.636 | 0.547 | 67.9 → 61.3 | 75.6 → 65.6 | 21.2 → 21.7 |
+| 1000 | 68.1 → 65.9 | 0.621 → 0.601 | 1.096 | 144.3 → 81.7 | 178.2 → 102.4 | 31.2 → 31.2 |
+| 2000 (1 run) | 93.1 → 90.1 | 0.425 → 0.411 | 2.19 | 318 → 254 | 375 → 320 | 52.0 → 51.4 |
+
+Every viewer received every frame in both builds (1097 frames per viewer in
+the steady window at 500/1000, ~2560 at 2000). **Read the CPU columns as "no
+regression, at best a few percent gain"**: round-to-round noise on this VM is
+about ±5 % (the 500-viewer baseline ranged 33.2–35.7 %), larger than the
+difference. The join-latency columns are noisier still (single-run p95 at
+1000 viewers ranged 52–177 ms for the *same* build), so no latency claim is
+made either way.
+
+**5000 viewers are not measurable on this host.** `bench_relay` runs one
+thread per viewer on the same 4 vCPUs as the server; at 5000 the benchmark
+client, not the server, is the bottleneck (the server uses ~67 % of one core
+while viewers receive only ~915–965 of the ~2560 frames they should get), so
+the 5000 step is useful only as a smoke test that the server accepts and
+serves 5000 concurrent viewers (RSS 105–108 MiB). Run it against a separate
+load generator host for capacity numbers.
+
+**Profile.** `perf record -e cpu-clock -g` of the server at 1000 viewers
+(`PERF_RECORD=1 PERF_RECORD_EVENT=cpu-clock`; this VM exposes no hardware
+counters, so cycles/instructions/branches are `<not supported>` here) —
+share of samples, before → after:
+
+| Category | before | after |
+|---|---|---|
+| kernel (TCP send path, scheduler, wakeups) | 72.8 % | 74.6 % |
+| `librtmp2-server` binary (user) | 18.3 % | 17.7 % |
+| libc | 6.9 % | 5.6 % |
+| `send_and_export_relay_frames` (incl. inlined per-frame connection scan) | 0.96 % | 1.04 % |
+| `Conn::send_staged_media` | 0.53 % | 0.48 % |
+| iovec/window building in `try_send_vectored` | 0.24 % | ~0 % |
+| sorting (`sort_by_key` over all staged messages) | 0.22 % | 0.06 % |
+| allocator (`malloc`/`free`/`alloc::`) | 2.7 % | 1.7 % |
+| `__libc_sendmsg` wrapper | 0.78 % | 0.76 % |
+| TCP transmit symbols (`tcp_sendmsg`, `tcp_write_xmit`, `ip_queue_xmit`, …) | 4.5 % | 4.4 % |
+
+Findings: (1) the library's user-space fan-out is a small slice; most of the
+CPU is the kernel TCP path and scheduler/wakeup cost (about 57,000 context
+switches per 10 s at 1000 viewers), which payload-neutral allocation changes
+cannot move. (2) The per-frame scan of `connections`
+(`conn_will_receive_relay_frame`) is ~1 % of samples at 1000 viewers, so a
+subscriber index was **not** built (it would have to be kept consistent with
+play start/stop, pause, `receiveAudio/Video`, multitrack negotiation, route
+renames, authorization and teardown for at most that 1 %). (3) The remaining
+user-space cost sits in the server's own per-connection bookkeeping
+(`update_rtt`, `stream_ids_for_conn`, `has_authorized_session`, hashing and
+string clones in `rtmp_bridge`, each ~0.5–1.8 %), a better next target than
+the fan-out itself. (4) A `strace -c` sample (slows the server) shows
+`sendmsg` as >90 % of socket syscalls; since the same bytes must traverse the
+kernel TCP path either way, bounded micro-batching to reduce syscalls was
+**not** implemented: with no hardware counters here there is no evidence that
+syscall entry, rather than per-byte TCP work and wakeups, is the cost, and
+batching would trade join latency for it. `io_uring` was likewise left out.
+
 ## Component microbenchmark: `benches/http_api.rs`
 
 This repo also ships a Criterion bench for the HTTP/REST API
@@ -343,6 +418,26 @@ reproduce the nginx 1.31.6 numbers above, build nginx from
 then point `NGINX_BIN` at `inst/sbin/nginx` and `NGINX_RTMP_MODULE` at
 `inst/modules/ngx_rtmp_module.so`. Use MediaMTX's prebuilt release binary
 from [github.com/bluenviron/mediamtx](https://github.com/bluenviron/mediamtx/releases).
+
+Fan-out runs on the server alone, with more viewer steps and CPU metrics:
+
+```bash
+BENCH_SERVERS=lrtmp2-server BENCH_PHASES=load \
+LOAD_VIEWERS="500 1000 2000 5000" \
+  scripts/run_rtmp_benchmarks.sh                      # load-summary per step
+# A/B two builds, plus optional perf (software events work in a VM):
+SERVER_BIN=/path/to/other-build PERF_STAT=auto PERF_RECORD=1 \
+PERF_RECORD_EVENT=cpu-clock STRACE_SAMPLE=1 \
+BENCH_SERVERS=lrtmp2-server BENCH_PHASES=load LOAD_VIEWERS="1000" \
+  scripts/run_rtmp_benchmarks.sh
+# flamegraph (FlameGraph scripts are not a dependency of this repo):
+perf script -i <work_dir>/perf/load-1000.data | stackcollapse-perf.pl | flamegraph.pl > fanout.svg
+```
+
+The options and exactly what is measured (which process, when the window
+starts and how long it is, publisher bitrate/GOP/fps) are documented at the
+top of the script. `perf` is optional; without it the benchmark runs as
+before.
 
 None of MediaMTX, SRS or LiveForge is vendored or built by this script (no
 Go toolchain dependency for MediaMTX/LiveForge, and SRS's own build is a

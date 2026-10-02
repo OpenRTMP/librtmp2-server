@@ -74,7 +74,8 @@ Set in `.env` or via `LRTMP2_CLUSTER_*` process overrides:
 | `CLUSTER_BANDWIDTH_MODE` | `tx` | `tx` / `rx` / `max` / `sum` |
 | `CLUSTER_BANDWIDTH_MAX_MBPS` | `0` | Denominator for utilization |
 | `CLUSTER_MEDIA_REPLICAS` | `0` | Standby mesh fan-out |
-| `CLUSTER_MEDIA_QUEUE_MB` | `32` | Per-peer backpressure |
+| `CLUSTER_MEDIA_QUEUE_MB` | `64` | Byte bound of each per-peer outbound media queue (and of the local export/inject queues); see [Backpressure](#media-backpressure-live-first) |
+| `CLUSTER_MEDIA_MAX_AGE_MS` | `0` (= 3000, **experimental**) | A peer whose queued media gets older than this drops that stream's stale frames and resyncs at the next keyframe; `0` or 100–600000 |
 | `CLUSTER_ADVERTISE_ADDR` | — | Control addr peers dial (defaults to loopback rewrite of BIND) |
 | `CLUSTER_MEDIA_ADVERTISE_ADDR` | — | Media addr peers dial |
 
@@ -220,11 +221,103 @@ ingress eligibility rapidly.
 
 ## Media path
 
-1. Owner RTMP poll loop: `enable_relay_export` → `drain_exported_relay_frames`
-   → `ClusterManager::enqueue_export` → media hub fan-out.
+1. Owner RTMP poll loop: `enable_relay_export` →
+   `drain_exported_relay_frames_with_hints` → `ClusterManager::enqueue_export`
+   → media hub fan-out.
 2. Non-owner play: `notify_play_subscription` → media `SUBSCRIBE` to owner.
 3. Inject path: hub → `drain_injects` → `inject_relay_frame` (route key =
    durable stream id / `relay_key`).
+
+### Delivery hints
+
+librtmp2 classifies every exported frame once, where it already parses media
+for its init cache, and attaches a codec-neutral `DeliveryHint`:
+
+| Hint | Meaning |
+| --- | --- |
+| `Critical` | codec headers (sequence headers), metadata/script |
+| `ResyncPoint` | a point a receiver can start decoding again: a video keyframe, or any audio frame on a route **without** video |
+| `Droppable` | everything else (dependent video frames, audio next to video) |
+
+The cluster never looks at codec payloads (no NAL/OBU parsing); it only reads
+the hint, which travels on the media wire.
+
+### Media backpressure (live first)
+
+Each media connection (outbound `MediaPeer` and inbound sink) owns a
+`LiveMediaQueue` instead of a plain bounded channel. Freshness beats
+completeness for live video, so a peer that falls behind jumps to the live
+edge instead of replaying a stale backlog:
+
+* Bounds: `CLUSTER_MEDIA_QUEUE_MB` bytes and 1024 messages, plus an **age**
+  bound (`CLUSTER_MEDIA_MAX_AGE_MS`). A single frame larger than half the byte
+  bound is refused (it cannot empty the queue).
+* **Normal → AwaitingResync**: when a stream's queued media is older than the
+  age bound (or the queue hits a bound), the stream's queued non-critical
+  frames are discarded and further `Droppable` frames of that stream are
+  dropped on arrival. A queued *fresh* keyframe is kept, so the stream is
+  already back near live. Otherwise the stream waits for the next
+  `ResyncPoint`; that frame is queued and the stream is `Normal` again
+  (audio-only streams resync on the next audio frame). Waiting is capped
+  (10 s) so a publisher without keyframes is not starved.
+* Protected: `Critical` frames and non-media control messages (`Subscribe`,
+  `InitCache`, …) are never dropped by the age/resync rules. Only the absolute
+  bounds can evict a `Critical` frame, as a last resort, after which the hub
+  re-sends the stream's cached init data ahead of the next resync point.
+* Fairness: under the absolute bounds the stream holding the most evictable
+  bytes loses its frames first (ties: smaller `(app, stream)`), so one
+  overloaded stream does not destroy the frames of the others. After a
+  reconnect, media queued for the dead connection is discarded the same way.
+* The write of one frame is bounded by an 8 s timeout; a peer that stops
+  reading is dropped and redialled.
+
+The local `ExportQueue` and `InjectQueue` are separate types (different
+consumers) but share one eviction policy: **evict, don't reject** — the
+heaviest stream gives up its oldest `Droppable` frame first, then
+`ResyncPoint`, and `Critical` only when nothing else of that stream is left;
+only a frame larger than the whole queue is refused. (Both used to be
+documented as "reject-new"/"drop-oldest" respectively; the inject queue has
+always evicted.)
+
+Counters (per peer and summed) are in `GET /api/v1/cluster` under `media`:
+`queue_messages`, `queue_bytes`, `oldest_queue_age_ms`,
+`dropped_frames_total` = `dropped_droppable_frames` + `dropped_stale_frames` +
+`dropped_critical_frames` + `oversized_frames_dropped` (each dropped frame is
+counted once), `resync_count`, `resync_timeouts`, `streams_awaiting_resync`,
+high-water marks (`max_queue_bytes_seen`, `max_oldest_queue_age_ms_seen`),
+`write_timeouts`, `reconnects`, `version_fallbacks`, and the protocol version
+of each connection; `export_queue` / `inject_queue` report their evictions.
+`dropped_stale_frames` counts frames discarded because they were too old or
+belonged to a purged stream (stall, reconnect); `dropped_droppable_frames`
+counts frames given up under queue pressure or while awaiting a resync point.
+
+The simulation behind the numbers (two streams, 2 s GOP, 8 s stall) runs as
+`cargo test --features cluster,test-support overload_report -- --nocapture`.
+
+### Media protocol v2
+
+`MEDIA_PROTOCOL_VERSION` is now `2` (`1` is still accepted). Authentication,
+`Hello` and a possible `Error{VERSION}` are always v1 (JSON) frames, so any two
+nodes can read each other's first messages; `Hello.version` then fixes the
+framing for the rest of the connection, in both directions:
+
+* v1: `u32` length + JSON of the message (a payload becomes a JSON array of
+  numbers — 2–4× the bytes).
+* v2: `u32` length + `u8` kind. `MediaFrame` and `InitCache` are compact binary
+  records (big endian: hint, frame type, epoch, timestamps, name lengths,
+  names, **raw payload**); all other messages are JSON inside a `Control`
+  record. Every length is validated against the frame length and hard caps
+  (32 MiB frame, 255 B app, 1024 B stream) before anything is allocated, and
+  the global read budget is reserved before the body is read. See
+  `src/cluster/media/wire.rs`.
+
+An acceptor that supports a `Hello` version newer than 1 confirms it with its
+own `Hello`. A v2 node dialing a v1-only node gets `Error{VERSION}` (or a
+hang-up instead of the confirmation) and redials with v1 for 60 s, then tries
+v2 again; a v1 node dialing a v2 node simply gets v1 framing. **Rolling
+upgrades therefore work in any order**; the two encodings are never mixed on
+one connection. A v1 node cannot read the `hint` of a v2 peer's frames
+(irrelevant: it never forwards them).
 
 ## Limitations
 

@@ -13,6 +13,37 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- Cluster media backpressure is live-media aware: every media connection has
+  a `LiveMediaQueue` (message, byte and **age** bounds) that, when a peer
+  falls behind, drops the stale frames of the affected stream and resumes at
+  the next resync point (a keyframe, or any audio frame on an audio-only
+  stream) instead of replaying a stale backlog. Codec headers, metadata and
+  control messages are protected, eviction is per stream so one overloaded
+  stream does not hurt the others, and an oversized frame is refused without
+  emptying the queue. New setting `CLUSTER_MEDIA_MAX_AGE_MS` (default 3000,
+  experimental).
+- Queue depth/age, drops by class, resyncs, write timeouts, reconnects and the
+  protocol version per media peer in `GET /api/v1/cluster` (`media`).
+- Media protocol v2: `MediaFrame` and `InitCache` travel as compact binary
+  records with the raw payload instead of a JSON number array (2–4× fewer
+  bytes), and carry librtmp2's codec-neutral delivery hint. v1 stays supported
+  (a v2 node falls back to v1 against a v1-only node), so rolling upgrades work
+  in any order.
+- `scripts/run_rtmp_benchmarks.sh`: `LOAD_VIEWERS` (e.g. `500 1000 2000 5000`),
+  `BENCH_SERVERS`, `BENCH_PHASES`, `SERVER_BIN`, a `load-summary` line with CPU
+  seconds, peak RSS, delivered Gbit/s and CPU core-seconds per delivered Gbit,
+  and optional `perf stat` / `perf record` / `strace -c` sampling.
+
+### Changed
+- `ExportQueue` and `InjectQueue` share one class-aware eviction policy
+  (heaviest stream first, `Droppable` before `ResyncPoint` before `Critical`);
+  the documentation now matches the behaviour (the inject queue always
+  evicted, it never rejected new frames).
+- `CLUSTER_MEDIA_QUEUE_MB` is documented with its real default (64).
+- Needs a librtmp2 with `DeliveryHint` /
+  `Server::drain_exported_relay_frames_with_hints`.
+
 ## [0.6.1] — 2026-09-28
 
 ### Changed
