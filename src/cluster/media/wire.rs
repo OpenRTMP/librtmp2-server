@@ -236,8 +236,7 @@ where
     if version >= 2 {
         read_body_v2(r, len as usize).await
     } else {
-        let mut buf = vec![0u8; len as usize];
-        r.read_exact(&mut buf).await?;
+        let buf = read_vec(r, len as usize).await?;
         serde_json::from_slice(&buf).map_err(Error::other)
     }
 }
@@ -250,8 +249,7 @@ async fn read_body_v2<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<Med
     let rest = len - 1;
     match kind {
         KIND_CONTROL => {
-            let mut buf = vec![0u8; rest];
-            r.read_exact(&mut buf).await?;
+            let buf = read_vec(r, rest).await?;
             let msg: MediaMessage = serde_json::from_slice(&buf).map_err(Error::other)?;
             // The binary kinds are the only encoding of these two messages
             // in v2; a JSON copy would give one message two spellings.
@@ -318,8 +316,7 @@ async fn read_media_frame_v2<R: AsyncRead + Unpin>(
     let stream = read_string(r, stream_len).await?;
     // Allocated only now that payload_len is proven to fit the (capped,
     // budget-reserved) frame; read straight into the final buffer.
-    let mut payload = vec![0u8; payload_len];
-    r.read_exact(&mut payload).await?;
+    let payload = read_vec(r, payload_len).await?;
     Ok(MediaMessage::MediaFrame {
         app,
         stream,
@@ -374,8 +371,7 @@ async fn read_init_cache_v2<R: AsyncRead + Unpin>(
         if len > remaining {
             return Err(invalid("v2 init-cache part exceeds frame"));
         }
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf).await?;
+        let buf = read_vec(r, len).await?;
         remaining -= len;
         *slot = Some(buf);
     }
@@ -394,9 +390,24 @@ async fn read_init_cache_v2<R: AsyncRead + Unpin>(
     })
 }
 
+/// Read exactly `len` bytes. The buffer grows as data actually arrives
+/// instead of being sized up front from a peer-supplied length, so a peer
+/// that announces a large frame and sends nothing cannot make us allocate it.
+async fn read_vec<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<Vec<u8>, Error> {
+    const INITIAL_CAP: usize = 64 * 1024;
+    let mut buf = Vec::with_capacity(len.min(INITIAL_CAP));
+    let got = r.take(len as u64).read_to_end(&mut buf).await?;
+    if got != len {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "truncated media frame",
+        ));
+    }
+    Ok(buf)
+}
+
 async fn read_string<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<String, Error> {
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
+    let buf = read_vec(r, len).await?;
     String::from_utf8(buf).map_err(|_| invalid("name is not UTF-8"))
 }
 
