@@ -1809,7 +1809,7 @@ mod tests {
     #[test]
     fn eviction_prefers_droppable_of_any_stream_over_critical_of_the_heaviest() {
         let q = ExportQueue::new(0); // clamps to 1 MiB
-        let mut f = |stream: &str, ts: u32, hint: DeliveryHint, len: usize| {
+        let f = |stream: &str, ts: u32, hint: DeliveryHint, len: usize| {
             let mut e = exported(1, ts, &vec![0; len]);
             e.stream = stream.into();
             e.hint = hint;
