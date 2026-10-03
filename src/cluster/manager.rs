@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use openraft::BasicNode;
@@ -46,6 +47,10 @@ const CLUSTER_ID_SETTING: &str = "cluster_id";
 /// seed actually landing.
 const BOOTSTRAP_SEEDED_SETTING: &str = "bootstrap_seeded";
 const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
+/// Stale ownership rows are released with one epoch-fenced Raft write each;
+/// cap how many a single drain attempt submits so a slow leader or quorum
+/// cannot block startup or a health tick for `count * 2s`.
+const PENDING_STREAM_CLEANUP_BATCH: usize = 4;
 /// Reject re-sent `admin_proof` values captured from the control plane.
 const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 /// Bounded retry budget for re-learning peer media addresses after a restart.
@@ -136,6 +141,9 @@ pub struct ClusterManager {
     /// stream this node re-acquired after restart (new epoch) is never
     /// deleted by the deferred cleanup.
     pending_stream_cleanups: Mutex<std::collections::HashSet<(String, u64)>>,
+    /// Guards against stacking drain tasks: the health loop spawns at most one
+    /// bounded [`Self::retry_pending_stream_cleanups`] run at a time.
+    pending_cleanup_drain_running: AtomicBool,
     /// (app, stream_id) -> owner node this node currently holds a
     /// standby-replica media subscription against. Reconciled every health
     /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
@@ -317,6 +325,7 @@ impl ClusterManager {
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_stream_cleanups: Mutex::new(std::collections::HashSet::new()),
+            pending_cleanup_drain_running: AtomicBool::new(false),
             standby_subs: Mutex::new(std::collections::HashMap::new()),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
@@ -806,11 +815,17 @@ impl ClusterManager {
     /// treats the stale release as an idempotent no-op and the fresh row
     /// survives; the ownership tracker is re-hydrated instead of cleared for
     /// the same reason.
+    ///
+    /// At most [`PENDING_STREAM_CLEANUP_BATCH`] rows are submitted per call:
+    /// each write can block up to the 2s Raft timeout, so an unbounded drain
+    /// of hundreds of stale rows could block startup or the heartbeat loop
+    /// long enough for peers to fence this node.
     fn retry_pending_stream_cleanups(&self) {
         let pending: Vec<(String, u64)> = self
             .pending_stream_cleanups
             .lock()
             .iter()
+            .take(PENDING_STREAM_CLEANUP_BATCH)
             .cloned()
             .collect();
         let mut released: Vec<String> = Vec::new();
@@ -2277,7 +2292,21 @@ impl ClusterManager {
                     ),
                 }
             }
-            self.retry_pending_stream_cleanups();
+            // Drain queued stale-owner releases off the heartbeat path: each
+            // write can block up to the 2s Raft timeout, so draining many rows
+            // synchronously would delay heartbeats and risk fencing.
+            if !self.pending_stream_cleanups.lock().is_empty()
+                && !self
+                    .pending_cleanup_drain_running
+                    .swap(true, Ordering::AcqRel)
+            {
+                let this = Arc::clone(&self);
+                tokio::spawn(async move {
+                    this.retry_pending_stream_cleanups();
+                    this.pending_cleanup_drain_running
+                        .store(false, Ordering::Release);
+                });
+            }
             // Keep session caches through the DOWN fencing grace so delete
             // finalize still sees remote sessions until ownership is released.
             let _ = down;
@@ -4245,6 +4274,30 @@ mod tests {
 
         n1.mgr.shutdown_blocking();
         mgr.shutdown_blocking();
+    }
+
+    /// The deferred stale-owner drain is bounded so a slow quorum cannot block
+    /// startup or the heartbeat loop for `rows * 2s`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_stream_cleanup_drains_in_bounded_batches() {
+        let n = bootstrap(1, |_| {}).await;
+        let total = PENDING_STREAM_CLEANUP_BATCH * 2 + 1;
+        {
+            let mut queued = n.mgr.pending_stream_cleanups.lock();
+            for i in 0..total {
+                queued.insert((format!("stale-{i}"), 1));
+            }
+        }
+
+        n.mgr.retry_pending_stream_cleanups();
+        assert_eq!(
+            n.mgr.pending_stream_cleanups.lock().len(),
+            total - PENDING_STREAM_CLEANUP_BATCH,
+        );
+        n.mgr.retry_pending_stream_cleanups();
+        n.mgr.retry_pending_stream_cleanups();
+        assert!(n.mgr.pending_stream_cleanups.lock().is_empty());
+        n.mgr.shutdown_blocking();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
