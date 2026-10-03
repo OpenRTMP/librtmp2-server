@@ -725,17 +725,25 @@ mod tests {
         let err = decode(&bytes, 2).await.unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
         let mut r: &[u8] = &(100u32).to_be_bytes();
-        let err = read_frame(&mut r, 2, 50, no_budget, None).await.unwrap_err();
+        let err = read_frame(&mut r, 2, 50, no_budget, None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
     }
 
     #[tokio::test]
     async fn read_budget_is_checked_before_the_body_is_read() {
         let mut r: &[u8] = &(1000u32).to_be_bytes();
-        let err = read_frame(&mut r, 2, MAX_FRAME, |n| {
-            assert_eq!(n, 1000);
-            Err::<(), _>(Error::other("budget exceeded"))
-        }, None)
+        let err = read_frame(
+            &mut r,
+            2,
+            MAX_FRAME,
+            |n| {
+                assert_eq!(n, 1000);
+                Err::<(), _>(Error::other("budget exceeded"))
+            },
+            None,
+        )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("budget"));
