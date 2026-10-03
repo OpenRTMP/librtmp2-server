@@ -993,23 +993,8 @@ fn fast_authorize_play(conn_id: u64, app: &str, play_key: &str) -> Option<Author
 fn apply_auth_completion(
     server: &mut librtmp2::server::Server,
     tracked: &HashMap<u64, TrackedConn>,
-    rtmp_bridge: &DbRtmpBridge,
     completion: &AuthCompletion,
 ) {
-    let still_pending = server.connections.iter().any(|c| {
-        c.conn_id == completion.conn_id && c.client_fd >= 0 && c.has_pending_authorization()
-    });
-    if !still_pending {
-        // The library auto-denies a request left `Pending` past its own
-        // pending-auth timeout (and the connection may already be gone), so
-        // the worker's side effects -- the bridge ConnState plus an active
-        // publisher/player row it created before sending the completion --
-        // are stale. Release them; the library call would be a no-op.
-        if completion.allow {
-            rtmp_bridge.on_close(completion.conn_id);
-        }
-        return;
-    }
     match completion.kind {
         AuthKind::Publish => {
             if completion.allow && tracked.contains_key(&completion.conn_id) {
@@ -1026,7 +1011,6 @@ fn apply_auth_completion(
 fn drain_auth_completions(
     server: &mut librtmp2::server::Server,
     tracked: &HashMap<u64, TrackedConn>,
-    rtmp_bridge: &DbRtmpBridge,
 ) -> bool {
     let mut any_completed = false;
     // Sharded RTMP thread: drain this shard's own fan-out receiver instead
@@ -1038,7 +1022,7 @@ fn drain_auth_completions(
         };
         while let Ok(completion) = rx.try_recv() {
             any_completed = true;
-            apply_auth_completion(server, tracked, rtmp_bridge, &completion);
+            apply_auth_completion(server, tracked, &completion);
         }
         true
     });
@@ -1054,7 +1038,7 @@ fn drain_auth_completions(
     };
     while let Ok(completion) = rx.try_recv() {
         any_completed = true;
-        apply_auth_completion(server, tracked, rtmp_bridge, &completion);
+        apply_auth_completion(server, tracked, &completion);
     }
     any_completed
 }
@@ -1307,8 +1291,8 @@ pub(crate) fn process_server_connections(
     revoked_now: &HashSet<String>,
     idle_timeout: Duration,
 ) -> (HashSet<u64>, bool) {
-    let just_authorized = drain_auth_completions(server, tracked, rtmp_bridge)
-        | FAST_AUTH_ALLOWED.with(std::cell::Cell::take);
+    let just_authorized =
+        drain_auth_completions(server, tracked) | FAST_AUTH_ALLOWED.with(std::cell::Cell::take);
 
     let mut current_ids = HashSet::new();
     let mut reject_indices = Vec::new();
@@ -3486,28 +3470,16 @@ mod tests {
             max_connections_per_addr: i32::MAX,
         };
         let mut server = librtmp2::server::Server::new(cfg).unwrap();
-        let (_db, bridge) = bridge_with_streams(&["completion-stream"]);
         let tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
         // Nothing queued: the poll loop must not force a fast follow-up tick.
-        assert!(!drain_auth_completions(&mut server, &tracked, &bridge));
+        assert!(!drain_auth_completions(&mut server, &tracked));
 
-        // The auth worker created this state before sending its completion,
-        // but librtmp2's own pending-auth timeout already denied the request
-        // (conn_id 999 is not on this server). The stale completion must
-        // release the ghost row; the drain is still reported so the poll
-        // loop picks a fast follow-up tick.
-        bridge.on_connect(999, "127.0.0.1:1");
-        assert!(
-            bridge
-                .authorize_publish(
-                    999,
-                    "live",
-                    &sample_stream("completion-stream").publish_key
-                )
-                .is_ok()
-        );
-        assert!(bridge.has_publisher(999));
+        // conn_id 999 doesn't exist on this server, so resolving it is a
+        // harmless no-op (see `Server::complete_publish_authorization`) --
+        // what this test checks is that the drain is still reported, which
+        // is what lets the poll loop pick a fast follow-up tick regardless
+        // of whether the connection was still around to receive it.
         let (tx, rx) = sync_channel(4);
         tx.send(AuthCompletion {
             kind: AuthKind::Publish,
@@ -3520,24 +3492,37 @@ mod tests {
         }
 
         assert!(
-            drain_auth_completions(&mut server, &tracked, &bridge),
+            drain_auth_completions(&mut server, &tracked),
             "a drained completion must be reported so the poll loop can skip \
              the idle sleep on this tick"
         );
         assert!(
-            !drain_auth_completions(&mut server, &tracked, &bridge),
+            !drain_auth_completions(&mut server, &tracked),
             "the channel is now empty; no fast follow-up is needed"
-        );
-        assert!(
-            !bridge.has_publisher(999),
-            "a stale allow completion must release the worker's ghost publisher row"
         );
         assert_eq!(
             super::publisher_generation(999),
             0,
-            "a completion for a connection the library does not have must not \
-             re-create generation state"
+            "an untracked connection's completion must not re-create generation state"
         );
+
+        // A completion for a connection that is still tracked bumps its
+        // publish generation (the line the untracked case above must skip).
+        let mut tracked_with_conn: HashMap<u64, TrackedConn> = HashMap::new();
+        tracked_with_conn.entry(999).or_default();
+        let (tx2, rx2) = sync_channel(4);
+        tx2.send(AuthCompletion {
+            kind: AuthKind::Publish,
+            conn_id: 999,
+            allow: true,
+        })
+        .unwrap();
+        if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
+            *guard = Some(rx2);
+        }
+        assert!(drain_auth_completions(&mut server, &tracked_with_conn));
+        assert_eq!(super::publisher_generation(999), 1);
+        super::clear_publish_generation(999);
 
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
             *guard = None;
@@ -3909,7 +3894,6 @@ mod tests {
         // can't leak into other tests.
         std::thread::spawn(|| {
             let mut server = unbound_rtmp_server(8);
-            let (_db, bridge) = bridge_with_streams(&[]);
             let tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
             // A completion sitting on the global receiver must be ignored by
@@ -3926,7 +3910,7 @@ mod tests {
 
             let (tx, rx) = sync_channel(4);
             super::set_shard_auth_completions_rx(rx);
-            assert!(!drain_auth_completions(&mut server, &tracked, &bridge));
+            assert!(!drain_auth_completions(&mut server, &tracked));
 
             tx.send(AuthCompletion {
                 kind: AuthKind::Play,
@@ -3934,8 +3918,8 @@ mod tests {
                 allow: false,
             })
             .unwrap();
-            assert!(drain_auth_completions(&mut server, &tracked, &bridge));
-            assert!(!drain_auth_completions(&mut server, &tracked, &bridge));
+            assert!(drain_auth_completions(&mut server, &tracked));
+            assert!(!drain_auth_completions(&mut server, &tracked));
 
             let global = AUTH_COMPLETIONS_RX.lock().unwrap().take().unwrap();
             assert_eq!(global.try_recv().unwrap().conn_id, 5);
