@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: keygen (2026-09-28)
+Last scanned: logger (2026-10-03)
 
 ## Modules
 
@@ -10,7 +10,20 @@ Last scanned: keygen (2026-09-28)
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [x] keygen — Stream key generation
-- [ ] logger — Logging
+- [x] logger — Logging
+
+## Findings (2026-10-03 logger pass)
+
+No critical bugs found in `src/logger.rs`. Reviewed init/close/generation
+handoff for the background flusher, level filtering, file vs stderr paths,
+mutex serialization for file logging, Error/Warn immediate flush vs
+Info/Debug throttling, and `sanitize_for_log()` (control chars including ANSI).
+All `log_*!` macros route through `log()` → `write_line()` → sanitization.
+Residual non-critical notes: stderr mode (default empty `LOG_FILE`) can
+interleave lines under concurrent writers without a stderr lock; U+2028/U+2029
+are not `char::is_control()` and thus not escaped (weaker log-forgery class
+than the fixed `\n`/ANSI case); `init()` without `close()` drops a replaced
+`BufWriter` on re-init (not used in `main`).
 
 ## Findings (2026-09-28 keygen pass)
 
