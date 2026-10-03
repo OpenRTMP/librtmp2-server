@@ -585,10 +585,17 @@ impl ClusterManager {
                 Ok(()) => crate::log_info!(
                     "Cluster: released {stale_owners} stream ownership row(s) left by a previous run"
                 ),
-                Err(e) => crate::log_warn!(
-                    "Cluster: releasing {stale_owners} stale stream ownership row(s) failed ({e:?}); \
-                     they stay blocked for other nodes until this node is fenced DOWN"
-                ),
+                Err(e) => {
+                    // Session hooks (and with them the admin proof token) are
+                    // registered after `start` returns, so a follower cannot
+                    // forward the write yet. Queue the release for the health
+                    // loop to retry once the token is available.
+                    mgr.pending_node_cleanups.lock().insert(config.node_id);
+                    crate::log_warn!(
+                        "Cluster: releasing {stale_owners} stale stream ownership row(s) failed ({e:?}); \
+                         retrying until this node can forward the release"
+                    );
+                }
             }
         }
 
@@ -2194,20 +2201,24 @@ impl ClusterManager {
                         Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
                     }
                 }
-                let pending_cleanups: Vec<NodeId> =
-                    self.pending_node_cleanups.lock().iter().copied().collect();
-                for id in pending_cleanups {
-                    match self.release_owners_for_node(id) {
-                        Ok(()) => {
-                            self.pending_node_cleanups.lock().remove(&id);
-                            crate::log_info!(
-                                "Cluster: finished pending ownership cleanup for removed node {id}"
-                            );
-                        }
-                        Err(e) => crate::log_warn!(
-                            "Cluster: pending ownership cleanup for removed node {id}: {e:?}"
-                        ),
+            }
+            // Any node retries pending cleanups, not just the leader: a
+            // follower forwards the write with the admin proof token, which
+            // is exactly what a restarted follower needs to release its own
+            // stale rows after `register_session_hooks` supplied the token.
+            let pending_cleanups: Vec<NodeId> =
+                self.pending_node_cleanups.lock().iter().copied().collect();
+            for id in pending_cleanups {
+                match self.release_owners_for_node(id) {
+                    Ok(()) => {
+                        self.pending_node_cleanups.lock().remove(&id);
+                        crate::log_info!(
+                            "Cluster: finished pending ownership cleanup for removed node {id}"
+                        );
                     }
+                    Err(e) => crate::log_warn!(
+                        "Cluster: pending ownership cleanup for removed node {id}: {e:?}"
+                    ),
                 }
             }
             // Keep session caches through the DOWN fencing grace so delete
@@ -4041,6 +4052,72 @@ mod tests {
             Err(CoordError::Cluster(_))
         ));
         n3.mgr.shutdown_blocking();
+    }
+
+    /// A follower that starts with `stream_owners` rows naming itself cannot
+    /// forward the release yet (`ClusterManager::start` runs before
+    /// `register_session_hooks` supplies the admin proof token), so the
+    /// release must be queued and retried by the health loop -- a follower,
+    /// not only the leader, has to run that retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joining_follower_releases_stale_ownership_via_pending_cleanup() {
+        let n1 = bootstrap(1, |_| {}).await;
+
+        // A node whose DB still names itself owner of a stream from a
+        // previous (non-clustered) run, joining the cluster fresh. Only the
+        // ownership row is seeded: a `streams` row would trip the join's
+        // populated-DB reseed guard.
+        let dir2 = Arc::new(TempDir::new().unwrap());
+        let db_path = dir2.path().join("n2.db");
+        {
+            let db = Db::open(db_path.to_str().unwrap()).unwrap();
+            db.with_conn(|c| {
+                // FK checks off for the dangling stream_id: a real `streams`
+                // row would trip the join's populated-DB reseed guard.
+                c.execute_batch(
+                    "PRAGMA foreign_keys=OFF; \
+                     INSERT INTO stream_owners(stream_id, owner_node_id, epoch, acquired_at) \
+                     VALUES ('stale', 2, 1, 1); \
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+            });
+        }
+        let mut cfg = node_cfg(2, false, Some(n1.mgr.config.advertise_control()));
+        cfg.join_proof = n1
+            .mgr
+            .mint_join_proof(2, &cfg.bind, &cfg.media_bind)
+            .expect("mint join proof");
+        let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
+        let mgr = ClusterManager::start(cfg, db, tokio::runtime::Handle::current())
+            .await
+            .expect("start joining node");
+
+        // Without hooks the startup release must have failed and queued the
+        // row instead of stranding it.
+        assert!(
+            mgr.db().stream_owner_get("stale").is_some(),
+            "startup release cannot succeed without the admin proof token"
+        );
+        assert!(mgr.pending_node_cleanups.lock().contains(&2));
+
+        let hooks = Hooks::new();
+        mgr.register_session_hooks(hooks.session_hooks());
+        assert!(
+            wait_until(Duration::from_secs(10), || mgr
+                .db()
+                .stream_owner_get("stale")
+                .is_none())
+            .await,
+            "the queued stale-owner release must run once the api token is available"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || mgr
+                .pending_node_cleanups
+                .lock()
+                .is_empty())
+            .await
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
