@@ -44,6 +44,7 @@
 //! length and a hard cap *before* anything is allocated for it.
 
 use std::io::{Error, ErrorKind};
+use std::time::Duration;
 
 use librtmp2::DeliveryHint;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -234,12 +235,15 @@ fn frame_len(len: usize) -> Result<u32, Error> {
 /// Read one frame in the given protocol `version`. `max` caps the frame
 /// length (a smaller cap applies before authentication completes);
 /// `reserve` accounts the frame's bytes against the shared read budget and
-/// is held until the frame was read.
+/// is held until the frame was read. `body_timeout` bounds only the body
+/// read, after the length prefix has arrived, so an idle peer waiting to
+/// send its next frame is never timed out.
 pub async fn read_frame<R, G>(
     r: &mut R,
     version: u16,
     max: u32,
     reserve: impl FnOnce(usize) -> Result<G, Error>,
+    body_timeout: Option<Duration>,
 ) -> Result<MediaMessage, Error>
 where
     R: AsyncRead + Unpin,
@@ -249,13 +253,21 @@ where
         return Err(Error::other("media frame too large"));
     }
     let _budget = reserve(len as usize)?;
-    if version >= 2 {
-        read_body_v2(r, len as usize).await
-    } else {
-        let buf = read_vec(r, len as usize).await?;
-        let msg: MediaMessage = serde_json::from_slice(&buf).map_err(Error::other)?;
-        check_message_names(&msg)?;
-        Ok(msg)
+    let body = async {
+        if version >= 2 {
+            read_body_v2(r, len as usize).await
+        } else {
+            let buf = read_vec(r, len as usize).await?;
+            let msg: MediaMessage = serde_json::from_slice(&buf).map_err(Error::other)?;
+            check_message_names(&msg)?;
+            Ok(msg)
+        }
+    };
+    match body_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, body)
+            .await
+            .map_err(|_| Error::new(ErrorKind::TimedOut, "media frame body read timeout"))?,
+        None => body.await,
     }
 }
 
@@ -459,7 +471,7 @@ mod tests {
 
     async fn decode(bytes: &[u8], version: u16) -> Result<MediaMessage, Error> {
         let mut r = bytes;
-        read_frame(&mut r, version, MAX_FRAME, no_budget).await
+        read_frame(&mut r, version, MAX_FRAME, no_budget, None).await
     }
 
     #[tokio::test]
@@ -713,17 +725,25 @@ mod tests {
         let err = decode(&bytes, 2).await.unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
         let mut r: &[u8] = &(100u32).to_be_bytes();
-        let err = read_frame(&mut r, 2, 50, no_budget).await.unwrap_err();
+        let err = read_frame(&mut r, 2, 50, no_budget, None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
     }
 
     #[tokio::test]
     async fn read_budget_is_checked_before_the_body_is_read() {
         let mut r: &[u8] = &(1000u32).to_be_bytes();
-        let err = read_frame(&mut r, 2, MAX_FRAME, |n| {
-            assert_eq!(n, 1000);
-            Err::<(), _>(Error::other("budget exceeded"))
-        })
+        let err = read_frame(
+            &mut r,
+            2,
+            MAX_FRAME,
+            |n| {
+                assert_eq!(n, 1000);
+                Err::<(), _>(Error::other("budget exceeded"))
+            },
+            None,
+        )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("budget"));

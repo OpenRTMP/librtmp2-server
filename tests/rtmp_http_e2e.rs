@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use librtmp2::client::Client;
 use librtmp2::types::{Frame, FrameType, VideoCodec};
+use librtmp2_server::db::DbLookup;
 use librtmp2_server::test_support::TestServer;
 use serial_test::serial;
 
@@ -181,6 +182,70 @@ fn delete_stream_via_http_then_list_excludes_it() {
         !list.iter().any(|s| s["id"] == "delete-me"),
         "deleted stream should not appear in list"
     );
+}
+
+/// A kicked publisher's publish-route claim must be released by the library's
+/// own teardown: re-creating the stream and publishing the same key again
+/// must succeed without a process restart.
+#[test]
+#[serial]
+fn republish_same_key_after_delete_kick_succeeds() {
+    let server = TestServer::start(RTMP_PORT + 4, API_TOKEN);
+    create_stream_via_http(&server, "kick-stream");
+
+    let rtmp_port = server.rtmp_port;
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let publisher = thread::spawn(move || {
+        let mut p = Client::new();
+        p.connect(&format!("rtmp://127.0.0.1:{rtmp_port}/live/{PUB_KEY}"))?;
+        p.publish()?;
+        // Keep the session open until the server kicks it; poll in slices so
+        // the disconnect is observed promptly.
+        while stop_rx.try_recv().is_err() {
+            let _ = p.poll(50);
+        }
+        Ok::<(), librtmp2::types::ErrorCode>(())
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !server
+        .db
+        .publisher_list(Some("kick-stream"))
+        .iter()
+        .any(|p| p.active)
+    {
+        assert!(Instant::now() < deadline, "publisher never became active");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Deleting the live stream drains the publisher role and kicks the
+    // connection through the reject path.
+    let client = reqwest::blocking::Client::new();
+    let del = client
+        .delete(format!("{}/api/v1/streams/kick-stream", server.http_base))
+        .header("Authorization", format!("Bearer {}", server.api_token))
+        .send()
+        .unwrap();
+    assert!(del.status().is_success(), "delete failed: {}", del.status());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(server.db.stream_get("kick-stream"), DbLookup::Missing) {
+        assert!(Instant::now() < deadline, "stream delete never finalized");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = stop_tx.send(());
+    let _ = publisher.join();
+    // The kicked connection's next poll reaps it and releases its route.
+    thread::sleep(Duration::from_millis(200));
+
+    create_stream_via_http(&server, "kick-stream-2");
+    let mut republisher = Client::new();
+    republisher
+        .connect(&format!("rtmp://127.0.0.1:{rtmp_port}/live/{PUB_KEY}"))
+        .expect("reconnect");
+    republisher
+        .publish()
+        .expect("republishing a kicked route must succeed");
 }
 
 #[test]
