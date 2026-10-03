@@ -130,6 +130,12 @@ pub struct ClusterManager {
     /// the leader health tick — a removed node has no `down_since`, so the
     /// normal DOWN sweep will not pick this up.
     pending_node_cleanups: Mutex<std::collections::HashSet<NodeId>>,
+    /// `(stream_id, epoch)` ownership rows left by a previous run of this
+    /// node whose startup release could not be forwarded yet (a follower
+    /// without the admin proof token). Retried with epoch fencing, so a
+    /// stream this node re-acquired after restart (new epoch) is never
+    /// deleted by the deferred cleanup.
+    pending_stream_cleanups: Mutex<std::collections::HashSet<(String, u64)>>,
     /// (app, stream_id) -> owner node this node currently holds a
     /// standby-replica media subscription against. Reconciled every health
     /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
@@ -310,6 +316,7 @@ impl ClusterManager {
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
+            pending_stream_cleanups: Mutex::new(std::collections::HashSet::new()),
             standby_subs: Mutex::new(std::collections::HashMap::new()),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
@@ -575,27 +582,28 @@ impl ClusterManager {
         // can take them again. This runs before `ServerApp::run_until`
         // spawns the shards, so a publisher cannot have acquired one in
         // between.
-        let stale_owners = db
+        let stale_owners: Vec<(String, u64)> = db
             .stream_owner_list()
             .iter()
             .filter(|o| o.owner_node_id == config.node_id)
-            .count();
-        if stale_owners > 0 {
-            match mgr.release_owners_for_node(config.node_id) {
-                Ok(()) => crate::log_info!(
-                    "Cluster: released {stale_owners} stream ownership row(s) left by a previous run"
-                ),
-                Err(e) => {
-                    // Session hooks (and with them the admin proof token) are
-                    // registered after `start` returns, so a follower cannot
-                    // forward the write yet. Queue the release for the health
-                    // loop to retry once the token is available.
-                    mgr.pending_node_cleanups.lock().insert(config.node_id);
-                    crate::log_warn!(
-                        "Cluster: releasing {stale_owners} stale stream ownership row(s) failed ({e:?}); \
-                         retrying until this node can forward the release"
-                    );
-                }
+            .map(|o| (o.stream_id.clone(), o.epoch))
+            .collect();
+        if !stale_owners.is_empty() {
+            // Queue the exact (stream_id, epoch) pairs instead of a blind
+            // node-wide release: a follower cannot forward the write before
+            // `register_session_hooks` supplies the admin proof token, and
+            // the deferred retry may run after the shards have accepted a
+            // fresh publisher. Epoch fencing makes the late release a no-op
+            // for any stream this node re-acquired in the meantime.
+            mgr.pending_stream_cleanups
+                .lock()
+                .extend(stale_owners.iter().cloned());
+            mgr.retry_pending_stream_cleanups();
+            if mgr.pending_stream_cleanups.lock().is_empty() {
+                crate::log_info!(
+                    "Cluster: released {} stream ownership row(s) left by a previous run",
+                    stale_owners.len()
+                );
             }
         }
 
@@ -790,6 +798,48 @@ impl ClusterManager {
         self.ownership.hydrate_from(&self.db.stream_owner_list());
         self.refresh_subscriptions_for(&affected);
         Ok(())
+    }
+
+    /// Retry the epoch-fenced release of stale ownership rows queued by
+    /// [`Self::start`] (see `pending_stream_cleanups`). A stream this node
+    /// re-acquired after restart carries a newer epoch, so the state machine
+    /// treats the stale release as an idempotent no-op and the fresh row
+    /// survives; the ownership tracker is re-hydrated instead of cleared for
+    /// the same reason.
+    fn retry_pending_stream_cleanups(&self) {
+        let pending: Vec<(String, u64)> = self
+            .pending_stream_cleanups
+            .lock()
+            .iter()
+            .cloned()
+            .collect();
+        let mut released: Vec<String> = Vec::new();
+        for (stream_id, epoch) in pending {
+            match self
+                .block_on_write(ClusterCommand::ReleaseStreamOwner {
+                    stream_id: stream_id.clone(),
+                    epoch,
+                })
+                .and_then(|resp| resp.into_coord_result())
+            {
+                Ok(()) => {
+                    self.pending_stream_cleanups
+                        .lock()
+                        .remove(&(stream_id.clone(), epoch));
+                    crate::log_info!(
+                        "Cluster: released stale ownership of {stream_id} (epoch {epoch}) left by a previous run"
+                    );
+                    released.push(stream_id);
+                }
+                Err(e) => crate::log_warn!(
+                    "Cluster: stale ownership cleanup for {stream_id} (epoch {epoch}): {e:?}"
+                ),
+            }
+        }
+        if !released.is_empty() {
+            self.ownership.hydrate_from(&self.db.stream_owner_list());
+            self.refresh_subscriptions_for(&released);
+        }
     }
 
     fn block_on_write(&self, cmd: ClusterCommand) -> Result<ClusterResponse, CoordError> {
@@ -1407,6 +1457,12 @@ impl ClusterManager {
 
     pub fn register_session_hooks(&self, hooks: SessionHooks) {
         *self.session_hooks.lock() = Some(hooks);
+        // A restarted node queued its stale ownership rows during `start` (a
+        // follower cannot forward the release before the admin proof token
+        // exists). Retry now, while the RTMP shards have not started
+        // accepting publishers yet; epoch fencing keeps the retry safe even
+        // if it has to fall back to the health tick.
+        self.retry_pending_stream_cleanups();
     }
 
     fn mark_stream_draining(&self, stream_id: &str) {
@@ -2221,6 +2277,7 @@ impl ClusterManager {
                     ),
                 }
             }
+            self.retry_pending_stream_cleanups();
             // Keep session caches through the DOWN fencing grace so delete
             // finalize still sees remote sessions until ownership is released.
             let _ = down;
@@ -4099,7 +4156,11 @@ mod tests {
             mgr.db().stream_owner_get("stale").is_some(),
             "startup release cannot succeed without the admin proof token"
         );
-        assert!(mgr.pending_node_cleanups.lock().contains(&2));
+        assert!(
+            mgr.pending_stream_cleanups
+                .lock()
+                .contains(&("stale".to_string(), 1))
+        );
 
         let hooks = Hooks::new();
         mgr.register_session_hooks(hooks.session_hooks());
@@ -4113,11 +4174,77 @@ mod tests {
         );
         assert!(
             wait_until(Duration::from_secs(10), || mgr
-                .pending_node_cleanups
+                .pending_stream_cleanups
                 .lock()
                 .is_empty())
             .await
         );
+    }
+
+    /// A deferred stale-owner cleanup must not delete a stream this node
+    /// re-acquired after restart: the queued release is epoch-fenced, so the
+    /// fresh row (newer epoch) survives the late retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_stream_cleanup_is_epoch_fenced() {
+        let n1 = bootstrap(1, |_| {}).await;
+
+        let dir2 = Arc::new(TempDir::new().unwrap());
+        let db_path = dir2.path().join("n2.db");
+        {
+            let db = Db::open(db_path.to_str().unwrap()).unwrap();
+            db.with_conn(|c| {
+                c.execute_batch(
+                    "PRAGMA foreign_keys=OFF; \
+                     INSERT INTO stream_owners(stream_id, owner_node_id, epoch, acquired_at) \
+                     VALUES ('live', 2, 1, 1); \
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+            });
+        }
+        let mut cfg = node_cfg(2, false, Some(n1.mgr.config.advertise_control()));
+        cfg.join_proof = n1
+            .mgr
+            .mint_join_proof(2, &cfg.bind, &cfg.media_bind)
+            .expect("mint join proof");
+        let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
+        let mgr = ClusterManager::start(cfg, db, tokio::runtime::Handle::current())
+            .await
+            .expect("start joining node");
+        assert!(
+            mgr.pending_stream_cleanups
+                .lock()
+                .contains(&("live".to_string(), 1))
+        );
+
+        // Simulate a fresh acquisition of the same stream after the restart:
+        // the row now carries a newer epoch, so the queued stale release
+        // (epoch 1) must become an idempotent no-op.
+        mgr.db().with_conn(|c| {
+            c.execute(
+                "UPDATE stream_owners SET epoch=2 WHERE stream_id='live'",
+                [],
+            )
+            .unwrap();
+        });
+
+        let hooks = Hooks::new();
+        mgr.register_session_hooks(hooks.session_hooks());
+        assert!(
+            wait_until(Duration::from_secs(10), || mgr
+                .pending_stream_cleanups
+                .lock()
+                .is_empty())
+            .await
+        );
+        let row = mgr
+            .db()
+            .stream_owner_get("live")
+            .expect("fresh row must survive the stale cleanup");
+        assert_eq!(row.epoch, 2);
+
+        n1.mgr.shutdown_blocking();
+        mgr.shutdown_blocking();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
