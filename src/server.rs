@@ -1564,8 +1564,14 @@ pub(crate) fn process_server_connections(
             tracked.remove(&conn_id);
             close_conn_off_poll_thread(rtmp_bridge, conn_id);
             clear_publish_generation(conn_id);
+            // Drop the transport instead of removing the Conn: the library
+            // reaps it on the next poll and runs its full teardown
+            // (`release_all_publish_routes` plus the publisher cache keys),
+            // which removing it from `server.connections` here would bypass
+            // -- leaving the publish route claimed by a dead conn_id and the
+            // next publisher of that route refused with Publish.BadName.
+            conn.disconnect_transport();
         }
-        server.connections.remove(idx);
     }
 
     (current_ids, just_authorized)
@@ -4494,11 +4500,15 @@ mod tests {
                 .expect("connection still open")
         }
 
+        /// Whether the RTMP session's transport is still attached. A kicked
+        /// connection is disconnected immediately but stays in the library's
+        /// `connections` list until its next `poll` reaps it (that reap is
+        /// what releases its publish route and cache entries).
         fn is_open(&self) -> bool {
             self.server
                 .connections
                 .iter()
-                .any(|c| c.conn_id == self.conn_id)
+                .any(|c| c.conn_id == self.conn_id && c.client_fd >= 0)
         }
 
         fn entry(&self) -> &TrackedConn {
@@ -4523,10 +4533,20 @@ mod tests {
             );
         }
 
-        fn assert_closed(&self) {
+        fn assert_closed(&mut self) {
             assert!(!self.is_open(), "connection must be closed");
             assert!(!self.tracked.contains_key(&self.conn_id));
             assert!(!self.bridge.is_registered(self.conn_id));
+            // The library reaps the disconnected Conn on its next poll.
+            self.server.poll(0).unwrap();
+            assert!(
+                !self
+                    .server
+                    .connections
+                    .iter()
+                    .any(|c| c.conn_id == self.conn_id),
+                "the library must reap the disconnected connection"
+            );
         }
     }
 
