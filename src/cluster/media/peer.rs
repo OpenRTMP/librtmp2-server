@@ -32,9 +32,16 @@ const MAX_MEDIA_READ_BYTES_INFLIGHT: usize = 128 * 1024 * 1024;
 static MEDIA_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 const MAX_AUTH_FRAME: u32 = 8 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bound post-authentication frame reads so a peer cannot reserve the media
-/// read budget indefinitely by advertising a frame and then withholding it.
-const MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound the body of a post-authentication frame so a peer cannot reserve
+/// the media read budget indefinitely by advertising a frame and then
+/// withholding it. It must not bound the wait for the next frame's length
+/// prefix: the media protocol has no keepalive, so an idle subscriber is
+/// legitimately silent.
+pub(crate) const MEDIA_READ_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(800)
+} else {
+    Duration::from_secs(30)
+};
 /// Bound on a single frame write to a peer. Without this, a peer that stops
 /// reading (backpressure with no consumer) leaves the write stuck forever —
 /// the task and socket never clean up, and heartbeat-driven peer replacement
@@ -73,36 +80,43 @@ pub async fn read_media_frame_v<R: AsyncReadExt + Unpin>(
     r: &mut R,
     version: u16,
 ) -> Result<MediaMessage, std::io::Error> {
-    tokio::time::timeout(
-        MEDIA_READ_TIMEOUT,
-        read_media_frame_max(r, version, MAX_FRAME),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "media frame read timeout"))?
+    // Only the body is bounded: the length prefix may take arbitrarily long
+    // (the peer is idle), but once a frame is announced its body must arrive
+    // within MEDIA_READ_TIMEOUT.
+    read_media_frame_max(r, version, MAX_FRAME, Some(MEDIA_READ_TIMEOUT)).await
 }
 
 async fn read_media_frame_max<R: AsyncReadExt + Unpin>(
     r: &mut R,
     version: u16,
     max: u32,
+    body_timeout: Option<Duration>,
 ) -> Result<MediaMessage, std::io::Error> {
-    wire::read_frame(r, version, max, |len| {
-        try_reserve_inflight_bytes(
-            &MEDIA_READ_BYTES_INFLIGHT,
-            MAX_MEDIA_READ_BYTES_INFLIGHT,
-            len,
-        )
-        .map_err(|_| std::io::Error::other("media read memory budget exceeded"))
-    })
+    wire::read_frame(
+        r,
+        version,
+        max,
+        |len| {
+            try_reserve_inflight_bytes(
+                &MEDIA_READ_BYTES_INFLIGHT,
+                MAX_MEDIA_READ_BYTES_INFLIGHT,
+                len,
+            )
+            .map_err(|_| std::io::Error::other("media read memory budget exceeded"))
+        },
+        body_timeout,
+    )
     .await
 }
 
 async fn read_auth_media_frame<R: AsyncReadExt + Unpin>(
     r: &mut R,
 ) -> Result<MediaMessage, std::io::Error> {
+    // Authentication keeps its whole-frame bound: no body timeout here, the
+    // outer AUTH_TIMEOUT covers the length prefix too.
     tokio::time::timeout(
         AUTH_TIMEOUT,
-        read_media_frame_max(r, MEDIA_PROTOCOL_MIN_VERSION, MAX_AUTH_FRAME),
+        read_media_frame_max(r, MEDIA_PROTOCOL_MIN_VERSION, MAX_AUTH_FRAME, None),
     )
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "media auth timeout"))?
@@ -442,7 +456,7 @@ async fn connect_and_run(
 async fn read_hello_ack<S: AsyncRead + Unpin>(stream: &mut S, version: u16) -> bool {
     match tokio::time::timeout(
         AUTH_TIMEOUT,
-        read_media_frame_max(stream, MEDIA_PROTOCOL_MIN_VERSION, MAX_AUTH_FRAME),
+        read_media_frame_max(stream, MEDIA_PROTOCOL_MIN_VERSION, MAX_AUTH_FRAME, None),
     )
     .await
     {
@@ -838,6 +852,38 @@ mod tests {
             .unwrap();
         let err = read_auth_media_frame(&mut b).await.unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    /// The media protocol has no keepalive, so a subscriber that has sent
+    /// its `Subscribe` and then stays silent must not be torn down by the
+    /// frame read timeout: the timeout bounds an announced body only, not
+    /// the wait for the next length prefix.
+    #[tokio::test]
+    async fn idle_media_read_is_not_bounded_by_the_frame_timeout() {
+        let (_writer, mut reader) = tokio::io::duplex(1 << 16);
+        let waited = tokio::time::timeout(
+            MEDIA_READ_TIMEOUT + Duration::from_millis(400),
+            read_media_frame_v(&mut reader, MEDIA_PROTOCOL_VERSION),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "an idle peer must keep waiting for its next frame instead of \
+             failing with a read timeout"
+        );
+    }
+
+    /// A peer that announces a frame and then withholds its body is still
+    /// bounded by [`MEDIA_READ_TIMEOUT`].
+    #[tokio::test]
+    async fn announced_media_frame_body_is_still_bounded() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, mut reader) = tokio::io::duplex(1 << 16);
+        writer.write_u32(100).await.unwrap(); // length prefix, no body
+        let err = read_media_frame_v(&mut reader, MEDIA_PROTOCOL_VERSION)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
     }
 
     #[tokio::test]

@@ -2164,6 +2164,32 @@ mod tests {
         owner.hub.shutdown();
     }
 
+    /// A subscriber only sends `Subscribe`/`Unsubscribe`; there is no
+    /// keepalive. The owner must therefore keep the session open when the
+    /// subscriber goes silent, not tear it down after the read timeout.
+    #[tokio::test]
+    async fn inbound_idle_session_survives_past_the_read_timeout() {
+        let owner = node(1);
+        let addr = listen(&owner.hub).await;
+        let mut c = dial_hub(addr, 2).await;
+        send(&mut c, subscribe(1)).await;
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![2]).await);
+
+        tokio::time::sleep(peer::MEDIA_READ_TIMEOUT + Duration::from_millis(400)).await;
+        assert!(
+            owner.hub.inbound_sinks.lock().contains_key(&2),
+            "an idle subscriber session must stay open past the read timeout"
+        );
+
+        // The session is still usable: a frame fanned out now reaches it.
+        owner.hub.fanout_local_frame(exported(7, 1, AVC_KEY)).await;
+        match next(&mut c).await {
+            MediaMessage::MediaFrame { payload, .. } => assert_eq!(payload, AVC_KEY),
+            other => panic!("unexpected {other:?}"),
+        }
+        owner.hub.shutdown();
+    }
+
     #[tokio::test]
     async fn inbound_auth_failure_and_non_member_are_dropped() {
         let owner = node_with(1, None, Arc::new(|id: NodeId| id != 9));
