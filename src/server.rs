@@ -996,16 +996,23 @@ fn apply_auth_completion(
     rtmp_bridge: &DbRtmpBridge,
     completion: &AuthCompletion,
 ) {
-    let still_pending = server.connections.iter().any(|c| {
-        c.conn_id == completion.conn_id && c.client_fd >= 0 && c.has_pending_authorization()
-    });
+    let conn = server
+        .connections
+        .iter()
+        .find(|c| c.conn_id == completion.conn_id);
+    let conn_alive = conn.is_some_and(|c| c.client_fd >= 0);
+    let still_pending = conn.is_some_and(|c| c.client_fd >= 0 && c.has_pending_authorization());
     if !still_pending {
         // The library auto-denies a request left `Pending` past its own
-        // pending-auth timeout (and the connection may already be gone), so
-        // the worker's side effects -- the bridge ConnState plus an active
-        // publisher/player row it created before sending the completion --
-        // are stale. Release them; the library call would be a no-op.
-        if completion.allow {
+        // pending-auth timeout, so the worker's side effects -- the bridge
+        // ConnState plus an active publisher/player row it created before
+        // sending the completion -- are stale. Reclaim them only when the
+        // connection is gone or already closed: a live connection without a
+        // pending authorization may hold an earlier authorized role
+        // (play-then-publish / republish on one conn), and `on_close` would
+        // tear that role down. The library call below is a no-op in every
+        // `!still_pending` case.
+        if completion.allow && !conn_alive {
             rtmp_bridge.on_close(completion.conn_id);
         }
         return;
@@ -3500,11 +3507,7 @@ mod tests {
         bridge.on_connect(999, "127.0.0.1:1");
         assert!(
             bridge
-                .authorize_publish(
-                    999,
-                    "live",
-                    &sample_stream("completion-stream").publish_key
-                )
+                .authorize_publish(999, "live", &sample_stream("completion-stream").publish_key)
                 .is_ok()
         );
         assert!(bridge.has_publisher(999));
