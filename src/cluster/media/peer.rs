@@ -645,6 +645,8 @@ pub struct InboundMediaSink {
     queue: Arc<LiveMediaQueue>,
     counters: Arc<PeerCounters>,
     closed: Arc<AtomicBool>,
+    close_tx: tokio::sync::watch::Sender<bool>,
+    close_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl InboundMediaSink {
@@ -662,9 +664,11 @@ impl InboundMediaSink {
         counters.connects.store(1, Ordering::Relaxed);
         counters.protocol_version.store(version, Ordering::Relaxed);
         let closed = Arc::new(AtomicBool::new(false));
+        let (close_tx, close_rx) = tokio::sync::watch::channel(false);
         let q = Arc::clone(&queue);
         let ctr = Arc::clone(&counters);
         let cl = Arc::clone(&closed);
+        let tx = close_tx.clone();
         tokio::spawn(async move {
             loop {
                 if cl.load(Ordering::Relaxed) {
@@ -691,6 +695,7 @@ impl InboundMediaSink {
                 }
             }
             cl.store(true, Ordering::Relaxed);
+            let _ = tx.send(true);
             q.close();
         });
         Self {
@@ -698,6 +703,8 @@ impl InboundMediaSink {
             queue,
             counters,
             closed,
+            close_tx,
+            close_rx,
         }
     }
 
@@ -735,7 +742,19 @@ impl InboundMediaSink {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+        let _ = self.close_tx.send(true);
         self.queue.close();
+    }
+
+    /// Wait until this sink is closed: superseded by a newer inbound session,
+    /// its write pump died, or the hub shut down. Cancel-safe, so an inbound
+    /// reader can select on it instead of blocking forever on an idle peer.
+    pub async fn wait_closed(&self) {
+        let mut rx = self.close_rx.clone();
+        if *rx.borrow() {
+            return;
+        }
+        let _ = rx.changed().await;
     }
 }
 
@@ -1536,6 +1555,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         sink.closed.store(true, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(sink.is_closed());
+    }
+
+    #[tokio::test]
+    async fn inbound_sink_wait_closed_resolves_on_close() {
+        let (w, _r) = tokio::io::duplex(1024);
+        let sink = InboundMediaSink::spawn(8, 1, MEDIA_PROTOCOL_VERSION, w);
+        sink.close();
+        tokio::time::timeout(WAIT, sink.wait_closed())
+            .await
+            .expect("wait_closed must resolve once the sink is closed");
         assert!(sink.is_closed());
     }
 }

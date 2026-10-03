@@ -830,7 +830,18 @@ impl MediaHub {
         }
         let result = async {
             loop {
-                let msg = peer::read_media_frame_v(&mut rh, version).await?;
+                let msg = tokio::select! {
+                    biased;
+                    () = sink.wait_closed() => {
+                        // Superseded by a newer inbound session (or the write
+                        // pump died). Stop reading: the idle length-prefix
+                        // wait is unbounded, so a peer that keeps the old
+                        // write half open would otherwise pin this task
+                        // forever and exhaust MAX_MEDIA_CONN_INFLIGHT.
+                        return Ok(());
+                    }
+                    msg = peer::read_media_frame_v(&mut rh, version) => msg?,
+                };
                 match msg {
                     MediaMessage::Subscribe {
                         app,
@@ -2187,6 +2198,34 @@ mod tests {
             MediaMessage::MediaFrame { payload, .. } => assert_eq!(payload, AVC_KEY),
             other => panic!("unexpected {other:?}"),
         }
+        owner.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn superseded_inbound_session_stops_reading() {
+        let owner = node(1);
+        let addr = listen(&owner.hub).await;
+
+        // First connection registers and keeps both halves open.
+        let mut first = dial_hub(addr, 2).await;
+        send(&mut first, subscribe(1)).await;
+        assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![2]).await);
+
+        // A replacement connection from the same peer supersedes it.
+        let mut second = dial_hub(addr, 2).await;
+        send(&mut second, subscribe(1)).await;
+        assert!(eventually(|| owner.hub.inbound_sinks.lock().len() == 1).await);
+
+        // The superseded reader must exit and tear the old connection down
+        // even though the peer never closes its write half.
+        let closed = tokio::time::timeout(
+            WAIT,
+            peer::read_media_frame_v(&mut first, MEDIA_PROTOCOL_VERSION),
+        )
+        .await
+        .expect("the superseded session must close promptly");
+        assert!(closed.is_err(), "the old connection must be torn down");
+
         owner.hub.shutdown();
     }
 
