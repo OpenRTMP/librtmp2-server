@@ -731,18 +731,17 @@ impl SqliteStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        // One `last_applied` acquisition pinned across BOTH the replicated row
-        // read and the index that becomes `SnapshotMeta::last_log_id`, and one
-        // `apply_lock` held across both plus every command's own writes — so
-        // no command can commit while it is captured. OpenRaft runs this
-        // builder on its own task and resumes applying while it runs, so
-        // without that lock a command applied in between would land in the
-        // payload while both indices stayed behind it: the snapshot would
-        // carry state the recorded log prefix does not cover. Holding the two
-        // together makes the payload and both indices a consistent prefix of
-        // the log. (The conservative direction, a follower re-applying
-        // idempotently, is preserved: an index is never newer than the rows.)
-        let (data, last_applied) = {
+        // `apply_lock` serializes this builder with `apply` and
+        // `install_snapshot`, but it is held only around state access, not
+        // around the size-dependent serialization of the snapshot payload:
+        // - the capture reads the rows, `last_applied` and `last_membership`
+        //   under the lock, so the payload and its indices are a consistent
+        //   prefix of the log, and
+        // - the publication reacquires it and refuses to overwrite a snapshot
+        //   an installation (or a newer build) has since superseded, so a
+        //   builder that paused after its capture cannot regress the stored
+        //   snapshot below `last_applied`.
+        let (data, last_applied, last_membership) = {
             let _apply = self.apply_lock.lock();
             let applied = self.last_applied.lock();
             let data = self
@@ -750,9 +749,8 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
                 })?;
-            (data, *applied)
+            (data, *applied, self.last_membership.lock().clone())
         };
-        let last_membership = self.last_membership.lock().clone();
         let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_state_machine(&e),
         })?;
@@ -766,6 +764,18 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
             last_membership,
             snapshot_id,
         };
+        let _apply = self.apply_lock.lock();
+        if let Some(existing) = self.current_snapshot.lock().clone() {
+            if existing.meta.last_log_id > meta.last_log_id {
+                // An install (or a newer build) superseded this snapshot while
+                // it was being serialized. Return the newer one instead of
+                // regressing the stored copies.
+                return Ok(Snapshot {
+                    meta: existing.meta,
+                    snapshot: Box::new(Cursor::new(existing.data)),
+                });
+            }
+        }
         *self.current_snapshot.lock() = Some(StoredSnapshot {
             meta: meta.clone(),
             data: bytes.clone(),
@@ -875,6 +885,13 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     responses.push(resp);
                 }
                 EntryPayload::Membership(ref mem) => {
+                    // Same lock as `apply`/`build_snapshot`/`install_snapshot`:
+                    // without it a concurrent builder could observe the new
+                    // membership log ID (persisted by `persist_applied_tx`)
+                    // while still cloning the previous membership, recording a
+                    // snapshot that restores the wrong voter set once that
+                    // entry is compacted.
+                    let _apply = self.apply_lock.lock();
                     let stored = StoredMembership::new(Some(entry.log_id), mem.clone());
                     let json = serde_json::to_string(&stored).map_err(|e| StorageError::IO {
                         source: StorageIOError::<u64>::write_state_machine(&e),
@@ -899,6 +916,12 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
+        // Same single-writer lock as `apply` and `build_snapshot`: OpenRaft
+        // runs the snapshot builder on its own task while this installs, so
+        // without it the builder could read the post-install rows while
+        // recording the pre-install index and persist a snapshot whose
+        // payload is ahead of its own log boundary.
+        let _apply = self.apply_lock.lock();
         let data = snapshot.into_inner();
         let app: AppSnapshot = serde_json::from_slice(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::<u64>::read_snapshot(Some(meta.signature()), &e),
@@ -1822,6 +1845,47 @@ mod tests {
         assert_eq!(loaded.snapshot.get_ref(), snap.snapshot.get_ref());
         // Second call is served from the cache populated by the first.
         assert!(reopened.get_current_snapshot().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_serializes_with_apply_lock() {
+        let (sm, _rx) = sm_with_effects();
+        let snap = sm
+            .clone()
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let meta = snap.meta.clone();
+        let data = snap.snapshot.get_ref().clone();
+
+        let guard = sm.apply_lock.lock();
+        let mut installer = sm.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt
+                .block_on(installer.install_snapshot(&meta, Box::new(std::io::Cursor::new(data))));
+            tx.blocking_send(result.is_ok()).unwrap();
+        });
+
+        // While the lock is held by another writer, install must not complete.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv())
+                .await
+                .is_err(),
+            "install_snapshot must wait for apply_lock"
+        );
+        drop(guard);
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("install_snapshot must complete once apply_lock is released");
+        assert!(completed.unwrap());
+        handle.join().unwrap();
     }
 
     #[tokio::test]
