@@ -308,12 +308,21 @@ impl ExportedRoutes {
             }
             let conn_id = frame.publisher_conn_id;
             let key = (frame.app.clone(), frame.stream_name.clone());
-            if self.conn_routes.get(&conn_id) == Some(&key) {
+            // Healthy fast path: this connection already owns this route.
+            // Anything else must repair the map like the base code did — a
+            // stale frame from a dead publisher may have overwritten the
+            // owner, and skipping the repair would emit a spurious RouteEnded
+            // for a route that is still being published.
+            if self.conn_routes.get(&conn_id) == Some(&key)
+                && self.routes.get(&key) == Some(&conn_id)
+            {
                 continue;
             }
             if let Some(previous) = self.conn_routes.insert(conn_id, key.clone()) {
-                self.routes.remove(&previous);
-                ended.push(previous);
+                if previous != key {
+                    self.routes.remove(&previous);
+                    ended.push(previous);
+                }
             }
             if self.routes.get(&key) != Some(&conn_id) {
                 self.routes.insert(key, conn_id);
@@ -3171,6 +3180,34 @@ mod tests {
         let mut ended = routes.take_ended(&HashSet::new());
         ended.sort();
         assert_eq!(ended, vec![("live".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn exported_routes_repair_stale_overwrites_without_spurious_end() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        routes.record(&[frame(1, "a")]);
+        // A stale frame from a dead publisher overwrites the route owner.
+        routes.record(&[frame(2, "a")]);
+        // The live owner's next frame must repair the map without ending the
+        // route (regression: the fast path used to skip the repair).
+        assert!(routes.record(&[frame(1, "a")]).is_empty());
+        assert!(routes.take_ended(&HashSet::from([1])).is_empty());
+        // Renaming the same connection still ends the previous route.
+        assert_eq!(
+            routes.record(&[frame(1, "b")]),
+            vec![("live".to_string(), "a".to_string())]
+        );
+        assert!(routes.take_ended(&HashSet::from([1])).is_empty());
     }
 
     #[test]
