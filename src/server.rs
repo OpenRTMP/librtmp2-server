@@ -320,6 +320,7 @@ impl ExportedRoutes {
             }
             if let Some(previous) = self.conn_routes.insert(conn_id, key.clone())
                 && previous != key
+                && self.routes.get(&previous) == Some(&conn_id)
             {
                 self.routes.remove(&previous);
                 ended.push(previous);
@@ -3238,6 +3239,31 @@ mod tests {
         assert_eq!(
             routes.take_ended(&HashSet::from([2])),
             vec![("live".to_string(), "b".to_string())]
+        );
+    }
+
+    #[test]
+    fn exported_routes_keep_reclaimed_route_when_old_owner_moves_away() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        routes.record(&[frame(1, "a")]);
+        // Conn 2 reclaims a, then conn 1 moves to b in the same batch: conn 1
+        // no longer owns a, so its move must not end a or drop conn 2's entry.
+        assert!(routes.record(&[frame(2, "a"), frame(1, "b")]).is_empty());
+        assert!(routes.take_ended(&HashSet::from([1, 2])).is_empty());
+        // Conn 2 stopping ends a; conn 1's b ended separately above.
+        assert_eq!(
+            routes.take_ended(&HashSet::from([1])),
+            vec![("live".to_string(), "a".to_string())]
         );
     }
 
