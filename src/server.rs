@@ -289,20 +289,37 @@ enum ShardRelayMsg {
 #[derive(Default)]
 struct ExportedRoutes {
     routes: HashMap<(String, String), u64>,
+    /// The route each connection currently exports, so a publish that
+    /// switches route on the same connection ends its previous route
+    /// instead of leaving the other shards' inject claim on it until the
+    /// stale timeout.
+    conn_routes: HashMap<u64, (String, String)>,
 }
 
 impl ExportedRoutes {
-    fn record(&mut self, frames: &[librtmp2::RelayFrame]) {
+    /// Records `frames` and returns the routes that ended because their
+    /// connection switched to a different route (publish rename).
+    fn record(&mut self, frames: &[librtmp2::RelayFrame]) -> Vec<(String, String)> {
+        let mut ended = Vec::new();
         for frame in frames {
             // Frames injected from elsewhere are never re-broadcast.
             if librtmp2::server::is_external_publisher_id(frame.publisher_conn_id) {
                 continue;
             }
+            let conn_id = frame.publisher_conn_id;
             let key = (frame.app.clone(), frame.stream_name.clone());
-            if self.routes.get(&key) != Some(&frame.publisher_conn_id) {
-                self.routes.insert(key, frame.publisher_conn_id);
+            if self.conn_routes.get(&conn_id) == Some(&key) {
+                continue;
+            }
+            if let Some(previous) = self.conn_routes.insert(conn_id, key.clone()) {
+                self.routes.remove(&previous);
+                ended.push(previous);
+            }
+            if self.routes.get(&key) != Some(&conn_id) {
+                self.routes.insert(key, conn_id);
             }
         }
+        ended
     }
 
     /// Removes and returns the routes whose publisher is no longer among
@@ -315,6 +332,11 @@ impl ExportedRoutes {
                 ended.push(route.clone());
             }
             live
+        });
+        // Drop per-connection entries with their route so a later republish
+        // on the same connection is recorded (and ended) again.
+        self.conn_routes.retain(|conn_id, route| {
+            publishing.contains(conn_id) && self.routes.get(route) == Some(conn_id)
         });
         ended
     }
@@ -2741,14 +2763,15 @@ impl ShardLoop {
         let Some(txs) = self.relay_txs.clone() else {
             return;
         };
-        self.exported_routes.record(frames);
+        let mut ended = self.exported_routes.record(frames);
         let publishing: HashSet<u64> = server
             .connections
             .iter()
             .filter(|c| c.state == librtmp2::types::ConnState::Publishing)
             .map(|c| c.conn_id)
             .collect();
-        for (app, stream_name) in self.exported_routes.take_ended(&publishing) {
+        ended.extend(self.exported_routes.take_ended(&publishing));
+        for (app, stream_name) in ended {
             for i in (0..txs.len()).filter(|&i| i != self.index) {
                 self.pending_route_ends
                     .push((i, app.clone(), stream_name.clone()));
