@@ -318,11 +318,11 @@ impl ExportedRoutes {
             {
                 continue;
             }
-            if let Some(previous) = self.conn_routes.insert(conn_id, key.clone()) {
-                if previous != key {
-                    self.routes.remove(&previous);
-                    ended.push(previous);
-                }
+            if let Some(previous) = self.conn_routes.insert(conn_id, key.clone())
+                && previous != key
+            {
+                self.routes.remove(&previous);
+                ended.push(previous);
             }
             if self.routes.get(&key) != Some(&conn_id) {
                 self.routes.insert(key, conn_id);
