@@ -58,9 +58,11 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq pkg-config libssl-dev >/dev/null
 cargo test --features cluster,test-support --test cluster_ha -- --nocapture > /src/cargo-cluster-ha.log 2>&1
-echo EXIT=$? >> /src/cargo-cluster-ha.log
+EXIT=$?
+echo EXIT=$EXIT >> /src/cargo-cluster-ha.log
 grep -E '^(test |failures:|error|EXIT=|thread )' /src/cargo-cluster-ha.log | tail -n 80
 tail -n 30 /src/cargo-cluster-ha.log
+exit $EXIT
 """
     cmd = [
         "docker",

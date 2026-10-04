@@ -754,6 +754,10 @@ impl SinkSender {
                 );
             }
         } else {
+            // The monitor only kills the FFmpeg child once `failed` is set;
+            // without it a worker blocked on a stalled child would leak both
+            // the child and the monitor thread.
+            self.failed.store(true, Ordering::Release);
             crate::log_warn!(
                 "Media output '{}' worker did not stop within 5s; continuing shutdown",
                 self.label

@@ -62,7 +62,7 @@ Set in `.env` or via `LRTMP2_CLUSTER_*` process overrides:
 | `CLUSTER_BOOTSTRAP` | `false` | First voter; mutually exclusive with JOIN |
 | `CLUSTER_JOIN` | — | Address of an existing control peer |
 | `CLUSTER_JOIN_PROOF` | — | Required for a fresh join; mint via authenticated `POST /api/v1/cluster/join-proof` |
-| `CLUSTER_SECRET` | — | Shared secret (≥16 chars); never logged |
+| `CLUSTER_SECRET` | — | Shared secret (32–256 ASCII letters, digits, `-` or `_`); never logged |
 | `CLUSTER_TLS_ENABLED` | `false` | mTLS for control/media when true |
 | `CLUSTER_TLS_CERT_FILE` / `KEY` / `CA` | — | Required if TLS enabled |
 | `CLUSTER_HEARTBEAT_MS` / `CLUSTER_HEARTBEAT_INTERVAL_MS` | `500` | Peer heartbeat interval |

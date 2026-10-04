@@ -289,20 +289,50 @@ enum ShardRelayMsg {
 #[derive(Default)]
 struct ExportedRoutes {
     routes: HashMap<(String, String), u64>,
+    /// The route each connection currently exports, so a publish that
+    /// switches route on the same connection ends its previous route
+    /// instead of leaving the other shards' inject claim on it until the
+    /// stale timeout.
+    conn_routes: HashMap<u64, (String, String)>,
 }
 
 impl ExportedRoutes {
-    fn record(&mut self, frames: &[librtmp2::RelayFrame]) {
+    /// Records `frames` and returns the routes that ended because their
+    /// connection switched to a different route (publish rename).
+    fn record(&mut self, frames: &[librtmp2::RelayFrame]) -> Vec<(String, String)> {
+        let mut ended = Vec::new();
         for frame in frames {
             // Frames injected from elsewhere are never re-broadcast.
             if librtmp2::server::is_external_publisher_id(frame.publisher_conn_id) {
                 continue;
             }
+            let conn_id = frame.publisher_conn_id;
             let key = (frame.app.clone(), frame.stream_name.clone());
-            if self.routes.get(&key) != Some(&frame.publisher_conn_id) {
-                self.routes.insert(key, frame.publisher_conn_id);
+            // Healthy fast path: this connection already owns this route.
+            // Anything else must repair the map like the base code did — a
+            // stale frame from a dead publisher may have overwritten the
+            // owner, and skipping the repair would emit a spurious RouteEnded
+            // for a route that is still being published.
+            if self.conn_routes.get(&conn_id) == Some(&key)
+                && self.routes.get(&key) == Some(&conn_id)
+            {
+                continue;
+            }
+            if let Some(previous) = self.conn_routes.insert(conn_id, key.clone())
+                && previous != key
+                && self.routes.get(&previous) == Some(&conn_id)
+            {
+                self.routes.remove(&previous);
+                ended.push(previous);
+            }
+            if self.routes.get(&key) != Some(&conn_id) {
+                self.routes.insert(key, conn_id);
             }
         }
+        // A route that was renamed away and then re-claimed later in the same
+        // batch is still live: do not announce its end.
+        ended.retain(|key| !self.routes.contains_key(key));
+        ended
     }
 
     /// Removes and returns the routes whose publisher is no longer among
@@ -315,6 +345,11 @@ impl ExportedRoutes {
                 ended.push(route.clone());
             }
             live
+        });
+        // Drop per-connection entries with their route so a later republish
+        // on the same connection is recorded (and ended) again.
+        self.conn_routes.retain(|conn_id, route| {
+            publishing.contains(conn_id) && self.routes.get(route) == Some(conn_id)
         });
         ended
     }
@@ -2741,14 +2776,15 @@ impl ShardLoop {
         let Some(txs) = self.relay_txs.clone() else {
             return;
         };
-        self.exported_routes.record(frames);
+        let mut ended = self.exported_routes.record(frames);
         let publishing: HashSet<u64> = server
             .connections
             .iter()
             .filter(|c| c.state == librtmp2::types::ConnState::Publishing)
             .map(|c| c.conn_id)
             .collect();
-        for (app, stream_name) in self.exported_routes.take_ended(&publishing) {
+        ended.extend(self.exported_routes.take_ended(&publishing));
+        for (app, stream_name) in ended {
             for i in (0..txs.len()).filter(|&i| i != self.index) {
                 self.pending_route_ends
                     .push((i, app.clone(), stream_name.clone()));
@@ -3148,6 +3184,87 @@ mod tests {
         let mut ended = routes.take_ended(&HashSet::new());
         ended.sort();
         assert_eq!(ended, vec![("live".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn exported_routes_repair_stale_overwrites_without_spurious_end() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        routes.record(&[frame(1, "a")]);
+        // A stale frame from a dead publisher overwrites the route owner.
+        routes.record(&[frame(2, "a")]);
+        // The live owner's next frame must repair the map without ending the
+        // route (regression: the fast path used to skip the repair).
+        assert!(routes.record(&[frame(1, "a")]).is_empty());
+        assert!(routes.take_ended(&HashSet::from([1])).is_empty());
+        // Renaming the same connection still ends the previous route.
+        assert_eq!(
+            routes.record(&[frame(1, "b")]),
+            vec![("live".to_string(), "a".to_string())]
+        );
+        assert!(routes.take_ended(&HashSet::from([1])).is_empty());
+    }
+
+    #[test]
+    fn exported_routes_do_not_end_routes_reclaimed_in_same_batch() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        // Conn 1 renames a -> b, then conn 2 claims a again, all in one batch:
+        // a must not be announced as ended (it is live under conn 2).
+        assert!(
+            routes
+                .record(&[frame(1, "a"), frame(1, "b"), frame(2, "a")])
+                .is_empty()
+        );
+        assert!(routes.take_ended(&HashSet::from([1, 2])).is_empty());
+        // Once conn 1 stops publishing, only its current route b ends.
+        assert_eq!(
+            routes.take_ended(&HashSet::from([2])),
+            vec![("live".to_string(), "b".to_string())]
+        );
+    }
+
+    #[test]
+    fn exported_routes_keep_reclaimed_route_when_old_owner_moves_away() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        routes.record(&[frame(1, "a")]);
+        // Conn 2 reclaims a, then conn 1 moves to b in the same batch: conn 1
+        // no longer owns a, so its move must not end a or drop conn 2's entry.
+        assert!(routes.record(&[frame(2, "a"), frame(1, "b")]).is_empty());
+        assert!(routes.take_ended(&HashSet::from([1, 2])).is_empty());
+        // Conn 2 stopping ends a; conn 1's b ended separately above.
+        assert_eq!(
+            routes.take_ended(&HashSet::from([1])),
+            vec![("live".to_string(), "a".to_string())]
+        );
     }
 
     #[test]
