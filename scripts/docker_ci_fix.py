@@ -39,7 +39,9 @@ cd /src
 cargo fmt
 cargo generate-lockfile
 cargo check --features test-support 2>&1 | tee /src/ci-fix.log | tail -n 60
-echo EXIT=$? >> /src/ci-fix.log
+EXIT=${PIPESTATUS[0]}
+echo EXIT=$EXIT >> /src/ci-fix.log
+exit $EXIT
 """
     r = subprocess.run(
         [
