@@ -531,7 +531,22 @@ impl ClusterManager {
             match join_action {
                 JoinReseedAction::ResumeExisting => {
                     mgr.refresh_topology_from_any(join_addr).await?;
-                    health.set_local(NodeHealthState::Ready);
+                    // A resumed learner must stay publish-gated; only promotion
+                    // to voter clears the gate (reconciled in
+                    // `prune_topology_to_membership`). The persisted membership
+                    // is the only source available before the metrics loop
+                    // starts; a missing/empty one keeps the learner gate.
+                    let is_voter = mgr
+                        .state_machine
+                        .last_membership()
+                        .membership()
+                        .voter_ids()
+                        .any(|id| id == config.node_id);
+                    health.set_local(if is_voter {
+                        NodeHealthState::Ready
+                    } else {
+                        NodeHealthState::Learner
+                    });
                     crate::log_info!(
                         "Cluster: resuming existing member node {} (CLUSTER_JOIN set but local raft state present)",
                         config.node_id
@@ -1004,6 +1019,7 @@ impl ClusterManager {
         }
         self.media.disconnect_peer(node_id);
         self.meta.remove(node_id);
+        self.health.remove(node_id);
         self.network.nodes.write().remove(&node_id);
         crate::log_info!("Cluster: removed node {node_id}");
         Ok(())
