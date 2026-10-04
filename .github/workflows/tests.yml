@@ -30,7 +30,7 @@ jobs:
       run: cargo clippy --all-targets --features test-support -- -D warnings
 
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked --verbose
 
     - name: Run tests
       run: cargo test --verbose --features test-support -- --test-threads=1
