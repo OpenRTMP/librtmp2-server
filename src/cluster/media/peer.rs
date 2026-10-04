@@ -548,9 +548,7 @@ pub async fn accept_auth_negotiated<S: AsyncRead + AsyncWrite + Unpin>(
 
     let hello = tokio::time::timeout(AUTH_TIMEOUT, read_media_frame(stream))
         .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "media hello timeout")
-        })??;
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "media hello timeout"))??;
     let MediaMessage::Hello {
         version,
         node_id: hello_id,
