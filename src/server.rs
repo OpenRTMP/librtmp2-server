@@ -328,6 +328,9 @@ impl ExportedRoutes {
                 self.routes.insert(key, conn_id);
             }
         }
+        // A route that was renamed away and then re-claimed later in the same
+        // batch is still live: do not announce its end.
+        ended.retain(|key| !self.routes.contains_key(key));
         ended
     }
 
@@ -3208,6 +3211,34 @@ mod tests {
             vec![("live".to_string(), "a".to_string())]
         );
         assert!(routes.take_ended(&HashSet::from([1])).is_empty());
+    }
+
+    #[test]
+    fn exported_routes_do_not_end_routes_reclaimed_in_same_batch() {
+        use super::ExportedRoutes;
+        let frame = |conn_id: u64, stream: &str| librtmp2::RelayFrame {
+            frame_type: librtmp2::types::FrameType::Video,
+            timestamp: 0,
+            payload: Vec::new(),
+            cache_payload: None,
+            app: "live".to_string(),
+            stream_name: stream.to_string(),
+            publisher_conn_id: conn_id,
+        };
+        let mut routes = ExportedRoutes::default();
+        // Conn 1 renames a -> b, then conn 2 claims a again, all in one batch:
+        // a must not be announced as ended (it is live under conn 2).
+        assert!(
+            routes
+                .record(&[frame(1, "a"), frame(1, "b"), frame(2, "a")])
+                .is_empty()
+        );
+        assert!(routes.take_ended(&HashSet::from([1, 2])).is_empty());
+        // Once conn 1 stops publishing, only its current route b ends.
+        assert_eq!(
+            routes.take_ended(&HashSet::from([2])),
+            vec![("live".to_string(), "b".to_string())]
+        );
     }
 
     #[test]
