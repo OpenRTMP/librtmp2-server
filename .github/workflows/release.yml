@@ -26,6 +26,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --all-features --format-version 1 > /dev/null
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build (release)
@@ -45,6 +48,9 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --all-features --format-version 1 > /dev/null
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
