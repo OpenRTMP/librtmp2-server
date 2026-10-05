@@ -65,7 +65,9 @@ def parse_log(text: str) -> dict:
         server, kind, players = section
         if kind in ("handshake", "play handshake"):
             row = [cur.get(k) for k in ("rate", "avg", "p50", "p95", "p99")]
-            if None not in row and cur.get("ok", 0) > 0:
+            # Only complete samples: a server that dropped some of the handshakes must
+            # not be published as an apparently valid result.
+            if None not in row and cur.get("ok", 0) > 0 and cur.get("failed", 0) == 0:
                 target = "handshake" if kind == "handshake" else "play_handshake"
                 sweep[target][server] = row
         elif kind == "relay":
@@ -95,6 +97,7 @@ def parse_log(text: str) -> dict:
             cur["avg"], cur["p50"], cur["p95"], cur["p99"] = (float(x) for x in m.groups())
         elif line.startswith("ok="):
             cur["ok"] = int(_kv(line, "ok") or 0)
+            cur["failed"] = int(_kv(line, "failed") or 0)
             cur["rate"] = _kv(line, "handshakes_per_s")
         elif line.startswith("steady-state"):
             cur["fps"] = _kv(line, "avg_fps_per_player")

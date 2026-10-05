@@ -99,9 +99,24 @@ jobs:
         if: env.RUN_SWEEP == 'true'
         run: |
           ver="$(awk '/^name = "librtmp2"$/ {getline; gsub(/[^0-9.]/, "", $3); print $3; exit}' Cargo.lock)"
-          echo "librtmp2 ${ver:-unknown} per Cargo.lock"
-          git clone --quiet --depth 1 --branch "v$ver" https://github.com/OpenRTMP/librtmp2 librtmp2-lib \
-            || git clone --quiet --depth 1 https://github.com/OpenRTMP/librtmp2 librtmp2-lib
+          if [ -z "$ver" ]; then
+            echo "::error::could not read the librtmp2 version from Cargo.lock"
+            exit 1
+          fi
+          echo "librtmp2 $ver per Cargo.lock"
+          # No fallback to the default branch: the report names this version, so the
+          # client must really be that version. Retry transient network errors only.
+          for attempt in 1 2 3; do
+            rm -rf librtmp2-lib
+            if git clone --quiet --depth 1 --branch "v$ver" https://github.com/OpenRTMP/librtmp2 librtmp2-lib; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::could not clone OpenRTMP/librtmp2 at v$ver"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
 
       - name: Build benchmark client and server
         if: env.RUN_SWEEP == 'true'
@@ -116,8 +131,8 @@ jobs:
           base="https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VERSION"
           mkdir -p "$RUNNER_TEMP/mediamtx" && cd "$RUNNER_TEMP/mediamtx"
           curl -fsSLO "$base/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz"
-          curl -fsSLO "$base/mediamtx_${MEDIAMTX_VERSION}_checksums.sha256"
-          grep " mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz\$" "mediamtx_${MEDIAMTX_VERSION}_checksums.sha256" | sha256sum -c -
+          curl -fsSLO "$base/checksums.sha256"
+          grep "[ *]mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz\$" checksums.sha256 | sha256sum -c -
           tar xzf "mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" mediamtx
           echo "MEDIAMTX_BIN=$PWD/mediamtx" >> "$GITHUB_ENV"
 

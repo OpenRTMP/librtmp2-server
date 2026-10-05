@@ -221,7 +221,9 @@ def cmd_collect(args: argparse.Namespace) -> None:
         "kind": args.kind,
         "version": cargo_version(workspace_path(args.cargo_toml)),
         "tag": args.tag or None,
-        "commit": os.environ.get("GITHUB_SHA") or _run("git", "rev-parse", "HEAD"),
+        # The checked-out commit, not GITHUB_SHA: in a reusable workflow GITHUB_SHA is the
+        # caller's, which differs from the benchmarked tag on a manual release run.
+        "commit": _run("git", "rev-parse", "HEAD") or os.environ.get("GITHUB_SHA", ""),
         "date": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "run_url": f"{server}/{repo}/actions/runs/{run_id}" if run_id else None,
         "deps": {},
@@ -241,7 +243,14 @@ def cmd_collect(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------
 
 def _version_key(name: str) -> tuple:
-    return tuple(int(p) if p.isdigit() else 0 for p in re.split(r"[.\-]", name.lstrip("v")))
+    """Sort key following semver precedence: 1.0.0-rc.1 < 1.0.0 < 1.0.1."""
+    core, _, pre = name.lstrip("v").partition("-")
+    nums = tuple(int(p) if p.isdigit() else 0 for p in core.split("."))
+    if not pre:
+        return (nums, 1, ())
+    # Numeric prerelease identifiers sort below alphanumeric ones.
+    ids = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in re.split(r"[.\-]", pre))
+    return (nums, 0, ids)
 
 
 def cmd_baselines(args: argparse.Namespace) -> None:
