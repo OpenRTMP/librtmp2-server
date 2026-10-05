@@ -2197,10 +2197,6 @@ impl ClusterManager {
             };
             self.media.evict_init_cache(&app, sid);
         }
-        // Ownership change invalidates the timeline remappers too (a new owner
-        // restarts its ts at 0); without this the map retains an entry per
-        // (app, stream) forever.
-        self.media.reset_timelines_for(&ids);
         self.resubscribe_active_players(&ids);
     }
 
