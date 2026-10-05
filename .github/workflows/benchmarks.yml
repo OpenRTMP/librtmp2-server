@@ -202,8 +202,8 @@ jobs:
       # ---- results -------------------------------------------------------------
       - name: Collect results
         run: |
-          python3 scripts/bench_report.py collect --suite http_api=crit-http \
-            --repo OpenRTMP/librtmp2-server --kind "$KIND" --tag "$TAG" --out results.json
+          python3 scripts/bench_report.py collect --suite http_api \
+            --repo OpenRTMP/librtmp2-server --kind "$KIND" --tag "$TAG"
 
       - name: Add the sweep to the results
         if: env.RUN_SWEEP == 'true'
@@ -214,7 +214,7 @@ jobs:
           nginx_v="$(dpkg-query -W -f='${Version}' nginx 2>/dev/null | cut -d- -f1 | cut -d+ -f1)"
           rtmp_v="$(dpkg-query -W -f='${Version}' libnginx-mod-rtmp 2>/dev/null | cut -d- -f1 | cut -d+ -f1)"
           lib_v="$(jq -r '.deps.librtmp2 // "unknown"' results.json)"
-          python3 scripts/bench_sweep.py merge --results results.json --log sweep.log \
+          python3 scripts/bench_sweep.py merge \
             --version "openrtmp=$(jq -r .version results.json)|librtmp2 $lib_v|Rust" \
             --version "mediamtx=$MEDIAMTX_VERSION||Go" \
             --version "liveforge=main @ ${LIVEFORGE_REF::7}||Go" \
@@ -227,14 +227,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/bench_report.py baselines --out-dir baselines --exclude-tag "$TAG"
+          python3 scripts/bench_report.py baselines --exclude-tag "$TAG"
 
       - name: Compare
         run: |
-          args=(--current results.json --mode "$KIND" --out comparison.md)
-          [ -f baselines/release.json ] && args+=(--release baselines/release.json)
-          [ -f baselines/previous.json ] && args+=(--previous baselines/previous.json)
-          python3 scripts/bench_report.py compare "${args[@]}" \
+          python3 scripts/bench_report.py compare --mode "$KIND" \
             --heading "### Benchmarks ($KIND run)"
           cat comparison.md >> "$GITHUB_STEP_SUMMARY"
           cat comparison.md
@@ -277,7 +274,7 @@ jobs:
         run: |
           # Heading and explanation are static text above the markers.
           sed '1,2d' comparison.md > ci-block.md
-          python3 scripts/bench_report.py splice --target ci --file BENCHMARKS.md --fragment ci-block.md
+          python3 scripts/bench_report.py splice --target ci
 
       - name: Commit BENCHMARKS.md
         run: |
@@ -331,7 +328,7 @@ jobs:
             sed '1,2d' comparison.md
           } > release-block.md
           gh release view "$TAG" --json body --jq .body > body.md
-          python3 scripts/bench_report.py splice --target release --file body.md --fragment release-block.md
+          python3 scripts/bench_report.py splice --target release
           gh release edit "$TAG" --notes-file body.md
 
       - name: Store under releases/ on bench-data

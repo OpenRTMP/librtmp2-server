@@ -3,8 +3,8 @@
 
 `scripts/run_rtmp_benchmarks.sh` prints human-readable sections. This module
 
-  * `merge`  parses that log into the `sweep` key of a results JSON written by
-             `bench_report.py collect`, and
+  * `merge`  parses sweep.log into the `sweep` key of results.json (written by
+             `bench_report.py collect`), and
   * plugs the cross-server tables plus librtmp2-server's change against the
     last release / last `main` run into `bench_report.py compare`.
 
@@ -24,6 +24,7 @@ import argparse
 import json
 import re
 import sys
+from pathlib import Path
 
 # Section labels used by run_rtmp_benchmarks.sh -> website server keys.
 SERVER_KEYS = {
@@ -108,12 +109,14 @@ def parse_log(text: str) -> dict:
     return sweep
 
 
-def cmd_merge(args: argparse.Namespace) -> int:
-    from bench_report import workspace_path  # same directory
+SWEEP_LOG = Path("sweep.log")  # written by the workflow; fixed name, no path on the command line
 
-    results_path = workspace_path(args.results)
-    results = json.loads(results_path.read_text())
-    sweep = parse_log(workspace_path(args.log).read_text(errors="replace"))
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    from bench_report import RESULTS_FILE  # same directory
+
+    results = json.loads(RESULTS_FILE.read_text())
+    sweep = parse_log(SWEEP_LOG.read_text(errors="replace"))
     versions = {}
     for spec in args.version:
         key, _, rest = spec.partition("=")
@@ -122,7 +125,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     sweep["versions"] = versions
     sweep["params"] = dict(p.split("=", 1) for p in args.param)
     results["sweep"] = sweep
-    results_path.write_text(json.dumps(results, indent=1) + "\n")
+    RESULTS_FILE.write_text(json.dumps(results, indent=1) + "\n")
     servers = sorted({s for k in ("handshake", "play_handshake") for s in sweep[k]})
     print(
         f"sweep: servers={servers} join={sorted(sweep['join'])} load={sorted(sweep['load'])}"
@@ -273,8 +276,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("merge")
-    p.add_argument("--results", required=True)
-    p.add_argument("--log", required=True)
     p.add_argument("--version", action="append", default=[], metavar="KEY=VERSION|DETAIL|LANGUAGE")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
     p.set_defaults(fn=cmd_merge)

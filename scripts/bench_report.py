@@ -6,13 +6,16 @@ a stock GitHub runner without installing anything.
 
 Sub-commands
 ------------
-collect     Criterion output directories -> one results JSON (with the
-            hardware/software environment of the machine that ran them).
+collect     Criterion output (crit-protocol, crit-relay, crit-http) -> results.json
+            (with the hardware/software environment of the machine that ran it).
 baselines   Fetch the comparison baselines (last release, last `main` run)
-            from the `bench-data` branch.
-compare     Render results (+ deltas against the baselines) as Markdown.
-splice      Replace a marker-delimited block in a Markdown file (BENCHMARKS.md,
-            a GitHub release body) with generated Markdown.
+            from the `bench-data` branch into baselines/.
+compare     results.json (+ deltas against baselines/) -> comparison.md.
+splice      Replace a marker-delimited block in BENCHMARKS.md (`ci`) or in a
+            GitHub release body, body.md (`release`) with generated Markdown.
+
+All file names are fixed (see the constants below); the command line carries
+no paths.
 
 Results are stored on the orphan branch `bench-data`:
     latest.json            newest run on `main` (overwritten on every merge)
@@ -44,13 +47,20 @@ RELEASE_START = "<!-- bench-release:start -->"
 RELEASE_END = "<!-- bench-release:end -->"
 
 
-def workspace_path(value: str) -> Path:
-    """Resolve a command-line path, refusing anything outside the working directory."""
-    root = os.path.realpath(os.getcwd())
-    full = os.path.realpath(os.path.join(root, value))
-    if full != root and not full.startswith(root + os.sep):
-        raise SystemExit(f"error: {value} is outside the working directory")
-    return Path(full)
+# Fixed file names. The workflow and this script agree on them, so no file path
+# ever comes from the command line (nothing to traverse, nothing to validate).
+RESULTS_FILE = Path("results.json")
+COMPARISON_FILE = Path("comparison.md")
+BASELINE_DIR = Path("baselines")
+CARGO_TOML = Path("Cargo.toml")
+CARGO_LOCK = Path("Cargo.lock")
+# Criterion output of each suite, moved aside by the workflow after its bench run.
+SUITE_DIRS = {"protocol": Path("crit-protocol"), "relay": Path("crit-relay"), "http_api": Path("crit-http")}
+# splice target -> (file to update, generated fragment, start marker, end marker)
+SPLICE_TARGETS = {
+    "ci": (Path("BENCHMARKS.md"), Path("ci-block.md"), CI_START, CI_END),
+    "release": (Path("body.md"), Path("release-block.md"), RELEASE_START, RELEASE_END),
+}
 
 
 # --------------------------------------------------------------------------
@@ -207,11 +217,12 @@ def lock_version(cargo_lock: Path, package: str) -> str | None:
 
 def cmd_collect(args: argparse.Namespace) -> None:
     suites = {}
-    for spec in args.suite:
-        name, _, path = spec.partition("=")
-        suites[name] = read_criterion(workspace_path(path))
+    for name, directory in SUITE_DIRS.items():
+        if name not in args.suite:
+            continue
+        suites[name] = read_criterion(directory)
         if not suites[name]:
-            print(f"warning: no Criterion results under {path}", file=sys.stderr)
+            print(f"warning: no Criterion results under {directory}", file=sys.stderr)
     repo = os.environ.get("GITHUB_REPOSITORY", args.repo)
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     run_id = os.environ.get("GITHUB_RUN_ID")
@@ -219,7 +230,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
         "schema": SCHEMA,
         "repo": repo,
         "kind": args.kind,
-        "version": cargo_version(workspace_path(args.cargo_toml)),
+        "version": cargo_version(CARGO_TOML),
         "tag": args.tag or None,
         # The checked-out commit, not GITHUB_SHA: in a reusable workflow GITHUB_SHA is the
         # caller's, which differs from the benchmarked tag on a manual release run.
@@ -230,12 +241,11 @@ def cmd_collect(args: argparse.Namespace) -> None:
         "environment": environment(),
         "suites": suites,
     }
-    lib = lock_version(workspace_path(args.cargo_lock), "librtmp2")
+    lib = lock_version(CARGO_LOCK, "librtmp2")
     if lib and result["repo"].endswith("-server"):
         result["deps"]["librtmp2"] = lib
-    # Path is from our own CI step and confined to the working directory by workspace_path().
-    workspace_path(args.out).write_text(json.dumps(result, indent=1) + "\n")  # NOSONAR(pythonsecurity:S2083)
-    print(f"wrote {args.out}: {sum(len(s) for s in suites.values())} benchmarks")
+    RESULTS_FILE.write_text(json.dumps(result, indent=1) + "\n")
+    print(f"wrote {RESULTS_FILE}: {sum(len(s) for s in suites.values())} benchmarks")
 
 
 # --------------------------------------------------------------------------
@@ -254,8 +264,8 @@ def _version_key(name: str) -> tuple:
 
 
 def cmd_baselines(args: argparse.Namespace) -> None:
-    """Write DIR/previous.json (last main run) and DIR/release.json (last release)."""
-    out = workspace_path(args.out_dir)
+    """Write baselines/previous.json (last main run) and baselines/release.json (last release)."""
+    out = BASELINE_DIR
     out.mkdir(parents=True, exist_ok=True)
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     git = ["git"]
@@ -330,10 +340,8 @@ def delta_cell(cur: float, base: float | None, noise: float, lower_better: bool 
     return f"{'🟢' if better else '🔴'} {text}"
 
 
-def load_json(path: str | None) -> dict | None:
-    if path and workspace_path(path).exists():
-        return json.loads(workspace_path(path).read_text())
-    return None
+def load_json(path: Path) -> dict | None:
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def ref_name(r: dict) -> str:
@@ -433,20 +441,16 @@ EXTRA_SECTIONS: list = []
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
-    cur = json.loads(workspace_path(args.current).read_text())
-    release = load_json(args.release)
-    previous = load_json(args.previous)
+    cur = json.loads(RESULTS_FILE.read_text())
+    release = load_json(BASELINE_DIR / "release.json")
+    previous = load_json(BASELINE_DIR / "previous.json")
     if args.mode == "release":
         previous = None  # a release is compared to the last release only
     if release and release.get("tag") == cur.get("tag") and cur.get("tag"):
         release = None
     heading = args.heading or f"### CI benchmarks — {cur['repo'].split('/')[-1]}"
-    md = render(cur, release, previous, heading)
-    if args.out:
-        # Path is from our own CI step and confined to the working directory by workspace_path().
-        workspace_path(args.out).write_text(md)  # NOSONAR(pythonsecurity:S2083)
-    else:
-        sys.stdout.write(md)
+    COMPARISON_FILE.write_text(render(cur, release, previous, heading))
+    print(f"wrote {COMPARISON_FILE}")
 
 
 # --------------------------------------------------------------------------
@@ -470,14 +474,14 @@ def splice_text(text: str, fragment: str, start: str, end: str) -> str:
 
 
 def cmd_splice(args: argparse.Namespace) -> int:
-    start, end = (RELEASE_START, RELEASE_END) if args.target == "release" else (CI_START, CI_END)
-    path = workspace_path(args.file)
-    text = path.read_text() if path.exists() else ""
-    if args.target == "ci" and (start not in text or end not in text):
-        print(f"error: {path} has no {start} … {end} block", file=sys.stderr)
-        return 1
-    # Path is from our own CI step and confined to the working directory by workspace_path().
-    path.write_text(splice_text(text, workspace_path(args.fragment).read_text(), start, end))  # NOSONAR(pythonsecurity:S2083)
+    for target, (path, fragment, start, end) in SPLICE_TARGETS.items():
+        if target != args.target:
+            continue
+        text = path.read_text() if path.exists() else ""
+        if target == "ci" and (start not in text or end not in text):
+            print(f"error: {path} has no {start} … {end} block", file=sys.stderr)
+            return 1
+        path.write_text(splice_text(text, fragment.read_text(), start, end))
     return 0
 
 
@@ -492,35 +496,25 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("collect")
-    p.add_argument("--suite", action="append", default=[], metavar="NAME=CRITERION_DIR")
+    p = sub.add_parser("collect", help="Criterion output (crit-*) -> results.json")
+    p.add_argument("--suite", action="append", default=[], choices=sorted(SUITE_DIRS))
     p.add_argument("--kind", required=True, choices=["main", "release", "manual", "pr"])
     p.add_argument("--tag", default="")
     p.add_argument("--repo", default="OpenRTMP/librtmp2")
-    p.add_argument("--cargo-toml", default="Cargo.toml")
-    p.add_argument("--cargo-lock", default="Cargo.lock")
-    p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_collect)
 
-    p = sub.add_parser("baselines")
-    p.add_argument("--out-dir", required=True)
+    p = sub.add_parser("baselines", help="fetch baselines/previous.json and baselines/release.json")
     p.add_argument("--exclude-tag", default="")
     p.add_argument("--skip-previous", action="store_true")
     p.set_defaults(fn=cmd_baselines)
 
-    p = sub.add_parser("compare")
-    p.add_argument("--current", required=True)
-    p.add_argument("--release")
-    p.add_argument("--previous")
+    p = sub.add_parser("compare", help="results.json + baselines/ -> comparison.md")
     p.add_argument("--mode", choices=["main", "release", "manual", "pr"], default="manual")
     p.add_argument("--heading")
-    p.add_argument("--out")
     p.set_defaults(fn=cmd_compare)
 
-    p = sub.add_parser("splice")
-    p.add_argument("--target", choices=["ci", "release"], required=True)
-    p.add_argument("--file", required=True)
-    p.add_argument("--fragment", required=True)
+    p = sub.add_parser("splice", help="insert the generated fragment into BENCHMARKS.md or body.md")
+    p.add_argument("--target", choices=sorted(SPLICE_TARGETS), required=True)
     p.set_defaults(fn=cmd_splice)
 
     args = ap.parse_args()
