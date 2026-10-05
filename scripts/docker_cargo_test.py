@@ -76,6 +76,9 @@ exit 0
         "-c",
         bash,
     ]
+    stale_log = os.path.join(DEST, LOG_NAME)
+    if os.path.exists(stale_log):
+        os.remove(stale_log)
     print("running docker cargo test...", flush=True)
     r = subprocess.run(cmd)
     src_log = os.path.join(DEST, LOG_NAME)
