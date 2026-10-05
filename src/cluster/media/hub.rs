@@ -920,8 +920,12 @@ impl MediaHub {
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
                     }
                     MediaMessage::Unsubscribe { app, stream } => {
-                        self.subs.remove(peer_id, &app, &stream);
+                        // Release only a ref this connection actually holds
+                        // (same invariant as teardown below): an Unsubscribe
+                        // with no matching Subscribe must not drain refs held
+                        // by other subscribers of the same stream.
                         if let Some(c) = conn_subs.get_mut(&(app.clone(), stream.clone())) {
+                            self.subs.remove(peer_id, &app, &stream);
                             *c = c.saturating_sub(1);
                             if *c == 0 {
                                 conn_subs.remove(&(app, stream));
