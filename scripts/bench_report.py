@@ -57,6 +57,12 @@ CARGO_LOCK = Path("Cargo.lock")
 # Criterion output of each suite, moved aside by the workflow after its bench run.
 SUITE_DIRS = {"protocol": Path("crit-protocol"), "relay": Path("crit-relay"), "http_api": Path("crit-http")}
 # splice target -> (file to update, generated fragment, start marker, end marker)
+def write_file(path: Path, content: str) -> None:
+    """Write generated text to one of the fixed output files."""
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+
+
 SPLICE_TARGETS = {
     "ci": (Path("BENCHMARKS.md"), Path("ci-block.md"), CI_START, CI_END),
     "release": (Path("body.md"), Path("release-block.md"), RELEASE_START, RELEASE_END),
@@ -244,7 +250,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
     lib = lock_version(CARGO_LOCK, "librtmp2")
     if lib and result["repo"].endswith("-server"):
         result["deps"]["librtmp2"] = lib
-    RESULTS_FILE.write_text(json.dumps(result, indent=1) + "\n")
+    write_file(RESULTS_FILE, json.dumps(result, indent=1) + "\n")
     print(f"wrote {RESULTS_FILE}: {sum(len(s) for s in suites.values())} benchmarks")
 
 
@@ -290,7 +296,7 @@ def cmd_baselines(args: argparse.Namespace) -> None:
 
     prev = show("latest.json")
     if prev and not args.skip_previous:
-        (out / "previous.json").write_text(prev)
+        write_file(out / "previous.json", prev)
         print("baseline: previous main run")
     names = _run("git", "ls-tree", "--name-only", ref, "releases/").splitlines()
     tags = sorted(
@@ -301,7 +307,7 @@ def cmd_baselines(args: argparse.Namespace) -> None:
     if tags:
         text = show(f"releases/{tags[-1]}.json")
         if text:
-            (out / "release.json").write_text(text)
+            write_file(out / "release.json", text)
             print(f"baseline: last release {tags[-1]}")
 
 
@@ -449,7 +455,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     if release and release.get("tag") == cur.get("tag") and cur.get("tag"):
         release = None
     heading = args.heading or f"### CI benchmarks — {cur['repo'].split('/')[-1]}"
-    COMPARISON_FILE.write_text(render(cur, release, previous, heading))
+    write_file(COMPARISON_FILE, render(cur, release, previous, heading))
     print(f"wrote {COMPARISON_FILE}")
 
 
@@ -481,7 +487,7 @@ def cmd_splice(args: argparse.Namespace) -> int:
         if target == "ci" and (start not in text or end not in text):
             print(f"error: {path} has no {start} … {end} block", file=sys.stderr)
             return 1
-        path.write_text(splice_text(text, fragment.read_text(), start, end))
+        write_file(path, splice_text(text, fragment.read_text(), start, end))
     return 0
 
 

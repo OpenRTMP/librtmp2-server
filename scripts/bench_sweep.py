@@ -147,14 +147,14 @@ def _parse_versions(specs: list[str]) -> dict:
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
-    from bench_report import RESULTS_FILE  # same directory
+    from bench_report import RESULTS_FILE, write_file  # same directory
 
     results = json.loads(RESULTS_FILE.read_text())
     sweep = parse_log(SWEEP_LOG.read_text(errors="replace"))
     sweep["versions"] = _parse_versions(args.version)
     sweep["params"] = {key: value for key, _, value in (p.partition("=") for p in args.param)}
     results["sweep"] = sweep
-    RESULTS_FILE.write_text(json.dumps(results, indent=1) + "\n")
+    write_file(RESULTS_FILE, json.dumps(results, indent=1) + "\n")
     servers = sorted({s for k in ("handshake", "play_handshake") for s in sweep[k]})
     print(f"sweep: servers={servers} join={sorted(sweep['join'])} load={sorted(sweep['load'])}")
     if "openrtmp" not in sweep["handshake"] or not sweep["load"]:
