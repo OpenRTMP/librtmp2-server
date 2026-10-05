@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
 import os
 import platform
@@ -41,6 +42,15 @@ CI_START = "<!-- ci-bench:start -->"
 CI_END = "<!-- ci-bench:end -->"
 RELEASE_START = "<!-- bench-release:start -->"
 RELEASE_END = "<!-- bench-release:end -->"
+
+
+def workspace_path(value: str) -> Path:
+    """Resolve a command-line path, refusing anything outside the working directory."""
+    root = os.path.realpath(os.getcwd())
+    full = os.path.realpath(os.path.join(root, value))
+    if os.path.commonpath([root, full]) != root:
+        raise SystemExit(f"error: {value} is outside the working directory")
+    return Path(full)
 
 
 # --------------------------------------------------------------------------
@@ -61,43 +71,53 @@ def _run(*cmd: str) -> str:
         return ""
 
 
-def environment() -> dict:
-    """Describe the machine that produced the numbers."""
-    cpu = ""
+def _cpu_model() -> str:
     for line in _read("/proc/cpuinfo").splitlines():
         if line.lower().startswith("model name"):
-            cpu = line.split(":", 1)[1].strip()
-            break
-    cpu = re.sub(r"\s+", " ", cpu) or platform.processor() or "unknown CPU"
-    mem_kib = 0
+            model = line.split(":", 1)[1].strip()
+            return re.sub(r"\s+", " ", model)
+    return platform.processor() or "unknown CPU"
+
+
+def _mem_gib() -> float:
     for line in _read("/proc/meminfo").splitlines():
         if line.startswith("MemTotal:"):
-            mem_kib = int(line.split()[1])
-            break
+            return round(int(line.split()[1]) / 1048576, 1)
+    return 0.0
+
+
+def _vcpus() -> int:
     try:
-        vcpus = len(os.sched_getaffinity(0))
+        return len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
-        vcpus = os.cpu_count() or 0
+        return os.cpu_count() or 0
+
+
+def _runner() -> tuple[str, bool]:
+    """(description, is a shared CI VM)"""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return "local machine", False
     hosted = os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        image = os.environ.get("ImageOS", "")
-        version = os.environ.get("ImageVersion", "")
-        runner = ("GitHub-hosted " if hosted else "self-hosted ") + (image or "runner")
-        if version:
-            runner += f" (image {version})"
-    else:
-        runner = "local machine"
-        hosted = False
+    runner = ("GitHub-hosted " if hosted else "self-hosted ") + (os.environ.get("ImageOS") or "runner")
+    version = os.environ.get("ImageVersion")
+    if version:
+        runner += f" (image {version})"
+    return runner, True
+
+
+def environment() -> dict:
+    """Describe the machine that produced the numbers."""
+    runner, shared = _runner()
     rustc = _run("rustc", "--version")
     m = re.match(r"rustc (\S+)", rustc)
     return {
-        "cpu": cpu,
-        "vcpus": vcpus,
-        "ram_gib": round(mem_kib / 1048576, 1),
+        "cpu": _cpu_model(),
+        "vcpus": _vcpus(),
+        "ram_gib": _mem_gib(),
         "kernel": f"{platform.system()} {platform.release()} {platform.machine()}",
         "rustc": m.group(1) if m else rustc,
         "runner": runner,
-        "shared_vm": hosted or os.environ.get("GITHUB_ACTIONS") == "true",
+        "shared_vm": shared,
     }
 
 
@@ -185,11 +205,11 @@ def lock_version(cargo_lock: Path, package: str) -> str | None:
     return m.group(1) if m else None
 
 
-def cmd_collect(args: argparse.Namespace) -> int:
+def cmd_collect(args: argparse.Namespace) -> None:
     suites = {}
     for spec in args.suite:
         name, _, path = spec.partition("=")
-        suites[name] = read_criterion(Path(path))
+        suites[name] = read_criterion(workspace_path(path))
         if not suites[name]:
             print(f"warning: no Criterion results under {path}", file=sys.stderr)
     repo = os.environ.get("GITHUB_REPOSITORY", args.repo)
@@ -199,7 +219,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "schema": SCHEMA,
         "repo": repo,
         "kind": args.kind,
-        "version": cargo_version(Path(args.cargo_toml)),
+        "version": cargo_version(workspace_path(args.cargo_toml)),
         "tag": args.tag or None,
         "commit": os.environ.get("GITHUB_SHA") or _run("git", "rev-parse", "HEAD"),
         "date": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -208,12 +228,11 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "environment": environment(),
         "suites": suites,
     }
-    lib = lock_version(Path(args.cargo_lock), "librtmp2")
+    lib = lock_version(workspace_path(args.cargo_lock), "librtmp2")
     if lib and result["repo"].endswith("-server"):
         result["deps"]["librtmp2"] = lib
-    Path(args.out).write_text(json.dumps(result, indent=1) + "\n")
+    workspace_path(args.out).write_text(json.dumps(result, indent=1) + "\n")
     print(f"wrote {args.out}: {sum(len(s) for s in suites.values())} benchmarks")
-    return 0
 
 
 # --------------------------------------------------------------------------
@@ -224,9 +243,9 @@ def _version_key(name: str) -> tuple:
     return tuple(int(p) if p.isdigit() else 0 for p in re.split(r"[.\-]", name.lstrip("v")))
 
 
-def cmd_baselines(args: argparse.Namespace) -> int:
+def cmd_baselines(args: argparse.Namespace) -> None:
     """Write DIR/previous.json (last main run) and DIR/release.json (last release)."""
-    out = Path(args.out_dir)
+    out = workspace_path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     git = ["git"]
@@ -242,7 +261,7 @@ def cmd_baselines(args: argparse.Namespace) -> int:
     )
     if fetch.returncode != 0:
         print(f"note: no {DATA_BRANCH} branch yet ({fetch.stderr.strip()})")
-        return 0
+        return
     ref = f"origin/{DATA_BRANCH}"
 
     def show(path: str) -> str | None:
@@ -264,7 +283,6 @@ def cmd_baselines(args: argparse.Namespace) -> int:
         if text:
             (out / "release.json").write_text(text)
             print(f"baseline: last release {tags[-1]}")
-    return 0
 
 
 # --------------------------------------------------------------------------
@@ -303,8 +321,8 @@ def delta_cell(cur: float, base: float | None, noise: float, lower_better: bool 
 
 
 def load_json(path: str | None) -> dict | None:
-    if path and Path(path).exists():
-        return json.loads(Path(path).read_text())
+    if path and workspace_path(path).exists():
+        return json.loads(workspace_path(path).read_text())
     return None
 
 
@@ -346,14 +364,23 @@ def header_md(cur: dict, extra_bases: list[tuple[str, dict]]) -> list[str]:
     return lines
 
 
+def _suite_row(suite: str, name: str, b: dict, bases: list[tuple[str, dict]], floors: list[float]) -> str:
+    cells = ""
+    for (_, base), floor in zip(bases, floors):
+        old = base["suites"].get(suite, {}).get(name)
+        noise = floor + b["ci_rel"] + (old["ci_rel"] if old else 0)
+        cells += f" {delta_cell(b['ns'], old['ns'] if old else None, noise)} |"
+    return f"| `{name}` | {fmt_time(b['ns'])} | {fmt_throughput(b)} |{cells}"
+
+
 def suite_tables_md(cur: dict, bases: list[tuple[str, dict]]) -> list[str]:
     """One table per suite; one delta column per baseline."""
     lines: list[str] = []
     floors = [comparability(cur, b)[1] for _, b in bases]
+    cols = "".join(f" {label} |" for label, _ in bases)
     for suite, benches in cur["suites"].items():
         if not benches:
             continue
-        cols = "".join(f" {label} |" for label, _ in bases)
         lines += [
             "",
             f"#### `{suite}`",
@@ -361,26 +388,20 @@ def suite_tables_md(cur: dict, bases: list[tuple[str, dict]]) -> list[str]:
             f"| Benchmark | Time | Throughput |{cols}",
             f"|---|---|---|{'---|' * len(bases)}",
         ]
-        for name, b in sorted(benches.items()):
-            cells = ""
-            for (_, base), floor in zip(bases, floors):
-                old = base["suites"].get(suite, {}).get(name)
-                noise = floor + b["ci_rel"] + (old["ci_rel"] if old else 0)
-                cells += f" {delta_cell(b['ns'], old['ns'] if old else None, noise)} |"
-            lines.append(f"| `{name}` | {fmt_time(b['ns'])} | {fmt_throughput(b)} |{cells}")
+        lines += [_suite_row(suite, name, b, bases, floors) for name, b in sorted(benches.items())]
     return lines
 
 
 def legend_md() -> list[str]:
-    return [
-        "",
+    text = (
         "🟢 faster · 🔴 slower · ⚪ within the noise band (5–25 % depending on how "
-        "comparable the two environments are, plus both runs' Criterion confidence "
-        "intervals). Lower time is better.",
-    ]
+        + "comparable the two environments are, plus both runs' Criterion confidence "
+        + "intervals). Lower time is better."
+    )
+    return ["", text]
 
 
-def render(cur: dict, release: dict | None, previous: dict | None, heading: str, mode: str) -> str:
+def render(cur: dict, release: dict | None, previous: dict | None, heading: str) -> str:
     bases: list[tuple[str, dict]] = []
     if release:
         bases.append((baseline_label("release", release), release))
@@ -401,8 +422,8 @@ def render(cur: dict, release: dict | None, previous: dict | None, heading: str,
 EXTRA_SECTIONS: list = []
 
 
-def cmd_compare(args: argparse.Namespace) -> int:
-    cur = json.loads(Path(args.current).read_text())
+def cmd_compare(args: argparse.Namespace) -> None:
+    cur = json.loads(workspace_path(args.current).read_text())
     release = load_json(args.release)
     previous = load_json(args.previous)
     if args.mode == "release":
@@ -410,17 +431,23 @@ def cmd_compare(args: argparse.Namespace) -> int:
     if release and release.get("tag") == cur.get("tag") and cur.get("tag"):
         release = None
     heading = args.heading or f"### CI benchmarks — {cur['repo'].split('/')[-1]}"
-    md = render(cur, release, previous, heading, args.mode)
+    md = render(cur, release, previous, heading)
     if args.out:
-        Path(args.out).write_text(md)
+        workspace_path(args.out).write_text(md)
     else:
         sys.stdout.write(md)
-    return 0
 
 
 # --------------------------------------------------------------------------
 # splice
 # --------------------------------------------------------------------------
+
+def _separator(text: str) -> str:
+    """What to put between existing text and an appended block (one blank line)."""
+    if not text or text.endswith("\n\n"):
+        return ""
+    return "\n" if text.endswith("\n") else "\n\n"
+
 
 def splice_text(text: str, fragment: str, start: str, end: str) -> str:
     block = f"{start}\n{fragment.rstrip()}\n{end}"
@@ -428,28 +455,25 @@ def splice_text(text: str, fragment: str, start: str, end: str) -> str:
         head, rest = text.split(start, 1)
         _old, tail = rest.split(end, 1)
         return head + block + tail
-    sep = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
-    return text + sep + block + "\n"
+    return text + _separator(text) + block + "\n"
 
 
 def cmd_splice(args: argparse.Namespace) -> int:
     start, end = (RELEASE_START, RELEASE_END) if args.target == "release" else (CI_START, CI_END)
-    path = Path(args.file)
+    path = workspace_path(args.file)
     text = path.read_text() if path.exists() else ""
     if args.target == "ci" and (start not in text or end not in text):
         print(f"error: {path} has no {start} … {end} block", file=sys.stderr)
         return 1
-    path.write_text(splice_text(text, Path(args.fragment).read_text(), start, end))
+    path.write_text(splice_text(text, workspace_path(args.fragment).read_text(), start, end))
     return 0
 
 
 # Optional: the cross-server sweep, only present in librtmp2-server.
-try:
+if importlib.util.find_spec("bench_sweep") is not None:
     import bench_sweep  # noqa: E402
 
     bench_sweep.register(sys.modules[__name__])
-except ImportError:
-    pass
 
 
 def main() -> int:
@@ -488,7 +512,7 @@ def main() -> int:
     p.set_defaults(fn=cmd_splice)
 
     args = ap.parse_args()
-    return args.fn(args)
+    return args.fn(args) or 0
 
 
 if __name__ == "__main__":

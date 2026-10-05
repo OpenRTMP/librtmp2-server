@@ -107,8 +107,11 @@ def parse_log(text: str) -> dict:
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
-    results = json.loads(Path(args.results).read_text())
-    sweep = parse_log(Path(args.log).read_text(errors="replace"))
+    from bench_report import workspace_path  # same directory
+
+    results_path = workspace_path(args.results)
+    results = json.loads(results_path.read_text())
+    sweep = parse_log(workspace_path(args.log).read_text(errors="replace"))
     versions = {}
     for spec in args.version:
         key, _, rest = spec.partition("=")
@@ -117,7 +120,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     sweep["versions"] = versions
     sweep["params"] = dict(p.split("=", 1) for p in args.param)
     results["sweep"] = sweep
-    Path(args.results).write_text(json.dumps(results, indent=1) + "\n")
+    results_path.write_text(json.dumps(results, indent=1) + "\n")
     servers = sorted({s for k in ("handshake", "play_handshake") for s in sweep[k]})
     print(
         f"sweep: servers={servers} join={sorted(sweep['join'])} load={sorted(sweep['load'])}"
@@ -255,7 +258,7 @@ def render_sweep(cur: dict, bases: list) -> list[str]:
         lines += [
             "",
             "A competitor delivering fewer frames per viewer than the others was overloaded at that step "
-            "(the delivered rate, not just latency, is the result).",
+            + "(the delivered rate, not just latency, is the result).",
         ]
     return lines
 
