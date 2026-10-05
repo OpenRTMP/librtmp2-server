@@ -48,7 +48,7 @@ def workspace_path(value: str) -> Path:
     """Resolve a command-line path, refusing anything outside the working directory."""
     root = os.path.realpath(os.getcwd())
     full = os.path.realpath(os.path.join(root, value))
-    if os.path.commonpath([root, full]) != root:
+    if full != root and not full.startswith(root + os.sep):
         raise SystemExit(f"error: {value} is outside the working directory")
     return Path(full)
 
