@@ -77,6 +77,9 @@ exit $EXIT
         "-c",
         bash,
     ]
+    stale_log = os.path.join(DEST, LOG_NAME)
+    if os.path.exists(stale_log):
+        os.remove(stale_log)
     print("running cluster_ha...", flush=True)
     try:
         r = subprocess.run(cmd, shell=False, check=True)

@@ -55,6 +55,9 @@ def main() -> int:
         "-c",
         bash,
     ]
+    stale_log = os.path.join(DEST, LOG_NAME)
+    if os.path.exists(stale_log):
+        os.remove(stale_log)
     print("running docker cargo check...", flush=True)
     try:
         r = subprocess.run(cmd, shell=False, check=True)
