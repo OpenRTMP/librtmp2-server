@@ -123,7 +123,7 @@ jobs:
       - name: Build benchmark client and server
         if: env.RUN_SWEEP == 'true'
         run: |
-          (cd librtmp2-lib && cargo build --release --example bench_handshake --example bench_relay)
+          (cd librtmp2-lib && cargo build --release --locked --example bench_handshake --example bench_relay)
           cargo build --release --locked
 
       - name: Fetch MediaMTX
@@ -132,8 +132,8 @@ jobs:
         run: |
           base="https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VERSION"
           mkdir -p "$RUNNER_TEMP/mediamtx" && cd "$RUNNER_TEMP/mediamtx"
-          curl -fsSLO "$base/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz"
-          curl -fsSLO "$base/checksums.sha256"
+          curl --proto '=https' --tlsv1.2 -fsSLO "$base/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSLO "$base/checksums.sha256"
           grep "[ *]mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz\$" checksums.sha256 | sha256sum -c -
           tar xzf "mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" mediamtx
           echo "MEDIAMTX_BIN=$PWD/mediamtx" >> "$GITHUB_ENV"

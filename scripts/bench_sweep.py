@@ -54,62 +54,96 @@ def _kv(line: str, key: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+LATENCY = re.compile(r"latency ms.*?: avg=" + NUM + r" p50=" + NUM + r" p95=" + NUM + r" p99=" + NUM)
+
+
+def _read_line(line: str, cur: dict) -> None:
+    """Fold one output line of the current section into `cur`."""
+    m = LATENCY.search(line)
+    if m:
+        cur["avg"], cur["p50"], cur["p95"], cur["p99"] = (float(x) for x in m.groups())
+    elif line.startswith("ok="):
+        cur["ok"] = int(_kv(line, "ok") or 0)
+        cur["failed"] = int(_kv(line, "failed") or 0)
+        cur["rate"] = _kv(line, "handshakes_per_s")
+    elif line.startswith("steady-state"):
+        cur["fps"] = _kv(line, "avg_fps_per_player")
+    elif line.startswith("server resources:"):
+        cur["cpu"] = _kv(line, "cpu_pct")
+        cur["rss"] = _kv(line, "peak_rss_mib")
+
+
+def _handshake_row(cur: dict) -> list | None:
+    """Only complete samples: a server that dropped some of the handshakes must
+    not be published as an apparently valid result."""
+    row = [cur.get(k) for k in ("rate", "avg", "p50", "p95", "p99")]
+    complete = None not in row and cur.get("ok", 0) > 0 and cur.get("failed", 0) == 0
+    return row if complete else None
+
+
+def _join_row(cur: dict) -> list | None:
+    if cur.get("avg") is None or cur.get("fps") is None:
+        return None
+    return [cur["avg"], cur["p95"], cur["fps"]]
+
+
+def _load_row(cur: dict) -> list | None:
+    row = [cur.get(k) for k in ("avg", "p95", "fps", "cpu", "rss")]
+    return row if None not in row else None
+
+
+def _store(sweep: dict, section: tuple, cur: dict) -> None:
+    """File the finished section's row under its phase (and viewer count)."""
+    server, kind, players = section
+    if kind in ("handshake", "play handshake"):
+        row = _handshake_row(cur)
+        if row:
+            sweep["handshake" if kind == "handshake" else "play_handshake"][server] = row
+    elif kind == "relay":
+        row = _join_row(cur)
+        if row:
+            sweep["join"].setdefault(str(players), {})[server] = row
+    elif kind == "load":
+        row = _load_row(cur)
+        if row:
+            sweep["load"].setdefault(str(players), {})[server] = row
+
+
+def _section_of(match: re.Match) -> tuple | None:
+    server = SERVER_KEYS.get(match.group(1).lower())
+    if not server:
+        return None
+    players = int(match.group(3)) if match.group(3) else None
+    return (server, match.group(2), players)
+
+
 def parse_log(text: str) -> dict:
     sweep: dict = {"handshake": {}, "play_handshake": {}, "join": {}, "load": {}}
     section = None  # (server, kind, players)
     cur: dict = {}
-
-    def flush() -> None:
-        nonlocal section, cur
-        if section is None:
-            return
-        server, kind, players = section
-        if kind in ("handshake", "play handshake"):
-            row = [cur.get(k) for k in ("rate", "avg", "p50", "p95", "p99")]
-            # Only complete samples: a server that dropped some of the handshakes must
-            # not be published as an apparently valid result.
-            if None not in row and cur.get("ok", 0) > 0 and cur.get("failed", 0) == 0:
-                target = "handshake" if kind == "handshake" else "play_handshake"
-                sweep[target][server] = row
-        elif kind == "relay":
-            if cur.get("avg") is not None and cur.get("fps") is not None:
-                sweep["join"].setdefault(str(players), {})[server] = [cur["avg"], cur["p95"], cur["fps"]]
-        elif kind == "load":
-            need = ("avg", "p95", "fps", "cpu", "rss")
-            if all(cur.get(k) is not None for k in need):
-                sweep["load"].setdefault(str(players), {})[server] = [cur[k] for k in need]
-        section, cur = None, {}
-
     for line in text.splitlines():
-        m = HEADER.match(line)
-        if m:
-            flush()
-            server = SERVER_KEYS.get(m.group(1).lower())
-            if server:
-                kind = m.group(2)
-                section = (server, kind, int(m.group(3)) if m.group(3) else None)
-            continue
-        if line.startswith("--- ") or line.startswith("Done."):
-            flush()
-            continue
-        if section is None:
-            continue
-        if m := re.search(r"latency ms.*?: avg=" + NUM + r" p50=" + NUM + r" p95=" + NUM + r" p99=" + NUM, line):
-            cur["avg"], cur["p50"], cur["p95"], cur["p99"] = (float(x) for x in m.groups())
-        elif line.startswith("ok="):
-            cur["ok"] = int(_kv(line, "ok") or 0)
-            cur["failed"] = int(_kv(line, "failed") or 0)
-            cur["rate"] = _kv(line, "handshakes_per_s")
-        elif line.startswith("steady-state"):
-            cur["fps"] = _kv(line, "avg_fps_per_player")
-        elif line.startswith("server resources:"):
-            cur["cpu"] = _kv(line, "cpu_pct")
-            cur["rss"] = _kv(line, "peak_rss_mib")
-    flush()
+        header = HEADER.match(line)
+        if header or line.startswith(("--- ", "Done.")):
+            if section is not None:
+                _store(sweep, section, cur)
+            section, cur = (_section_of(header) if header else None), {}
+        elif section is not None:
+            _read_line(line, cur)
+    if section is not None:
+        _store(sweep, section, cur)
     return sweep
 
 
 SWEEP_LOG = Path("sweep.log")  # written by the workflow; fixed name, no path on the command line
+
+
+def _parse_versions(specs: list[str]) -> dict:
+    versions = {}
+    for spec in specs:
+        key, _, rest = spec.partition("=")
+        version, detail, language = (rest.split("|") + ["", ""])[:3]
+        versions[key] = {"version": version, "detail": detail, "language": language}
+    return versions
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
@@ -117,19 +151,12 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     results = json.loads(RESULTS_FILE.read_text())
     sweep = parse_log(SWEEP_LOG.read_text(errors="replace"))
-    versions = {}
-    for spec in args.version:
-        key, _, rest = spec.partition("=")
-        version, detail, language = (rest.split("|") + ["", ""])[:3]
-        versions[key] = {"version": version, "detail": detail, "language": language}
-    sweep["versions"] = versions
-    sweep["params"] = dict(p.split("=", 1) for p in args.param)
+    sweep["versions"] = _parse_versions(args.version)
+    sweep["params"] = {key: value for key, _, value in (p.partition("=") for p in args.param)}
     results["sweep"] = sweep
     RESULTS_FILE.write_text(json.dumps(results, indent=1) + "\n")
     servers = sorted({s for k in ("handshake", "play_handshake") for s in sweep[k]})
-    print(
-        f"sweep: servers={servers} join={sorted(sweep['join'])} load={sorted(sweep['load'])}"
-    )
+    print(f"sweep: servers={servers} join={sorted(sweep['join'])} load={sorted(sweep['load'])}")
     if "openrtmp" not in sweep["handshake"] or not sweep["load"]:
         print("error: librtmp2-server produced no handshake/load rows; see the sweep log", file=sys.stderr)
         return 1
@@ -140,22 +167,37 @@ def cmd_merge(args: argparse.Namespace) -> int:
 # rendering
 # --------------------------------------------------------------------------
 
-def metrics(sweep: dict | None, server: str = "openrtmp") -> dict[str, tuple[float, bool]]:
-    """name -> (value, lower_is_better) for one server."""
-    out: dict[str, tuple[float, bool]] = {}
-    if not sweep:
-        return out
+def _viewers(n: str) -> str:
+    return f"{n} viewer" if n == "1" else f"{n} viewers"
+
+
+def _by_viewers(tiers: dict) -> list[tuple[str, dict]]:
+    return sorted(tiers.items(), key=lambda kv: int(kv[0]))
+
+
+def _handshake_metrics(sweep: dict, server: str) -> dict:
+    out: dict = {}
     for kind, label in (("handshake", "publish"), ("play_handshake", "play")):
         row = sweep.get(kind, {}).get(server)
         if row:
             out[f"{label} handshakes/s"] = (row[0], False)
             out[f"{label} handshake avg (ms)"] = (row[1], True)
             out[f"{label} handshake p95 (ms)"] = (row[3], True)
-    for n, rows in sorted(sweep.get("join", {}).items(), key=lambda kv: int(kv[0])):
+    return out
+
+
+def _join_metrics(sweep: dict, server: str) -> dict:
+    out: dict = {}
+    for n, rows in _by_viewers(sweep.get("join", {})):
         if server in rows:
-            out[f"join, {n} viewer{'' if n == '1' else 's'}: avg (ms)"] = (rows[server][0], True)
-            out[f"join, {n} viewer{'' if n == '1' else 's'}: p95 (ms)"] = (rows[server][1], True)
-    for n, rows in sorted(sweep.get("load", {}).items(), key=lambda kv: int(kv[0])):
+            out[f"join, {_viewers(n)}: avg (ms)"] = (rows[server][0], True)
+            out[f"join, {_viewers(n)}: p95 (ms)"] = (rows[server][1], True)
+    return out
+
+
+def _load_metrics(sweep: dict, server: str) -> dict:
+    out: dict = {}
+    for n, rows in _by_viewers(sweep.get("load", {})):
         if server in rows:
             avg, p95, fps, cpu, rss = rows[server]
             out[f"load, {n} viewers: join avg (ms)"] = (avg, True)
@@ -166,106 +208,143 @@ def metrics(sweep: dict | None, server: str = "openrtmp") -> dict[str, tuple[flo
     return out
 
 
-def _num(v: float) -> str:
-    return f"{v:,.0f}" if v >= 1000 else (f"{v:.1f}" if v >= 100 else f"{v:.2f}")
-
-
-def render_sweep(cur: dict, bases: list) -> list[str]:
-    from bench_report import comparability, delta_cell  # same directory
-
-    sweep = cur.get("sweep")
+def metrics(sweep: dict | None, server: str = "openrtmp") -> dict[str, tuple[float, bool]]:
+    """name -> (value, lower_is_better) for one server."""
     if not sweep:
-        return []
+        return {}
+    return {**_handshake_metrics(sweep, server), **_join_metrics(sweep, server), **_load_metrics(sweep, server)}
+
+
+def _num(v: float) -> str:
+    if v >= 1000:
+        return f"{v:,.0f}"
+    return f"{v:.1f}" if v >= 100 else f"{v:.2f}"
+
+
+def _name(key: str) -> str:
+    return f"**{SERVER_NAMES[key]}**" if key == "openrtmp" else SERVER_NAMES[key]
+
+
+def _intro_md(sweep: dict) -> list[str]:
     lines = ["", "#### Cross-server sweep", ""]
     params = sweep.get("params") or {}
     if params:
-        lines.append(
+        lines += [
             "Same RTMP client and ffmpeg source for every server, one server at a time: "
             + ", ".join(f"{k} {v}" for k, v in params.items())
             + ". One sweep per run, no repetitions — the shared runner makes single values noisy, "
-            "so compare servers **within** this run rather than across runs."
-        )
-        lines.append("")
-    versions = sweep.get("versions") or {}
-    if versions:
-        parts = []
-        present = {k for sec in ("handshake", "play_handshake") for k in sweep.get(sec, {})}
-        for key in ORDER:
-            v = versions.get(key)
-            if v and key in present:
-                parts.append(f"{SERVER_NAMES[key]} {v['version']}" + (f" ({v['detail']})" if v["detail"] else ""))
-        lines += ["Servers: " + " · ".join(parts), ""]
-
-    # librtmp2-server against the baselines
-    ours = metrics(sweep)
-    if ours and bases:
-        floors = [max(comparability(cur, b)[1], 0.10) for _, b in bases]
-        cols = "".join(f" {label} |" for label, _ in bases)
-        lines += [
-            "##### librtmp2-server vs the baselines",
+            + "so compare servers **within** this run rather than across runs.",
             "",
-            f"| Metric | Now |{cols}",
-            f"|---|---|{'---|' * len(bases)}",
         ]
-        base_metrics = [metrics(b.get("sweep")) for _, b in bases]
-        for name, (value, lower) in ours.items():
-            cells = ""
-            for bm, floor in zip(base_metrics, floors):
-                old = bm.get(name)
-                cells += f" {delta_cell(value, old[0] if old else None, floor, lower)} |"
-            lines.append(f"| {name} | {_num(value)} |{cells}")
-        lines.append("")
+    versions = sweep.get("versions") or {}
+    present = {k for sec in ("handshake", "play_handshake", "join", "load") for k in _server_keys(sweep.get(sec, {}))}
+    parts = [
+        f"{SERVER_NAMES[key]} {versions[key]['version']}" + (f" ({versions[key]['detail']})" if versions[key]["detail"] else "")
+        for key in ORDER
+        if key in versions and key in present
+    ]
+    if parts:
+        lines += ["Servers: " + " · ".join(parts), ""]
+    return lines
 
-    # cross-server tables
+
+def _server_keys(rows: dict) -> set:
+    """Server keys of {server: row} or of {viewers: {server: row}}."""
+    keys: set = set()
+    for k, v in rows.items():
+        if k in SERVER_NAMES:
+            keys.add(k)
+        elif isinstance(v, dict):
+            keys.update(v)
+    return keys
+
+
+def _baseline_md(cur: dict, bases: list, sweep: dict) -> list[str]:
+    from bench_report import comparability, delta_cell  # same directory
+
+    ours = metrics(sweep)
+    if not ours or not bases:
+        return []
+    floors = [max(comparability(cur, b)[1], 0.10) for _, b in bases]
+    cols = "".join(f" {label} |" for label, _ in bases)
+    lines = [
+        "##### librtmp2-server vs the baselines",
+        "",
+        f"| Metric | Now |{cols}",
+        f"|---|---|{'---|' * len(bases)}",
+    ]
+    base_metrics = [metrics(b.get("sweep")) for _, b in bases]
+    for name, (value, lower) in ours.items():
+        cells = ""
+        for bm, floor in zip(base_metrics, floors):
+            old = bm.get(name)
+            cells += f" {delta_cell(value, old[0] if old else None, floor, lower)} |"
+        lines.append(f"| {name} | {_num(value)} |{cells}")
+    return lines + [""]
+
+
+def _handshake_md(sweep: dict) -> list[str]:
     hs, ph = sweep.get("handshake", {}), sweep.get("play_handshake", {})
     keys = [k for k in ORDER if k in hs or k in ph]
-    if keys:
-        lines += [
-            "##### Handshake latency",
-            "",
-            "| Server | publish /s | avg ms | p95 | p99 | play /s | avg ms | p95 | p99 |",
-            "|---|---|---|---|---|---|---|---|---|",
-        ]
-        for k in keys:
-            a, b = hs.get(k), ph.get(k)
-            fa = [_num(a[0]), _num(a[1]), _num(a[3]), _num(a[4])] if a else ["—"] * 4
-            fb = [_num(b[0]), _num(b[1]), _num(b[3]), _num(b[4])] if b else ["—"] * 4
-            name = f"**{SERVER_NAMES[k]}**" if k == "openrtmp" else SERVER_NAMES[k]
-            lines.append(f"| {name} | " + " | ".join(fa + fb) + " |")
-        lines.append("")
+    if not keys:
+        return []
+    lines = [
+        "##### Handshake latency",
+        "",
+        "| Server | publish /s | avg ms | p95 | p99 | play /s | avg ms | p95 | p99 |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for k in keys:
+        cells: list[str] = []
+        for row in (hs.get(k), ph.get(k)):
+            cells += [_num(row[0]), _num(row[1]), _num(row[3]), _num(row[4])] if row else ["—"] * 4
+        lines.append(f"| {_name(k)} | " + " | ".join(cells) + " |")
+    return lines + [""]
+
+
+def _join_md(sweep: dict) -> list[str]:
     join = sweep.get("join", {})
-    if join:
-        counts = sorted(join, key=int)
-        lines += [
-            "##### Join latency (avg / p95 ms)",
-            "",
-            "| Server | " + " | ".join(f"{n} viewer" + ("" if n == "1" else "s") for n in counts) + " |",
-            "|---|" + "---|" * len(counts),
-        ]
-        for k in [k for k in ORDER if any(k in join[n] for n in counts)]:
-            cells = [f"{_num(join[n][k][0])} / {_num(join[n][k][1])}" if k in join[n] else "—" for n in counts]
-            name = f"**{SERVER_NAMES[k]}**" if k == "openrtmp" else SERVER_NAMES[k]
-            lines.append(f"| {name} | " + " | ".join(cells) + " |")
-        lines.append("")
+    if not join:
+        return []
+    counts = sorted(join, key=int)
+    lines = [
+        "##### Join latency (avg / p95 ms)",
+        "",
+        "| Server | " + " | ".join(_viewers(n) for n in counts) + " |",
+        "|---|" + "---|" * len(counts),
+    ]
+    for k in [k for k in ORDER if any(k in join[n] for n in counts)]:
+        cells = [f"{_num(join[n][k][0])} / {_num(join[n][k][1])}" if k in join[n] else "—" for n in counts]
+        lines.append(f"| {_name(k)} | " + " | ".join(cells) + " |")
+    return lines + [""]
+
+
+def _load_md(sweep: dict) -> list[str]:
     load = sweep.get("load", {})
-    if load:
-        lines += [
-            "##### Many viewers on one stream",
-            "",
-            "| Viewers | Server | join avg / p95 ms | CPU % (one core) | peak RSS MiB | frames/viewer |",
-            "|---|---|---|---|---|---|",
-        ]
-        for n in sorted(load, key=int):
-            for k in [k for k in ORDER if k in load[n]]:
-                avg, p95, fps, cpu, rss = load[n][k]
-                name = f"**{SERVER_NAMES[k]}**" if k == "openrtmp" else SERVER_NAMES[k]
-                lines.append(f"| {n} | {name} | {_num(avg)} / {_num(p95)} | {_num(cpu)} | {_num(rss)} | {_num(fps)} |")
-        lines += [
-            "",
-            "A competitor delivering fewer frames per viewer than the others was overloaded at that step "
-            + "(the delivered rate, not just latency, is the result).",
-        ]
-    return lines
+    if not load:
+        return []
+    lines = [
+        "##### Many viewers on one stream",
+        "",
+        "| Viewers | Server | join avg / p95 ms | CPU % (one core) | peak RSS MiB | frames/viewer |",
+        "|---|---|---|---|---|---|",
+    ]
+    for n, rows in _by_viewers(load):
+        for k in [k for k in ORDER if k in rows]:
+            avg, p95, fps, cpu, rss = rows[k]
+            lines.append(f"| {n} | {_name(k)} | {_num(avg)} / {_num(p95)} | {_num(cpu)} | {_num(rss)} | {_num(fps)} |")
+    return lines + [
+        "",
+        "A competitor delivering fewer frames per viewer than the others was overloaded at that step "
+        + "(the delivered rate, not just latency, is the result).",
+    ]
+
+
+def render_sweep(cur: dict, bases: list) -> list[str]:
+    sweep = cur.get("sweep")
+    if not sweep:
+        return []
+    return _intro_md(sweep) + _baseline_md(cur, bases, sweep) + _handshake_md(sweep) + _join_md(sweep) + _load_md(sweep)
 
 
 def register(report_module) -> None:
