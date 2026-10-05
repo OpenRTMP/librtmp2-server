@@ -302,6 +302,12 @@ impl ClusterConfig {
         if !self.capacity.is_finite() || !(0.0..=1.0).contains(&self.capacity) {
             return Err("CLUSTER_CAPACITY must be a finite value between 0.0 and 1.0".into());
         }
+        // 0.0 / negative stay legal (bandwidth-based admission is off), but a
+        // non-finite value makes utilization NaN, which fails every load
+        // comparison open and silently disables load-based draining.
+        if !self.bandwidth_max_mbps.is_finite() {
+            return Err("CLUSTER_BANDWIDTH_MAX_MBPS must be a finite value".into());
+        }
         if self.media_queue_mb == 0 || self.media_queue_mb > 1024 {
             return Err("CLUSTER_MEDIA_QUEUE_MB must be 1–1024".into());
         }
