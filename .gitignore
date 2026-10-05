@@ -5,3 +5,5 @@
 # Bug Hunter local artifacts
 .bug-hunter/
 
+__pycache__/
+*.pyc

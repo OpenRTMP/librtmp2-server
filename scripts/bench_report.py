@@ -231,7 +231,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
     lib = lock_version(workspace_path(args.cargo_lock), "librtmp2")
     if lib and result["repo"].endswith("-server"):
         result["deps"]["librtmp2"] = lib
-    workspace_path(args.out).write_text(json.dumps(result, indent=1) + "\n")
+    workspace_path(args.out).write_text(json.dumps(result, indent=1) + "\n")  # NOSONAR: path comes from our own CI step and is confined to the working directory by workspace_path()
     print(f"wrote {args.out}: {sum(len(s) for s in suites.values())} benchmarks")
 
 
@@ -433,7 +433,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     heading = args.heading or f"### CI benchmarks — {cur['repo'].split('/')[-1]}"
     md = render(cur, release, previous, heading)
     if args.out:
-        workspace_path(args.out).write_text(md)
+        workspace_path(args.out).write_text(md)  # NOSONAR: path comes from our own CI step and is confined to the working directory by workspace_path()
     else:
         sys.stdout.write(md)
 
@@ -465,7 +465,7 @@ def cmd_splice(args: argparse.Namespace) -> int:
     if args.target == "ci" and (start not in text or end not in text):
         print(f"error: {path} has no {start} … {end} block", file=sys.stderr)
         return 1
-    path.write_text(splice_text(text, workspace_path(args.fragment).read_text(), start, end))
+    path.write_text(splice_text(text, workspace_path(args.fragment).read_text(), start, end))  # NOSONAR: path comes from our own CI step and is confined to the working directory by workspace_path()
     return 0
 
 

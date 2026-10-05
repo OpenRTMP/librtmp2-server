@@ -24,7 +24,6 @@ import argparse
 import json
 import re
 import sys
-from pathlib import Path
 
 # Section labels used by run_rtmp_benchmarks.sh -> website server keys.
 SERVER_KEYS = {
