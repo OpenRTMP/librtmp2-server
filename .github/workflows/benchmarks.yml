@@ -1,19 +1,78 @@
 name: Benchmarks
 
+# What runs when (see docs/ci-benchmarks.md):
+#
+#   merge to main      HTTP API microbenchmarks + the cross-server sweep
+#                      (librtmp2-server vs nginx-rtmp, MediaMTX, SRS, LiveForge)
+#                      -> rewrite the "CI benchmarks" block in BENCHMARKS.md
+#                      -> store as the latest run on `bench-data` (the website
+#                      shows it as "next release preview")
+#   release            called from release.yml once the GitHub Release exists
+#                      (a separate job there, so the Docker image never waits
+#                      for it): bench -> attach results to the release (asset +
+#                      release notes) -> store under releases/<tag>.json
+#   workflow_dispatch  bench -> comparison in the job log only, nothing published
+#   pull_request       microbenchmarks only, log only
+#
+# Every run is compared against the last release and the last `main` run, with
+# a note on how comparable the machines were.
+
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - BENCHMARKS.md
   pull_request:
   workflow_dispatch:
+    inputs:
+      sweep:
+        description: Run the cross-server sweep (otherwise only the microbenchmarks)
+        type: boolean
+        default: true
+      servers:
+        description: "Sweep servers (space separated: lrtmp2-server nginx mediamtx srs liveforge)"
+        type: string
+        default: lrtmp2-server nginx mediamtx srs liveforge
+      load_viewers:
+        description: Viewer counts of the load test
+        type: string
+        default: 500 1000 2000
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to benchmark (e.g. v0.6.2)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # Competitor versions are pinned so a run only changes when we change them.
+  MEDIAMTX_VERSION: v1.21.1
+  SRS_REF: v8.0-d0
+  LIVEFORGE_REF: 4e70fb3a7b6b3d92bf2e099965f2c81c4f3f98c5
 
 jobs:
   bench:
-    name: cargo bench
+    name: cargo bench + sweep
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 120
+    # A benchmark problem must never turn a finished release red.
+    continue-on-error: ${{ inputs.tag && true || false }}
+    concurrency:
+      group: bench-${{ inputs.tag || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    env:
+      KIND: ${{ inputs.tag && 'release' || (github.event_name == 'push' && 'main' || (github.event_name == 'pull_request' && 'pr' || 'manual')) }}
+      TAG: ${{ inputs.tag }}
+      RUN_SWEEP: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.sweep) }}
+      SWEEP_SERVERS: ${{ github.event_name == 'workflow_dispatch' && inputs.servers || 'lrtmp2-server nginx mediamtx srs liveforge' }}
+      LOAD_VIEWERS: ${{ github.event_name == 'workflow_dispatch' && inputs.load_viewers || '500 1000 2000' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag || github.sha }}
           persist-credentials: false
 
       - name: Install Rust
@@ -23,10 +82,240 @@ jobs:
 
       - name: Run HTTP API benchmarks
         run: |
+          set -o pipefail
           cargo bench --features test-support --bench http_api -- --sample-size 20 --test-threads 1 --noplot 2>&1 | tee bench-http-api.txt
+          rm -rf crit-http && mv target/criterion crit-http
 
-      - name: Upload benchmark output
-        uses: actions/upload-artifact@v7
+      # ---- cross-server sweep ------------------------------------------------
+      - name: Install sweep dependencies
+        if: env.RUN_SWEEP == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg nginx libnginx-mod-rtmp libssl-dev pkg-config
+          sudo systemctl stop nginx || true
+          sudo systemctl disable nginx || true
+
+      - name: Check out librtmp2 (the benchmark client, at the version this server builds on)
+        if: env.RUN_SWEEP == 'true'
+        run: |
+          ver="$(awk '/^name = "librtmp2"$/ {getline; gsub(/[^0-9.]/, "", $3); print $3; exit}' Cargo.lock)"
+          echo "librtmp2 ${ver:-unknown} per Cargo.lock"
+          git clone --quiet --depth 1 --branch "v$ver" https://github.com/OpenRTMP/librtmp2 librtmp2-lib \
+            || git clone --quiet --depth 1 https://github.com/OpenRTMP/librtmp2 librtmp2-lib
+
+      - name: Build benchmark client and server
+        if: env.RUN_SWEEP == 'true'
+        run: |
+          (cd librtmp2-lib && cargo build --release --example bench_handshake --example bench_relay)
+          cargo build --release --locked
+
+      - name: Fetch MediaMTX
+        if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'mediamtx')
+        continue-on-error: true
+        run: |
+          base="https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VERSION"
+          mkdir -p "$RUNNER_TEMP/mediamtx" && cd "$RUNNER_TEMP/mediamtx"
+          curl -fsSLO "$base/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "$base/mediamtx_${MEDIAMTX_VERSION}_checksums.sha256"
+          grep " mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz\$" "mediamtx_${MEDIAMTX_VERSION}_checksums.sha256" | sha256sum -c -
+          tar xzf "mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" mediamtx
+          echo "MEDIAMTX_BIN=$PWD/mediamtx" >> "$GITHUB_ENV"
+
+      - name: Cache SRS build
+        if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'srs')
+        id: srs-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/srs-bin
+          key: srs-${{ runner.os }}-${{ env.SRS_REF }}-v1
+
+      - name: Build SRS
+        if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'srs')
+        continue-on-error: true
+        run: |
+          if [ ! -x "$HOME/srs-bin/srs" ]; then
+            git clone --quiet --depth 1 --branch "$SRS_REF" https://github.com/ossrs/srs "$RUNNER_TEMP/srs"
+            cd "$RUNNER_TEMP/srs/trunk"
+            # Same flags as the published runs: the default dev build enables
+            # AddressSanitizer, which would distort every number.
+            ./configure --rtc=off --srt=off --gb28181=off --https=off --sanitizer=off --debug=off \
+              || ./configure --sanitizer=off
+            make -j"$(nproc)"
+            mkdir -p "$HOME/srs-bin" && cp objs/srs "$HOME/srs-bin/srs"
+          fi
+          echo "SRS_BIN=$HOME/srs-bin/srs" >> "$GITHUB_ENV"
+
+      - name: Cache LiveForge build
+        if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'liveforge')
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/liveforge-bin
+          key: liveforge-${{ runner.os }}-${{ env.LIVEFORGE_REF }}-v1
+
+      - name: Build LiveForge
+        if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'liveforge')
+        continue-on-error: true
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          if [ ! -x "$HOME/liveforge-bin/liveforge" ]; then
+            git clone --quiet https://github.com/im-pingo/liveforge "$RUNNER_TEMP/liveforge"
+            cd "$RUNNER_TEMP/liveforge"
+            git checkout --quiet "$LIVEFORGE_REF"
+            go build -o liveforge ./cmd/liveforge
+            mkdir -p "$HOME/liveforge-bin" && cp liveforge "$HOME/liveforge-bin/liveforge"
+          fi
+          echo "LIVEFORGE_BIN=$HOME/liveforge-bin/liveforge" >> "$GITHUB_ENV"
+
+      - name: Run the sweep
+        id: sweep
+        if: env.RUN_SWEEP == 'true'
+        # A competitor that fails to start must not throw away the finished
+        # legs; the merge step below still insists on librtmp2-server's rows.
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # Root: nginx wants to write its default log paths and the load test
+          # needs more than the runner user's file-descriptor limit.
+          sudo -E env "PATH=$PATH" \
+            LIBRTMP2_DIR="$PWD/librtmp2-lib" \
+            BENCH_SERVERS="$SWEEP_SERVERS" LOAD_VIEWERS="$LOAD_VIEWERS" PERF_STAT=0 \
+            scripts/run_rtmp_benchmarks.sh "$RUNNER_TEMP/sweep-work" 2>&1 | tee sweep.log
+
+      # ---- results -------------------------------------------------------------
+      - name: Collect results
+        run: |
+          python3 scripts/bench_report.py collect --suite http_api=crit-http \
+            --repo OpenRTMP/librtmp2-server --kind "$KIND" --tag "$TAG" --out results.json
+
+      - name: Add the sweep to the results
+        if: env.RUN_SWEEP == 'true'
+        run: |
+          if [ "${{ steps.sweep.outcome }}" != "success" ]; then
+            echo "::warning::the sweep script exited non-zero; using the legs that finished (see sweep.log)"
+          fi
+          nginx_v="$(dpkg-query -W -f='${Version}' nginx 2>/dev/null | cut -d- -f1 | cut -d+ -f1)"
+          rtmp_v="$(dpkg-query -W -f='${Version}' libnginx-mod-rtmp 2>/dev/null | cut -d- -f1 | cut -d+ -f1)"
+          lib_v="$(jq -r '.deps.librtmp2 // "unknown"' results.json)"
+          python3 scripts/bench_sweep.py merge --results results.json --log sweep.log \
+            --version "openrtmp=$(jq -r .version results.json)|librtmp2 $lib_v|Rust" \
+            --version "mediamtx=$MEDIAMTX_VERSION||Go" \
+            --version "liveforge=main @ ${LIVEFORGE_REF::7}||Go" \
+            --version "srs=$SRS_REF||C++" \
+            --version "nginx=nginx $nginx_v|libnginx-mod-rtmp $rtmp_v|C" \
+            --param "load viewers=$LOAD_VIEWERS" \
+            --param "publisher=ffmpeg 1280x720@30 H.264 2.5 Mbps + AAC 128 kbps"
+
+      - name: Fetch baselines (last release, last main run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/bench_report.py baselines --out-dir baselines --exclude-tag "$TAG"
+
+      - name: Compare
+        run: |
+          args=(--current results.json --mode "$KIND" --out comparison.md)
+          [ -f baselines/release.json ] && args+=(--release baselines/release.json)
+          [ -f baselines/previous.json ] && args+=(--previous baselines/previous.json)
+          python3 scripts/bench_report.py compare "${args[@]}" \
+            --heading "### Benchmarks ($KIND run)"
+          cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+          cat comparison.md
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: librtmp2-server-benchmarks
-          path: bench-*.txt
+          path: |
+            bench-*.txt
+            sweep.log
+            results.json
+            comparison.md
+          if-no-files-found: ignore
+
+  publish-main:
+    name: update BENCHMARKS.md and latest run
+    needs: bench
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: bench-publish-main
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: librtmp2-server-benchmarks
+
+      - name: Rewrite the CI block in BENCHMARKS.md
+        run: |
+          # Heading and explanation are static text above the markers.
+          sed '1,2d' comparison.md > ci-block.md
+          python3 scripts/bench_report.py splice --target ci --file BENCHMARKS.md --fragment ci-block.md
+
+      - name: Commit BENCHMARKS.md
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add BENCHMARKS.md
+          if git diff --cached --quiet; then echo "BENCHMARKS.md unchanged"; exit 0; fi
+          git commit -m "docs(bench): update CI benchmarks for ${GITHUB_SHA::7} [skip ci]"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          for i in 1 2 3; do
+            git -c http.extraheader="$auth" pull --rebase origin main || true
+            if git -c http.extraheader="$auth" push origin HEAD:main; then exit 0; fi
+            sleep $((i * 5))
+          done
+          echo "::warning::could not push BENCHMARKS.md to main (branch protection?). The results are still in the job summary."
+
+      - name: Store as latest run on bench-data
+        run: scripts/publish-bench-data.sh latest.json results.json
+
+  publish-release:
+    name: attach to release
+    needs: bench
+    if: inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: librtmp2-server-benchmarks
+
+      - name: Add results to the GitHub Release
+        run: |
+          cp results.json "bench-results-$TAG.json"
+          cp comparison.md "BENCHMARKS-$TAG.md"
+          gh release upload "$TAG" "bench-results-$TAG.json" "BENCHMARKS-$TAG.md" --clobber
+          {
+            echo "## Benchmarks"
+            echo
+            echo "_Measured automatically for this release on a CI runner; the machine is described below. Raw data: \`bench-results-$TAG.json\`._"
+            echo
+            sed '1,2d' comparison.md
+          } > release-block.md
+          gh release view "$TAG" --json body --jq .body > body.md
+          python3 scripts/bench_report.py splice --target release --file body.md --fragment release-block.md
+          gh release edit "$TAG" --notes-file body.md
+
+      - name: Store under releases/ on bench-data
+        run: scripts/publish-bench-data.sh "releases/$TAG.json" results.json
