@@ -83,7 +83,9 @@ jobs:
       - name: Run HTTP API benchmarks
         run: |
           set -o pipefail
-          cargo bench --features test-support --bench http_api -- --sample-size 20 --test-threads 1 --noplot 2>&1 | tee bench-http-api.txt
+          # A restored target/ cache may hold Criterion output of earlier runs.
+          rm -rf target/criterion
+          cargo bench --features test-support --bench http_api -- --sample-size 20 --noplot 2>&1 | tee bench-http-api.txt
           rm -rf crit-http && mv target/criterion crit-http
 
       # ---- cross-server sweep ------------------------------------------------

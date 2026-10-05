@@ -27,6 +27,12 @@ for attempt in 1 2 3 4; do
     git -C "$work/data" remote add origin "$url"
     printf '# bench-data\n\nMachine-written benchmark results. `latest.json` is the newest run on `main`; `releases/<tag>.json` are the release runs. Do not edit by hand.\n' > "$work/data/README.md"
   fi
+  # Release results are immutable: a re-run of a release must not rewrite the
+  # baseline later runs are compared against. Only latest.json is overwritten.
+  if [[ "$dest" == releases/* && -e "$work/data/$dest" ]]; then
+    echo "bench-data: $dest already exists, keeping the recorded release result"
+    exit 0
+  fi
   mkdir -p "$work/data/$(dirname "$dest")"
   cp "$src" "$work/data/$dest"
   git -C "$work/data" config user.name "github-actions[bot]"
