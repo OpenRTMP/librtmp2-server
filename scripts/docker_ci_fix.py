@@ -64,18 +64,15 @@ exit $EXIT
         if os.path.exists(s):
             shutil.copy2(s, os.path.join(SRC, name))
     # copy formatted sources
-    for root, dirs, files in os.walk(os.path.join(DEST, "src")):
-        dirs[:] = [d for d in dirs if d != "target"]
-        rel = os.path.relpath(root, DEST)
-        for f in files:
-            if f.endswith(".rs"):
-                s = os.path.join(root, f)
-                d = os.path.join(SRC, rel, f)
-                shutil.copy2(s, d)
-    for name in ("tests/cluster_ha.rs",):
-        s = os.path.join(DEST, name.replace("/", os.sep))
-        if os.path.exists(s):
-            shutil.copy2(s, os.path.join(SRC, name.replace("/", os.sep)))
+    for sub in ("src", "tests", "benches"):
+        for root, dirs, files in os.walk(os.path.join(DEST, sub)):
+            dirs[:] = [d for d in dirs if d != "target"]
+            rel = os.path.relpath(root, DEST)
+            for f in files:
+                if f.endswith(".rs"):
+                    s = os.path.join(root, f)
+                    d = os.path.join(SRC, rel, f)
+                    shutil.copy2(s, d)
     print("docker exit", r.returncode)
     return r.returncode
 
