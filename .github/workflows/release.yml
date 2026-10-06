@@ -120,3 +120,14 @@ jobs:
     secrets: inherit
     with:
       version: ${{ needs.package.outputs.version }}
+
+  # Benchmarks run after the release exists and are attached to it afterwards;
+  # the Docker image above does not wait for them.
+  benchmarks:
+    name: benchmarks
+    needs: package
+    uses: ./.github/workflows/benchmarks.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+    permissions:
+      contents: write
