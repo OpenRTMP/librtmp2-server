@@ -336,4 +336,5 @@ jobs:
           if [ -e "bench/releases/$TAG.json" ]; then echo "bench/releases/$TAG.json already recorded"; exit 0; fi
           mkdir -p bench/releases
           cp ../results.json "bench/releases/$TAG.json"
-          ../scripts/push-bench-data.sh "docs(bench): record benchmarks of $TAG [skip ci]" "bench/releases/$TAG.json"
+          # Run the helper of main (data/), not the one of the tag: older tags do not have it.
+          ./scripts/push-bench-data.sh "docs(bench): record benchmarks of $TAG [skip ci]" "bench/releases/$TAG.json"
