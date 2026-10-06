@@ -123,7 +123,11 @@ jobs:
       - name: Build benchmark client and server
         if: env.RUN_SWEEP == 'true'
         run: |
-          (cd librtmp2-lib && cargo build --release --locked --example bench_handshake --example bench_relay)
+          # The librtmp2 tag ships no Cargo.lock. Seed it with this server's lock
+          # (same dependency versions), drop the entries only the server needs, and
+          # build --locked so nothing is resolved afresh.
+          cp Cargo.lock librtmp2-lib/Cargo.lock
+          (cd librtmp2-lib && cargo update --workspace && cargo build --release --locked --example bench_handshake --example bench_relay)
           cargo build --release --locked
 
       - name: Fetch MediaMTX
