@@ -36,6 +36,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SCHEMA = 1
@@ -277,13 +278,17 @@ def cmd_baselines(args: argparse.Namespace) -> None:
     ref = f"origin/{DATA_REF}"
     # Public repositories: no credentials needed. A failed fetch is an error,
     # not "no data yet" (the data files are simply absent until the first run).
-    fetch = subprocess.run(
-        ["git", "fetch", "--quiet", "--depth", "1", "origin", f"{DATA_REF}:refs/remotes/{ref}"],
-        capture_output=True,
-        text=True,
-    )
-    if fetch.returncode != 0:
-        sys.exit(f"could not fetch {DATA_REF} for the baselines: {fetch.stderr.strip()}")
+    for attempt in range(1, 4):
+        fetch = subprocess.run(
+            ["git", "fetch", "--quiet", "--depth", "1", "origin", f"{DATA_REF}:refs/remotes/{ref}"],
+            capture_output=True,
+            text=True,
+        )
+        if fetch.returncode == 0:
+            break
+        if attempt == 3:
+            sys.exit(f"could not fetch {DATA_REF} for the baselines: {fetch.stderr.strip()}")
+        time.sleep(attempt * 3)
 
     def show(path: str) -> str | None:
         p = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True, text=True)
