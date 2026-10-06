@@ -8,9 +8,9 @@ GitHub-hosted runner and compares every run with the last release and the last
 
 | Trigger | What happens | Published? |
 |---|---|---|
-| Merge to `main` | Microbenchmarks + sweep run, the *CI benchmarks* block in [`BENCHMARKS.md`](../BENCHMARKS.md) is rewritten (a `docs(bench)` commit by `github-actions[bot]`), the run is stored as `latest.json` on the `bench-data` branch | yes — `BENCHMARKS.md` + website "next release" preview |
-| Release | `release.yml` calls the workflow in its own job after the GitHub Release exists, so the Docker image never waits for it. Results are attached to the release as `bench-results-<tag>.json` and `BENCHMARKS-<tag>.md`, appended to the release notes, and stored as `releases/<tag>.json` on `bench-data` | yes — on the release |
-| *Actions → Benchmarks → Run workflow* | Runs and shows the comparison in the **job summary** (and log). Nothing is committed, uploaded to a release, or written to `bench-data`. Inputs: skip the sweep, pick servers, pick viewer counts | no |
+| Merge to `main` | Microbenchmarks + sweep run, the *CI benchmarks* block in [`BENCHMARKS.md`](../BENCHMARKS.md) is rewritten (a `docs(bench)` commit by `github-actions[bot]`), the run is stored as `bench/latest.json` in the same commit | yes — `BENCHMARKS.md` + website "next release" preview |
+| Release | `release.yml` calls the workflow in its own job after the GitHub Release exists, so the Docker image never waits for it. Results are attached to the release as `bench-results-<tag>.json` and `BENCHMARKS-<tag>.md`, appended to the release notes, and recorded as `bench/releases/<tag>.json` on `main` | yes — on the release |
+| *Actions → Benchmarks → Run workflow* | Runs and shows the comparison in the **job summary** (and log). Nothing is committed, uploaded to a release, or recorded under `bench/`. Inputs: skip the sweep, pick servers, pick viewer counts | no |
 | Pull request | Microbenchmarks only, same as a manual run | no |
 
 ## What the sweep uses
@@ -44,12 +44,12 @@ GitHub-hosted runner and compares every run with the last release and the last
 
 ## Data
 
-Results live on the orphan branch `bench-data` (written by
-[`scripts/publish-bench-data.sh`](../scripts/publish-bench-data.sh)):
+Results are plain files on `main` (committed by
+[`scripts/push-bench-data.sh`](../scripts/push-bench-data.sh)):
 
 ```
-latest.json            newest run on main, overwritten on every merge
-releases/<tag>.json    one file per release, never rewritten
+bench/latest.json            newest run on main, overwritten on every merge
+bench/releases/<tag>.json    one file per release, never rewritten
 ```
 
 openrtmp.org reads `latest.json` (this repo and librtmp2) to offer the newest
@@ -65,11 +65,11 @@ parses the sweep log. Both use only the Python standard library.
 - The release tag is **not** moved after the benchmark finished: the Docker
   image and the release tarballs are built from the tagged commit, and
   re-pointing a published tag would make the tag disagree with them. The
-  release numbers are therefore attached to the GitHub Release (and stored on
-  `bench-data`) instead of living in the tagged source tree.
-- Pushing the `BENCHMARKS.md` update to `main` needs `contents: write` and a
+  release numbers are therefore attached to the GitHub Release (and recorded under
+  `bench/releases/` on `main`) instead of living in the tagged source tree.
+- Pushing the `BENCHMARKS.md` and `bench/` updates to `main` needs `contents: write` and a
   `main` that accepts pushes from `github-actions[bot]`. If branch protection
   blocks it, the job prints a warning and the numbers are still in the job
-  summary and on `bench-data`.
+  summary and, if the push worked, in `bench/`.
 - A sweep takes a while (five servers, three load steps each); a new merge to
   `main` cancels a still-running sweep of the previous merge.

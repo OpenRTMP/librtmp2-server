@@ -9,7 +9,7 @@ Sub-commands
 collect     Criterion output (crit-protocol, crit-relay, crit-http) -> results.json
             (with the hardware/software environment of the machine that ran it).
 baselines   Fetch the comparison baselines (last release, last `main` run)
-            from the `bench-data` branch into baselines/.
+            from `bench/` on `main` into baselines/.
 compare     results.json (+ deltas against baselines/) -> comparison.md.
 splice      Replace a marker-delimited block in BENCHMARKS.md (`ci`) or in a
             GitHub release body, body.md (`release`) with generated Markdown.
@@ -17,9 +17,9 @@ splice      Replace a marker-delimited block in BENCHMARKS.md (`ci`) or in a
 All file names are fixed (see the constants below); the command line carries
 no paths.
 
-Results are stored on the orphan branch `bench-data`:
-    latest.json            newest run on `main` (overwritten on every merge)
-    releases/<tag>.json    one immutable file per release
+Results are stored on `main`, under bench/:
+    bench/latest.json            newest run on `main` (overwritten on every merge)
+    bench/releases/<tag>.json    one immutable file per release
 
 This file is kept byte-identical in OpenRTMP/librtmp2 and
 OpenRTMP/librtmp2-server (the latter adds scripts/bench_sweep.py on top).
@@ -39,7 +39,8 @@ import sys
 from pathlib import Path
 
 SCHEMA = 1
-DATA_BRANCH = "bench-data"
+DATA_REF = "main"
+DATA_DIR = "bench"
 
 CI_START = "<!-- ci-bench:start -->"
 CI_END = "<!-- ci-bench:end -->"
@@ -255,7 +256,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
 
 # --------------------------------------------------------------------------
-# baselines (bench-data branch)
+# baselines (bench/ on main)
 # --------------------------------------------------------------------------
 
 def _version_key(name: str) -> tuple:
@@ -273,39 +274,33 @@ def cmd_baselines(args: argparse.Namespace) -> None:
     """Write baselines/previous.json (last main run) and baselines/release.json (last release)."""
     out = BASELINE_DIR
     out.mkdir(parents=True, exist_ok=True)
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    git = ["git"]
-    if token:
-        import base64
-
-        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-        git += ["-c", f"http.extraheader=AUTHORIZATION: basic {basic}"]
+    ref = f"origin/{DATA_REF}"
+    # Public repositories: no credentials needed. A failed fetch is an error,
+    # not "no data yet" (the data files are simply absent until the first run).
     fetch = subprocess.run(
-        git + ["fetch", "--quiet", "--depth", "1", "origin", f"{DATA_BRANCH}:refs/remotes/origin/{DATA_BRANCH}"],
+        ["git", "fetch", "--quiet", "--depth", "1", "origin", f"{DATA_REF}:refs/remotes/{ref}"],
         capture_output=True,
         text=True,
     )
     if fetch.returncode != 0:
-        print(f"note: no {DATA_BRANCH} branch yet ({fetch.stderr.strip()})")
-        return
-    ref = f"origin/{DATA_BRANCH}"
+        sys.exit(f"could not fetch {DATA_REF} for the baselines: {fetch.stderr.strip()}")
 
     def show(path: str) -> str | None:
         p = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True, text=True)
         return p.stdout if p.returncode == 0 else None
 
-    prev = show("latest.json")
+    prev = show(f"{DATA_DIR}/latest.json")
     if prev and not args.skip_previous:
         write_file(out / "previous.json", prev)
         print("baseline: previous main run")
-    names = _run("git", "ls-tree", "--name-only", ref, "releases/").splitlines()
+    names = _run("git", "ls-tree", "--name-only", ref, f"{DATA_DIR}/releases/").splitlines()
     tags = sorted(
         (Path(n).stem for n in names if n.endswith(".json")),
         key=_version_key,
     )
     tags = [t for t in tags if t != (args.exclude_tag or "")]
     if tags:
-        text = show(f"releases/{tags[-1]}.json")
+        text = show(f"{DATA_DIR}/releases/{tags[-1]}.json")
         if text:
             write_file(out / "release.json", text)
             print(f"baseline: last release {tags[-1]}")
