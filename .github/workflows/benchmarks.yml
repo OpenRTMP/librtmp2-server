@@ -5,7 +5,7 @@ name: Benchmarks
 #   merge to main      HTTP API microbenchmarks + the cross-server sweep
 #                      (librtmp2-server vs nginx-rtmp, MediaMTX, SRS, LiveForge)
 #                      -> rewrite the "CI benchmarks" block in BENCHMARKS.md
-#                      -> store as the latest run on `bench-data` (the website
+#                      -> store as bench/latest.json (the website
 #                      shows it as "next release preview")
 #   release            called from release.yml once the GitHub Release exists
 #                      (a separate job there, so the Docker image never waits
@@ -22,6 +22,7 @@ on:
     branches: [main]
     paths-ignore:
       - BENCHMARKS.md
+      - bench/**
   pull_request:
   workflow_dispatch:
     inputs:
@@ -228,8 +229,6 @@ jobs:
             --param "publisher=ffmpeg 1280x720@30 H.264 2.5 Mbps + AAC 128 kbps"
 
       - name: Fetch baselines (last release, last main run)
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/bench_report.py baselines --exclude-tag "$TAG"
 
@@ -279,24 +278,12 @@ jobs:
           # Heading and explanation are static text above the markers.
           sed '1,2d' comparison.md > ci-block.md
           python3 scripts/bench_report.py splice --target ci
+          mkdir -p bench
+          cp results.json bench/latest.json
 
-      - name: Commit BENCHMARKS.md
+      - name: Commit BENCHMARKS.md and bench/latest.json
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add BENCHMARKS.md
-          if git diff --cached --quiet; then echo "BENCHMARKS.md unchanged"; exit 0; fi
-          git commit -m "docs(bench): update CI benchmarks for ${GITHUB_SHA::7} [skip ci]"
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          for i in 1 2 3; do
-            git -c http.extraheader="$auth" pull --rebase origin main || true
-            if git -c http.extraheader="$auth" push origin HEAD:main; then exit 0; fi
-            sleep $((i * 5))
-          done
-          echo "::warning::could not push BENCHMARKS.md to main (branch protection?). The results are still in the job summary."
-
-      - name: Store as latest run on bench-data
-        run: scripts/publish-bench-data.sh latest.json results.json
+          scripts/push-bench-data.sh "docs(bench): update CI benchmarks for ${GITHUB_SHA::7} [skip ci]" BENCHMARKS.md bench/latest.json
 
   publish-release:
     name: attach to release
@@ -313,6 +300,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: data
           persist-credentials: false
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -335,5 +328,13 @@ jobs:
           python3 scripts/bench_report.py splice --target release
           gh release edit "$TAG" --notes-file body.md
 
-      - name: Store under releases/ on bench-data
-        run: scripts/publish-bench-data.sh "releases/$TAG.json" results.json
+      - name: Record under bench/releases/ on main
+        working-directory: data
+        run: |
+          # Release results are immutable: a re-run must not change the
+          # baseline later runs are compared against.
+          if [ -e "bench/releases/$TAG.json" ]; then echo "bench/releases/$TAG.json already recorded"; exit 0; fi
+          mkdir -p bench/releases
+          cp ../results.json "bench/releases/$TAG.json"
+          # Run the helper of main (data/), not the one of the tag: older tags do not have it.
+          ./scripts/push-bench-data.sh "docs(bench): record benchmarks of $TAG [skip ci]" "bench/releases/$TAG.json"
