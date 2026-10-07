@@ -418,6 +418,7 @@ if want_server nginx && command -v "$NGINX_BIN" >/dev/null && [[ -e "$NGINX_RTMP
   cat > "$WORK_DIR/nginx/nginx.conf" <<EOF
 load_module $NGINX_RTMP_MODULE;
 worker_processes 1; # see BENCHMARKS.md: nginx-rtmp relay state is per worker
+daemon off;
 error_log $WORK_DIR/logs/nginx-error.log info;
 pid $WORK_DIR/nginx/nginx.pid;
 events { worker_connections 4096; }
@@ -429,7 +430,9 @@ rtmp {
     }
 }
 EOF
-  "$NGINX_BIN" -c "$WORK_DIR/nginx/nginx.conf"
+  "$NGINX_BIN" -c "$WORK_DIR/nginx/nginx.conf" >"$WORK_DIR/logs/nginx-stdout.log" 2>&1 &
+  echo $! > "$WORK_DIR/nginx/run.pid"
+  PIDS+=("$(cat "$WORK_DIR/nginx/run.pid")")
   wait_port 1936 "$WORK_DIR/logs/nginx-error.log"
   if want_phase handshake; then
   echo "=== nginx-rtmp handshake (count=120, concurrency=30) ==="
