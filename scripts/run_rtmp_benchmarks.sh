@@ -109,6 +109,9 @@ for _v in LOAD_RUN_SECS LOAD_WARMUP_MS LOAD_MEASURE_DELAY LOAD_MEASURE_SECS STRA
   [[ "${!_v}" =~ ^[0-9]+$ ]] || { echo "error: $_v must be a non-negative integer" >&2; exit 2; }
 done
 ((LOAD_MEASURE_SECS > 0)) || { echo "error: LOAD_MEASURE_SECS must be > 0" >&2; exit 2; }
+if [[ "$STRACE_SAMPLE" = "1" ]]; then
+  ((STRACE_SECS > 0)) || { echo "error: STRACE_SECS must be > 0 (0 disables the timeout)" >&2; exit 2; }
+fi
 want_server() { [[ " $BENCH_SERVERS " == *" $1 "* ]]; }
 want_phase() { [[ " $BENCH_PHASES " == *" $1 "* ]]; }
 # Largest load step, to size connection limits and viewer key pools.
