@@ -66,6 +66,10 @@ def _read_line(line: str, cur: dict) -> None:
         cur["ok"] = int(_kv(line, "ok") or 0)
         cur["failed"] = int(_kv(line, "failed") or 0)
         cur["rate"] = _kv(line, "handshakes_per_s")
+    elif line.startswith("connected="):
+        cur["received"] = int(_kv(line, "received_frames") or 0)
+    elif line.startswith("delivered:"):
+        cur["received"] = int(_kv(line, "viewers") or 0)
     elif line.startswith("steady-state"):
         cur["fps"] = _kv(line, "avg_fps_per_player")
     elif line.startswith("server resources:"):
@@ -82,14 +86,18 @@ def _handshake_row(cur: dict) -> list | None:
 
 
 def _join_row(cur: dict) -> list | None:
-    if cur.get("avg") is None or cur.get("fps") is None:
+    """Only legs that actually delivered frames: the client prints zeroed
+    latency/throughput for a leg in which no viewer received a frame, and that
+    must not be published as a valid result."""
+    if cur.get("avg") is None or cur.get("fps") is None or cur.get("received", 0) <= 0:
         return None
     return [cur["avg"], cur["p95"], cur["fps"]]
 
 
 def _load_row(cur: dict) -> list | None:
     row = [cur.get(k) for k in ("avg", "p95", "fps", "cpu", "rss")]
-    return row if None not in row else None
+    complete = None not in row and cur.get("received", 0) > 0
+    return row if complete else None
 
 
 def _store(sweep: dict, section: tuple, cur: dict) -> None:
