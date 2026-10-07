@@ -318,18 +318,23 @@ load_test() {
       timeout "$STRACE_SECS" strace -c -f -p "$server_pid" \
         -e trace=sendmsg,sendto,write,writev,send -o "$WORK_DIR/logs/strace-$label-load-$n.txt" || true
     fi
-    wait "$bench_pid" || true
-    cat "$relay_out"
-    cpu_pct="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", 100 * d / hz / (t1 - t0) }')"
-    cpu_s="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" 'BEGIN { printf "%.2f", d / hz }')"
-    peak_mib="$(awk -v rss="$peak_rss" 'BEGIN { printf "%.1f", rss / 1024 }')"
-    echo "server resources: cpu_pct=$cpu_pct peak_rss_mib=$peak_mib"
-    gbps="$(sed -n 's/^delivered:.*aggregate_gbps=\([0-9.]*\).*/\1/p' "$relay_out")"
-    fpv="$(sed -n 's/^delivered:.*steady_frames_per_viewer=\([0-9.]*\).*/\1/p' "$relay_out")"
-    awk -v n="$n" -v pct="$cpu_pct" -v cs="$cpu_s" -v rss="$peak_mib" -v g="${gbps:-0}" -v f="${fpv:-0}" \
-      -v win="$LOAD_MEASURE_SECS" 'BEGIN {
-        printf "load-summary: viewers=%d cpu_pct=%s cpu_seconds=%s (window %ss) peak_rss_mib=%s delivered_gbps=%s frames_per_viewer=%s core_s_per_gbit=%s\n",
-          n, pct, cs, win, rss, g, f, (g > 0 ? sprintf("%.3f", pct / 100 / g) : "n/a") }'
+    local rc=0
+    wait "$bench_pid" || rc=$?
+    if ((rc != 0)); then
+      echo "error: bench_relay exited $rc for $label load, players=$n — leg failed; results skipped" >&2
+    else
+      cat "$relay_out"
+      cpu_pct="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", 100 * d / hz / (t1 - t0) }')"
+      cpu_s="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" 'BEGIN { printf "%.2f", d / hz }')"
+      peak_mib="$(awk -v rss="$peak_rss" 'BEGIN { printf "%.1f", rss / 1024 }')"
+      echo "server resources: cpu_pct=$cpu_pct peak_rss_mib=$peak_mib"
+      gbps="$(sed -n 's/^delivered:.*aggregate_gbps=\([0-9.]*\).*/\1/p' "$relay_out")"
+      fpv="$(sed -n 's/^delivered:.*steady_frames_per_viewer=\([0-9.]*\).*/\1/p' "$relay_out")"
+      awk -v n="$n" -v pct="$cpu_pct" -v cs="$cpu_s" -v rss="$peak_mib" -v g="${gbps:-0}" -v f="${fpv:-0}" \
+        -v win="$LOAD_MEASURE_SECS" 'BEGIN {
+          printf "load-summary: viewers=%d cpu_pct=%s cpu_seconds=%s (window %ss) peak_rss_mib=%s delivered_gbps=%s frames_per_viewer=%s core_s_per_gbit=%s\n",
+            n, pct, cs, win, rss, g, f, (g > 0 ? sprintf("%.3f", pct / 100 / g) : "n/a") }'
+    fi
     if [[ -s "$WORK_DIR/logs/perfstat-$label-load-$n.csv" ]]; then
       echo "perf stat (server pid $server_pid, ${LOAD_MEASURE_SECS}s window, value,unit,event):"
       grep -v '^#' "$WORK_DIR/logs/perfstat-$label-load-$n.csv" | cut -d, -f1-3 | sed 's/^/  /'
