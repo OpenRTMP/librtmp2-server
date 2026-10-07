@@ -280,7 +280,7 @@ def cmd_baselines(args: argparse.Namespace) -> None:
     # not "no data yet" (the data files are simply absent until the first run).
     for attempt in range(1, 4):
         fetch = subprocess.run(
-            ["git", "fetch", "--quiet", "--depth", "1", "origin", f"{DATA_REF}:refs/remotes/{ref}"],
+            ["git", "fetch", "--depth", "1", "origin", f"+{DATA_REF}:refs/remotes/{ref}"],
             capture_output=True,
             text=True,
             encoding="utf-8",
