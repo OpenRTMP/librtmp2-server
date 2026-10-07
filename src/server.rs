@@ -1477,6 +1477,14 @@ pub(crate) fn process_server_connections(
                 entry.stream_id = sid.clone();
                 conn.relay_key = sid;
             }
+            // A rename under defer_media_relay clears relay_enabled in the
+            // library; restore it once the bridge owns the publisher row and
+            // no authorization is pending. Idempotent per tick: the worker
+            // moves the bridge row before the completion is drained, and the
+            // completion clears relay_enabled again.
+            if rtmp_bridge.has_publisher(conn_id) && !conn.has_pending_authorization() {
+                conn.relay_enabled = true;
+            }
         }
 
         if is_playing && !entry.playing {
@@ -4715,6 +4723,22 @@ mod tests {
         assert!(h.entry().stream_id.is_empty());
         assert!(h.conn().relay_key.is_empty());
         assert!(!h.conn().relay_enabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn poll_pass_restores_relay_cleared_by_a_same_conn_rename() {
+        let mut h = PollHarness::new(&["pub1"]);
+        h.publish("pub1");
+        h.set_session(true, false);
+        h.tick();
+        assert!(h.conn().relay_enabled);
+        // librtmp2 clears relay_enabled when the publish name changes under
+        // defer_media_relay; while the bridge still owns the publisher row the
+        // next tick must restore delivery.
+        h.conn().relay_enabled = false;
+        h.tick();
+        assert!(h.conn().relay_enabled);
     }
 
     #[test]
