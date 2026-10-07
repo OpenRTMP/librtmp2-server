@@ -84,7 +84,7 @@ def _read(path: str) -> str:
 
 def _run(*cmd: str) -> str:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, check=False).stdout.strip()
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", check=False).stdout.strip()
     except OSError:
         return ""
 
@@ -283,6 +283,7 @@ def cmd_baselines(args: argparse.Namespace) -> None:
             ["git", "fetch", "--quiet", "--depth", "1", "origin", f"{DATA_REF}:refs/remotes/{ref}"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
         if fetch.returncode == 0:
             break
@@ -291,7 +292,9 @@ def cmd_baselines(args: argparse.Namespace) -> None:
         time.sleep(attempt * 3)
 
     def show(path: str) -> str | None:
-        p = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True, text=True)
+        p = subprocess.run(
+            ["git", "show", f"{ref}:{path}"], capture_output=True, text=True, encoding="utf-8"
+        )
         return p.stdout if p.returncode == 0 else None
 
     prev = show(f"{DATA_DIR}/latest.json")
@@ -483,11 +486,13 @@ def cmd_splice(args: argparse.Namespace) -> int:
     for target, (path, fragment, start, end) in SPLICE_TARGETS.items():
         if target != args.target:
             continue
-        text = path.read_text() if path.exists() else ""
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
         if target == "ci" and (start not in text or end not in text):
             print(f"error: {path} has no {start} … {end} block", file=sys.stderr)
             return 1
-        write_file(path, splice_text(text, fragment.read_text(), start, end))
+        write_file(
+            path, splice_text(text, fragment.read_text(encoding="utf-8"), start, end)
+        )
     return 0
 
 
