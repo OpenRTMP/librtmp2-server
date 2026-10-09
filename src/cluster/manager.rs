@@ -2191,11 +2191,7 @@ impl ClusterManager {
         }
         let ids: Vec<String> = changed.into_iter().map(|(id, _)| id).collect();
         for sid in &ids {
-            let app = match self.db.stream_get(sid) {
-                crate::db::DbLookup::Ok(s) => s.app,
-                _ => "live".to_string(),
-            };
-            self.media.evict_init_cache(&app, sid);
+            self.media.evict_init_cache_for_stream(sid);
         }
         self.resubscribe_active_players(&ids);
     }

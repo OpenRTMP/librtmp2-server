@@ -159,6 +159,10 @@ pub struct DbRtmpBridge {
     /// The RTMP poll loop closes these sockets after `deleted_streams` no
     /// longer matches (finalize already cleared the marker).
     pending_force_close: Mutex<HashSet<ConnId>>,
+    /// Test hook: number of remote-play unsubscribe calls issued (asserts one
+    /// per abandoned local play role).
+    #[cfg(all(test, feature = "cluster"))]
+    remote_play_unsubscribes: std::sync::atomic::AtomicUsize,
 }
 
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
@@ -235,6 +239,8 @@ impl DbRtmpBridge {
             #[cfg(feature = "cluster")]
             pending_ownership_releases: Mutex::new(Vec::new()),
             pending_force_close: Mutex::new(HashSet::new()),
+            #[cfg(all(test, feature = "cluster"))]
+            remote_play_unsubscribes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -591,7 +597,7 @@ impl DbRtmpBridge {
     /// `deleted_streams`).
     pub fn abandon_roles_for_stream(&self, stream_id: &str) {
         let mut abandoned_pubs: Vec<ConnId> = Vec::new();
-        let mut abandoned_any_play = false;
+        let mut abandoned_plays: usize = 0;
         let mut force_close: Vec<ConnId> = Vec::new();
         {
             let mut guard = self.conns.lock();
@@ -621,7 +627,7 @@ impl DbRtmpBridge {
                     cs.player_stats_reset_pending = true;
                     self.player_stats_generation
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    abandoned_any_play = true;
+                    abandoned_plays += 1;
                 }
                 if drop_pub || drop_play {
                     if let Some(ref pub_row) = cs.publisher {
@@ -640,11 +646,11 @@ impl DbRtmpBridge {
             self.try_release_ownership_for_conn(conn_id);
         }
         #[cfg(feature = "cluster")]
-        if abandoned_any_play {
+        for _ in 0..abandoned_plays {
             self.maybe_unsubscribe_remote_play(stream_id);
         }
         #[cfg(not(feature = "cluster"))]
-        let _ = abandoned_any_play;
+        let _ = abandoned_plays;
 
         if !force_close.is_empty() {
             let mut pending = self.pending_force_close.lock();
@@ -1626,6 +1632,9 @@ impl DbRtmpBridge {
         if let Some(coord) = self.coordinator.lock().clone()
             && let Some(mgr) = coord.cluster_manager()
         {
+            #[cfg(test)]
+            self.remote_play_unsubscribes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             mgr.notify_play_unsubscribe(&app, stream_id);
         }
     }
@@ -2620,6 +2629,97 @@ mod tests {
         bridge.persist_fast_play(1, &row);
         assert!(active_players(&db, "s1").is_empty());
         assert_eq!(db.player_active_count_for_viewer(&row.viewer_id), 0);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandon_roles_issues_one_remote_unsubscribe_per_abandoned_play() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(Db::open(dir.path().join("bridge.db").to_str().unwrap()).unwrap());
+        let owned = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        // A second stream with no cluster owner: abandoning its play roles must
+        // not be counted as remote unsubscribes — there is nobody to notify.
+        let standalone = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        // The owner of s1 is a peer node, so each local play role holds one ref
+        // on this node's remote subscription to it.
+        db.stream_owner_acquire("s1", 2, 1, crate::db::now_ts())
+            .expect("owner row");
+
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        for conn in [1, 2] {
+            bridge
+                .try_fast_authorize_play(conn, "live", &owned.play_key)
+                .expect("player admitted");
+        }
+        for conn in [3, 4] {
+            bridge
+                .try_fast_authorize_play(conn, "live", &standalone.play_key)
+                .expect("player admitted");
+        }
+
+        bridge.abandon_roles_for_stream("s2");
+        assert_eq!(
+            bridge
+                .remote_play_unsubscribes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "without a cluster coordinator nothing was notified, so nothing may \
+             have been counted"
+        );
+
+        let free_port = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let config = crate::cluster::ClusterConfig {
+            enabled: true,
+            node_id: 1,
+            bind: format!("127.0.0.1:{}", free_port()),
+            media_bind: format!("127.0.0.1:{}", free_port()),
+            bootstrap: true,
+            secret: "test-cluster-secret-0123456789abcd".to_string(),
+            heartbeat: Duration::from_millis(100),
+            allow_loopback_peer_addrs: true,
+            ..Default::default()
+        };
+        let mgr = crate::cluster::ClusterManager::start(
+            config,
+            Arc::clone(&db),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("start cluster manager");
+        bridge.set_coordinator(Arc::new(StateCoordinator::cluster(Arc::clone(&mgr))));
+
+        // One remote subscription ref per local play role, as the peer's media
+        // hub tracks them (an unlearned address keeps the ref without dialing).
+        mgr.media().subscribe_remote("", 2, "live", "s1", 1).await;
+        mgr.media().subscribe_remote("", 2, "live", "s1", 1).await;
+        assert_eq!(mgr.media().subscribed_nodes_for("live", "s1"), vec![2]);
+
+        bridge.abandon_roles_for_stream("s1");
+
+        assert_eq!(
+            bridge
+                .remote_play_unsubscribes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each abandoned play role issues one remote-play unsubscribe to the \
+             coordinator"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !mgr.media().subscribed_nodes_for("live", "s1").is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "each abandoned play role holds its own subscription ref and must \
+                 release it, or the owner keeps forwarding with no local viewer"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[test]

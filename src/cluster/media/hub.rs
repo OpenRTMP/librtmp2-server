@@ -1485,6 +1485,12 @@ impl MediaHub {
         self.cache.remove(app, stream);
     }
 
+    /// Evict every cached init entry for `stream` regardless of app, for
+    /// callers that cannot resolve the stream's app (e.g. its row is gone).
+    pub fn evict_init_cache_for_stream(&self, stream: &str) {
+        self.cache.remove_stream(stream);
+    }
+
     /// Bind the media port before spawning accept so startup fails hard on conflict.
     pub async fn start(self: &Arc<Self>, bind: SocketAddr) -> Result<(), String> {
         let listener = TcpListener::bind(bind)
@@ -2156,6 +2162,33 @@ mod tests {
         owner.hub.evict_init_cache("live", "s");
         assert!(owner.hub.cache.get("live", "s").is_none());
         owner.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn evict_init_cache_for_stream_drops_entries_of_any_app() {
+        let n = node(1);
+        n.hub.put_init_cache(
+            "live",
+            "s1",
+            1,
+            InitCacheEntry {
+                avc_header: Some(AVC_SEQ.to_vec()),
+                ..InitCacheEntry::default()
+            },
+        );
+        n.hub
+            .put_init_cache("other", "s1", 1, InitCacheEntry::default());
+        n.hub
+            .put_init_cache("live", "s2", 1, InitCacheEntry::default());
+
+        n.hub.evict_init_cache_for_stream("s1");
+        assert!(n.hub.cache.get("live", "s1").is_none());
+        assert!(
+            n.hub.cache.get("other", "s1").is_none(),
+            "the entry under the stream's real app must be dropped too"
+        );
+        assert!(n.hub.cache.get("live", "s2").is_some());
+        n.hub.shutdown();
     }
 
     #[tokio::test]

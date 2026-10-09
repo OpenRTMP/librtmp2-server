@@ -42,6 +42,12 @@ impl InitCacheStore {
             .remove(&(app.to_string(), stream.to_string()));
     }
 
+    /// Drop every entry for `stream`, whatever app it was staged under — for
+    /// callers that can no longer resolve the stream's app.
+    pub fn remove_stream(&self, stream: &str) {
+        self.inner.lock().retain(|(_, s), _| s != stream);
+    }
+
     pub fn update_from_frame(
         &self,
         app: &str,
@@ -183,6 +189,43 @@ mod tests {
         assert!(store.get("live", "s1").is_none());
         // Removing a missing key is a no-op.
         store.remove("live", "missing");
+    }
+
+    #[test]
+    fn remove_stream_drops_every_app_for_that_stream() {
+        let store = InitCacheStore::new();
+        store.put(
+            "live",
+            "s1",
+            InitCacheEntry {
+                metadata: Some(vec![1]),
+                epoch: 1,
+                ..InitCacheEntry::default()
+            },
+        );
+        store.put(
+            "other",
+            "s1",
+            InitCacheEntry {
+                epoch: 7,
+                ..InitCacheEntry::default()
+            },
+        );
+        store.put("live", "s2", InitCacheEntry::default());
+
+        store.remove_stream("s1");
+        assert!(store.get("live", "s1").is_none());
+        assert!(
+            store.get("other", "s1").is_none(),
+            "an entry under a different app must be dropped too"
+        );
+        assert_eq!(
+            store.get("live", "s2").unwrap().epoch,
+            0,
+            "another stream's entries must survive"
+        );
+        // Removing a stream with no entries is a no-op.
+        store.remove_stream("missing");
     }
 
     #[test]
