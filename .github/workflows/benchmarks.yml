@@ -50,9 +50,11 @@ permissions:
 
 env:
   # Competitor versions are pinned so a run only changes when we change them.
-  MEDIAMTX_VERSION: v1.21.1
+  MEDIAMTX_VERSION: v1.21.2
   SRS_REF: v8.0-d0
   LIVEFORGE_REF: 4e70fb3a7b6b3d92bf2e099965f2c81c4f3f98c5
+  NGINX_REF: release-1.31.6
+  NGINX_RTMP_REF: 6c7719d0ba32e00b563ec70bd43dad11960fa9c4
 
 jobs:
   bench:
@@ -94,9 +96,7 @@ jobs:
         if: env.RUN_SWEEP == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg nginx libnginx-mod-rtmp libssl-dev pkg-config
-          sudo systemctl stop nginx || true
-          sudo systemctl disable nginx || true
+          sudo apt-get install -y ffmpeg libssl-dev pkg-config
 
       - name: Check out librtmp2 (the benchmark client, at the version this server builds on)
         if: env.RUN_SWEEP == 'true'
@@ -142,6 +142,33 @@ jobs:
           grep "[ *]mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz\$" checksums.sha256 | sha256sum -c -
           tar xzf "mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" mediamtx
           echo "MEDIAMTX_BIN=$PWD/mediamtx" >> "$GITHUB_ENV"
+
+      - name: Cache nginx-rtmp build
+        if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'nginx')
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/nginx-bin
+          key: nginx-${{ runner.os }}-${{ env.NGINX_REF }}-${{ env.NGINX_RTMP_REF }}-v1
+
+      - name: Build nginx-rtmp
+        if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'nginx')
+        continue-on-error: true
+        run: |
+          # The latest nginx release with nginx-rtmp-module as a dynamic module,
+          # the same build as the published runs (the distro package lags behind).
+          if [ ! -x "$HOME/nginx-bin/sbin/nginx" ]; then
+            git clone --quiet --depth 1 --branch "$NGINX_REF" https://github.com/nginx/nginx "$RUNNER_TEMP/nginx"
+            git clone --quiet https://github.com/arut/nginx-rtmp-module "$RUNNER_TEMP/nginx-rtmp-module"
+            git -C "$RUNNER_TEMP/nginx-rtmp-module" checkout --quiet "$NGINX_RTMP_REF"
+            cd "$RUNNER_TEMP/nginx"
+            ./auto/configure --prefix="$HOME/nginx-bin" \
+              --add-dynamic-module="$RUNNER_TEMP/nginx-rtmp-module" \
+              --without-http_rewrite_module --without-http_gzip_module
+            make -j"$(nproc)"
+            make install
+          fi
+          echo "NGINX_BIN=$HOME/nginx-bin/sbin/nginx" >> "$GITHUB_ENV"
+          echo "NGINX_RTMP_MODULE=$HOME/nginx-bin/modules/ngx_rtmp_module.so" >> "$GITHUB_ENV"
 
       - name: Cache SRS build
         if: env.RUN_SWEEP == 'true' && contains(env.SWEEP_SERVERS, 'srs')
@@ -216,15 +243,13 @@ jobs:
           if [ "${{ steps.sweep.outcome }}" != "success" ]; then
             echo "::warning::the sweep script exited non-zero; using the legs that finished (see sweep.log)"
           fi
-          nginx_v="$(dpkg-query -W -f='${Version}' nginx 2>/dev/null | cut -d- -f1 | cut -d+ -f1)"
-          rtmp_v="$(dpkg-query -W -f='${Version}' libnginx-mod-rtmp 2>/dev/null | cut -d- -f1 | cut -d+ -f1)"
           lib_v="$(jq -r '.deps.librtmp2 // "unknown"' results.json)"
           python3 scripts/bench_sweep.py merge \
             --version "openrtmp=$(jq -r .version results.json)|librtmp2 $lib_v|Rust" \
             --version "mediamtx=$MEDIAMTX_VERSION||Go" \
             --version "liveforge=main @ ${LIVEFORGE_REF::7}||Go" \
             --version "srs=$SRS_REF||C++" \
-            --version "nginx=nginx $nginx_v|libnginx-mod-rtmp $rtmp_v|C" \
+            --version "nginx=nginx ${NGINX_REF#release-}|nginx-rtmp-module @ ${NGINX_RTMP_REF::7}|C" \
             --param "load viewers=$LOAD_VIEWERS" \
             --param "publisher=ffmpeg 1280x720@30 H.264 2.5 Mbps + AAC 128 kbps"
 
