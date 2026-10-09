@@ -1,6 +1,6 @@
 # Bug scan progress
 
-Last scanned: keygen (2026-09-28)
+Last scanned: logger (2026-10-09)
 
 ## Modules
 
@@ -10,7 +10,17 @@ Last scanned: keygen (2026-09-28)
 - [x] server — App lifecycle, HTTP+RTMP wiring, deleted_streams eviction
 - [x] rtmp_bridge — RTMP protocol ↔ DB integration seam
 - [x] keygen — Stream key generation
-- [ ] logger — Logging
+- [x] logger — Logging
+
+## Findings (2026-10-09 logger pass)
+
+- **Critical (fixed):** `logger::init()` opened `LOG_FILE` with plain
+  `OpenOptions::append(true)` and no `O_NOFOLLOW`. A local attacker (or race
+  before startup) could replace the log path with a symlink to another writable
+  file in the same directory — notably `server.db` when both paths share a
+  data dir — causing append-only log writes to corrupt the SQLite database
+  (data loss / server breakage). Unix open now uses `O_NOFOLLOW`, matching
+  `LRTMP2_DB` hardening in `db.rs`.
 
 ## Findings (2026-09-28 keygen pass)
 
