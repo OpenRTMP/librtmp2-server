@@ -159,6 +159,10 @@ pub struct DbRtmpBridge {
     /// The RTMP poll loop closes these sockets after `deleted_streams` no
     /// longer matches (finalize already cleared the marker).
     pending_force_close: Mutex<HashSet<ConnId>>,
+    /// Test hook: number of remote-play unsubscribe calls issued (asserts one
+    /// per abandoned local play role).
+    #[cfg(all(test, feature = "cluster"))]
+    remote_play_unsubscribes: std::sync::atomic::AtomicUsize,
 }
 
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
@@ -235,6 +239,8 @@ impl DbRtmpBridge {
             #[cfg(feature = "cluster")]
             pending_ownership_releases: Mutex::new(Vec::new()),
             pending_force_close: Mutex::new(HashSet::new()),
+            #[cfg(all(test, feature = "cluster"))]
+            remote_play_unsubscribes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -591,7 +597,7 @@ impl DbRtmpBridge {
     /// `deleted_streams`).
     pub fn abandon_roles_for_stream(&self, stream_id: &str) {
         let mut abandoned_pubs: Vec<ConnId> = Vec::new();
-        let mut abandoned_any_play = false;
+        let mut abandoned_plays: usize = 0;
         let mut force_close: Vec<ConnId> = Vec::new();
         {
             let mut guard = self.conns.lock();
@@ -621,7 +627,7 @@ impl DbRtmpBridge {
                     cs.player_stats_reset_pending = true;
                     self.player_stats_generation
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    abandoned_any_play = true;
+                    abandoned_plays += 1;
                 }
                 if drop_pub || drop_play {
                     if let Some(ref pub_row) = cs.publisher {
@@ -640,11 +646,11 @@ impl DbRtmpBridge {
             self.try_release_ownership_for_conn(conn_id);
         }
         #[cfg(feature = "cluster")]
-        if abandoned_any_play {
+        for _ in 0..abandoned_plays {
             self.maybe_unsubscribe_remote_play(stream_id);
         }
         #[cfg(not(feature = "cluster"))]
-        let _ = abandoned_any_play;
+        let _ = abandoned_plays;
 
         if !force_close.is_empty() {
             let mut pending = self.pending_force_close.lock();
@@ -1619,6 +1625,9 @@ impl DbRtmpBridge {
 
     #[cfg(feature = "cluster")]
     fn maybe_unsubscribe_remote_play(&self, stream_id: &str) {
+        #[cfg(test)]
+        self.remote_play_unsubscribes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let app = match self.db.stream_get(stream_id) {
             DbLookup::Ok(s) => s.app,
             _ => "live".to_string(),
@@ -2620,6 +2629,32 @@ mod tests {
         bridge.persist_fast_play(1, &row);
         assert!(active_players(&db, "s1").is_empty());
         assert_eq!(db.player_active_count_for_viewer(&row.viewer_id), 0);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn abandon_roles_issues_one_remote_unsubscribe_per_abandoned_play() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        let _p1 = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("first player admitted");
+        let _p2 = bridge
+            .try_fast_authorize_play(2, "live", &s.play_key)
+            .expect("second player admitted");
+
+        bridge.abandon_roles_for_stream("s1");
+
+        assert_eq!(
+            bridge
+                .remote_play_unsubscribes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each abandoned play role holds its own subscription ref and must \
+             release it, or the owner keeps forwarding with no local viewer"
+        );
     }
 
     #[test]
