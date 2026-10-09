@@ -13,6 +13,70 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- CI benchmark workflow: every merge to `main` and every release runs the
+  HTTP API microbenchmarks and the cross-server RTMP sweep (nginx-rtmp,
+  MediaMTX, SRS, LiveForge), compares the result with the last release and
+  updates the CI block in `BENCHMARKS.md`; releases attach their results to
+  the GitHub Release. History is kept in `bench/` on `main`. See
+  `docs/ci-benchmarks.md`.
+
+### Changed
+- `BENCHMARKS.md` compares against MediaMTX v1.21.2, nginx 1.31.6 with
+  nginx-rtmp-module master (built from source), SRS 8.0 and LiveForge main.
+- The build, clippy and release jobs use `--locked`, so they fail instead of
+  building a dependency graph that differs from the committed `Cargo.lock`.
+
+### Fixed
+- Publish rename on the same connection: the previous route is ended right
+  away instead of keeping the other shards' inject claim until the stale
+  timeout, and relay delivery to the renamed stream's players resumes.
+- A frame from a dead publisher that overwrote a route owner is repaired
+  without announcing a spurious route end, and a route renamed away and
+  re-claimed in the same batch is not reported as ended.
+- Player cap: deactivating a viewer keeps in-flight player reservations
+  counted, so the cap cannot be exceeded while their rows are still being
+  written.
+- Unsubscribing no longer lets one connection drain other connections'
+  references to a shared subscription (which stalled live players), and an
+  abandoned play role releases exactly one remote subscription reference.
+- The init cache is evicted per stream even when the stream's app can no
+  longer be resolved.
+- Cluster: a removed node is dropped from the health tracker, a resumed
+  learner stays publish-gated until promoted, the post-auth media hello read
+  is bounded by the authentication timeout, only media frame bodies (not idle waits) have
+  a read deadline, and superseded inbound media readers are stopped.
+- Cluster: stale ownership rows left by a previous run are released with
+  epoch fencing, so a stream the node re-acquired after restart is never
+  deleted. Each pass releases a bounded batch, and the batches after startup
+  are drained off the heartbeat path.
+- Cluster: kicked publishers release their routes through the regular
+  disconnect path.
+- Cluster: JSON-decoded media messages enforce the same `app`/`stream` name
+  caps as the binary v2 decoders.
+- Raft snapshots: building, installing and membership applies are
+  serialized, so a snapshot can no longer regress below `last_applied` or
+  record the wrong voter set.
+- `CLUSTER_BANDWIDTH_MAX_MBPS` rejects `nan`/`inf`, which disabled
+  load-based draining.
+- An output sink whose FFmpeg child stalls is marked failed so the monitor
+  kills the child instead of leaking it and its thread.
+- `scripts/run_rtmp_benchmarks.sh`: legs that delivered no frames or whose
+  `bench_relay` failed are rejected, nginx runs in the foreground so the
+  sweep can stop it, and `STRACE_SECS=0` is refused when strace sampling is
+  on.
+
+### Documentation
+- The README terminal demo is re-recorded against the current server: the
+  `POST /api/v1/streams` call sends `Content-Type: application/json` (required
+  by the API), the generated keys are stored in shell variables, and the
+  session shows live stats after ffmpeg publishes.
+
+### Security
+- `LOG_FILE` is opened with `O_NOFOLLOW` on Unix, so a symlink placed at the
+  configured log path cannot redirect logging into another file such as the
+  database.
+
 ## [0.6.2] — 2026-10-02
 
 ### Added
