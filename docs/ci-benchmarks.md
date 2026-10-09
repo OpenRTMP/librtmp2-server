@@ -19,9 +19,9 @@ GitHub-hosted runner and compares every run with the last release and the last
 - **Client:** `bench_handshake` / `bench_relay` from the librtmp2 version in
   `Cargo.lock` (tag `v<version>`).
 - **Competitors**, pinned in the workflow's `env:` block so a run only changes
-  when we change them: nginx-rtmp from the Ubuntu package
-  (`libnginx-mod-rtmp`, `worker_processes 1`), MediaMTX release binary
-  (checksum-verified), SRS and LiveForge built from source and cached.
+  when we change them, always the newest release: nginx-rtmp (latest nginx
+  release plus nginx-rtmp-module, `worker_processes 1`), SRS and LiveForge
+  built from source and cached, MediaMTX release binary (checksum-verified).
   If a competitor cannot be built, the sweep skips it and the tables simply
   have no row for it; librtmp2-server's rows are required.
 - **Load steps:** 500 / 1000 / 2000 viewers by default.
