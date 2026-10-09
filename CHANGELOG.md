@@ -24,7 +24,8 @@ begin at `1.0.0`.
 ### Changed
 - `BENCHMARKS.md` compares against MediaMTX v1.21.2, nginx 1.31.6 with
   nginx-rtmp-module master (built from source), SRS 8.0 and LiveForge main.
-- CI builds use `--locked`, so the committed `Cargo.lock` is what gets built.
+- The build, clippy and release jobs use `--locked`, so they fail instead of
+  building a dependency graph that differs from the committed `Cargo.lock`.
 
 ### Fixed
 - Publish rename on the same connection: the previous route is ended right
@@ -41,16 +42,14 @@ begin at `1.0.0`.
   abandoned play role releases exactly one remote subscription reference.
 - The init cache is evicted per stream even when the stream's app can no
   longer be resolved.
-- Media hub timelines are pruned in production instead of leaking one entry
-  per stream for the lifetime of the process.
 - Cluster: a removed node is dropped from the health tracker, a resumed
   learner stays publish-gated until promoted, the post-auth media hello read
   is bounded by the authentication timeout, only media frame bodies (not idle waits) have
   a read deadline, and superseded inbound media readers are stopped.
 - Cluster: stale ownership rows left by a previous run are released with
-  epoch fencing in bounded batches off the heartbeat path, so a stream the
-  node re-acquired after restart is never deleted and startup is not
-  blocked.
+  epoch fencing, so a stream the node re-acquired after restart is never
+  deleted. Each pass releases a bounded batch, and the batches after startup
+  are drained off the heartbeat path.
 - Cluster: kicked publishers release their routes through the regular
   disconnect path.
 - Cluster: JSON-decoded media messages enforce the same `app`/`stream` name
@@ -70,11 +69,13 @@ begin at `1.0.0`.
 ### Documentation
 - The README terminal demo is re-recorded against the current server: the
   `POST /api/v1/streams` call sends `Content-Type: application/json` (required
-  by the API), and the session shows live stats after ffmpeg publishes.
+  by the API), the generated keys are stored in shell variables, and the
+  session shows live stats after ffmpeg publishes.
 
 ### Security
-- `LOG_FILE` is opened with `O_NOFOLLOW` on Unix, so a symlink cannot
-  redirect logging into another file such as the database.
+- `LOG_FILE` is opened with `O_NOFOLLOW` on Unix, so a symlink placed at the
+  configured log path cannot redirect logging into another file such as the
+  database.
 
 ## [0.6.2] — 2026-10-02
 
