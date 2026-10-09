@@ -35,10 +35,29 @@ struct LogFile {
     last_flush: Instant,
 }
 
+/// Open the configured log path for append. On Unix, `O_NOFOLLOW` blocks a
+/// local attacker from planting a symlink at `LOG_FILE` to append server log
+/// lines into another file (e.g. the SQLite database in the same directory).
+#[cfg(unix)]
+fn open_log_file(file_path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file_path)
+}
+
+#[cfg(not(unix))]
+fn open_log_file(file_path: &str) -> std::io::Result<std::fs::File> {
+    OpenOptions::new().create(true).append(true).open(file_path)
+}
+
 pub fn init(level: i32, file_path: &str) {
     LEVEL.store(level.clamp(0, 3) as u8, Ordering::Relaxed);
     if !file_path.is_empty() {
-        match OpenOptions::new().create(true).append(true).open(file_path) {
+        match open_log_file(file_path) {
             Ok(file) => {
                 *FILE.lock() = Some(LogFile {
                     file: BufWriter::new(file),
@@ -184,5 +203,21 @@ mod tests {
     fn sanitize_leaves_normal_text_and_utf8_untouched() {
         let msg = "stream 'café' app='live'";
         assert_eq!(sanitize_for_log(msg), msg);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_symlink_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.log");
+        let link = dir.path().join("link.log");
+        std::fs::write(&real, b"seed\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        init(3, link.to_str().unwrap());
+        assert!(
+            FILE.lock().is_none(),
+            "symlinked LOG_FILE must not be opened for append"
+        );
     }
 }
