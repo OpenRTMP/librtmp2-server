@@ -1513,10 +1513,13 @@ impl Db {
     }
 
     /// Mark active player sessions for a revoked viewer slot inactive, and
-    /// zero its in-memory active-session count to match — every session
-    /// this viewer had is gone after this call, however it got there
-    /// (including a row that was skipped rather than updated, e.g. a Raft
-    /// snapshot install that drops it entirely; see `install_app_snapshot`).
+    /// drop its in-memory active-session count to match what remains —
+    /// every session this viewer had is gone after this call, however it
+    /// got there (including a row that was skipped rather than updated, e.g.
+    /// a Raft snapshot install that drops it entirely; see
+    /// `install_app_snapshot`). In-flight reservations
+    /// ([`Self::player_reserve`]) whose row is not written yet stay counted:
+    /// that row is still coming and must keep occupying a slot.
     pub fn players_deactivate_for_viewer(&self, viewer_id: &str) -> bool {
         let conn = self.conn.lock();
         let ok = conn
@@ -1526,7 +1529,20 @@ impl Db {
             )
             .is_ok();
         if ok {
-            self.active_player_counts.lock().remove(viewer_id);
+            // Lock order: `active_player_counts` before
+            // `unpersisted_player_counts`.
+            let mut counts = self.active_player_counts.lock();
+            let pending = self
+                .unpersisted_player_counts
+                .lock()
+                .get(viewer_id)
+                .copied()
+                .unwrap_or(0);
+            if pending == 0 {
+                counts.remove(viewer_id);
+            } else {
+                counts.insert(viewer_id.to_string(), pending);
+            }
         }
         ok
     }
@@ -3337,6 +3353,62 @@ mod tests {
         // or underflow.
         assert!(db.players_deactivate_for_viewer(&viewer.id));
         assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
+    }
+
+    #[test]
+    fn players_deactivate_for_viewer_keeps_in_flight_reservations_counted() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+
+        // Deactivate while a reserved slot's `players` row is still in flight:
+        // the row is written afterwards and must remain counted, otherwise the
+        // cap is enforced against a counter that does not know about it.
+        assert!(db.player_reserve(&viewer.id));
+        assert!(db.players_deactivate_for_viewer(&viewer.id));
+        let reserved = Player {
+            id: "pl_reserved".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(db.player_insert_reserved(&reserved));
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            1,
+            "the row written from an in-flight reservation must stay counted"
+        );
+
+        for i in 0..MAX_CONNECTIONS_PER_PLAY_KEY - 1 {
+            assert!(db.player_try_acquire(&Player {
+                id: format!("pl{i}"),
+                stream_id: "stream1".to_string(),
+                viewer_id: viewer.id.clone(),
+                connected_at: now_ts(),
+                active: true,
+                ..Default::default()
+            }));
+        }
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            MAX_CONNECTIONS_PER_PLAY_KEY as u64
+        );
+        assert!(
+            !db.player_try_acquire(&Player {
+                id: "pl_overflow".to_string(),
+                stream_id: "stream1".to_string(),
+                viewer_id: viewer.id.clone(),
+                connected_at: now_ts(),
+                active: true,
+                ..Default::default()
+            }),
+            "the in-flight reservation must still consume a cap slot"
+        );
     }
 
     #[test]
