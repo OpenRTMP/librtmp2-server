@@ -253,21 +253,28 @@ impl ClusterConfig {
         parse_bind(&self.media_bind).map_err(|e| format!("CLUSTER_MEDIA_BIND: {e}"))?;
         // Peers dial the advertised addresses through
         // `validate_cluster_peer_addr`, which parses a `SocketAddr` and rejects
-        // hostnames. A hostname advertise would therefore be silently skipped on
-        // the peer side, so reject it up front instead of failing deeper at join.
-        if let Some(advertise) = self.advertise_addr.as_deref().filter(|a| !a.is_empty()) {
+        // hostnames, loopback (unless allowed), link-local/metadata and other
+        // non-dialable targets. Reject a bad or empty configured value up front
+        // instead of failing deeper at join.
+        if let Some(advertise) = self.advertise_addr.as_deref() {
             advertise.parse::<SocketAddr>().map_err(|e| {
                 format!("CLUSTER_ADVERTISE_ADDR must be a literal IP socket address: {e}")
             })?;
+            crate::cluster::security::validate_cluster_peer_addr(
+                advertise,
+                self.allow_loopback_peer_addrs,
+            )
+            .map_err(|e| format!("CLUSTER_ADVERTISE_ADDR: {e}"))?;
         }
-        if let Some(advertise) = self
-            .media_advertise_addr
-            .as_deref()
-            .filter(|a| !a.is_empty())
-        {
+        if let Some(advertise) = self.media_advertise_addr.as_deref() {
             advertise.parse::<SocketAddr>().map_err(|e| {
                 format!("CLUSTER_MEDIA_ADVERTISE_ADDR must be a literal IP socket address: {e}")
             })?;
+            crate::cluster::security::validate_cluster_peer_addr(
+                advertise,
+                self.allow_loopback_peer_addrs,
+            )
+            .map_err(|e| format!("CLUSTER_MEDIA_ADVERTISE_ADDR: {e}"))?;
         }
         if self.bootstrap && self.join.is_some() {
             return Err("CLUSTER_BOOTSTRAP and CLUSTER_JOIN are mutually exclusive".into());
@@ -762,6 +769,31 @@ mod tests {
         let err =
             ClusterConfig::load_from_kv(|k| bad.get(k).map(|s| (*s).to_string())).unwrap_err();
         assert!(err.contains("CLUSTER_ADVERTISE_ADDR"), "{err}");
+
+        let mut empty = base.clone();
+        empty.insert("CLUSTER_ADVERTISE_ADDR", "");
+        let err =
+            ClusterConfig::load_from_kv(|k| empty.get(k).map(|s| (*s).to_string())).unwrap_err();
+        assert!(err.contains("CLUSTER_ADVERTISE_ADDR"), "{err}");
+
+        let mut metadata = base.clone();
+        metadata.insert("CLUSTER_ADVERTISE_ADDR", "169.254.169.254:1940");
+        let err =
+            ClusterConfig::load_from_kv(|k| metadata.get(k).map(|s| (*s).to_string())).unwrap_err();
+        assert!(err.contains("CLUSTER_ADVERTISE_ADDR"), "{err}");
+
+        let mut loopback = base.clone();
+        loopback.insert("CLUSTER_ADVERTISE_ADDR", "127.0.0.1:1940");
+        let err =
+            ClusterConfig::load_from_kv(|k| loopback.get(k).map(|s| (*s).to_string())).unwrap_err();
+        assert!(err.contains("CLUSTER_ADVERTISE_ADDR"), "{err}");
+
+        let mut loopback_ok = base.clone();
+        loopback_ok.insert("CLUSTER_ADVERTISE_ADDR", "127.0.0.1:1940");
+        loopback_ok.insert("CLUSTER_ALLOW_LOOPBACK_PEER_ADDRS", "true");
+        let cfg =
+            ClusterConfig::load_from_kv(|k| loopback_ok.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!(cfg.validate().is_ok());
 
         let mut bad_media = base;
         bad_media.insert("CLUSTER_MEDIA_ADVERTISE_ADDR", "node1.example.com:1941");
