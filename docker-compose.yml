@@ -2,13 +2,13 @@ services:
   server:
     build:
       # Default: standalone clone of this repo (`docker compose up -d`).
-      # Dockerfile fetches librtmp2 from Git when the context is librtmp2-server.
+      # librtmp2 comes from crates.io (Cargo.lock) when the context is librtmp2-server.
       # Optional monorepo override (OpenRTMP parent with sibling librtmp2/):
       #   context: ..
       #   dockerfile: librtmp2-server/Dockerfile
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/OpenRTMP/librtmp2-server:latest
+    image: ghcr.io/openrtmp/librtmp2-server:latest
     container_name: librtmp2-server
     restart: unless-stopped
     environment:

@@ -667,10 +667,10 @@ fn parse_bind(bind: &str) -> Result<SocketAddr, String> {
 }
 
 fn rewrite_wildcard_to_loopback(bind: &str) -> String {
-    if let Ok(addr) = bind.parse::<SocketAddr>() {
-        if addr.ip().is_unspecified() {
-            return format!("127.0.0.1:{}", addr.port());
-        }
+    if let Ok(addr) = bind.parse::<SocketAddr>()
+        && addr.ip().is_unspecified()
+    {
+        return format!("127.0.0.1:{}", addr.port());
     }
     bind.to_string()
 }

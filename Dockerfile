@@ -40,12 +40,16 @@ RUN set -eu; \
     fi
 
 WORKDIR /build/librtmp2-server
-# Monorepo builds must resolve the sibling checkout, not the pinned git rev.
+# A sibling librtmp2 checkout (monorepo context or LIBRTMP2_REF) replaces the
+# crates.io release. Without one the build must match the committed Cargo.lock.
 RUN set -eu; \
     if [ -f /build/librtmp2/Cargo.toml ]; then \
-      printf '\n[patch."https://github.com/OpenRTMP/librtmp2"]\nlibrtmp2 = { path = "../librtmp2" }\n' >> Cargo.toml; \
+      printf '\n[patch.crates-io]\nlibrtmp2 = { path = "../librtmp2" }\n' >> Cargo.toml; \
+      LOCKED=""; \
+    else \
+      LOCKED="--locked"; \
     fi; \
-    cargo build --release --features cluster,vendored-openssl; \
+    cargo build $LOCKED --release --features cluster,vendored-openssl; \
     install -Dm755 target/*/release/librtmp2-server /build/out/librtmp2-server
 
 ARG APP_VERSION=""

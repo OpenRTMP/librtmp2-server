@@ -1317,8 +1317,8 @@ mod tests {
         }
 
         fn produce_tick(&mut self, ms: u64) {
-            if ms % 33 == 0 {
-                let key = (ms / 33) % 60 == 0;
+            if ms.is_multiple_of(33) {
+                let key = (ms / 33).is_multiple_of(60);
                 let (hint, len) = if key {
                     (ResyncPoint, 60 * KB)
                 } else {
@@ -1327,10 +1327,10 @@ mod tests {
                 self.produce("a", ms, hint, (self.seq % 250) as u8, len);
                 self.seq += 1;
             }
-            if ms % 23 == 0 {
+            if ms.is_multiple_of(23) {
                 self.produce("a", ms, Droppable, 1, KB);
             }
-            if ms % 20 == 0 {
+            if ms.is_multiple_of(20) {
                 self.produce("b", ms, ResyncPoint, 2, 300);
             }
         }

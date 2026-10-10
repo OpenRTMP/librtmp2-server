@@ -393,8 +393,8 @@ async fn client_write_command_roundtrip() {
     };
     n1.create_stream(&stream).unwrap();
     n1.set_stream_enabled("en", false).unwrap();
-    let DbLookup = n1.db().stream_get("en");
-    match DbLookup {
+    let lookup = n1.db().stream_get("en");
+    match lookup {
         librtmp2_server::db::DbLookup::Ok(s) => assert!(!s.enabled),
         other => panic!("unexpected {other:?}"),
     }

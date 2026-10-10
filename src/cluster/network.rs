@@ -255,7 +255,7 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     msg: &ControlMessage,
 ) -> Result<(), std::io::Error> {
-    let bytes = serde_json::to_vec(msg).map_err(|e| std::io::Error::other(e))?;
+    let bytes = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
     if bytes.len() > MAX_FRAME as usize {
         return Err(std::io::Error::other("frame too large"));
     }
@@ -413,8 +413,7 @@ async fn read_budgeted_frame<R: AsyncReadExt + Unpin>(
             buf.resize(len as usize, 0);
             r.read_exact(&mut buf[prefix_len..]).await?;
         }
-        let msg: ControlMessage =
-            serde_json::from_slice(&buf).map_err(|e| std::io::Error::other(e))?;
+        let msg: ControlMessage = serde_json::from_slice(&buf).map_err(std::io::Error::other)?;
         let is_snapshot = matches!(
             msg,
             ControlMessage::RaftSnapshot(_) | ControlMessage::RaftSnapshotResp(_)
@@ -445,7 +444,7 @@ async fn read_frame_max<R: AsyncReadExt + Unpin>(
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
-    serde_json::from_slice(&buf).map_err(|e| std::io::Error::other(e))
+    serde_json::from_slice(&buf).map_err(std::io::Error::other)
 }
 
 async fn read_auth_frame<R: AsyncReadExt + Unpin>(
@@ -943,7 +942,7 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             // entries carried in exactly these RPCs — so gating on
             // `is_member` here would deadlock every new node's bootstrap.
             let parsed: AppendEntriesRequest<TypeConfig> =
-                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
+                serde_json::from_value(req).map_err(std::io::Error::other)?;
             let r = raft.append_entries(parsed).await;
             let v =
                 serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
@@ -952,7 +951,7 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
         ControlMessage::RaftVote(req) => {
             // See RaftAppend above: no is_member gate, same bootstrap reason.
             let parsed: VoteRequest<NodeId> =
-                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
+                serde_json::from_value(req).map_err(std::io::Error::other)?;
             let r = raft.vote(parsed).await;
             let v =
                 serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
@@ -961,7 +960,7 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
         ControlMessage::RaftSnapshot(req) => {
             // See RaftAppend above: no is_member gate, same bootstrap reason.
             let parsed: InstallSnapshotRequest<TypeConfig> =
-                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
+                serde_json::from_value(req).map_err(std::io::Error::other)?;
             let r = raft.install_snapshot(parsed).await;
             let v =
                 serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
@@ -1053,7 +1052,7 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             }
             use crate::cluster::command::ClusterCommand;
             let cmd: ClusterCommand =
-                serde_json::from_value(req.clone()).map_err(|e| std::io::Error::other(e))?;
+                serde_json::from_value(req.clone()).map_err(std::io::Error::other)?;
             // Every ClientWrite must carry an HTTP-API admin_proof (see
             // ClusterCommand::requires_admin_proof).
             if cmd.requires_admin_proof() {
@@ -1127,7 +1126,7 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             }
             use openraft::ChangeMembers;
             let change: ChangeMembers<NodeId, BasicNode> =
-                serde_json::from_value(req).map_err(|e| std::io::Error::other(e))?;
+                serde_json::from_value(req).map_err(std::io::Error::other)?;
             match raft.change_membership(change, false).await {
                 Ok(_) => ControlMessage::ChangeMembershipResp {
                     ok: true,
@@ -1653,10 +1652,12 @@ mod tests {
     /// pre-decode classification is inconclusive.
     fn padded_frame_beyond_peek(json: &str, filler: usize) -> Vec<u8> {
         const LEAD: usize = 40;
-        assert!(
-            LEAD + 14 > 32,
-            "the peek must be inconclusive for this helper to be meaningful"
-        );
+        const {
+            assert!(
+                LEAD + 14 > 32,
+                "the peek must be inconclusive for this helper to be meaningful"
+            )
+        };
         let body = format!("{}{json}{}", " ".repeat(LEAD), " ".repeat(filler));
         let payload = body.as_bytes();
         assert!(payload.len() as u32 > super::MAX_SNAPSHOT_FRAME);
@@ -2198,12 +2199,13 @@ mod tests {
             None,
         )
         .await;
-        let hbs = ctl.rec.heartbeats.lock();
-        assert_eq!(hbs.len(), 1);
-        assert_eq!(hbs[0].node_id, 2);
-        assert_eq!(hbs[0].players, 2);
-        assert_eq!(hbs[0].stream_players, vec![("s".to_string(), 2)]);
-        drop(hbs);
+        {
+            let hbs = ctl.rec.heartbeats.lock();
+            assert_eq!(hbs.len(), 1);
+            assert_eq!(hbs[0].node_id, 2);
+            assert_eq!(hbs[0].players, 2);
+            assert_eq!(hbs[0].stream_players, vec![("s".to_string(), 2)]);
+        }
 
         // Wrong secret: the client reports an auth failure.
         let err = send_topology(&ctl.addr, "wrong-secret", 1, None)

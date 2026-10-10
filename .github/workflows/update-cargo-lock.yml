@@ -1,7 +1,9 @@
 name: Update Cargo.lock
 
 on:
+  # Branches only: a release tag is a detached checkout that cannot be pushed to.
   push:
+    branches: ['**']
   workflow_dispatch:
 
 permissions:

@@ -336,7 +336,7 @@ impl SqliteStateMachine {
                 // FinalizeDeleteStream can complete instead of leaving a
                 // disabled ghost stream behind.
                 for stream_id in pending_delete_stream_ids {
-                    if self.db.stream_disable(&stream_id).is_none() {
+                    if self.db.stream_disable(stream_id).is_none() {
                         return ClusterResponse::Error(
                             "stream_disable failed during SeedFromStandalone".into(),
                         );
@@ -765,16 +765,16 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
             snapshot_id,
         };
         let _apply = self.apply_lock.lock();
-        if let Some(existing) = self.current_snapshot.lock().clone() {
-            if existing.meta.last_log_id > meta.last_log_id {
-                // An install (or a newer build) superseded this snapshot while
-                // it was being serialized. Return the newer one instead of
-                // regressing the stored copies.
-                return Ok(Snapshot {
-                    meta: existing.meta,
-                    snapshot: Box::new(Cursor::new(existing.data)),
-                });
-            }
+        if let Some(existing) = self.current_snapshot.lock().clone()
+            && existing.meta.last_log_id > meta.last_log_id
+        {
+            // An install (or a newer build) superseded this snapshot while
+            // it was being serialized. Return the newer one instead of
+            // regressing the stored copies.
+            return Ok(Snapshot {
+                meta: existing.meta,
+                snapshot: Box::new(Cursor::new(existing.data)),
+            });
         }
         *self.current_snapshot.lock() = Some(StoredSnapshot {
             meta: meta.clone(),
@@ -1847,6 +1847,9 @@ mod tests {
         assert!(reopened.get_current_snapshot().await.unwrap().is_some());
     }
 
+    // Holding `apply_lock` across the await is the point: the install must
+    // block on it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn install_snapshot_serializes_with_apply_lock() {
         let (sm, _rx) = sm_with_effects();

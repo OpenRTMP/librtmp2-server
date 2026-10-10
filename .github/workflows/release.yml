@@ -35,7 +35,7 @@ jobs:
         run: cargo build --locked --release
 
       - name: Run tests
-        run: cargo test --release
+        run: cargo test --locked --release
 
   package:
     name: build & package
@@ -56,9 +56,30 @@ jobs:
 
       - name: Resolve version
         id: ver
+        env:
+          REF: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          if ! printf '%s' "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Release tag '$REF' must look like v<major>.<minor>.<patch>"
+            exit 1
+          fi
           VERSION="${REF#v}"
+          CRATE_VERSION="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "librtmp2-server") | .version')"
+          if [ "$VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::Release tag $REF does not match the crate version $CRATE_VERSION in Cargo.toml"
+            exit 1
+          fi
+          # A dispatch for a tag that already exists must build that tag's
+          # commit, not whatever the dispatched branch points at now.
+          if git ls-remote --exit-code --tags origin "refs/tags/$REF" > /dev/null; then
+            git fetch --quiet --depth 1 origin "refs/tags/$REF:refs/tags/$REF"
+            TAG_SHA="$(git rev-list -n 1 "$REF")"
+            if [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $REF points at $TAG_SHA, but this run builds $GITHUB_SHA"
+              exit 1
+            fi
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$REF" >> "$GITHUB_OUTPUT"
 
@@ -104,6 +125,9 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          # Create a missing tag at the commit that was built, not at the
+          # default branch's head (which can move while the release builds).
+          target_commitish: ${{ github.sha }}
           name: librtmp2-server ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           files: |

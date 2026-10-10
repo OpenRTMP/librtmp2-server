@@ -3,6 +3,15 @@
 //! Gated by Cargo feature `cluster`. Runtime still defaults to
 //! `CLUSTER_ENABLED=false` (standalone).
 
+// The Raft storage traits fix `StorageError` as the error type, and the media
+// and control-plane task spawners take their shared handles explicitly.
+#![allow(
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::result_unit_err
+)]
+
 pub mod admission;
 pub mod command;
 pub mod config;
