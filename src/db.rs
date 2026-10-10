@@ -1616,6 +1616,7 @@ impl Db {
     /// snapshot is internally consistent (a stream's `enabled` flag and its
     /// pending-delete state cannot disagree).
     #[cfg(feature = "cluster")]
+    #[allow(clippy::type_complexity)]
     pub fn read_replicated_snapshot(
         &self,
     ) -> Result<

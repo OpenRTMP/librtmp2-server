@@ -165,7 +165,7 @@ pub fn measure_interface_utilization(
         let tx_bps = tx2.saturating_sub(tx1) as f64 / 0.2;
         let bytes_per_sec = mode.combine(rx_bps, tx_bps);
         let mbps = bytes_per_sec * 8.0 / 1_000_000.0;
-        return Ok((mbps / max_mbps).clamp(0.0, 1.0));
+        Ok((mbps / max_mbps).clamp(0.0, 1.0))
     }
     #[cfg(target_os = "windows")]
     {
@@ -211,9 +211,11 @@ mod tests {
 
     #[test]
     fn hysteresis_drain_and_resume() {
-        let mut cfg = ClusterConfig::default();
-        cfg.drain_threshold = 0.8;
-        cfg.resume_threshold = 0.5;
+        let cfg = ClusterConfig {
+            drain_threshold: 0.8,
+            resume_threshold: 0.5,
+            ..Default::default()
+        };
         let health = HealthTracker::new(Duration::from_millis(100));
         health.set_local(NodeHealthState::Ready);
         let adm = AdmissionController::new(cfg, health);
@@ -228,9 +230,11 @@ mod tests {
 
     #[test]
     fn force_resume_clears_load_draining() {
-        let mut cfg = ClusterConfig::default();
-        cfg.drain_threshold = 0.8;
-        cfg.resume_threshold = 0.5;
+        let cfg = ClusterConfig {
+            drain_threshold: 0.8,
+            resume_threshold: 0.5,
+            ..Default::default()
+        };
         let health = HealthTracker::new(Duration::from_millis(100));
         health.set_local(NodeHealthState::Ready);
         let adm = AdmissionController::new(cfg, health.clone());

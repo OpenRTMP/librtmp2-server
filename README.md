@@ -29,6 +29,7 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 - **JSON stats** — `/stats?key=***`
 - **Nginx-RTMP XML** — `/stats-nginx?key=***`
 - **REST API** — stream CRUD, Bearer token auth
+- **Media outputs** — recording, HLS, RTMP/RTMPS push relay and exec hooks via FFmpeg (off by default, see [docs/media-outputs.md](docs/media-outputs.md))
 - **Docker** — Alpine-based images on GHCR
 
 ### Protocol behaviour inherited from librtmp2 (not reimplemented here)
@@ -37,7 +38,8 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 - Late player join gets cached codec sequence headers (legacy + Enhanced-RTMP) and last keyframe; `onMetaData` is replayed to late joiners
 - Legacy RTMP commands (`pause`, `seek`, `receiveAudio`/`receiveVideo`, `closeStream`) are handled in the protocol layer
 - E-RTMP v2 connect capability negotiation and multitrack relay live in `librtmp2`; this server does not expose per-track IDs in the HTTP API yet
-- No nginx-rtmp feature parity (HLS, exec, push relay, recording)
+
+Not supported: DASH, LL-HLS, WebRTC, SRT and adaptive-bitrate ladders.
 
 Test your OBS/FFmpeg workflow before using this for critical streams. It is not a drop-in replacement for `nginx-rtmp`.
 
@@ -54,6 +56,8 @@ Everything below is implemented **in this repo**. Wire-protocol limits are defin
 - **Privacy by design** — no public stream list without keys
 - **JSON + Nginx-compatible XML stats**
 - **REST API** — stream CRUD, Bearer token auth
+- **Recording, HLS, push relay and exec hooks** — optional FFmpeg-backed
+  media outputs. See [docs/media-outputs.md](docs/media-outputs.md)
 - **Docker-ready** — lightweight Alpine container
 - **Optional HA clustering** — OpenRaft + media mesh (`--features cluster`;
   runtime `CLUSTER_ENABLED=false` by default). See [docs/clustering.md](docs/clustering.md)
@@ -109,10 +113,10 @@ OBS / FFmpeg / App
 
 ### Compile
 
-`librtmp2-server` uses the published `librtmp2` 0.9.1 release from crates.io:
+`librtmp2-server` uses the published `librtmp2` 0.11.0 release from crates.io:
 
 ```toml
-librtmp2 = { version = "0.9.1", features = ["tls"] }
+librtmp2 = { version = "0.11.0", features = ["tls"] }
 ```
 
 ```bash
@@ -171,6 +175,13 @@ Every `RTMP_*` key above is read from the `.env` file; the corresponding
 process environment variable uses an `LRTMP2_RTMP_*` prefix instead (e.g.
 `LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR`) and takes precedence over the `.env`
 file when set.
+
+RTMP connections are spread over up to 4 poll threads (one per CPU) by
+default. The process environment variable `LRTMP2_RTMP_SHARDS` sets the number
+explicitly (1–32; `1` runs a single poll thread). Media outputs and HA
+clustering always run a single thread. A per-address cap
+(`RTMP_MAX_CONNECTIONS_PER_ADDR`) also selects a single thread unless
+`LRTMP2_RTMP_SHARDS` is set, because that cap is counted per thread.
 
 ```env
 # RTMPS (TLS) - disabled by default.

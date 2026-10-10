@@ -219,7 +219,14 @@ fn resolve_shard_count(
 ) -> usize {
     let explicit = std::env::var("LRTMP2_RTMP_SHARDS")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok());
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| match v.trim().parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                crate::log_warn!("Ignoring invalid LRTMP2_RTMP_SHARDS value '{v}'");
+                None
+            }
+        });
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -2099,7 +2106,13 @@ impl ServerApp {
         // bump it back up -- more shards than `rtmp_max_conn` would otherwise
         // silently raise the effective global cap from `rtmp_max_conn` to
         // `n_shards` (each shard's own floor-of-1 minimum summing past it).
-        n_shards.min(self.config.rtmp_max_conn as usize).max(1)
+        let shards = n_shards.min(self.config.rtmp_max_conn as usize).max(1);
+        if per_addr_caps_configured && shards > 1 {
+            crate::log_warn!(
+                "LRTMP2_RTMP_SHARDS={shards}: the per-address RTMP caps are enforced per shard, so one address can hold up to {shards}x the configured cap"
+            );
+        }
+        shards
     }
 
     /// Relay-export buffer size for each shard's `Server` (0 = disabled).

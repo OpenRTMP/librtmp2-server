@@ -12,6 +12,10 @@ on:
         description: 'Version tag to publish alongside latest/beta/alpha (e.g. 0.1.0)'
         type: string
         required: false
+      ref:
+        description: 'Commit to build (defaults to the triggering commit)'
+        type: string
+        required: false
 
 jobs:
   build:
@@ -22,6 +26,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0

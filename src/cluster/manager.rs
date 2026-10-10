@@ -378,11 +378,11 @@ impl ClusterManager {
                         ctrl.clone(),
                         media_a.clone(),
                     );
-                    if counts_hb.config.tls_enabled {
-                        if let (Some(c), Some(m)) = (ctrl.as_ref(), media_a.as_ref()) {
-                            meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
-                            network_hb.upsert_node(info.node_id, c.clone());
-                        }
+                    if counts_hb.config.tls_enabled
+                        && let (Some(c), Some(m)) = (ctrl.as_ref(), media_a.as_ref())
+                    {
+                        meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
+                        network_hb.upsert_node(info.node_id, c.clone());
                     }
                     // Dial known membership media addrs in both TLS and plaintext.
                     // Plaintext still must not `set_addrs` from advertised values;

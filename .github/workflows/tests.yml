@@ -29,6 +29,10 @@ jobs:
     - name: Clippy
       run: cargo clippy --locked --all-targets --features test-support -- -D warnings
 
+    # The Docker image ships with the cluster feature, so its code is linted too.
+    - name: Clippy (cluster)
+      run: cargo clippy --locked --all-targets --features test-support,cluster -- -D warnings
+
     - name: Build
       run: cargo build --locked --verbose
 

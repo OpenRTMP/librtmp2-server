@@ -78,10 +78,10 @@ pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
     let Some(entries) = guard.get_mut(&peer) else {
-        if guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS {
-            if !evict_oldest_eligible_cluster_auth_ip(&mut guard, now) {
-                return true;
-            }
+        if guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS
+            && !evict_oldest_eligible_cluster_auth_ip(&mut guard, now)
+        {
+            return true;
         }
         return false;
     };
@@ -93,10 +93,11 @@ pub fn record_cluster_auth_failure(peer: IpAddr) {
     let mut guard = CLUSTER_AUTH_FAILURES.lock();
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
-    if !guard.contains_key(&peer) && guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS {
-        if !evict_oldest_eligible_cluster_auth_ip(&mut guard, now) {
-            return;
-        }
+    if !guard.contains_key(&peer)
+        && guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS
+        && !evict_oldest_eligible_cluster_auth_ip(&mut guard, now)
+    {
+        return;
     }
     guard.entry(peer).or_default().push(now);
 }

@@ -78,7 +78,7 @@ impl SubscriptionTable {
     /// is held, so registration cannot interleave mid-fan-out.
     pub fn for_each_peer(&self, app: &str, stream: &str, mut f: impl FnMut(u64)) {
         let g = self.inner.lock();
-        for ((peer, a, s), _) in g.iter() {
+        for (peer, a, s) in g.keys() {
             if a == app && s == stream {
                 f(*peer);
             }
