@@ -292,6 +292,13 @@ Each stream has **three unique, auto-generated keys**:
 | `/stats?key=<stats_key>` | JSON | Modern stats |
 | `/stats-nginx?key=<stats_key>` | XML | Nginx-rtmp compatible |
 
+The stats endpoints (`/stats`, `/stats-nginx`, `/stat.xsl` and the `?key=`
+form of `/api/v1/streams/:id/stats`) send `Access-Control-Allow-Origin: *` on
+every response, offline and error answers included, so a browser source such
+as an OBS overlay can poll them from another origin without a reverse proxy.
+The admin API (Bearer token) gets no CORS headers. Anyone who has the
+`stats_key` can read the stats, so keep it out of public pages.
+
 ---
 
 ## Example: Create a stream

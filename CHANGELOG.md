@@ -13,6 +13,15 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- CORS for the public stats endpoints: `/stats`, `/stats-nginx`, `/stat.xsl`
+  and the `?key=` form of `/api/v1/streams/:id/stats` answer with
+  `Access-Control-Allow-Origin: *` on every response (live, offline, invalid
+  or missing key, rate limited) and answer the `OPTIONS` preflight, so browser
+  overlays (e.g. an OBS browser source) can read stats from another origin
+  without a reverse proxy. Admin API routes and Bearer requests to the
+  per-stream stats route get no CORS headers.
+
 ## [0.6.3] — 2026-10-10
 
 ### Added

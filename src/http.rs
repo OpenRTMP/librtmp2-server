@@ -9,10 +9,15 @@
 //!   GET    /stats?key=<stats_key>               flat JSON stats (no stream ids)
 //!   GET    /api/v1/streams/:id/stats            Bearer = full JSON; key = flat public JSON
 //!   GET    /stats-nginx?key=<stats_key>         XML (nginx-rtmp compatible)
+//!
+//! The key-protected public stats routes answer cross-origin requests
+//! (`Access-Control-Allow-Origin: *`, see [`public_stats_cors`]) so browser
+//! overlays can poll them directly. Bearer-protected admin routes get no CORS
+//! headers.
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, request::Parts};
-use axum::middleware;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -106,7 +111,65 @@ pub fn router(state: Arc<AppState>) -> Router {
             limiter,
             rate_limit::middleware,
         ))
+        // Outermost, so rate-limit and routing errors on public stats routes
+        // stay readable cross-origin too.
+        .layer(middleware::from_fn(public_stats_cors))
         .with_state(state)
+}
+
+// ---------- CORS (public stats only) ----------
+
+/// Key-protected stats routes that browser overlays may read cross-origin:
+/// `/stats`, `/stats-nginx`, `/stat.xsl` and the `?key=` form of
+/// `/api/v1/streams/:id/stats`. The per-stream route only counts when the
+/// request carries no `Authorization` header, so its Bearer (admin) answer is
+/// never shared with other origins.
+fn is_public_stats_request(path: &str, headers: &HeaderMap) -> bool {
+    match path {
+        "/stats" | "/stats-nginx" | "/stat.xsl" => true,
+        _ => {
+            !headers.contains_key(header::AUTHORIZATION)
+                && path
+                    .strip_prefix("/api/v1/streams/")
+                    .and_then(|rest| rest.strip_suffix("/stats"))
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+        }
+    }
+}
+
+/// Adds `Access-Control-Allow-Origin: *` to every response of the public stats
+/// routes (live, offline, invalid key, missing key, rate limited) and answers
+/// their CORS preflight. Only `GET` is allowed and no request headers, so a
+/// cross-origin page cannot attach a Bearer token through a preflight. The
+/// `stats_key` still has to be known: CORS only lets a page that already has
+/// it read the answer.
+async fn public_stats_cors(request: Request, next: Next) -> Response {
+    if !is_public_stats_request(request.uri().path(), request.headers()) {
+        return next.run(request).await;
+    }
+    if request.method() == Method::OPTIONS {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        let h = response.headers_mut();
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, OPTIONS"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("86400"),
+        );
+        return response;
+    }
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    response
 }
 
 fn now_ts() -> i64 {
@@ -4457,5 +4520,191 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error_code(&body), "CLUSTER_DISABLED");
+    }
+
+    const CORS_STATS_KEY: &str = "st_cors_key_with_sufficient_length_here";
+
+    fn cors_state(live: bool) -> Arc<AppState> {
+        use crate::db::Publisher;
+
+        let state = test_state("a-strong-random-secret-value");
+        state
+            .db
+            .stream_add(&Stream {
+                id: "corsstream".to_string(),
+                name: "Cors".to_string(),
+                app: "live".to_string(),
+                publish_key: "pub_cors_key_with_sufficient_length_here".to_string(),
+                play_key: "play_cors_key_with_sufficient_length_here".to_string(),
+                stats_key: CORS_STATS_KEY.to_string(),
+                enabled: true,
+                created_at: now_ts(),
+            })
+            .unwrap();
+        if live {
+            state.db.publisher_try_acquire(&Publisher {
+                id: "cors_pub".to_string(),
+                stream_id: "corsstream".to_string(),
+                app: "live".to_string(),
+                stream_name: "Cors".to_string(),
+                active: true,
+                connected_at: now_ts(),
+                ..Default::default()
+            });
+        }
+        state
+    }
+
+    async fn cors_request(
+        state: Arc<AppState>,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        router(state)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn allow_origin(resp: &Response) -> Option<&str> {
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn public_stats_send_cors_header_live_offline_and_on_errors() {
+        let live_key = format!("/stats?key={CORS_STATS_KEY}");
+        let resp = cors_request(cors_state(true), Method::GET, &live_key, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(allow_origin(&resp), Some("*"));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(serde_json::from_slice::<Value>(&body).is_ok());
+
+        let cases = [
+            (live_key.as_str(), StatusCode::OK),
+            (
+                "/stats?key=st_wrong_key_with_sufficient_length_here",
+                StatusCode::OK,
+            ),
+            ("/stats", StatusCode::UNAUTHORIZED),
+            ("/stats-nginx", StatusCode::UNAUTHORIZED),
+            ("/stat.xsl", StatusCode::OK),
+        ];
+        for (uri, status) in cases {
+            let resp = cors_request(cors_state(false), Method::GET, uri, &[]).await;
+            assert_eq!(resp.status(), status, "{uri}");
+            assert_eq!(allow_origin(&resp), Some("*"), "{uri}");
+        }
+
+        let nginx = format!("/stats-nginx?key={CORS_STATS_KEY}");
+        let resp = cors_request(cors_state(false), Method::GET, &nginx, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(allow_origin(&resp), Some("*"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_cors_header_survives_rate_limit() {
+        let state = test_state_with_config(ServerConfig {
+            api_token: "a-strong-random-secret-value".to_string(),
+            http_rate_limit_stats: 0,
+            ..Default::default()
+        });
+        let uri = format!("/stats?key={CORS_STATS_KEY}");
+        let resp = cors_request(state, Method::GET, &uri, &[]).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(allow_origin(&resp), Some("*"));
+    }
+
+    #[tokio::test]
+    async fn public_stats_answer_cors_preflight() {
+        let resp = cors_request(
+            cors_state(false),
+            Method::OPTIONS,
+            "/stats",
+            &[
+                ("Origin", "https://overlay.example"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(allow_origin(&resp), Some("*"));
+        let h = resp.headers();
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_METHODS], "GET, OPTIONS");
+        assert!(!h.contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS));
+        assert!(!h.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+    }
+
+    #[tokio::test]
+    async fn per_stream_stats_cors_only_for_key_access() {
+        let uri = format!("/api/v1/streams/corsstream/stats?key={CORS_STATS_KEY}");
+        let resp = cors_request(cors_state(true), Method::GET, &uri, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(allow_origin(&resp), Some("*"));
+
+        let (name, value) = bearer("a-strong-random-secret-value");
+        let resp = cors_request(
+            cors_state(true),
+            Method::GET,
+            "/api/v1/streams/corsstream/stats",
+            &[(name, &value)],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(allow_origin(&resp), None);
+    }
+
+    #[tokio::test]
+    async fn admin_api_gets_no_cors_headers() {
+        let (name, value) = bearer("a-strong-random-secret-value");
+        for uri in ["/api/v1/streams", "/api/v1/health", "/api/v1/cluster"] {
+            let resp = cors_request(cors_state(false), Method::GET, uri, &[(name, &value)]).await;
+            assert_eq!(allow_origin(&resp), None, "{uri}");
+            let resp = cors_request(cors_state(false), Method::GET, uri, &[]).await;
+            assert_eq!(allow_origin(&resp), None, "{uri}");
+        }
+        let resp = cors_request(
+            cors_state(false),
+            Method::OPTIONS,
+            "/api/v1/streams",
+            &[
+                ("Origin", "https://evil.example"),
+                ("Access-Control-Request-Method", "POST"),
+                ("Access-Control-Request-Headers", "authorization"),
+            ],
+        )
+        .await;
+        assert_eq!(allow_origin(&resp), None);
+        assert!(
+            !resp
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS)
+        );
+    }
+
+    #[test]
+    fn public_stats_request_matching() {
+        let none = HeaderMap::new();
+        let mut auth = HeaderMap::new();
+        auth.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer x"));
+        assert!(is_public_stats_request("/stats", &none));
+        assert!(is_public_stats_request("/stats", &auth));
+        assert!(is_public_stats_request("/api/v1/streams/abc/stats", &none));
+        assert!(!is_public_stats_request("/api/v1/streams/abc/stats", &auth));
+        assert!(!is_public_stats_request("/api/v1/streams//stats", &none));
+        assert!(!is_public_stats_request("/api/v1/streams/a/b/stats", &none));
+        assert!(!is_public_stats_request(
+            "/api/v1/streams/abc/players",
+            &none
+        ));
+        assert!(!is_public_stats_request("/stats/", &none));
     }
 }
