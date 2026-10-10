@@ -638,10 +638,12 @@ impl ClusterManager {
                     let (cluster_id, peers) = network::send_join(
                         join_addr,
                         &config.secret,
-                        config.node_id,
-                        advertise.clone(),
-                        media_advertise.clone(),
-                        config.join_proof.clone(),
+                        network::JoinRequestSpec {
+                            node_id: config.node_id,
+                            control_addr: advertise.clone(),
+                            media_addr: media_advertise.clone(),
+                            proof: config.join_proof.clone(),
+                        },
                         tls_client.clone(),
                         config.allow_loopback_peer_addrs,
                     )
