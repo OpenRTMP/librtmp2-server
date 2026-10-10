@@ -271,13 +271,7 @@ fn shard_count_for(
         }
         return 1;
     }
-    let shards = requested.clamp(1, MAX_SHARDS);
-    if per_addr_caps_configured && shards > 1 {
-        crate::log_warn!(
-            "LRTMP2_RTMP_SHARDS={shards}: the per-address RTMP caps are enforced per shard, so one address can hold up to {shards}x the configured cap"
-        );
-    }
-    shards
+    requested.clamp(1, MAX_SHARDS)
 }
 
 /// Default shard count ceiling when `LRTMP2_RTMP_SHARDS` is unset. Every
@@ -2112,7 +2106,13 @@ impl ServerApp {
         // bump it back up -- more shards than `rtmp_max_conn` would otherwise
         // silently raise the effective global cap from `rtmp_max_conn` to
         // `n_shards` (each shard's own floor-of-1 minimum summing past it).
-        n_shards.min(self.config.rtmp_max_conn as usize).max(1)
+        let shards = n_shards.min(self.config.rtmp_max_conn as usize).max(1);
+        if per_addr_caps_configured && shards > 1 {
+            crate::log_warn!(
+                "LRTMP2_RTMP_SHARDS={shards}: the per-address RTMP caps are enforced per shard, so one address can hold up to {shards}x the configured cap"
+            );
+        }
+        shards
     }
 
     /// Relay-export buffer size for each shard's `Server` (0 = disabled).
