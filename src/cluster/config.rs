@@ -251,6 +251,24 @@ impl ClusterConfig {
         }
         parse_bind(&self.bind).map_err(|e| format!("CLUSTER_BIND: {e}"))?;
         parse_bind(&self.media_bind).map_err(|e| format!("CLUSTER_MEDIA_BIND: {e}"))?;
+        // Peers dial the advertised addresses through
+        // `validate_cluster_peer_addr`, which parses a `SocketAddr` and rejects
+        // hostnames. A hostname advertise would therefore be silently skipped on
+        // the peer side, so reject it up front instead of failing deeper at join.
+        if let Some(advertise) = self.advertise_addr.as_deref().filter(|a| !a.is_empty()) {
+            advertise.parse::<SocketAddr>().map_err(|e| {
+                format!("CLUSTER_ADVERTISE_ADDR must be a literal IP socket address: {e}")
+            })?;
+        }
+        if let Some(advertise) = self
+            .media_advertise_addr
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
+            advertise.parse::<SocketAddr>().map_err(|e| {
+                format!("CLUSTER_MEDIA_ADVERTISE_ADDR must be a literal IP socket address: {e}")
+            })?;
+        }
         if self.bootstrap && self.join.is_some() {
             return Err("CLUSTER_BOOTSTRAP and CLUSTER_JOIN are mutually exclusive".into());
         }
@@ -720,6 +738,36 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.node_id, 1);
         assert!(cfg.bootstrap);
+    }
+
+    #[test]
+    fn advertise_addr_must_be_literal_ip() {
+        let base = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "1"),
+            ("CLUSTER_BOOTSTRAP", "true"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("CLUSTER_BIND", "127.0.0.1:1940"),
+            ("CLUSTER_MEDIA_BIND", "127.0.0.1:1941"),
+        ]);
+
+        let mut ok = base.clone();
+        ok.insert("CLUSTER_ADVERTISE_ADDR", "10.0.0.1:1940");
+        ok.insert("CLUSTER_MEDIA_ADVERTISE_ADDR", "10.0.0.1:1941");
+        let cfg = ClusterConfig::load_from_kv(|k| ok.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!(cfg.validate().is_ok());
+
+        let mut bad = base.clone();
+        bad.insert("CLUSTER_ADVERTISE_ADDR", "node1.example.com:1940");
+        let err =
+            ClusterConfig::load_from_kv(|k| bad.get(k).map(|s| (*s).to_string())).unwrap_err();
+        assert!(err.contains("CLUSTER_ADVERTISE_ADDR"), "{err}");
+
+        let mut bad_media = base;
+        bad_media.insert("CLUSTER_MEDIA_ADVERTISE_ADDR", "node1.example.com:1941");
+        let err = ClusterConfig::load_from_kv(|k| bad_media.get(k).map(|s| (*s).to_string()))
+            .unwrap_err();
+        assert!(err.contains("CLUSTER_MEDIA_ADVERTISE_ADDR"), "{err}");
     }
 
     #[test]

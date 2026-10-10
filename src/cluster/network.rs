@@ -1272,6 +1272,7 @@ pub async fn send_join(
     media_addr: String,
     proof: String,
     tls_client: Option<Arc<ClientConfig>>,
+    allow_loopback: bool,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
     if proof.is_empty() {
         return Err(
@@ -1287,6 +1288,7 @@ pub async fn send_join(
         media_addr,
         proof,
         tls_client,
+        allow_loopback,
         0,
     )
     .await
@@ -1302,6 +1304,7 @@ async fn send_join_with_hops(
     media_addr: String,
     proof: String,
     tls_client: Option<Arc<ClientConfig>>,
+    allow_loopback: bool,
     hops: u8,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
     let (msg, _read_budget) = authed_roundtrip_inner(
@@ -1341,6 +1344,11 @@ async fn send_join_with_hops(
             if leader.control_addr == leader_addr {
                 return Err(format!("join forward cycle at {leader_addr}"));
             }
+            crate::cluster::security::validate_cluster_peer_addr(
+                &leader.control_addr,
+                allow_loopback,
+            )
+            .map_err(|reason| format!("join redirect target rejected: {reason}"))?;
             Box::pin(send_join_with_hops(
                 &leader.control_addr,
                 secret,
@@ -1349,6 +1357,7 @@ async fn send_join_with_hops(
                 media_addr,
                 proof,
                 tls_client,
+                allow_loopback,
                 hops + 1,
             ))
             .await
@@ -2235,6 +2244,7 @@ mod tests {
             "m".into(),
             String::new(),
             None,
+            true,
         )
         .await
         .unwrap_err();
@@ -2248,6 +2258,7 @@ mod tests {
             "m5".into(),
             GOOD_PROOF.into(),
             None,
+            true,
         )
         .await
         .unwrap();
@@ -2267,7 +2278,8 @@ mod tests {
                 "c".into(),
                 "m".into(),
                 "bad".into(),
-                None
+                None,
+                true,
             )
             .await
             .is_err()
@@ -2281,6 +2293,7 @@ mod tests {
             "m".into(),
             GOOD_PROOF.into(),
             None,
+            true,
         )
         .await
         .unwrap_err();
@@ -2384,6 +2397,7 @@ mod tests {
             "m".into(),
             "p".into(),
             None,
+            true,
         )
         .await
         .unwrap();
@@ -2405,6 +2419,7 @@ mod tests {
             "m".into(),
             "p".into(),
             None,
+            true,
         )
         .await
         .unwrap_err();
@@ -2412,24 +2427,51 @@ mod tests {
 
         // Redirect back to itself.
         let cyc = fake_ctl_redirect_to_self().await;
-        let err = send_join(&cyc, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
-            .await
-            .unwrap_err();
+        let err = send_join(
+            &cyc,
+            SECRET,
+            5,
+            "c".into(),
+            "m".into(),
+            "p".into(),
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("cycle"), "{err}");
 
         // Endless redirects between two nodes hit the hop limit.
         let (a, b) = fake_ctl_ping_pong().await;
         assert_ne!(a, b);
-        let err = send_join(&a, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
-            .await
-            .unwrap_err();
+        let err = send_join(
+            &a,
+            SECRET,
+            5,
+            "c".into(),
+            "m".into(),
+            "p".into(),
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("hop limit"), "{err}");
 
         // Unexpected response type.
         let odd = fake_ctl(vec![ControlMessage::AdminOk, ControlMessage::AdminOk]).await;
-        let err = send_join(&odd, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
-            .await
-            .unwrap_err();
+        let err = send_join(
+            &odd,
+            SECRET,
+            5,
+            "c".into(),
+            "m".into(),
+            "p".into(),
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, "unexpected join response");
         let err = forward_join(&odd, SECRET, 2, 5, "c".into(), "m".into(), "p".into(), None)
             .await

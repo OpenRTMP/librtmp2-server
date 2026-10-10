@@ -154,6 +154,10 @@ pub struct ClusterManager {
     /// Recently accepted `admin_proof` values — blocks captured ClientWrite /
     /// membership proofs from being replayed while the API token is unchanged.
     used_admin_proofs: Mutex<HashMap<String, Instant>>,
+    /// Last peer-address value rejected per `(node, kind)`, so a peer that
+    /// keeps advertising an invalid address (mTLS heartbeat) only warns when the
+    /// rejected value changes instead of on every heartbeat.
+    rejected_peer_addrs: Mutex<std::collections::HashMap<(NodeId, u8), String>>,
 }
 
 /// Shared with AppState so Raft applies can mark deleted streams / revoked viewers
@@ -329,6 +333,7 @@ impl ClusterManager {
             standby_subs: Mutex::new(std::collections::HashMap::new()),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
+            rejected_peer_addrs: Mutex::new(std::collections::HashMap::new()),
         });
 
         let mgr_gate = Arc::clone(&mgr);
@@ -387,23 +392,34 @@ impl ClusterManager {
                             crate::cluster::security::validate_cluster_peer_addr(m, allow_loopback),
                         ) {
                             (Ok(()), Ok(())) => {
+                                counts_hb
+                                    .rejected_peer_addrs
+                                    .lock()
+                                    .remove(&(info.node_id, 0));
                                 meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
                                 network_hb.upsert_node(info.node_id, c.clone());
                             }
                             (control, media) => {
-                                if let Err(reason) = control {
-                                    crate::log_warn!(
-                                        "Cluster: ignoring heartbeat control address for node {}: {}",
-                                        info.node_id,
-                                        reason
-                                    );
-                                }
-                                if let Err(reason) = media {
-                                    crate::log_warn!(
-                                        "Cluster: ignoring heartbeat media address for node {}: {}",
-                                        info.node_id,
-                                        reason
-                                    );
+                                let signature = format!("{c}|{m}");
+                                let mut logged = counts_hb.rejected_peer_addrs.lock();
+                                if logged.get(&(info.node_id, 0)).map(String::as_str)
+                                    != Some(signature.as_str())
+                                {
+                                    if let Err(reason) = &control {
+                                        crate::log_warn!(
+                                            "Cluster: ignoring heartbeat control address for node {}: {}",
+                                            info.node_id,
+                                            reason
+                                        );
+                                    }
+                                    if let Err(reason) = &media {
+                                        crate::log_warn!(
+                                            "Cluster: ignoring heartbeat media address for node {}: {}",
+                                            info.node_id,
+                                            reason
+                                        );
+                                    }
+                                    logged.insert((info.node_id, 0), signature);
                                 }
                             }
                         }
@@ -416,12 +432,22 @@ impl ClusterManager {
                         if let Err(reason) =
                             crate::cluster::security::validate_cluster_peer_addr(&m, allow_loopback)
                         {
-                            crate::log_warn!(
-                                "Cluster: skipping media dial for node {}: {}",
-                                info.node_id,
-                                reason
-                            );
+                            let mut logged = counts_hb.rejected_peer_addrs.lock();
+                            if logged.get(&(info.node_id, 1)).map(String::as_str)
+                                != Some(m.as_str())
+                            {
+                                crate::log_warn!(
+                                    "Cluster: skipping media dial for node {}: {}",
+                                    info.node_id,
+                                    reason
+                                );
+                                logged.insert((info.node_id, 1), m.clone());
+                            }
                         } else {
+                            counts_hb
+                                .rejected_peer_addrs
+                                .lock()
+                                .remove(&(info.node_id, 1));
                             let hub = Arc::clone(&media_hb);
                             let mid = info.node_id;
                             tokio::spawn(async move {
@@ -598,6 +624,7 @@ impl ClusterManager {
                         media_advertise.clone(),
                         config.join_proof.clone(),
                         tls_client.clone(),
+                        config.allow_loopback_peer_addrs,
                     )
                     .await?;
                     let local_id = db.setting_get(CLUSTER_ID_SETTING);
@@ -1831,6 +1858,8 @@ impl ClusterManager {
             self.peer_session_counts.lock().remove(&id);
             self.peer_stream_players.lock().remove(&id);
             self.peer_viewer_players.lock().remove(&id);
+            self.rejected_peer_addrs.lock().remove(&(id, 0));
+            self.rejected_peer_addrs.lock().remove(&(id, 1));
             crate::log_info!("Cluster: pruned removed node {id} from local topology caches");
         }
     }

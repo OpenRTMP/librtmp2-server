@@ -292,9 +292,21 @@ pub fn validate_cluster_peer_addr(addr: &str, allow_loopback: bool) -> Result<()
         std::net::IpAddr::V6(v6) if v6.is_unicast_link_local() => {
             return Err(format!("peer address '{trimmed}' must not be link-local"));
         }
+        std::net::IpAddr::V6(v6) if is_aws_ipv6_imds(v6) => {
+            return Err(format!(
+                "peer address '{trimmed}' must not be the EC2 IPv6 instance-metadata endpoint"
+            ));
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// AWS EC2 IPv6 instance-metadata endpoint `fd00:ec2::254`. It sits in
+/// unique-local space (`fc00::/7`), which the generic unicast/link-local checks
+/// do not reject, so it needs an explicit deny.
+fn is_aws_ipv6_imds(v6: std::net::Ipv6Addr) -> bool {
+    v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
 }
 
 /// RFC 6598 carrier-grade NAT / shared address space `100.64.0.0/10`, which
@@ -441,6 +453,9 @@ mod tests {
         assert!(validate_cluster_peer_addr("[::ffff:10.0.0.2]:1940", false).is_ok());
         assert!(validate_cluster_peer_addr("127.0.0.1:1940", true).is_ok());
         assert!(validate_cluster_peer_addr("[::ffff:127.0.0.1]:1940", true).is_ok());
+        assert!(validate_cluster_peer_addr("[fd00:ec2::254]:80", false).is_err());
+        assert!(validate_cluster_peer_addr("[fd00:ec2::254]:80", true).is_err());
+        assert!(validate_cluster_peer_addr("[fd00::1]:1940", false).is_ok());
     }
 
     #[test]
