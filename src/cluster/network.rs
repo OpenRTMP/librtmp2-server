@@ -2458,6 +2458,40 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("hop limit"), "{err}");
 
+        // A redirect target is validated too: a loopback leader is refused when
+        // loopback peers are not allowed, closing the redirect SSRF path.
+        let redirect_leader = fake_ctl(vec![ControlMessage::JoinResponse {
+            ok: true,
+            message: String::new(),
+            cluster_id: "cid".into(),
+            peers: Vec::new(),
+        }])
+        .await;
+        let redirect_follower = fake_ctl(vec![ControlMessage::JoinResponse {
+            ok: false,
+            message: "forward_to_leader".into(),
+            cluster_id: String::new(),
+            peers: vec![JoinPeerInfo {
+                node_id: 1,
+                control_addr: redirect_leader.clone(),
+                media_addr: String::new(),
+            }],
+        }])
+        .await;
+        let err = send_join(
+            &redirect_follower,
+            SECRET,
+            5,
+            "c".into(),
+            "m".into(),
+            "p".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("join redirect target rejected"), "{err}");
+
         // Unexpected response type.
         let odd = fake_ctl(vec![ControlMessage::AdminOk, ControlMessage::AdminOk]).await;
         let err = send_join(

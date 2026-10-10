@@ -88,6 +88,23 @@ fn heartbeat_routing_addrs(
         .unwrap_or((None, None))
 }
 
+/// Record a rejected peer-address value and report whether it is newly seen.
+/// A peer that keeps advertising the same invalid address only warns once
+/// instead of on every heartbeat.
+fn note_rejected_peer_addr(
+    seen: &Mutex<std::collections::HashMap<(NodeId, u8), String>>,
+    node_id: NodeId,
+    kind: u8,
+    value: &str,
+) -> bool {
+    let mut seen = seen.lock();
+    if seen.get(&(node_id, kind)).map(String::as_str) == Some(value) {
+        return false;
+    }
+    seen.insert((node_id, kind), value.to_string());
+    true
+}
+
 pub struct ClusterManager {
     pub config: ClusterConfig,
     db: Arc<Db>,
@@ -401,10 +418,12 @@ impl ClusterManager {
                             }
                             (control, media) => {
                                 let signature = format!("{c}|{m}");
-                                let mut logged = counts_hb.rejected_peer_addrs.lock();
-                                if logged.get(&(info.node_id, 0)).map(String::as_str)
-                                    != Some(signature.as_str())
-                                {
+                                if note_rejected_peer_addr(
+                                    &counts_hb.rejected_peer_addrs,
+                                    info.node_id,
+                                    0,
+                                    &signature,
+                                ) {
                                     if let Err(reason) = &control {
                                         crate::log_warn!(
                                             "Cluster: ignoring heartbeat control address for node {}: {}",
@@ -419,7 +438,6 @@ impl ClusterManager {
                                             reason
                                         );
                                     }
-                                    logged.insert((info.node_id, 0), signature);
                                 }
                             }
                         }
@@ -432,16 +450,17 @@ impl ClusterManager {
                         if let Err(reason) =
                             crate::cluster::security::validate_cluster_peer_addr(&m, allow_loopback)
                         {
-                            let mut logged = counts_hb.rejected_peer_addrs.lock();
-                            if logged.get(&(info.node_id, 1)).map(String::as_str)
-                                != Some(m.as_str())
-                            {
+                            if note_rejected_peer_addr(
+                                &counts_hb.rejected_peer_addrs,
+                                info.node_id,
+                                1,
+                                &m,
+                            ) {
                                 crate::log_warn!(
                                     "Cluster: skipping media dial for node {}: {}",
                                     info.node_id,
                                     reason
                                 );
-                                logged.insert((info.node_id, 1), m.clone());
                             }
                         } else {
                             counts_hb
@@ -3015,6 +3034,17 @@ mod heartbeat_routing_tests {
         );
         assert_eq!(ctrl.as_deref(), Some("victim:1940"));
         assert_eq!(media.as_deref(), Some("victim:1941"));
+    }
+
+    #[test]
+    fn rejected_peer_addr_warns_once_per_value() {
+        let seen = Mutex::new(std::collections::HashMap::new());
+        assert!(note_rejected_peer_addr(&seen, 7, 0, "a"));
+        assert!(!note_rejected_peer_addr(&seen, 7, 0, "a"));
+        assert!(note_rejected_peer_addr(&seen, 7, 0, "b"));
+        assert!(note_rejected_peer_addr(&seen, 8, 0, "a"));
+        assert!(note_rejected_peer_addr(&seen, 7, 1, "a"));
+        assert!(!note_rejected_peer_addr(&seen, 7, 1, "a"));
     }
 
     #[test]
