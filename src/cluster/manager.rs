@@ -88,6 +88,23 @@ fn heartbeat_routing_addrs(
         .unwrap_or((None, None))
 }
 
+/// Record a rejected peer-address value and report whether it is newly seen.
+/// A peer that keeps advertising the same invalid address only warns once
+/// instead of on every heartbeat.
+fn note_rejected_peer_addr(
+    seen: &Mutex<std::collections::HashMap<(NodeId, u8), String>>,
+    node_id: NodeId,
+    kind: u8,
+    value: &str,
+) -> bool {
+    let mut seen = seen.lock();
+    if seen.get(&(node_id, kind)).map(String::as_str) == Some(value) {
+        return false;
+    }
+    seen.insert((node_id, kind), value.to_string());
+    true
+}
+
 pub struct ClusterManager {
     pub config: ClusterConfig,
     db: Arc<Db>,
@@ -154,6 +171,10 @@ pub struct ClusterManager {
     /// Recently accepted `admin_proof` values — blocks captured ClientWrite /
     /// membership proofs from being replayed while the API token is unchanged.
     used_admin_proofs: Mutex<HashMap<String, Instant>>,
+    /// Last peer-address value rejected per `(node, kind)`, so a peer that
+    /// keeps advertising an invalid address (mTLS heartbeat) only warns when the
+    /// rejected value changes instead of on every heartbeat.
+    rejected_peer_addrs: Mutex<std::collections::HashMap<(NodeId, u8), String>>,
 }
 
 /// Shared with AppState so Raft applies can mark deleted streams / revoked viewers
@@ -329,6 +350,7 @@ impl ClusterManager {
             standby_subs: Mutex::new(std::collections::HashMap::new()),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
+            rejected_peer_addrs: Mutex::new(std::collections::HashMap::new()),
         });
 
         let mgr_gate = Arc::clone(&mgr);
@@ -357,8 +379,8 @@ impl ClusterManager {
             let media_hb = Arc::clone(&mgr.media);
             let network_hb = Arc::clone(&mgr.network);
             let counts_hb = Arc::clone(&mgr);
-            let on_heartbeat: Arc<dyn Fn(network::HeartbeatInfo) + Send + Sync> =
-                Arc::new(move |info: network::HeartbeatInfo| {
+            let on_heartbeat: Arc<dyn Fn(network::HeartbeatInfo) + Send + Sync> = Arc::new(
+                move |info: network::HeartbeatInfo| {
                     if !counts_hb.peer_in_membership(info.node_id) {
                         return;
                     }
@@ -381,18 +403,76 @@ impl ClusterManager {
                     if counts_hb.config.tls_enabled
                         && let (Some(c), Some(m)) = (ctrl.as_ref(), media_a.as_ref())
                     {
-                        meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
-                        network_hb.upsert_node(info.node_id, c.clone());
+                        let allow_loopback = counts_hb.config.allow_loopback_peer_addrs;
+                        match (
+                            crate::cluster::security::validate_cluster_peer_addr(c, allow_loopback),
+                            crate::cluster::security::validate_cluster_peer_addr(m, allow_loopback),
+                        ) {
+                            (Ok(()), Ok(())) => {
+                                counts_hb
+                                    .rejected_peer_addrs
+                                    .lock()
+                                    .remove(&(info.node_id, 0));
+                                meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
+                                network_hb.upsert_node(info.node_id, c.clone());
+                            }
+                            (control, media) => {
+                                let signature = format!("{c}|{m}");
+                                if note_rejected_peer_addr(
+                                    &counts_hb.rejected_peer_addrs,
+                                    info.node_id,
+                                    0,
+                                    &signature,
+                                ) {
+                                    if let Err(reason) = &control {
+                                        crate::log_warn!(
+                                            "Cluster: ignoring heartbeat control address for node {}: {}",
+                                            info.node_id,
+                                            reason
+                                        );
+                                    }
+                                    if let Err(reason) = &media {
+                                        crate::log_warn!(
+                                            "Cluster: ignoring heartbeat media address for node {}: {}",
+                                            info.node_id,
+                                            reason
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     // Dial known membership media addrs in both TLS and plaintext.
                     // Plaintext still must not `set_addrs` from advertised values;
                     // `media_a` is already the trusted join/topology address.
                     if let Some(m) = media_a {
-                        let hub = Arc::clone(&media_hb);
-                        let mid = info.node_id;
-                        tokio::spawn(async move {
-                            let _ = hub.connect_peer(mid, &m).await;
-                        });
+                        let allow_loopback = counts_hb.config.allow_loopback_peer_addrs;
+                        if let Err(reason) =
+                            crate::cluster::security::validate_cluster_peer_addr(&m, allow_loopback)
+                        {
+                            if note_rejected_peer_addr(
+                                &counts_hb.rejected_peer_addrs,
+                                info.node_id,
+                                1,
+                                &m,
+                            ) {
+                                crate::log_warn!(
+                                    "Cluster: skipping media dial for node {}: {}",
+                                    info.node_id,
+                                    reason
+                                );
+                            }
+                        } else {
+                            counts_hb
+                                .rejected_peer_addrs
+                                .lock()
+                                .remove(&(info.node_id, 1));
+                            let hub = Arc::clone(&media_hb);
+                            let mid = info.node_id;
+                            tokio::spawn(async move {
+                                let _ = hub.connect_peer(mid, &m).await;
+                            });
+                        }
                     }
                     // Plaintext clustering explicitly uses possession of CLUSTER_SECRET
                     // plus Raft membership as its trust boundary; mTLS strengthens that
@@ -411,7 +491,8 @@ impl ClusterManager {
                         .peer_viewer_players
                         .lock()
                         .insert(info.node_id, info.viewer_players.into_iter().collect());
-                });
+                },
+            );
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
                 dyn Fn(network::ControlMessage) -> network::ControlMessage + Send + Sync,
@@ -557,11 +638,14 @@ impl ClusterManager {
                     let (cluster_id, peers) = network::send_join(
                         join_addr,
                         &config.secret,
-                        config.node_id,
-                        advertise.clone(),
-                        media_advertise.clone(),
-                        config.join_proof.clone(),
+                        network::JoinRequestSpec {
+                            node_id: config.node_id,
+                            control_addr: advertise.clone(),
+                            media_addr: media_advertise.clone(),
+                            proof: config.join_proof.clone(),
+                        },
                         tls_client.clone(),
+                        config.allow_loopback_peer_addrs,
                     )
                     .await?;
                     let local_id = db.setting_get(CLUSTER_ID_SETTING);
@@ -571,6 +655,32 @@ impl ClusterManager {
                     }
                     for p in peers {
                         if p.node_id == config.node_id {
+                            continue;
+                        }
+                        let allow_loopback = config.allow_loopback_peer_addrs;
+                        if let Err(reason) = crate::cluster::security::validate_cluster_peer_addr(
+                            &p.control_addr,
+                            allow_loopback,
+                        ) {
+                            crate::log_warn!(
+                                "Cluster: ignoring join peer {} with rejected control address: {}",
+                                p.node_id,
+                                reason
+                            );
+                            continue;
+                        }
+                        if !p.media_addr.is_empty()
+                            && let Err(reason) =
+                                crate::cluster::security::validate_cluster_peer_addr(
+                                    &p.media_addr,
+                                    allow_loopback,
+                                )
+                        {
+                            crate::log_warn!(
+                                "Cluster: ignoring join peer {} with rejected media address: {}",
+                                p.node_id,
+                                reason
+                            );
                             continue;
                         }
                         mgr.network.upsert_node(p.node_id, p.control_addr.clone());
@@ -1769,6 +1879,8 @@ impl ClusterManager {
             self.peer_session_counts.lock().remove(&id);
             self.peer_stream_players.lock().remove(&id);
             self.peer_viewer_players.lock().remove(&id);
+            self.rejected_peer_addrs.lock().remove(&(id, 0));
+            self.rejected_peer_addrs.lock().remove(&(id, 1));
             crate::log_info!("Cluster: pruned removed node {id} from local topology caches");
         }
     }
@@ -1786,8 +1898,20 @@ impl ClusterManager {
         if !cluster_id.is_empty() && local.is_none() {
             let _ = self.db.setting_set(CLUSTER_ID_SETTING, &cluster_id);
         }
+        let allow_loopback = self.config.allow_loopback_peer_addrs;
         for p in peers {
             if p.node_id == self.config.node_id {
+                continue;
+            }
+            if let Err(reason) = crate::cluster::security::validate_cluster_peer_addr(
+                &p.control_addr,
+                allow_loopback,
+            ) {
+                crate::log_warn!(
+                    "Cluster: ignoring topology peer {} with rejected control address: {}",
+                    p.node_id,
+                    reason
+                );
                 continue;
             }
             let media_addr = if p.media_addr.is_empty() {
@@ -1795,6 +1919,19 @@ impl ClusterManager {
             } else {
                 p.media_addr.clone()
             };
+            if !media_addr.is_empty()
+                && let Err(reason) = crate::cluster::security::validate_cluster_peer_addr(
+                    &media_addr,
+                    allow_loopback,
+                )
+            {
+                crate::log_warn!(
+                    "Cluster: ignoring topology peer {} with rejected media address: {}",
+                    p.node_id,
+                    reason
+                );
+                continue;
+            }
             self.network.upsert_node(p.node_id, p.control_addr.clone());
             self.meta
                 .set_addrs(p.node_id, p.control_addr.clone(), media_addr.clone());
@@ -2899,6 +3036,17 @@ mod heartbeat_routing_tests {
         );
         assert_eq!(ctrl.as_deref(), Some("victim:1940"));
         assert_eq!(media.as_deref(), Some("victim:1941"));
+    }
+
+    #[test]
+    fn rejected_peer_addr_warns_once_per_value() {
+        let seen = Mutex::new(std::collections::HashMap::new());
+        assert!(note_rejected_peer_addr(&seen, 7, 0, "a"));
+        assert!(!note_rejected_peer_addr(&seen, 7, 0, "a"));
+        assert!(note_rejected_peer_addr(&seen, 7, 0, "b"));
+        assert!(note_rejected_peer_addr(&seen, 8, 0, "a"));
+        assert!(note_rejected_peer_addr(&seen, 7, 1, "a"));
+        assert!(!note_rejected_peer_addr(&seen, 7, 1, "a"));
     }
 
     #[test]

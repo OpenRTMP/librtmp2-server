@@ -1262,34 +1262,32 @@ async fn authed_roundtrip_unbounded(
     read_frame(&mut stream).await.map_err(|e| e.to_string())
 }
 
+/// Joiner identity and proof carried in a `JoinRequest`. It is replayed
+/// unchanged when a follower redirects the join to the leader, so grouping it
+/// here keeps the join helpers within the parameter limit.
+pub struct JoinRequestSpec {
+    pub node_id: NodeId,
+    pub control_addr: String,
+    pub media_addr: String,
+    pub proof: String,
+}
+
 /// Client helper: authenticated join against a bootstrap/leader node.
 /// Returns `(cluster_id, peers)` on success.
 pub async fn send_join(
     leader_addr: &str,
     secret: &str,
-    local_id: NodeId,
-    control_addr: String,
-    media_addr: String,
-    proof: String,
+    spec: JoinRequestSpec,
     tls_client: Option<Arc<ClientConfig>>,
+    allow_loopback: bool,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
-    if proof.is_empty() {
+    if spec.proof.is_empty() {
         return Err(
             "CLUSTER_JOIN_PROOF is required for a fresh join; mint one via POST /api/v1/cluster/join-proof on an existing cluster member"
                 .into(),
         );
     }
-    send_join_with_hops(
-        leader_addr,
-        secret,
-        local_id,
-        control_addr,
-        media_addr,
-        proof,
-        tls_client,
-        0,
-    )
-    .await
+    send_join_with_hops(leader_addr, secret, &spec, tls_client, allow_loopback, 0).await
 }
 
 const MAX_JOIN_FORWARD_HOPS: u8 = 3;
@@ -1297,23 +1295,21 @@ const MAX_JOIN_FORWARD_HOPS: u8 = 3;
 async fn send_join_with_hops(
     leader_addr: &str,
     secret: &str,
-    local_id: NodeId,
-    control_addr: String,
-    media_addr: String,
-    proof: String,
+    spec: &JoinRequestSpec,
     tls_client: Option<Arc<ClientConfig>>,
+    allow_loopback: bool,
     hops: u8,
 ) -> Result<(String, Vec<JoinPeerInfo>), String> {
     let (msg, _read_budget) = authed_roundtrip_inner(
         leader_addr,
         secret,
-        local_id,
+        spec.node_id,
         tls_client.clone(),
         ControlMessage::JoinRequest {
-            node_id: local_id,
-            control_addr: control_addr.clone(),
-            media_addr: media_addr.clone(),
-            proof: proof.clone(),
+            node_id: spec.node_id,
+            control_addr: spec.control_addr.clone(),
+            media_addr: spec.media_addr.clone(),
+            proof: spec.proof.clone(),
         },
     )
     .await?;
@@ -1341,14 +1337,17 @@ async fn send_join_with_hops(
             if leader.control_addr == leader_addr {
                 return Err(format!("join forward cycle at {leader_addr}"));
             }
+            crate::cluster::security::validate_cluster_peer_addr(
+                &leader.control_addr,
+                allow_loopback,
+            )
+            .map_err(|reason| format!("join redirect target rejected: {reason}"))?;
             Box::pin(send_join_with_hops(
                 &leader.control_addr,
                 secret,
-                local_id,
-                control_addr,
-                media_addr,
-                proof,
+                spec,
                 tls_client,
+                allow_loopback,
                 hops + 1,
             ))
             .await
@@ -1608,6 +1607,16 @@ mod tests {
     use openraft::{LogId, SnapshotMeta, Vote};
     use std::collections::BTreeSet;
     use std::net::Ipv4Addr;
+
+    /// Build a join request spec for the client-helper tests.
+    fn jreq(node_id: NodeId, control: &str, media: &str, proof: String) -> JoinRequestSpec {
+        JoinRequestSpec {
+            node_id,
+            control_addr: control.into(),
+            media_addr: media.into(),
+            proof,
+        }
+    }
 
     #[tokio::test]
     async fn control_accept_backoff_survives_transient_errors() {
@@ -2230,11 +2239,9 @@ mod tests {
         let err = send_join(
             &ctl.addr,
             SECRET,
-            5,
-            "c".into(),
-            "m".into(),
-            String::new(),
+            jreq(5, "c", "m", String::new()),
             None,
+            true,
         )
         .await
         .unwrap_err();
@@ -2243,11 +2250,9 @@ mod tests {
         let (cid, peers) = send_join(
             &ctl.addr,
             SECRET,
-            5,
-            "c5".into(),
-            "m5".into(),
-            GOOD_PROOF.into(),
+            jreq(5, "c5", "m5", GOOD_PROOF.into()),
             None,
+            true,
         )
         .await
         .unwrap();
@@ -2263,11 +2268,9 @@ mod tests {
             send_join(
                 &ctl.addr,
                 SECRET,
-                5,
-                "c".into(),
-                "m".into(),
-                "bad".into(),
-                None
+                jreq(5, "c", "m", "bad".into()),
+                None,
+                true,
             )
             .await
             .is_err()
@@ -2276,11 +2279,9 @@ mod tests {
         let err = send_join(
             &ctl.addr,
             SECRET,
-            66,
-            "c".into(),
-            "m".into(),
-            GOOD_PROOF.into(),
+            jreq(66, "c", "m", GOOD_PROOF.into()),
             None,
+            true,
         )
         .await
         .unwrap_err();
@@ -2376,17 +2377,9 @@ mod tests {
             }],
         }])
         .await;
-        let (cid, _) = send_join(
-            &follower,
-            SECRET,
-            5,
-            "c".into(),
-            "m".into(),
-            "p".into(),
-            None,
-        )
-        .await
-        .unwrap();
+        let (cid, _) = send_join(&follower, SECRET, jreq(5, "c", "m", "p".into()), None, true)
+            .await
+            .unwrap();
         assert_eq!(cid, "cid");
 
         // Redirect without a leader hint.
@@ -2397,22 +2390,14 @@ mod tests {
             peers: Vec::new(),
         }])
         .await;
-        let err = send_join(
-            &no_hint,
-            SECRET,
-            5,
-            "c".into(),
-            "m".into(),
-            "p".into(),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = send_join(&no_hint, SECRET, jreq(5, "c", "m", "p".into()), None, true)
+            .await
+            .unwrap_err();
         assert!(err.contains("forward_to_leader"), "{err}");
 
         // Redirect back to itself.
         let cyc = fake_ctl_redirect_to_self().await;
-        let err = send_join(&cyc, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
+        let err = send_join(&cyc, SECRET, jreq(5, "c", "m", "p".into()), None, true)
             .await
             .unwrap_err();
         assert!(err.contains("cycle"), "{err}");
@@ -2420,14 +2405,45 @@ mod tests {
         // Endless redirects between two nodes hit the hop limit.
         let (a, b) = fake_ctl_ping_pong().await;
         assert_ne!(a, b);
-        let err = send_join(&a, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
+        let err = send_join(&a, SECRET, jreq(5, "c", "m", "p".into()), None, true)
             .await
             .unwrap_err();
         assert!(err.contains("hop limit"), "{err}");
 
+        // A redirect target is validated too: a loopback leader is refused when
+        // loopback peers are not allowed, closing the redirect SSRF path.
+        let redirect_leader = fake_ctl(vec![ControlMessage::JoinResponse {
+            ok: true,
+            message: String::new(),
+            cluster_id: "cid".into(),
+            peers: Vec::new(),
+        }])
+        .await;
+        let redirect_follower = fake_ctl(vec![ControlMessage::JoinResponse {
+            ok: false,
+            message: "forward_to_leader".into(),
+            cluster_id: String::new(),
+            peers: vec![JoinPeerInfo {
+                node_id: 1,
+                control_addr: redirect_leader.clone(),
+                media_addr: String::new(),
+            }],
+        }])
+        .await;
+        let err = send_join(
+            &redirect_follower,
+            SECRET,
+            jreq(5, "c", "m", "p".into()),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("join redirect target rejected"), "{err}");
+
         // Unexpected response type.
         let odd = fake_ctl(vec![ControlMessage::AdminOk, ControlMessage::AdminOk]).await;
-        let err = send_join(&odd, SECRET, 5, "c".into(), "m".into(), "p".into(), None)
+        let err = send_join(&odd, SECRET, jreq(5, "c", "m", "p".into()), None, true)
             .await
             .unwrap_err();
         assert_eq!(err, "unexpected join response");
