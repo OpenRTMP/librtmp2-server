@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-10-10
+
 ### Added
 - CI benchmark workflow: every merge to `main` and every release runs the
   HTTP API microbenchmarks and the cross-server RTMP sweep (nginx-rtmp,
@@ -26,8 +28,29 @@ begin at `1.0.0`.
   nginx-rtmp-module master (built from source), SRS 8.0 and LiveForge main.
 - The build, clippy and release jobs use `--locked`, so they fail instead of
   building a dependency graph that differs from the committed `Cargo.lock`.
+  The Docker image and the release test run do too.
+- CI runs clippy with the `cluster` feature as well; the Docker image ships
+  with it.
+- The release workflow refuses a tag that does not match the crate version in
+  `Cargo.toml`, builds an existing tag's own commit, and creates a missing tag
+  at the commit it built instead of the default branch's current head.
+- `LRTMP2_RTMP_SHARDS` logs a warning for an unparsable value, and when an
+  explicit shard count multiplies the per-address RTMP caps (they are counted
+  per shard).
 
 ### Fixed
+- HTTP behind a local reverse proxy with a dual-stack `HTTP_BIND` (`[::]:…`):
+  IPv4 clients arrive as `::ffff:a.b.c.d`, so `HTTP_TRUSTED_PROXIES=127.0.0.1`
+  never matched and `X-Forwarded-For` was ignored, putting every client into
+  the proxy's rate-limit bucket. IPv4-mapped addresses are now compared and
+  bucketed as plain IPv4.
+- Docker: building against a sibling `librtmp2` checkout (monorepo context or
+  `LIBRTMP2_REF`) silently used the crates.io release, because the override
+  still patched the old git source. It now patches crates.io.
+- `docker-compose.yml` referenced `ghcr.io/OpenRTMP/librtmp2-server`, which
+  Docker rejects (image names must be lowercase).
+- The `Update Cargo.lock` workflow no longer runs on tag pushes, where it
+  could not push and failed.
 - Publish rename on the same connection: the previous route is ended right
   away instead of keeping the other shards' inject claim until the stale
   timeout, and relay delivery to the renamed stream's players resumes.
@@ -67,6 +90,12 @@ begin at `1.0.0`.
   on.
 
 ### Documentation
+- README: recording, HLS, push relay and exec hooks are listed as implemented
+  (they were described as missing); DASH, LL-HLS, WebRTC, SRT and ABR are named
+  as unsupported. The `librtmp2` version is 0.11.0, and `LRTMP2_RTMP_SHARDS` is
+  documented.
+- `.env.example`: `RTMP_MAX_CONNECTIONS` is shared by all listeners (it said
+  "per listener").
 - The README terminal demo is re-recorded against the current server: the
   `POST /api/v1/streams` call sends `Content-Type: application/json` (required
   by the API), the generated keys are stored in shell variables, and the
@@ -916,7 +945,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.5.0...v0.6.0

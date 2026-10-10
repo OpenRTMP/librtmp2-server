@@ -29,6 +29,7 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 - **JSON stats** — `/stats?key=***`
 - **Nginx-RTMP XML** — `/stats-nginx?key=***`
 - **REST API** — stream CRUD, Bearer token auth
+- **Media outputs** — recording, HLS, RTMP/RTMPS push relay and exec hooks via FFmpeg (off by default, see [docs/media-outputs.md](docs/media-outputs.md))
 - **Docker** — Alpine-based images on GHCR
 
 ### Protocol behaviour inherited from librtmp2 (not reimplemented here)
@@ -37,7 +38,8 @@ Focused on RTMP/E-RTMP only. SQLite-backed. JSON stats. Nginx-compatible XML.
 - Late player join gets cached codec sequence headers (legacy + Enhanced-RTMP) and last keyframe; `onMetaData` is replayed to late joiners
 - Legacy RTMP commands (`pause`, `seek`, `receiveAudio`/`receiveVideo`, `closeStream`) are handled in the protocol layer
 - E-RTMP v2 connect capability negotiation and multitrack relay live in `librtmp2`; this server does not expose per-track IDs in the HTTP API yet
-- No nginx-rtmp feature parity (HLS, exec, push relay, recording)
+
+Not supported: DASH, LL-HLS, WebRTC, SRT and adaptive-bitrate ladders.
 
 Test your OBS/FFmpeg workflow before using this for critical streams. It is not a drop-in replacement for `nginx-rtmp`.
 
@@ -54,6 +56,8 @@ Everything below is implemented **in this repo**. Wire-protocol limits are defin
 - **Privacy by design** — no public stream list without keys
 - **JSON + Nginx-compatible XML stats**
 - **REST API** — stream CRUD, Bearer token auth
+- **Recording, HLS, push relay and exec hooks** — optional FFmpeg-backed
+  media outputs. See [docs/media-outputs.md](docs/media-outputs.md)
 - **Docker-ready** — lightweight Alpine container
 - **Optional HA clustering** — OpenRaft + media mesh (`--features cluster`;
   runtime `CLUSTER_ENABLED=false` by default). See [docs/clustering.md](docs/clustering.md)
