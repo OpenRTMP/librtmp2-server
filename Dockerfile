@@ -41,10 +41,13 @@ RUN set -eu; \
 
 WORKDIR /build/librtmp2-server
 # A sibling librtmp2 checkout (monorepo context or LIBRTMP2_REF) replaces the
-# crates.io release. Without one the build must match the committed Cargo.lock.
+# crates.io release: the dependency becomes a path dependency, so the checkout
+# is used whatever its version. Without one the build must match the committed
+# Cargo.lock.
 RUN set -eu; \
     if [ -f /build/librtmp2/Cargo.toml ]; then \
-      printf '\n[patch.crates-io]\nlibrtmp2 = { path = "../librtmp2" }\n' >> Cargo.toml; \
+      sed -i 's|^librtmp2 = { version = "[^"]*"|librtmp2 = { path = "../librtmp2"|' Cargo.toml; \
+      grep -q '^librtmp2 = { path = "../librtmp2"' Cargo.toml; \
       cargo build --release --features cluster,vendored-openssl; \
     else \
       cargo build --locked --release --features cluster,vendored-openssl; \

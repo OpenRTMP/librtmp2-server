@@ -17,11 +17,59 @@ permissions:
   contents: write
 
 jobs:
+  # Decide what gets built: an existing tag is built from its own commit, a new
+  # tag from the dispatched commit (and created there when the release is
+  # published). The tag must match the crate version in that commit.
+  resolve:
+    name: resolve release commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.ref.outputs.sha }}
+      tag: ${{ steps.ref.outputs.tag }}
+      version: ${{ steps.ref.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve tag, commit and version
+        id: ref
+        env:
+          REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if ! printf '%s' "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Release tag '$REF' must look like v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          if SHA="$(git rev-parse -q --verify "refs/tags/$REF^{commit}")"; then
+            echo "Tag $REF exists at $SHA; building that commit"
+          else
+            SHA="$GITHUB_SHA"
+            echo "Tag $REF does not exist yet; building $SHA"
+          fi
+          VERSION="${REF#v}"
+          CRATE_VERSION="$(git show "$SHA:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
+          if [ "$VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::Release tag $REF does not match the crate version $CRATE_VERSION in Cargo.toml at $SHA"
+            exit 1
+          fi
+          {
+            echo "sha=$SHA"
+            echo "tag=$REF"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+
   verify:
     name: verify before release
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -39,12 +87,14 @@ jobs:
 
   package:
     name: build & package
-    needs: verify
+    needs: [resolve, verify]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -56,32 +106,9 @@ jobs:
 
       - name: Resolve version
         id: ver
-        env:
-          REF: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          if ! printf '%s' "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-            echo "::error::Release tag '$REF' must look like v<major>.<minor>.<patch>"
-            exit 1
-          fi
-          VERSION="${REF#v}"
-          CRATE_VERSION="$(cargo metadata --locked --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "librtmp2-server") | .version')"
-          if [ "$VERSION" != "$CRATE_VERSION" ]; then
-            echo "::error::Release tag $REF does not match the crate version $CRATE_VERSION in Cargo.toml"
-            exit 1
-          fi
-          # A dispatch for a tag that already exists must build that tag's
-          # commit, not whatever the dispatched branch points at now.
-          if git ls-remote --exit-code --tags origin "refs/tags/$REF" > /dev/null; then
-            git fetch --quiet --depth 1 origin "refs/tags/$REF:refs/tags/$REF"
-            TAG_SHA="$(git rev-list -n 1 "$REF")"
-            if [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
-              echo "::error::Tag $REF points at $TAG_SHA, but this run builds $GITHUB_SHA"
-              exit 1
-            fi
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$REF" >> "$GITHUB_OUTPUT"
+          echo "version=${{ needs.resolve.outputs.version }}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ needs.resolve.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
         run: cargo build --locked --release
@@ -127,7 +154,7 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           # Create a missing tag at the commit that was built, not at the
           # default branch's head (which can move while the release builds).
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ needs.resolve.outputs.sha }}
           name: librtmp2-server ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           files: |
@@ -136,7 +163,7 @@ jobs:
 
   docker:
     name: build & push docker image
-    needs: package
+    needs: [resolve, package]
     uses: ./.github/workflows/docker-multiarch.yml
     permissions:
       packages: write
@@ -144,6 +171,7 @@ jobs:
     secrets: inherit
     with:
       version: ${{ needs.package.outputs.version }}
+      ref: ${{ needs.resolve.outputs.sha }}
 
   # Benchmarks run after the release exists and are attached to it afterwards;
   # the Docker image above does not wait for them.

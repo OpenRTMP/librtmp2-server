@@ -32,8 +32,9 @@ begin at `1.0.0`.
 - CI runs clippy with the `cluster` feature as well; the Docker image ships
   with it.
 - The release workflow refuses a tag that does not match the crate version in
-  `Cargo.toml`, builds an existing tag's own commit, and creates a missing tag
-  at the commit it built instead of the default branch's current head.
+  `Cargo.toml`. A dispatch for an existing tag builds, tests, packages and
+  publishes the Docker image from that tag's commit; a new tag is created at
+  the commit that was built instead of the default branch's current head.
 - `LRTMP2_RTMP_SHARDS` logs a warning for an unparsable value, and when an
   explicit shard count multiplies the per-address RTMP caps (they are counted
   per shard).
@@ -46,7 +47,8 @@ begin at `1.0.0`.
   bucketed as plain IPv4.
 - Docker: building against a sibling `librtmp2` checkout (monorepo context or
   `LIBRTMP2_REF`) silently used the crates.io release, because the override
-  still patched the old git source. It now patches crates.io.
+  still patched the old git source. The checkout now replaces the dependency
+  as a path dependency, whatever its version.
 - `docker-compose.yml` referenced `ghcr.io/OpenRTMP/librtmp2-server`, which
   Docker rejects (image names must be lowercase).
 - The `Update Cargo.lock` workflow no longer runs on tag pushes, where it
