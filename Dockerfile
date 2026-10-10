@@ -45,11 +45,10 @@ WORKDIR /build/librtmp2-server
 RUN set -eu; \
     if [ -f /build/librtmp2/Cargo.toml ]; then \
       printf '\n[patch.crates-io]\nlibrtmp2 = { path = "../librtmp2" }\n' >> Cargo.toml; \
-      LOCKED=""; \
+      cargo build --release --features cluster,vendored-openssl; \
     else \
-      LOCKED="--locked"; \
+      cargo build --locked --release --features cluster,vendored-openssl; \
     fi; \
-    cargo build $LOCKED --release --features cluster,vendored-openssl; \
     install -Dm755 target/*/release/librtmp2-server /build/out/librtmp2-server
 
 ARG APP_VERSION=""
