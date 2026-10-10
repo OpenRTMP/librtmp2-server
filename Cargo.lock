@@ -1249,9 +1249,9 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "librtmp2"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2ca644ff1c96fc63496502d8f827b56fdd2846d342542fd4f01471897d99a06"
+checksum = "48a1f18895bef21727d55b5c546fa98c482bdb1863e8d8e185c0ab7dd411bb53"
 dependencies = [
  "cc",
  "libc",
@@ -1259,6 +1259,7 @@ dependencies = [
  "parking_lot",
  "socket2",
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2250,9 +2251,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.152"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "1741ab7a6cc54a03a89b5d563ed60075c277d9e3cfa73ad0c1f23f23974703c6"
 dependencies = [
  "itoa",
  "memchr",
