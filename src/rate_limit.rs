@@ -251,7 +251,15 @@ pub fn resolve_client_ip(
     x_forwarded_for: Option<&axum::http::HeaderValue>,
     trusted_proxies: &[IpAddr],
 ) -> IpAddr {
-    if trusted_proxies.contains(&peer) {
+    // A dual-stack HTTP listener (`HTTP_BIND=[::]:…`) reports IPv4 peers as
+    // IPv4-mapped IPv6 (`::ffff:a.b.c.d`). Compare and bucket them as plain
+    // IPv4 so `HTTP_TRUSTED_PROXIES=127.0.0.1` still matches and one client
+    // does not get two rate-limit buckets.
+    let peer = peer.to_canonical();
+    if trusted_proxies
+        .iter()
+        .any(|proxy| proxy.to_canonical() == peer)
+    {
         // Use the rightmost address: the one appended by the immediate trusted
         // proxy ($proxy_add_x_forwarded_for), not client-controlled leftmost entries.
         //
@@ -263,7 +271,7 @@ pub fn resolve_client_ip(
             && let Some(rightmost) = xff.split(',').map(str::trim).rfind(|part| !part.is_empty())
         {
             match rightmost.parse::<IpAddr>() {
-                Ok(client) => return client,
+                Ok(client) => return client.to_canonical(),
                 Err(_) => crate::log_warn!(
                     "rate_limit: trusted proxy {peer} sent unparsable X-Forwarded-For hop '{rightmost}', falling back to peer IP"
                 ),
@@ -616,6 +624,23 @@ mod tests {
 
         let ip = client_ip(&request, &[proxy]);
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn ipv4_mapped_peer_matches_ipv4_trusted_proxy() {
+        let proxy = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mapped_peer: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let xff = axum::http::HeaderValue::from_static("203.0.113.5");
+
+        assert_eq!(
+            resolve_client_ip(mapped_peer, Some(&xff), &[proxy]),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
+        // Without a trusted proxy the mapped peer is reported as plain IPv4.
+        assert_eq!(
+            resolve_client_ip(mapped_peer, Some(&xff), &[]),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
     }
 
     #[test]

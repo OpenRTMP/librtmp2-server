@@ -172,6 +172,13 @@ process environment variable uses an `LRTMP2_RTMP_*` prefix instead (e.g.
 `LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR`) and takes precedence over the `.env`
 file when set.
 
+RTMP connections are spread over up to 4 poll threads (one per CPU) by
+default. The process environment variable `LRTMP2_RTMP_SHARDS` sets the number
+explicitly (1–32; `1` runs a single poll thread). Media outputs and HA
+clustering always run a single thread. A per-address cap
+(`RTMP_MAX_CONNECTIONS_PER_ADDR`) also selects a single thread unless
+`LRTMP2_RTMP_SHARDS` is set, because that cap is counted per thread.
+
 ```env
 # RTMPS (TLS) - disabled by default.
 # When enabled, RTMPS_BIND runs *alongside* RTMP_BIND rather than replacing it.
