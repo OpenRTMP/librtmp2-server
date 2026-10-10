@@ -24,6 +24,10 @@ begin at `1.0.0`.
   `docs/ci-benchmarks.md`.
 
 ### Changed
+- Depends on librtmp2 `0.12.0`, which adds native Windows support, puts the
+  transport socket into non-blocking mode on Unix (a plaintext send on macOS
+  could block) and closes a connection whose publish/play authorization timed
+  out.
 - `BENCHMARKS.md` compares against MediaMTX v1.21.2, nginx 1.31.6 with
   nginx-rtmp-module master (built from source), SRS 8.0 and LiveForge main.
 - The build, clippy and release jobs use `--locked`, so they fail instead of
@@ -94,7 +98,7 @@ begin at `1.0.0`.
 ### Documentation
 - README: recording, HLS, push relay and exec hooks are listed as implemented
   (they were described as missing); DASH, LL-HLS, WebRTC, SRT and ABR are named
-  as unsupported. The `librtmp2` version is 0.11.0, and `LRTMP2_RTMP_SHARDS` is
+  as unsupported. The `librtmp2` version is 0.12.0, and `LRTMP2_RTMP_SHARDS` is
   documented.
 - `.env.example`: `RTMP_MAX_CONNECTIONS` is shared by all listeners (it said
   "per listener").
