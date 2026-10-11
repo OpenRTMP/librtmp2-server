@@ -2609,6 +2609,19 @@ struct ShardLoop {
     pending_route_ends: Vec<(usize, String, String)>,
 }
 
+/// Connection ids of connections currently publishing.
+///
+/// Keyed on the tracked `publishing` flag -- the authoritative publisher
+/// signal -- rather than librtmp2's `ConnState`, which only moves forward and
+/// misreports a play-then-publish connection as `Playing` while it is
+/// genuinely publishing.
+fn live_publisher_ids(tracked: &HashMap<u64, TrackedConn>) -> HashSet<u64> {
+    tracked
+        .iter()
+        .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
+        .collect()
+}
+
 impl ShardLoop {
     fn run(&mut self, server: &mut librtmp2::server::Server) {
         loop {
@@ -2675,7 +2688,7 @@ impl ShardLoop {
                 (Vec::new(), Vec::new())
             };
         self.feed_media_outputs(&exported_frames, &generations_before);
-        self.relay_to_other_shards(server, &exported_frames);
+        self.relay_to_other_shards(&current_ids, &exported_frames);
         // Frames injected here are only fanned out to this shard's viewers
         // inside the next `server.poll`, so re-poll immediately (below)
         // rather than holding them for a tick.
@@ -2791,18 +2804,26 @@ impl ShardLoop {
     /// shard too.
     fn relay_to_other_shards(
         &mut self,
-        server: &librtmp2::server::Server,
+        current_ids: &HashSet<u64>,
         frames: &[librtmp2::RelayFrame],
     ) {
         let Some(txs) = self.relay_txs.clone() else {
             return;
         };
         let mut ended = self.exported_routes.record(frames);
-        let publishing: HashSet<u64> = server
-            .connections
-            .iter()
-            .filter(|c| c.state == librtmp2::types::ConnState::Publishing)
-            .map(|c| c.conn_id)
+        // Derive the live-publisher set from the tracked `publishing` flag, the
+        // authoritative publisher signal (see `prune_markers_if_due`), not
+        // librtmp2's `ConnState`: the state machine only moves forward, so a
+        // play-then-publish connection stays `Playing` while genuinely
+        // publishing and would be reported as a route end on every tick.
+        //
+        // Intersect with `current_ids`: a publisher whose socket vanished during
+        // this poll is still in `self.tracked` until `close_vanished_conns`
+        // runs later in the tick, but must not keep its route "live" and delay
+        // the RouteEnded notice.
+        let publishing: HashSet<u64> = live_publisher_ids(&self.tracked)
+            .into_iter()
+            .filter(|conn_id| current_ids.contains(conn_id))
             .collect();
         ended.extend(self.exported_routes.take_ended(&publishing));
         for (app, stream_name) in ended {
@@ -2944,11 +2965,7 @@ impl ShardLoop {
         self.last_prune = Instant::now();
         let bridge = &self.shared.bridge;
 
-        let live_publishers: HashSet<u64> = self
-            .tracked
-            .iter()
-            .filter_map(|(&conn_id, entry)| entry.publishing.then_some(conn_id))
-            .collect();
+        let live_publishers = live_publisher_ids(&self.tracked);
         self.media_outputs.retain_publishers(&live_publishers);
 
         // Prune transient drain markers (e.g. ownership force_unpublish) once
@@ -3086,6 +3103,38 @@ mod tests {
             "a viewer that is playing but hasn't received its first relayed \
              frame yet must still keep the poll loop on the fast interval"
         );
+    }
+
+    #[test]
+    fn live_publisher_ids_include_play_then_publish_connections() {
+        use super::{TrackedConn, live_publisher_ids};
+
+        let mut tracked: HashMap<u64, TrackedConn> = HashMap::new();
+        // A connection that played first and then published keeps
+        // `ConnState::Playing`, but its tracked publish role is set.
+        tracked.insert(
+            1,
+            TrackedConn {
+                publishing: true,
+                playing: true,
+                ..Default::default()
+            },
+        );
+        tracked.insert(
+            2,
+            TrackedConn {
+                publishing: false,
+                playing: true,
+                ..Default::default()
+            },
+        );
+
+        let ids = live_publisher_ids(&tracked);
+        assert!(
+            ids.contains(&1),
+            "a play-then-publish connection is still a live publisher"
+        );
+        assert!(!ids.contains(&2), "a pure viewer is not a live publisher");
     }
 
     #[test]
