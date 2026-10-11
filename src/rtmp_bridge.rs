@@ -986,11 +986,23 @@ impl DbRtmpBridge {
         // stream is classified as an operational rejection below, not a
         // credential mismatch — otherwise a publisher retrying against its own
         // just-disabled stream would burn the shared per-IP auth-failure budget.
-        let DbLookup::Ok(stream) = self.db.stream_find_by_publish_key_any(stream_key) else {
-            crate::log_warn!(
-                "RTMP: publish rejected — invalid publish_key for app='{app}' from {peer}"
-            );
-            return Err(AuthFailureKind::Credential);
+        let stream = match self.db.stream_find_by_publish_key_any(stream_key) {
+            DbLookup::Ok(stream) => stream,
+            DbLookup::Missing => {
+                crate::log_warn!(
+                    "RTMP: publish rejected — invalid publish_key for app='{app}' from {peer}"
+                );
+                return Err(AuthFailureKind::Credential);
+            }
+            DbLookup::Failed => {
+                // A database fault is not a credential mismatch: mirror the
+                // play path and classify it as operational so a transient
+                // lookup error does not consume the per-IP publish auth budget.
+                crate::log_warn!(
+                    "RTMP: publish rejected — stream lookup failed for app='{app}' from {peer}"
+                );
+                return Err(AuthFailureKind::Operational);
+            }
         };
         if !stream.enabled {
             crate::log_warn!(
