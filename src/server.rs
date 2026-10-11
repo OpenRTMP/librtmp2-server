@@ -2688,7 +2688,7 @@ impl ShardLoop {
                 (Vec::new(), Vec::new())
             };
         self.feed_media_outputs(&exported_frames, &generations_before);
-        self.relay_to_other_shards(&exported_frames);
+        self.relay_to_other_shards(&current_ids, &exported_frames);
         // Frames injected here are only fanned out to this shard's viewers
         // inside the next `server.poll`, so re-poll immediately (below)
         // rather than holding them for a tick.
@@ -2802,7 +2802,11 @@ impl ShardLoop {
     /// frames past that bound rather than this shard's poll tick blocking
     /// on a slow/stuck peer, which would stall every connection on *this*
     /// shard too.
-    fn relay_to_other_shards(&mut self, frames: &[librtmp2::RelayFrame]) {
+    fn relay_to_other_shards(
+        &mut self,
+        current_ids: &HashSet<u64>,
+        frames: &[librtmp2::RelayFrame],
+    ) {
         let Some(txs) = self.relay_txs.clone() else {
             return;
         };
@@ -2812,7 +2816,15 @@ impl ShardLoop {
         // librtmp2's `ConnState`: the state machine only moves forward, so a
         // play-then-publish connection stays `Playing` while genuinely
         // publishing and would be reported as a route end on every tick.
-        let publishing = live_publisher_ids(&self.tracked);
+        //
+        // Intersect with `current_ids`: a publisher whose socket vanished during
+        // this poll is still in `self.tracked` until `close_vanished_conns`
+        // runs later in the tick, but must not keep its route "live" and delay
+        // the RouteEnded notice.
+        let publishing: HashSet<u64> = live_publisher_ids(&self.tracked)
+            .into_iter()
+            .filter(|conn_id| current_ids.contains(conn_id))
+            .collect();
         ended.extend(self.exported_routes.take_ended(&publishing));
         for (app, stream_name) in ended {
             for i in (0..txs.len()).filter(|&i| i != self.index) {
