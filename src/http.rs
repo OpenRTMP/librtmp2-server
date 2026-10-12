@@ -1749,11 +1749,7 @@ async fn handle_stream_player_create(
                 StatusCode::CONFLICT,
                 "play key already in use",
             );
-            return err_json(
-                StatusCode::CONFLICT,
-                "CONFLICT",
-                "play_key already in use",
-            );
+            return err_json(StatusCode::CONFLICT, "CONFLICT", "play_key already in use");
         }
         Err(_) => {
             log_http_access(
