@@ -727,10 +727,9 @@ impl SqliteStateMachine {
         }
         // Acquire/Release emit OwnershipChanged so process_state_effects can
         // refresh OwnershipTracker immediately; snapshot install must too,
-        // otherwise media fencing stays stale until the next heartbeat sync.
-        if !snap.owners.is_empty() {
-            self.emit_effect(StateEffect::OwnershipChanged);
-        }
+        // including empty owner sets that clear prior rows — otherwise media
+        // fencing retains stale epochs until the next heartbeat sync.
+        self.emit_effect(StateEffect::OwnershipChanged);
         Ok(())
     }
 }
@@ -2085,7 +2084,19 @@ mod tests {
             .await
             .unwrap();
         assert!(sm.applied_state().await.unwrap().0.is_none());
-        assert!(drain(&rx).is_empty());
+        let effects = drain(&rx);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, StateEffect::OwnershipChanged)),
+            "empty snapshot owners must still emit OwnershipChanged to clear stale fencing"
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|e| matches!(e, StateEffect::OwnershipChanged)),
+            "empty snapshot with default payload should only emit OwnershipChanged"
+        );
 
         // Undecodable payload.
         assert!(
