@@ -454,7 +454,7 @@ pub struct MediaHub {
     #[allow(dead_code)]
     replicas: u32,
     ownership: Arc<OwnershipTracker>,
-    peers: Mutex<HashMap<NodeId, Arc<MediaPeer>>>,
+    pub(crate) peers: Mutex<HashMap<NodeId, Arc<MediaPeer>>>,
     /// Write pumps for accepted inbound sessions, keyed by remote node.
     inbound_sinks: Mutex<HashMap<NodeId, Arc<InboundMediaSink>>>,
     /// Per-(owner, app, stream) NACK retries after `subscribe_denied`.
@@ -1269,6 +1269,10 @@ impl MediaHub {
         }
     }
 
+    /// Returns `true` when a subscription refcount is held (including
+    /// already-subscribed and empty-address deferred dial). Returns `false`
+    /// only when a sole first Subscribe is rolled back after a send failure,
+    /// so callers (standby reconcile) can clear optimistic bookkeeping.
     pub async fn subscribe_remote(
         &self,
         media_addr: &str,
@@ -1276,20 +1280,20 @@ impl MediaHub {
         app: &str,
         stream: &str,
         epoch: u64,
-    ) {
+    ) -> bool {
         // Hold `subscribe_lock` across add + peer creation + the fresh-peer
         // resubscribe snapshot so a concurrent subscribe for another stream
         // cannot be added between the peer-map insert and the snapshot (which
         // would send that stream's Subscribe twice).
         let _guard = self.subscribe_lock.lock();
         if !self.subs.add(peer_id, app, stream) {
-            return; // already subscribed (refcount)
+            return true; // already subscribed (refcount)
         }
         if media_addr.is_empty() {
             // Owner address not learned yet (e.g. just after a restart). Keep
             // the refcount so a later `connect_peer` resubscribes it, but do
             // not spawn a peer that would dial an empty address forever.
-            return;
+            return true;
         }
         let (peer, fresh) = self.ensure_peer_locked(peer_id, media_addr);
         // A fresh connection already resent every tracked subscription for
@@ -1306,9 +1310,11 @@ impl MediaHub {
                     let _ = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
                 } else {
                     self.bump_sub_gen(peer_id, app, stream);
+                    return false;
                 }
             }
         }
+        true
     }
 
     pub async fn unsubscribe_remote(&self, peer_id: NodeId, app: &str, stream: &str) {
@@ -2654,7 +2660,10 @@ mod tests {
         let p = n.hub.peers.lock().get(&2).cloned().unwrap();
         while p.try_send(MediaMessage::AuthOk).is_ok() {}
         let gen_before = n.hub.sub_gen(2, "live", "s");
-        n.hub.subscribe_remote(&dead, 2, "live", "s", 0).await;
+        assert!(
+            !n.hub.subscribe_remote(&dead, 2, "live", "s", 0).await,
+            "sole Subscribe send failure must report false so standby reconcile can retry"
+        );
         assert!(
             n.hub.subscribed_nodes_for("live", "s").is_empty(),
             "failed first Subscribe must roll back the refcount"

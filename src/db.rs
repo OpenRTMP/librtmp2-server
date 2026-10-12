@@ -572,23 +572,12 @@ impl Db {
         })
     }
 
-    /// Increments the in-memory active-session count for `viewer_id`. Must
-    /// only be called while holding `self.conn`'s lock, in the same
-    /// critical section as the SQLite write that activated the row, so the
-    /// map never observes a state SQLite doesn't also have.
-    fn player_count_incr(&self, viewer_id: &str) {
-        *self
-            .active_player_counts
-            .lock()
-            .entry(viewer_id.to_string())
-            .or_insert(0) += 1;
-    }
-
     /// Decrements the in-memory active-session count for `viewer_id`,
-    /// removing the entry once it reaches zero. Same locking requirement as
-    /// [`Self::player_count_incr`]. Safe to call for a viewer with no
-    /// tracked sessions (a no-op) so duplicate release/disconnect handling
-    /// can never underflow.
+    /// removing the entry once it reaches zero. Pair with
+    /// [`Self::player_count_try_incr`] (or reservation cancel) so the map
+    /// never observes a state SQLite doesn't also have. Safe to call for a
+    /// viewer with no tracked sessions (a no-op) so duplicate
+    /// release/disconnect handling can never underflow.
     fn player_count_decr(&self, viewer_id: &str) {
         Self::decr_count(&mut self.active_player_counts.lock(), viewer_id);
     }
@@ -1230,10 +1219,18 @@ impl Db {
             Ok(_) => Ok(()),
             Err(e) => {
                 crate::log_error!("viewer_add insert failed for {}: {e}", v.id);
+                // Only UNIQUE/PRIMARY KEY collisions are Duplicate. Trigger
+                // RAISE(FAIL) and other constraint codes stay Db so callers
+                // (HTTP 500 vs 409) can tell them apart.
                 if matches!(
                     e,
                     rusqlite::Error::SqliteFailure(ref err, _)
                         if err.code == rusqlite::ErrorCode::ConstraintViolation
+                            && matches!(
+                                err.extended_code,
+                                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                            )
                 ) {
                     Err(ViewerAddError::Duplicate)
                 } else {
@@ -2459,6 +2456,7 @@ impl Db {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
+        let mut reserved_slot = false;
         if p.active {
             if p.viewer_id.is_empty() {
                 crate::log_error!("player_update: missing viewer_id for {id}");
@@ -2472,20 +2470,18 @@ impl Db {
             // must not be double-checked against its own contribution.
             let is_transition =
                 !matches!(&current, Some((true, viewer_id)) if *viewer_id == p.viewer_id);
-            if is_transition
-                && self
-                    .active_player_counts
-                    .lock()
-                    .get(&p.viewer_id)
-                    .copied()
-                    .unwrap_or(0)
-                    >= MAX_CONNECTIONS_PER_PLAY_KEY
-            {
+            // Take the slot atomically (same as player_try_acquire) so a
+            // concurrent player_reserve cannot claim the last slot between a
+            // read-check and the later incr after UPDATE.
+            if is_transition && !self.player_count_try_incr(&p.viewer_id) {
                 crate::log_warn!(
                     "player_update: rejected reactivation of {id} — viewer '{}' is at the connection cap",
                     p.viewer_id
                 );
                 return false;
+            }
+            if is_transition {
+                reserved_slot = true;
             }
         }
         let updated = match conn.execute(
@@ -2517,14 +2513,18 @@ impl Db {
             let was_active_viewer =
                 current.and_then(|(active, viewer_id)| active.then_some(viewer_id));
             match (was_active_viewer, p.active) {
-                (None, true) => self.player_count_incr(&p.viewer_id),
+                (None, true) => {
+                    // Slot already taken via player_count_try_incr.
+                }
                 (Some(old_viewer_id), false) => self.player_count_decr(&old_viewer_id),
                 (Some(old_viewer_id), true) if old_viewer_id != p.viewer_id => {
                     self.player_count_decr(&old_viewer_id);
-                    self.player_count_incr(&p.viewer_id);
+                    // New viewer slot already taken via player_count_try_incr.
                 }
                 _ => {}
             }
+        } else if reserved_slot {
+            self.player_count_decr(&p.viewer_id);
         }
         updated
     }
@@ -3456,6 +3456,76 @@ mod tests {
             db.viewer_add(&viewer),
             Err(ViewerAddError::Duplicate),
             "viewer play_key must not reuse another stream's publish_key"
+        );
+    }
+
+    #[test]
+    fn viewer_add_maps_primary_key_collision_to_duplicate() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream_pk",
+            "pub_pk_key_with_sufficient_length_here",
+            "play_pk_key_with_sufficient_length_here",
+            "stats_pk_key_with_sufficient_length_here",
+        ))
+        .unwrap();
+        let first = StreamViewer {
+            id: "viewer_same_id".to_string(),
+            stream_id: "stream_pk".to_string(),
+            name: "First".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_pk_play_a_xxxxxxxxxxxx"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        db.viewer_add(&first).unwrap();
+        let same_id = StreamViewer {
+            id: "viewer_same_id".to_string(),
+            stream_id: "stream_pk".to_string(),
+            name: "Second".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_pk_play_b_xxxxxxxxxxxx"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&same_id),
+            Err(ViewerAddError::Duplicate),
+            "PRIMARY KEY collision on viewer id must be Duplicate, not Db"
+        );
+    }
+
+    #[test]
+    fn viewer_add_maps_unique_play_key_insert_race_to_duplicate() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream_uq",
+            "pub_uq_key_with_sufficient_length_here",
+            "play_uq_key_with_sufficient_length_here",
+            "stats_uq_key_with_sufficient_length_here",
+        ))
+        .unwrap();
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER race_uq BEFORE INSERT ON stream_viewers \
+                 WHEN NEW.id != 'preempted' \
+                 BEGIN \
+                   INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+                   VALUES ('preempted', NEW.stream_id, 'x', NEW.play_key, 1, 0); \
+                 END;",
+            )
+        })
+        .unwrap();
+        let viewer = StreamViewer {
+            id: "viewer_racer".to_string(),
+            stream_id: "stream_uq".to_string(),
+            name: "Racer".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_uq_race_key_xxxxxxxxxx"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&viewer),
+            Err(ViewerAddError::Duplicate),
+            "UNIQUE play_key race at INSERT must be Duplicate"
         );
     }
 

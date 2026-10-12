@@ -284,6 +284,25 @@ impl DbRtmpBridge {
         }
     }
 
+    /// Resolve the durable stream id for a media-output / recording frame.
+    ///
+    /// Prefers treating `frame_route` as a stream **id** (librtmp2-server pins
+    /// `relay_key` to the DB id) so a late bridge republish cannot reattribute
+    /// already-exported frames, and so `id == other.publish_key` cannot steal
+    /// sinks via publish_key lookup. Falls back to the conn mapping, then
+    /// publish_key resolution.
+    pub fn resolve_media_output_stream_id(&self, conn: ConnId, frame_route: &str) -> String {
+        if let DbLookup::Ok(s) = self.db.stream_get(frame_route) {
+            return s.id;
+        }
+        let sid = self.stream_id_for_conn(conn);
+        if !sid.is_empty() {
+            return sid;
+        }
+        self.stream_id_for_publish_route(frame_route)
+            .unwrap_or_else(|| frame_route.to_string())
+    }
+
     /// True once `on_connect` has recorded a remote IP for `conn`. Lets
     /// callers that may need to register a connection mid-poll (before the
     /// normal `on_connect` pass runs) skip the redundant re-registration and
@@ -1588,6 +1607,15 @@ impl DbRtmpBridge {
             && cs.player.as_ref().is_some_and(|p| p.id == row.id)
         {
             cs.player = None;
+            // Mirror release_player: drop the orphan viewer_id so a later HTTP
+            // revoke cannot kick a still-authorized publisher on this socket,
+            // and keep stream_id aligned with any surviving publisher role.
+            cs.viewer_id.clear();
+            if let Some(ref pub_row) = cs.publisher {
+                cs.stream_id = pub_row.stream_id.clone();
+            } else {
+                cs.stream_id.clear();
+            }
         }
         drop(guard);
         self.db.player_cancel_reservation(&row.viewer_id);
@@ -2620,6 +2648,10 @@ mod tests {
 
         bridge.cancel_fast_play(0, &rows[0]);
         assert!(bridge.session_rows(0).1.is_none());
+        assert!(
+            bridge.viewer_id_for_conn(0).is_empty(),
+            "cancel_fast_play must drop orphan viewer_id"
+        );
         assert!(bridge.authorize_play(max, "live", &s.play_key).is_ok());
         for (conn, row) in rows.iter().enumerate().skip(1) {
             bridge.persist_fast_play(conn as ConnId, row);
@@ -2853,6 +2885,99 @@ mod tests {
             bridge
                 .try_fast_authorize_publish(1, "live", &s.publish_key)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_media_output_stream_id_prefers_route_as_stream_id() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let a = add_stream_with_player(&db, "stream_a", "pub_a", "play_a");
+        let b = add_stream_with_player(&db, "stream_b", "pub_b", "play_b");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        assert_eq!(
+            bridge.resolve_media_output_stream_id(1, "stream_b"),
+            "stream_b",
+            "frame_route matching a stream id must win before conn/publish_key"
+        );
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &a.publish_key).is_ok());
+        assert_eq!(
+            bridge.resolve_media_output_stream_id(1, "not_a_stream_id"),
+            "stream_a",
+            "unknown route falls back to the conn's authorized stream"
+        );
+
+        assert_eq!(
+            bridge.resolve_media_output_stream_id(99, &b.publish_key),
+            "stream_b",
+            "no conn mapping falls back to publish_key lookup"
+        );
+        assert_eq!(
+            bridge.resolve_media_output_stream_id(99, "orphan_route"),
+            "orphan_route",
+            "final fallback keeps the frame route string"
+        );
+    }
+
+    #[test]
+    fn resolve_media_output_stream_id_id_beats_foreign_publish_key() {
+        // stream_b.id == stream_a's publish_key: media-output must attribute
+        // to B (id lookup) and never steal via publish_key → A.
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let shared = crate::keygen::test_pad_access_key("shared_id_and_pub_key_xxxxxxxxxx");
+        let stream_a = crate::db::Stream {
+            id: "stream_a".to_string(),
+            name: "A".to_string(),
+            app: "live".to_string(),
+            publish_key: shared.clone(),
+            play_key: crate::keygen::test_pad_access_key("play_a_key_xxxxxxxxxxxxxxxxxx"),
+            stats_key: crate::keygen::test_pad_access_key("stats_a_key_xxxxxxxxxxxxxxxxx"),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        let stream_b = crate::db::Stream {
+            id: shared.clone(),
+            name: "B".to_string(),
+            app: "live".to_string(),
+            publish_key: crate::keygen::test_pad_access_key("pub_b_key_xxxxxxxxxxxxxxxxxxx"),
+            play_key: crate::keygen::test_pad_access_key("play_b_key_xxxxxxxxxxxxxxxxxx"),
+            stats_key: crate::keygen::test_pad_access_key("stats_b_key_xxxxxxxxxxxxxxxxx"),
+            enabled: true,
+            created_at: crate::db::now_ts(),
+        };
+        db.stream_add(&stream_a).unwrap();
+        db.stream_add(&stream_b).unwrap();
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &shared).is_ok());
+        assert_eq!(bridge.stream_id_for_conn(1), "stream_a");
+        assert_eq!(
+            bridge.resolve_media_output_stream_id(1, &shared),
+            shared,
+            "id-shaped route must not be re-resolved as another stream's publish_key"
+        );
+    }
+
+    #[test]
+    fn cancel_fast_play_keeps_publisher_stream_id() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
+        let play = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted alongside publisher");
+        bridge.cancel_fast_play(1, &play);
+        assert!(bridge.session_rows(1).1.is_none());
+        assert!(bridge.viewer_id_for_conn(1).is_empty());
+        assert_eq!(
+            bridge.stream_id_for_conn(1),
+            "s1",
+            "surviving publisher must keep stream_id after play cancel"
         );
     }
 }

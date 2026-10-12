@@ -166,7 +166,7 @@ pub struct ClusterManager {
     /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
     /// actually causes standby nodes to receive continuous media, not just be
     /// reported as replicas with no data behind them.
-    standby_subs: Mutex<std::collections::HashMap<(String, String), NodeId>>,
+    standby_subs: Arc<Mutex<std::collections::HashMap<(String, String), NodeId>>>,
     state_machine: SqliteStateMachine,
     /// Recently accepted `admin_proof` values — blocks captured ClientWrite /
     /// membership proofs from being replayed while the API token is unchanged.
@@ -347,7 +347,7 @@ impl ClusterManager {
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_stream_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_cleanup_drain_running: AtomicBool::new(false),
-            standby_subs: Mutex::new(std::collections::HashMap::new()),
+            standby_subs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
             rejected_peer_addrs: Mutex::new(std::collections::HashMap::new()),
@@ -2939,10 +2939,25 @@ impl ClusterManager {
                     .map(|o| o.epoch)
                     .unwrap_or(0);
                 let media = Arc::clone(&self.media);
+                let standby_subs = Arc::clone(&self.standby_subs);
+                let app_key = app.clone();
+                let stream_key = stream_id.clone();
                 self.rt_handle.spawn(async move {
-                    media
+                    let ok = media
                         .subscribe_remote(&media_addr, new_owner, &app, &stream_id, epoch)
                         .await;
+                    if !ok {
+                        // Sole Subscribe send failed and hub rolled back —
+                        // drop optimistic standby bookkeeping so the next
+                        // reconcile tick retries (same class as empty media_addr).
+                        // Only clear if this entry still names the owner we
+                        // tried; a newer reconcile may already have replaced it.
+                        let key = (app_key, stream_key);
+                        let mut guard = standby_subs.lock();
+                        if guard.get(&key) == Some(&new_owner) {
+                            guard.remove(&key);
+                        }
+                    }
                 });
             }
         }
@@ -3962,6 +3977,84 @@ mod tests {
         m.release_owners_for_node(1).unwrap();
         m.acquire_stream_owner("rep", 5, 0, 5).unwrap();
         assert!(!m.authorize_inbound_media_subscribe(5, "live", "rep").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn standby_subscribe_send_failure_clears_optimistic_entry() {
+        use crate::cluster::media::protocol::MediaMessage;
+
+        let n = bootstrap(1, |c| c.media_replicas = 1).await;
+        let m = &n.mgr;
+        let s = stream("subfail");
+        m.create_stream(&s).unwrap();
+
+        // Peer exists with a saturated outbound queue *before* reconcile so
+        // subscribe_remote is not fresh and the sole Subscribe try_send fails.
+        let ctrl = dead_addr();
+        let media = dead_addr();
+        m.raft()
+            .add_learner(5, BasicNode { addr: ctrl.clone() }, false)
+            .await
+            .expect("add learner");
+        m.media()
+            .connect_peer(5, &media)
+            .await
+            .expect("pre-connect media peer");
+        {
+            let peer = m
+                .media()
+                .peers
+                .lock()
+                .get(&5)
+                .cloned()
+                .expect("peer after connect");
+            while peer.try_send(MediaMessage::AuthOk).is_ok() {}
+        }
+        m.meta().set_addrs(5, ctrl, media);
+        m.health()
+            .note_peer(5, NodeHealthState::Ready, 0.0, None, None);
+
+        raw_write(m, raw_acquire("subfail", 5)).await;
+        m.poll_side_effects();
+        m.standby_subs.lock().clear();
+        m.reconcile_media_replicas();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !m.standby_subs
+                    .lock()
+                    .contains_key(&("live".to_string(), "subfail".to_string()))
+            })
+            .await,
+            "failed sole Subscribe must drop optimistic standby_subs entry"
+        );
+
+        // Newer reconcile replaced the owner before the failure task ran:
+        // clear only when the entry still names the owner we tried.
+        {
+            let peer = m
+                .media()
+                .peers
+                .lock()
+                .get(&5)
+                .cloned()
+                .expect("peer still present");
+            while peer.try_send(MediaMessage::AuthOk).is_ok() {}
+        }
+        m.reconcile_media_replicas();
+        m.standby_subs
+            .lock()
+            .insert(("live".to_string(), "subfail".to_string()), 6);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                m.standby_subs
+                    .lock()
+                    .get(&("live".to_string(), "subfail".to_string()))
+                    == Some(&6)
+            })
+            .await,
+            "standby clear must not wipe an entry that already moved to another owner"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
