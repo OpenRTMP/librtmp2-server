@@ -572,23 +572,12 @@ impl Db {
         })
     }
 
-    /// Increments the in-memory active-session count for `viewer_id`. Must
-    /// only be called while holding `self.conn`'s lock, in the same
-    /// critical section as the SQLite write that activated the row, so the
-    /// map never observes a state SQLite doesn't also have.
-    fn player_count_incr(&self, viewer_id: &str) {
-        *self
-            .active_player_counts
-            .lock()
-            .entry(viewer_id.to_string())
-            .or_insert(0) += 1;
-    }
-
     /// Decrements the in-memory active-session count for `viewer_id`,
-    /// removing the entry once it reaches zero. Same locking requirement as
-    /// [`Self::player_count_incr`]. Safe to call for a viewer with no
-    /// tracked sessions (a no-op) so duplicate release/disconnect handling
-    /// can never underflow.
+    /// removing the entry once it reaches zero. Pair with
+    /// [`Self::player_count_try_incr`] (or reservation cancel) so the map
+    /// never observes a state SQLite doesn't also have. Safe to call for a
+    /// viewer with no tracked sessions (a no-op) so duplicate
+    /// release/disconnect handling can never underflow.
     fn player_count_decr(&self, viewer_id: &str) {
         Self::decr_count(&mut self.active_player_counts.lock(), viewer_id);
     }
