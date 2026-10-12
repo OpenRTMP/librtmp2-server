@@ -166,7 +166,7 @@ pub struct ClusterManager {
     /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
     /// actually causes standby nodes to receive continuous media, not just be
     /// reported as replicas with no data behind them.
-    standby_subs: Mutex<std::collections::HashMap<(String, String), NodeId>>,
+    standby_subs: Arc<Mutex<std::collections::HashMap<(String, String), NodeId>>>,
     state_machine: SqliteStateMachine,
     /// Recently accepted `admin_proof` values — blocks captured ClientWrite /
     /// membership proofs from being replayed while the API token is unchanged.
@@ -347,7 +347,7 @@ impl ClusterManager {
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_stream_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_cleanup_drain_running: AtomicBool::new(false),
-            standby_subs: Mutex::new(std::collections::HashMap::new()),
+            standby_subs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
             rejected_peer_addrs: Mutex::new(std::collections::HashMap::new()),
@@ -2939,10 +2939,19 @@ impl ClusterManager {
                     .map(|o| o.epoch)
                     .unwrap_or(0);
                 let media = Arc::clone(&self.media);
+                let standby_subs = Arc::clone(&self.standby_subs);
+                let app_key = app.clone();
+                let stream_key = stream_id.clone();
                 self.rt_handle.spawn(async move {
-                    media
+                    let ok = media
                         .subscribe_remote(&media_addr, new_owner, &app, &stream_id, epoch)
                         .await;
+                    if !ok {
+                        // Sole Subscribe send failed and hub rolled back —
+                        // drop optimistic standby bookkeeping so the next
+                        // reconcile tick retries (same class as empty media_addr).
+                        standby_subs.lock().remove(&(app_key, stream_key));
+                    }
                 });
             }
         }
