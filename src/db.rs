@@ -1219,10 +1219,18 @@ impl Db {
             Ok(_) => Ok(()),
             Err(e) => {
                 crate::log_error!("viewer_add insert failed for {}: {e}", v.id);
+                // Only UNIQUE/PRIMARY KEY collisions are Duplicate. Trigger
+                // RAISE(FAIL) and other constraint codes stay Db so callers
+                // (HTTP 500 vs 409) can tell them apart.
                 if matches!(
                     e,
                     rusqlite::Error::SqliteFailure(ref err, _)
                         if err.code == rusqlite::ErrorCode::ConstraintViolation
+                            && matches!(
+                                err.extended_code,
+                                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                            )
                 ) {
                     Err(ViewerAddError::Duplicate)
                 } else {

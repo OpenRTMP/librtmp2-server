@@ -4120,12 +4120,10 @@ mod tests {
     async fn player_create_reports_db_failures() {
         let state = roomy_state();
         add_stream(&state, "pcdb");
-        // RAISE(FAIL) surfaces as SQLITE_CONSTRAINT and is mapped to Duplicate
-        // (HTTP 409). Use a plain missing-table error so this path stays a 500.
         exec_sql(
             &state,
             "CREATE TRIGGER no_viewers BEFORE INSERT ON stream_viewers \
-             BEGIN SELECT * FROM __no_such_table_injected__; END;",
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
         );
         let app = router(state.clone());
         let uri = "/api/v1/streams/pcdb/players";
