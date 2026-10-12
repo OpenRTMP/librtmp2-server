@@ -284,6 +284,25 @@ impl DbRtmpBridge {
         }
     }
 
+    /// Resolve the durable stream id for a media-output / recording frame.
+    ///
+    /// Prefers treating `frame_route` as a stream **id** (librtmp2-server pins
+    /// `relay_key` to the DB id) so a late bridge republish cannot reattribute
+    /// already-exported frames, and so `id == other.publish_key` cannot steal
+    /// sinks via publish_key lookup. Falls back to the conn mapping, then
+    /// publish_key resolution.
+    pub fn resolve_media_output_stream_id(&self, conn: ConnId, frame_route: &str) -> String {
+        if let DbLookup::Ok(s) = self.db.stream_get(frame_route) {
+            return s.id;
+        }
+        let sid = self.stream_id_for_conn(conn);
+        if !sid.is_empty() {
+            return sid;
+        }
+        self.stream_id_for_publish_route(frame_route)
+            .unwrap_or_else(|| frame_route.to_string())
+    }
+
     /// True once `on_connect` has recorded a remote IP for `conn`. Lets
     /// callers that may need to register a connection mid-poll (before the
     /// normal `on_connect` pass runs) skip the redundant re-registration and

@@ -2950,7 +2950,13 @@ impl ClusterManager {
                         // Sole Subscribe send failed and hub rolled back —
                         // drop optimistic standby bookkeeping so the next
                         // reconcile tick retries (same class as empty media_addr).
-                        standby_subs.lock().remove(&(app_key, stream_key));
+                        // Only clear if this entry still names the owner we
+                        // tried; a newer reconcile may already have replaced it.
+                        let key = (app_key, stream_key);
+                        let mut guard = standby_subs.lock();
+                        if guard.get(&key) == Some(&new_owner) {
+                            guard.remove(&key);
+                        }
                     }
                 });
             }

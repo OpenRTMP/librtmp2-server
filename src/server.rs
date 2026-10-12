@@ -2760,20 +2760,14 @@ impl ShardLoop {
                 if republished_during_poll(generations_before, conn_id, generation) {
                     continue;
                 }
-                // Prefer the bridge's per-conn stream id (matches
-                // cluster_export_frame). `relay_key` is pinned to the DB id, so
-                // looking up `frame.stream_name` as a publish_key can hit a
-                // different stream whose publish_key equals that id. Same-poll
-                // republish tails are skipped above via republished_during_poll.
-                let sid = self.shared.bridge.stream_id_for_conn(conn_id);
-                let frame_stream_id = if sid.is_empty() {
-                    self.shared
-                        .bridge
-                        .stream_id_for_publish_route(&frame.stream_name)
-                        .unwrap_or_else(|| frame.stream_name.clone())
-                } else {
-                    sid
-                };
+                // Prefer the frame route as a stream id (pinned relay_key), not
+                // a publish_key lookup — avoids id/publish_key collisions and
+                // late bridge republish reattribution before generation bumps.
+                // Same-poll generation changes are skipped above.
+                let frame_stream_id = self
+                    .shared
+                    .bridge
+                    .resolve_media_output_stream_id(conn_id, &frame.stream_name);
                 self.media_outputs
                     .handle_frame(frame, &frame_stream_id, generation);
             }
