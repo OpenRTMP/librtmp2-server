@@ -454,7 +454,7 @@ pub struct MediaHub {
     #[allow(dead_code)]
     replicas: u32,
     ownership: Arc<OwnershipTracker>,
-    peers: Mutex<HashMap<NodeId, Arc<MediaPeer>>>,
+    pub(crate) peers: Mutex<HashMap<NodeId, Arc<MediaPeer>>>,
     /// Write pumps for accepted inbound sessions, keyed by remote node.
     inbound_sinks: Mutex<HashMap<NodeId, Arc<InboundMediaSink>>>,
     /// Per-(owner, app, stream) NACK retries after `subscribe_denied`.

@@ -3980,6 +3980,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn standby_subscribe_send_failure_clears_optimistic_entry() {
+        use crate::cluster::media::protocol::MediaMessage;
+
+        let n = bootstrap(1, |c| c.media_replicas = 1).await;
+        let m = &n.mgr;
+        let s = stream("subfail");
+        m.create_stream(&s).unwrap();
+
+        // Peer exists with a saturated outbound queue *before* reconcile so
+        // subscribe_remote is not fresh and the sole Subscribe try_send fails.
+        let ctrl = dead_addr();
+        let media = dead_addr();
+        m.raft()
+            .add_learner(5, BasicNode { addr: ctrl.clone() }, false)
+            .await
+            .expect("add learner");
+        m.media()
+            .connect_peer(5, &media)
+            .await
+            .expect("pre-connect media peer");
+        {
+            let peer = m
+                .media()
+                .peers
+                .lock()
+                .get(&5)
+                .cloned()
+                .expect("peer after connect");
+            while peer.try_send(MediaMessage::AuthOk).is_ok() {}
+        }
+        m.meta().set_addrs(5, ctrl, media);
+        m.health()
+            .note_peer(5, NodeHealthState::Ready, 0.0, None, None);
+
+        raw_write(m, raw_acquire("subfail", 5)).await;
+        m.poll_side_effects();
+        m.standby_subs.lock().clear();
+        m.reconcile_media_replicas();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !m.standby_subs
+                    .lock()
+                    .contains_key(&("live".to_string(), "subfail".to_string()))
+            })
+            .await,
+            "failed sole Subscribe must drop optimistic standby_subs entry"
+        );
+
+        // Newer reconcile replaced the owner before the failure task ran:
+        // clear only when the entry still names the owner we tried.
+        {
+            let peer = m
+                .media()
+                .peers
+                .lock()
+                .get(&5)
+                .cloned()
+                .expect("peer still present");
+            while peer.try_send(MediaMessage::AuthOk).is_ok() {}
+        }
+        m.reconcile_media_replicas();
+        m.standby_subs
+            .lock()
+            .insert(("live".to_string(), "subfail".to_string()), 6);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                m.standby_subs
+                    .lock()
+                    .get(&("live".to_string(), "subfail".to_string()))
+                    == Some(&6)
+            })
+            .await,
+            "standby clear must not wipe an entry that already moved to another owner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topology_pruning_promotion_and_eviction() {
         let n = bootstrap(1, |_| {}).await;
         let m = &n.mgr;

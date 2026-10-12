@@ -3460,6 +3460,76 @@ mod tests {
     }
 
     #[test]
+    fn viewer_add_maps_primary_key_collision_to_duplicate() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream_pk",
+            "pub_pk_key_with_sufficient_length_here",
+            "play_pk_key_with_sufficient_length_here",
+            "stats_pk_key_with_sufficient_length_here",
+        ))
+        .unwrap();
+        let first = StreamViewer {
+            id: "viewer_same_id".to_string(),
+            stream_id: "stream_pk".to_string(),
+            name: "First".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_pk_play_a_xxxxxxxxxxxx"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        db.viewer_add(&first).unwrap();
+        let same_id = StreamViewer {
+            id: "viewer_same_id".to_string(),
+            stream_id: "stream_pk".to_string(),
+            name: "Second".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_pk_play_b_xxxxxxxxxxxx"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&same_id),
+            Err(ViewerAddError::Duplicate),
+            "PRIMARY KEY collision on viewer id must be Duplicate, not Db"
+        );
+    }
+
+    #[test]
+    fn viewer_add_maps_unique_play_key_insert_race_to_duplicate() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream_uq",
+            "pub_uq_key_with_sufficient_length_here",
+            "play_uq_key_with_sufficient_length_here",
+            "stats_uq_key_with_sufficient_length_here",
+        ))
+        .unwrap();
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER race_uq BEFORE INSERT ON stream_viewers \
+                 WHEN NEW.id != 'preempted' \
+                 BEGIN \
+                   INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+                   VALUES ('preempted', NEW.stream_id, 'x', NEW.play_key, 1, 0); \
+                 END;",
+            )
+        })
+        .unwrap();
+        let viewer = StreamViewer {
+            id: "viewer_racer".to_string(),
+            stream_id: "stream_uq".to_string(),
+            name: "Racer".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_uq_race_key_xxxxxxxxxx"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&viewer),
+            Err(ViewerAddError::Duplicate),
+            "UNIQUE play_key race at INSERT must be Duplicate"
+        );
+    }
+
+    #[test]
     fn startup_audit_detects_pre_existing_cross_stream_key_collision() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("collisions.db");

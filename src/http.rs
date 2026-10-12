@@ -4138,6 +4138,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn player_create_reports_duplicate_on_insert_race() {
+        // HTTP pre-checks pass, then a BEFORE INSERT trigger claims the same
+        // play_key so viewer_add's INSERT hits UNIQUE → CoordError::Duplicate.
+        let state = roomy_state();
+        add_stream(&state, "pcdup");
+        exec_sql(
+            &state,
+            "CREATE TRIGGER race_play_key BEFORE INSERT ON stream_viewers \
+             WHEN NEW.id != 'preempted' \
+             BEGIN \
+               INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+               VALUES ('preempted', NEW.stream_id, 'x', NEW.play_key, 1, 0); \
+             END;",
+        );
+        let app = router(state.clone());
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/pcdup/players",
+            true,
+            Some(r#"{"name":"Guest","play_key":"race_play_key_with_sufficient_len01"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "CONFLICT");
+        assert!(body.contains("play_key already in use"));
+    }
+
+    #[tokio::test]
     async fn player_delete_validation_errors() {
         let state = roomy_state();
         let only_viewer = add_stream(&state, "pd");
