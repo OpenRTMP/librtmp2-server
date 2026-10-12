@@ -1739,19 +1739,36 @@ async fn handle_stream_player_create(
             "Key generation failed",
         );
     };
-    if state.coordinator.create_viewer(&viewer).is_err() {
-        log_http_access(
-            "POST",
-            &path,
-            &peer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "db error",
-        );
-        return err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            "Failed to create play key",
-        );
+    match state.coordinator.create_viewer(&viewer) {
+        Ok(()) => {}
+        Err(CoordError::Duplicate) => {
+            log_http_access(
+                "POST",
+                &path,
+                &peer,
+                StatusCode::CONFLICT,
+                "play key already in use",
+            );
+            return err_json(
+                StatusCode::CONFLICT,
+                "CONFLICT",
+                "play_key already in use",
+            );
+        }
+        Err(_) => {
+            log_http_access(
+                "POST",
+                &path,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to create play key",
+            );
+        }
     }
 
     crate::log_info!(

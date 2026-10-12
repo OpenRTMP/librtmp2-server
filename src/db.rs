@@ -2459,6 +2459,7 @@ impl Db {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
+        let mut reserved_slot = false;
         if p.active {
             if p.viewer_id.is_empty() {
                 crate::log_error!("player_update: missing viewer_id for {id}");
@@ -2472,20 +2473,18 @@ impl Db {
             // must not be double-checked against its own contribution.
             let is_transition =
                 !matches!(&current, Some((true, viewer_id)) if *viewer_id == p.viewer_id);
-            if is_transition
-                && self
-                    .active_player_counts
-                    .lock()
-                    .get(&p.viewer_id)
-                    .copied()
-                    .unwrap_or(0)
-                    >= MAX_CONNECTIONS_PER_PLAY_KEY
-            {
+            // Take the slot atomically (same as player_try_acquire) so a
+            // concurrent player_reserve cannot claim the last slot between a
+            // read-check and the later incr after UPDATE.
+            if is_transition && !self.player_count_try_incr(&p.viewer_id) {
                 crate::log_warn!(
                     "player_update: rejected reactivation of {id} — viewer '{}' is at the connection cap",
                     p.viewer_id
                 );
                 return false;
+            }
+            if is_transition {
+                reserved_slot = true;
             }
         }
         let updated = match conn.execute(
@@ -2517,14 +2516,18 @@ impl Db {
             let was_active_viewer =
                 current.and_then(|(active, viewer_id)| active.then_some(viewer_id));
             match (was_active_viewer, p.active) {
-                (None, true) => self.player_count_incr(&p.viewer_id),
+                (None, true) => {
+                    // Slot already taken via player_count_try_incr.
+                }
                 (Some(old_viewer_id), false) => self.player_count_decr(&old_viewer_id),
                 (Some(old_viewer_id), true) if old_viewer_id != p.viewer_id => {
                     self.player_count_decr(&old_viewer_id);
-                    self.player_count_incr(&p.viewer_id);
+                    // New viewer slot already taken via player_count_try_incr.
                 }
                 _ => {}
             }
+        } else if reserved_slot {
+            self.player_count_decr(&p.viewer_id);
         }
         updated
     }

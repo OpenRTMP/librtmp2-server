@@ -725,6 +725,12 @@ impl SqliteStateMachine {
         if let Some(token) = &snap.api_token {
             self.emit_effect(StateEffect::ApiToken(token.clone()));
         }
+        // Acquire/Release emit OwnershipChanged so process_state_effects can
+        // refresh OwnershipTracker immediately; snapshot install must too,
+        // otherwise media fencing stays stale until the next heartbeat sync.
+        if !snap.owners.is_empty() {
+            self.emit_effect(StateEffect::OwnershipChanged);
+        }
         Ok(())
     }
 }
@@ -2050,6 +2056,12 @@ mod tests {
             effects
                 .iter()
                 .any(|e| matches!(e, StateEffect::ApiToken(t) if t == "snap-token"))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, StateEffect::OwnershipChanged)),
+            "snapshot owners must emit OwnershipChanged so fencing refreshes immediately"
         );
 
         // Raft bookkeeping updated and snapshot persisted.

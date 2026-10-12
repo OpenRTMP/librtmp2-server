@@ -1588,6 +1588,15 @@ impl DbRtmpBridge {
             && cs.player.as_ref().is_some_and(|p| p.id == row.id)
         {
             cs.player = None;
+            // Mirror release_player: drop the orphan viewer_id so a later HTTP
+            // revoke cannot kick a still-authorized publisher on this socket,
+            // and keep stream_id aligned with any surviving publisher role.
+            cs.viewer_id.clear();
+            if let Some(ref pub_row) = cs.publisher {
+                cs.stream_id = pub_row.stream_id.clone();
+            } else {
+                cs.stream_id.clear();
+            }
         }
         drop(guard);
         self.db.player_cancel_reservation(&row.viewer_id);
