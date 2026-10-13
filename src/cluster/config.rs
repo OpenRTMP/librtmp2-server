@@ -286,9 +286,8 @@ impl ClusterConfig {
             );
         }
         if let Some(join) = self.join.as_deref() {
-            join.parse::<SocketAddr>().map_err(|e| {
-                format!("CLUSTER_JOIN must be a literal IP socket address: {e}")
-            })?;
+            join.parse::<SocketAddr>()
+                .map_err(|e| format!("CLUSTER_JOIN must be a literal IP socket address: {e}"))?;
             crate::cluster::security::validate_cluster_peer_addr(
                 join,
                 self.allow_loopback_peer_addrs,
