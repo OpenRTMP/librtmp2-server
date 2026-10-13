@@ -211,12 +211,10 @@ impl ClusterManager {
             && matches!(join_action, JoinReseedAction::ResumeExisting)
             && db.setting_get(CLUSTER_ID_SETTING).is_none()
         {
-            return Err(
-                "local Raft state exists but cluster_id is missing; \
+            return Err("local Raft state exists but cluster_id is missing; \
                  finish bootstrap with CLUSTER_BOOTSTRAP or reseed \
                  with an empty DB (see docs/clustering.md#reseed)"
-                    .into(),
-            );
+                .into());
         }
 
         let (tls_server, tls_client) = if config.tls_enabled {
