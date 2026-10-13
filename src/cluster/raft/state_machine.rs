@@ -2142,8 +2142,11 @@ mod tests {
         );
 
         // Legacy / omitted cluster_id (None) must not wipe a persisted identity.
+        // A snapshot that omits `cluster_id` (legacy payload) must not wipe a
+        // persisted identity, while an omitted `api_token` does clear.
         let (mut sm_cid, _rx_cid) = sm_with_effects();
         assert!(sm_cid.db().setting_set("cluster_id", "keep-cid").is_ok());
+        assert!(sm_cid.db().token_replace("stale-token").is_ok());
         let empty_legacy = serde_json::to_vec(&AppSnapshot::default()).unwrap();
         sm_cid
             .install_snapshot(&meta, Box::new(Cursor::new(empty_legacy)))
@@ -2153,6 +2156,11 @@ mod tests {
             sm_cid.db().setting_get("cluster_id").as_deref(),
             Some("keep-cid"),
             "omitted snapshot cluster_id must preserve the existing settings row"
+        );
+        assert_eq!(
+            sm_cid.db().token_get().unwrap(),
+            None,
+            "omitted snapshot api_token must clear the persisted bearer"
         );
 
         // Undecodable payload.
