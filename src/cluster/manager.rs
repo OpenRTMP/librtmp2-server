@@ -611,6 +611,18 @@ impl ClusterManager {
         } else if let Some(ref join_addr) = config.join {
             match join_action {
                 JoinReseedAction::ResumeExisting => {
+                    // Interrupted bootstrap can leave raft_* rows without a
+                    // settings.cluster_id. refresh_topology_from would then
+                    // adopt the join target's identity via setting_set — refuse
+                    // and force finish-bootstrap / reseed instead.
+                    if db.setting_get(CLUSTER_ID_SETTING).is_none() {
+                        return Err(
+                            "local Raft state exists but cluster_id is missing; \
+                             finish bootstrap with CLUSTER_BOOTSTRAP or reseed \
+                             with an empty DB (see docs/clustering.md#reseed)"
+                                .into(),
+                        );
+                    }
                     mgr.refresh_topology_from_any(join_addr).await?;
                     // A resumed learner must stay publish-gated; only promotion
                     // to voter clears the gate (reconciled in
