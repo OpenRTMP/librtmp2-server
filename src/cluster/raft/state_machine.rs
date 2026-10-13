@@ -2129,14 +2129,15 @@ mod tests {
             "empty snapshot owners must still emit OwnershipChanged to clear stale fencing"
         );
         assert!(
-            effects.iter().any(|e| matches!(e, StateEffect::ApiToken(t) if t.is_empty())),
+            effects
+                .iter()
+                .any(|e| matches!(e, StateEffect::ApiToken(t) if t.is_empty())),
             "empty snapshot must clear in-memory api_token (None → empty)"
         );
         assert!(
-            effects.iter().all(|e| matches!(
-                e,
-                StateEffect::OwnershipChanged | StateEffect::ApiToken(_)
-            )),
+            effects
+                .iter()
+                .all(|e| matches!(e, StateEffect::OwnershipChanged | StateEffect::ApiToken(_))),
             "empty snapshot with default payload should only emit OwnershipChanged + ApiToken clear"
         );
 
