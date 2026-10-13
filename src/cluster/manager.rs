@@ -616,12 +616,10 @@ impl ClusterManager {
                     // adopt the join target's identity via setting_set — refuse
                     // and force finish-bootstrap / reseed instead.
                     if db.setting_get(CLUSTER_ID_SETTING).is_none() {
-                        return Err(
-                            "local Raft state exists but cluster_id is missing; \
+                        return Err("local Raft state exists but cluster_id is missing; \
                              finish bootstrap with CLUSTER_BOOTSTRAP or reseed \
                              with an empty DB (see docs/clustering.md#reseed)"
-                                .into(),
-                        );
+                            .into());
                     }
                     mgr.refresh_topology_from_any(join_addr).await?;
                     // A resumed learner must stay publish-gated; only promotion
@@ -2276,10 +2274,7 @@ impl ClusterManager {
     /// Must run *after* the ownership tracker has been updated, using the
     /// `(node, epoch)` values captured *before* the swap — looking the owner
     /// up again would only see the new owner (see `sync_ownership_from_db`).
-    fn unsubscribe_captured_remote_owners(
-        &self,
-        previous: &[(String, Option<(u64, u64)>)],
-    ) {
+    fn unsubscribe_captured_remote_owners(&self, previous: &[(String, Option<(u64, u64)>)]) {
         for (stream_id, old_owner) in previous {
             let Some((old_node, _)) = old_owner else {
                 continue;
