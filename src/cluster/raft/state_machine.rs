@@ -715,10 +715,10 @@ impl SqliteStateMachine {
                     params![cid],
                 )
                 .map_err(|e| e.to_string())?;
-            } else {
-                tx.execute("DELETE FROM settings WHERE key='cluster_id'", [])
-                    .map_err(|e| e.to_string())?;
             }
+            // Do not DELETE on None: `#[serde(default)]` makes a missing
+            // legacy `cluster_id` field deserialize as None, and wiping the
+            // row would erase this node's Raft identity on install.
             tx.commit().map_err(|e| e.to_string())?;
             Ok((revoke_viewers, drain_streams, dropped_player_viewers))
         })?;
@@ -2139,6 +2139,20 @@ mod tests {
                 .iter()
                 .all(|e| matches!(e, StateEffect::OwnershipChanged | StateEffect::ApiToken(_))),
             "empty snapshot with default payload should only emit OwnershipChanged + ApiToken clear"
+        );
+
+        // Legacy / omitted cluster_id (None) must not wipe a persisted identity.
+        let (mut sm_cid, _rx_cid) = sm_with_effects();
+        assert!(sm_cid.db().setting_set("cluster_id", "keep-cid").is_ok());
+        let empty_legacy = serde_json::to_vec(&AppSnapshot::default()).unwrap();
+        sm_cid
+            .install_snapshot(&meta, Box::new(Cursor::new(empty_legacy)))
+            .await
+            .unwrap();
+        assert_eq!(
+            sm_cid.db().setting_get("cluster_id").as_deref(),
+            Some("keep-cid"),
+            "omitted snapshot cluster_id must preserve the existing settings row"
         );
 
         // Undecodable payload.
