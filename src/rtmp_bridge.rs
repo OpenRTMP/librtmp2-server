@@ -2985,4 +2985,36 @@ mod tests {
             "surviving publisher must keep stream_id after play cancel"
         );
     }
+
+    #[test]
+    fn cancel_fast_publish_keeps_player_stream_id() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        let play = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+        let publish = bridge
+            .try_fast_authorize_publish(1, "live", &s.publish_key)
+            .expect("publish admitted alongside play");
+
+        bridge.cancel_fast_publish(1, &publish);
+
+        assert!(
+            bridge.session_rows(1).0.is_none(),
+            "the cancelled publisher must be dropped"
+        );
+        assert_eq!(
+            bridge.session_rows(1).1.map(|p| p.id),
+            Some(play.id),
+            "the player must survive the publisher cancel"
+        );
+        assert_eq!(
+            bridge.stream_id_for_conn(1),
+            "s1",
+            "surviving player must keep stream_id after publish cancel"
+        );
+    }
 }
