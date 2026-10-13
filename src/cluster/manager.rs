@@ -204,6 +204,20 @@ impl ClusterManager {
 
         let joining = config.join.is_some();
         let join_action = check_join_reseed(&db, joining)?;
+        // Refuse resume-without-identity before binding control/media listeners
+        // or starting Raft-facing tasks (otherwise Err would leave them live).
+        if !config.bootstrap
+            && config.join.is_some()
+            && matches!(join_action, JoinReseedAction::ResumeExisting)
+            && db.setting_get(CLUSTER_ID_SETTING).is_none()
+        {
+            return Err(
+                "local Raft state exists but cluster_id is missing; \
+                 finish bootstrap with CLUSTER_BOOTSTRAP or reseed \
+                 with an empty DB (see docs/clustering.md#reseed)"
+                    .into(),
+            );
+        }
 
         let (tls_server, tls_client) = if config.tls_enabled {
             let server = build_server_tls(
@@ -611,16 +625,7 @@ impl ClusterManager {
         } else if let Some(ref join_addr) = config.join {
             match join_action {
                 JoinReseedAction::ResumeExisting => {
-                    // Interrupted bootstrap can leave raft_* rows without a
-                    // settings.cluster_id. refresh_topology_from would then
-                    // adopt the join target's identity via setting_set — refuse
-                    // and force finish-bootstrap / reseed instead.
-                    if db.setting_get(CLUSTER_ID_SETTING).is_none() {
-                        return Err("local Raft state exists but cluster_id is missing; \
-                             finish bootstrap with CLUSTER_BOOTSTRAP or reseed \
-                             with an empty DB (see docs/clustering.md#reseed)"
-                            .into());
-                    }
+                    // Missing cluster_id already rejected before listeners start.
                     mgr.refresh_topology_from_any(join_addr).await?;
                     // A resumed learner must stay publish-gated; only promotion
                     // to voter clears the gate (reconciled in
@@ -888,6 +893,10 @@ impl ClusterManager {
                 "node is draining; refusing new publish ownership".into(),
             ));
         }
+        // Snapshot before the Raft write: an apply-effect health tick can update
+        // the tracker while we wait, so a post-write get() may already see the
+        // new owner and skip the prior remote unsubscribe.
+        let previous = self.ownership.get(stream_id);
         let resp = match self.block_on_write(ClusterCommand::AcquireStreamOwner {
             stream_id: stream_id.to_string(),
             node_id,
@@ -910,11 +919,6 @@ impl ClusterManager {
             Err(e) => return Err(e),
         };
         let epoch = resp.into_owner_epoch()?;
-        // Capture the previous owner before set(): refresh_subscriptions_for's
-        // notify_play_unsubscribe resolves the owner from the tracker, so after
-        // set() it would only ever see the new owner and never tear down the
-        // prior remote subscription (same masking sync_ownership_from_db docs).
-        let previous = self.ownership.get(stream_id);
         self.ownership.set(stream_id, node_id, epoch);
         self.ownership.advance_past(epoch);
         self.unsubscribe_captured_remote_owners(&[(stream_id.to_string(), previous)]);
@@ -944,6 +948,7 @@ impl ClusterManager {
             .collect();
         // Snapshot prior owners before clear/hydrate so we can unsubscribe from
         // the remote peers that actually held fan-out refs.
+        // Snapshot before the Raft write (same race as acquire_stream_owner).
         let previous: Vec<(String, Option<(u64, u64)>)> = affected
             .iter()
             .map(|sid| (sid.clone(), self.ownership.get(sid)))
