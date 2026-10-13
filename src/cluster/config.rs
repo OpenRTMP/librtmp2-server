@@ -285,6 +285,15 @@ impl ClusterConfig {
                     .into(),
             );
         }
+        if let Some(join) = self.join.as_deref() {
+            join.parse::<SocketAddr>()
+                .map_err(|e| format!("CLUSTER_JOIN must be a literal IP socket address: {e}"))?;
+            crate::cluster::security::validate_cluster_peer_addr(
+                join,
+                self.allow_loopback_peer_addrs,
+            )
+            .map_err(|e| format!("CLUSTER_JOIN: {e}"))?;
+        }
         // CLUSTER_JOIN_PROOF is intentionally not required here. Existing members
         // commonly retain CLUSTER_JOIN across restarts and skip the join handshake
         // once durable Raft state is present. Fresh joins are rejected without a
@@ -745,6 +754,28 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.node_id, 1);
         assert!(cfg.bootstrap);
+    }
+
+    #[test]
+    fn join_addr_rejects_ssrf_targets() {
+        let base = HashMap::from([
+            ("CLUSTER_ENABLED", "true"),
+            ("CLUSTER_NODE_ID", "2"),
+            ("CLUSTER_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("CLUSTER_BIND", "10.0.0.2:1940"),
+            ("CLUSTER_MEDIA_BIND", "10.0.0.2:1941"),
+        ]);
+
+        let mut ok = base.clone();
+        ok.insert("CLUSTER_JOIN", "10.0.0.1:1940");
+        let cfg = ClusterConfig::load_from_kv(|k| ok.get(k).map(|s| (*s).to_string())).unwrap();
+        assert!(cfg.validate().is_ok());
+
+        let mut metadata = base.clone();
+        metadata.insert("CLUSTER_JOIN", "169.254.169.254:1940");
+        let err =
+            ClusterConfig::load_from_kv(|k| metadata.get(k).map(|s| (*s).to_string())).unwrap_err();
+        assert!(err.contains("CLUSTER_JOIN"), "{err}");
     }
 
     #[test]
