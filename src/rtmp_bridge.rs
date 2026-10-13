@@ -1549,7 +1549,12 @@ impl DbRtmpBridge {
             && cs.publisher.as_ref().is_some_and(|p| p.id == row.id)
         {
             cs.publisher = None;
-            if cs.player.is_none() {
+            // Mirror release_publisher / cancel_fast_play: keep stream_id
+            // aligned with any surviving player so process_server_connections
+            // does not retarget relay_key onto the cancelled publish route.
+            if let Some(ref player) = cs.player {
+                cs.stream_id = player.stream_id.clone();
+            } else {
                 cs.stream_id.clear();
             }
         }

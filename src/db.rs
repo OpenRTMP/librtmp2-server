@@ -1241,20 +1241,33 @@ impl Db {
     }
 
     pub fn viewer_list(&self, stream_id: &str) -> Vec<StreamViewer> {
-        let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(&format!(
-            "SELECT {} FROM stream_viewers WHERE stream_id=? ORDER BY created_at",
-            Self::VIEWER_COLS
-        )) {
-            Ok(s) => s,
+        match self.viewer_list_checked(stream_id) {
+            Ok(v) => v,
             Err(e) => {
-                crate::log_error!("viewer_list: prepare failed: {e}");
-                return Vec::new();
+                crate::log_error!("{e}");
+                Vec::new()
             }
-        };
-        stmt.query_map(params![stream_id], Self::load_viewer_row)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+        }
+    }
+
+    /// Like [`Self::viewer_list`], but surfaces prepare/query/decode failures
+    /// instead of returning an empty list (which would look like "no viewers").
+    pub fn viewer_list_checked(&self, stream_id: &str) -> Result<Vec<StreamViewer>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM stream_viewers WHERE stream_id=? ORDER BY created_at",
+                Self::VIEWER_COLS
+            ))
+            .map_err(|e| format!("viewer_list: prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map(params![stream_id], Self::load_viewer_row)
+            .map_err(|e| format!("viewer_list: query failed: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("viewer_list: row decode failed: {e}"))?);
+        }
+        Ok(out)
     }
 
     pub fn viewer_find_by_play_key(&self, key: &str) -> DbLookup<StreamViewer> {

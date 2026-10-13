@@ -233,7 +233,13 @@ impl SqliteStateMachine {
                 // Raft serializes the actual applies, so recheck here — the
                 // second one to apply must not leave the stream with zero
                 // usable play keys.
-                let viewers = self.db.viewer_list(stream_id);
+                let viewers = match self.db.viewer_list_checked(stream_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        crate::log_error!("DeleteViewer fence: {e}");
+                        return ClusterResponse::Error("db".into());
+                    }
+                };
                 let would_remove_last =
                     viewers.len() == 1 && viewers.iter().any(|v| v.id == *viewer_id);
                 if would_remove_last {
@@ -696,6 +702,11 @@ impl SqliteStateMachine {
                     params![token],
                 )
                 .map_err(|e| e.to_string())?;
+            } else {
+                // Snapshot without api_token must clear a follower's stale bearer,
+                // not leave the previous settings row intact.
+                tx.execute("DELETE FROM settings WHERE key='api_token'", [])
+                    .map_err(|e| e.to_string())?;
             }
             if let Some(cid) = &snap.cluster_id {
                 tx.execute(
@@ -704,6 +715,9 @@ impl SqliteStateMachine {
                     params![cid],
                 )
                 .map_err(|e| e.to_string())?;
+            } else {
+                tx.execute("DELETE FROM settings WHERE key='cluster_id'", [])
+                    .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
             Ok((revoke_viewers, drain_streams, dropped_player_viewers))
@@ -722,9 +736,10 @@ impl SqliteStateMachine {
         for viewer_id in dropped_player_viewers {
             self.db.players_deactivate_for_viewer(&viewer_id);
         }
-        if let Some(token) = &snap.api_token {
-            self.emit_effect(StateEffect::ApiToken(token.clone()));
-        }
+        // Always refresh in-memory token: Some installs the snap value, None clears.
+        self.emit_effect(StateEffect::ApiToken(
+            snap.api_token.clone().unwrap_or_default(),
+        ));
         // Acquire/Release emit OwnershipChanged so process_state_effects can
         // refresh OwnershipTracker immediately; snapshot install must too,
         // including empty owner sets that clear prior rows — otherwise media
