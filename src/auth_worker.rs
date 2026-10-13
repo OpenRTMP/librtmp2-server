@@ -25,7 +25,7 @@
 //! bound while the DB falls behind.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 
 use crate::db::{Player, Publisher};
@@ -49,6 +49,17 @@ struct AuthRequest {
     conn_id: u64,
     app: String,
     stream_key: String,
+    /// Identifier handed back with the completion, so librtmp2 applies the
+    /// decision only to this request.
+    request_id: u64,
+}
+
+/// Allocates request identifiers. Process-global and monotonic, so an id is
+/// never reused for a different request even across shards.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> u64 {
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Work items for the worker thread, processed strictly in submission order.
@@ -72,6 +83,8 @@ pub struct AuthCompletion {
     pub kind: AuthKind,
     pub conn_id: u64,
     pub allow: bool,
+    /// The id the request was submitted with.
+    pub request_id: u64,
 }
 
 /// Handle used by the RTMP `publish`/`play` callbacks to submit
@@ -87,10 +100,11 @@ pub struct AuthWorkerHandle {
 
 impl AuthWorkerHandle {
     /// Submits publish/play authorization work to the dedicated worker
-    /// thread. Returns `Err(())` when the queue is full or the worker thread
-    /// is gone; the caller must treat that as `AuthorizationResult::Deny`
-    /// (fail closed) rather than retry synchronously, since retrying inline
-    /// would reintroduce blocking on the RTMP thread.
+    /// thread. Returns the request id the completion will carry, or `Err(())`
+    /// when the queue is full or the worker thread is gone; the caller must
+    /// treat that as `AuthorizationResult::Deny` (fail closed) rather than
+    /// retry synchronously, since retrying inline would reintroduce blocking
+    /// on the RTMP thread.
     #[allow(clippy::result_unit_err)]
     pub fn try_submit(
         &self,
@@ -98,7 +112,7 @@ impl AuthWorkerHandle {
         conn_id: u64,
         app: &str,
         stream_key: &str,
-    ) -> Result<(), ()> {
+    ) -> Result<u64, ()> {
         if self.pending_auth.fetch_add(1, Ordering::AcqRel) >= AUTH_QUEUE_CAPACITY {
             self.pending_auth.fetch_sub(1, Ordering::AcqRel);
             crate::log_warn!(
@@ -106,13 +120,16 @@ impl AuthWorkerHandle {
             );
             return Err(());
         }
+        let request_id = next_request_id();
         self.tx
             .send(Job::Authorize(AuthRequest {
                 kind,
                 conn_id,
                 app: app.to_string(),
                 stream_key: stream_key.to_string(),
+                request_id,
             }))
+            .map(|()| request_id)
             .map_err(|_| {
                 self.pending_auth.fetch_sub(1, Ordering::AcqRel);
                 crate::log_error!("RTMP auth worker thread is not running; denying conn={conn_id}");
@@ -201,6 +218,7 @@ fn run_jobs(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
                     kind: req.kind,
                     conn_id: req.conn_id,
                     allow,
+                    request_id: req.request_id,
                 });
             }
         }
@@ -538,6 +556,7 @@ mod tests {
                 conn_id,
                 app: "live".to_string(),
                 stream_key: key.to_string(),
+                request_id: conn_id,
             })
         };
         for conn_id in 1..=3 {

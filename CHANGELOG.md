@@ -13,6 +13,9 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- Depends on librtmp2 `0.13.0`. A deferred publish/play authorization now carries the request id from that release, and the completion is applied only to that request.
+
 ### Added
 - CORS for the public stats endpoints: `/stats`, `/stats-nginx`, `/stat.xsl`
   and the `?key=` form of `/api/v1/streams/:id/stats` answer with

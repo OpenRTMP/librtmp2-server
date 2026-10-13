@@ -874,7 +874,7 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
             .map(|h| h.try_submit(kind, conn_id, app, stream_key))
     });
     match submitted {
-        Some(Ok(())) => AuthorizationResult::Pending,
+        Some(Ok(request_id)) => AuthorizationResult::Pending { request_id },
         _ => AuthorizationResult::Deny,
     }
 }
@@ -1042,10 +1042,18 @@ fn apply_auth_completion(
             if completion.allow && tracked.contains_key(&completion.conn_id) {
                 bump_publish_generation(completion.conn_id);
             }
-            let _ = server.complete_publish_authorization(completion.conn_id, completion.allow);
+            let _ = server.complete_publish_authorization(
+                completion.conn_id,
+                completion.request_id,
+                completion.allow,
+            );
         }
         AuthKind::Play => {
-            let _ = server.complete_play_authorization(completion.conn_id, completion.allow);
+            let _ = server.complete_play_authorization(
+                completion.conn_id,
+                completion.request_id,
+                completion.allow,
+            );
         }
     }
 }
@@ -3671,6 +3679,7 @@ mod tests {
             kind: AuthKind::Publish,
             conn_id: 999,
             allow: true,
+            request_id: 1,
         })
         .unwrap();
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
@@ -3701,6 +3710,7 @@ mod tests {
             kind: AuthKind::Publish,
             conn_id: 999,
             allow: true,
+            request_id: 1,
         })
         .unwrap();
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
@@ -4090,6 +4100,7 @@ mod tests {
                     kind: AuthKind::Play,
                     conn_id: 5,
                     allow: true,
+                    request_id: 1,
                 })
                 .unwrap();
             *AUTH_COMPLETIONS_RX.lock().unwrap() = Some(global_rx);
@@ -4102,6 +4113,7 @@ mod tests {
                 kind: AuthKind::Play,
                 conn_id: 7,
                 allow: false,
+                request_id: 1,
             })
             .unwrap();
             assert!(drain_auth_completions(&mut server, &tracked));
@@ -4450,26 +4462,30 @@ mod tests {
         );
         assert!(bridge.has_player(2));
 
-        // Unknown keys go to the worker, which answers asynchronously.
+        // Unknown keys go to the worker, which answers asynchronously. The
+        // decision names the request it resolves.
         bridge.on_connect(3, "127.0.0.1:1003");
-        assert_eq!(
-            super::rtmp_publish_auth_cb(3, "live", "unknown_publish_key_long_enough_000"),
-            AuthorizationResult::Pending
-        );
+        let decision =
+            super::rtmp_publish_auth_cb(3, "live", "unknown_publish_key_long_enough_000");
+        let AuthorizationResult::Pending { request_id } = decision else {
+            panic!("an unknown key must be answered asynchronously, got {decision:?}");
+        };
         let done = completions.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             (done.conn_id, done.kind, done.allow),
             (3, AuthKind::Publish, false)
         );
-        assert_eq!(
-            super::rtmp_play_auth_cb(3, "live", "unknown_play_key_long_enough_00000"),
-            AuthorizationResult::Pending
-        );
+        assert_eq!(done.request_id, request_id);
+        let decision = super::rtmp_play_auth_cb(3, "live", "unknown_play_key_long_enough_00000");
+        let AuthorizationResult::Pending { request_id } = decision else {
+            panic!("an unknown key must be answered asynchronously, got {decision:?}");
+        };
         let done = completions.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             (done.conn_id, done.kind, done.allow),
             (3, AuthKind::Play, false)
         );
+        assert_eq!(done.request_id, request_id);
 
         // Media callbacks reach the bridge; non-A/V frames are accepted as-is.
         assert!(super::rtmp_media_cb(
