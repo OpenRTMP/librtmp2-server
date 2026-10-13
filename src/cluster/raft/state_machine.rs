@@ -943,15 +943,37 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         // a crash between two separate writes here would leave the snapshot
         // boundary recorded with stale membership, and once logs through
         // that boundary are compacted, restart could resume with the wrong
-        // voter set.
+        // voter set. When last_log_id is None, clear durable last_applied in
+        // the same transaction so a prior high index cannot survive restart.
+        let membership_json =
+            serde_json::to_string(&meta.last_membership).map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::write_state_machine(&e),
+            })?;
         if let Some(log_id) = meta.last_log_id {
-            let membership_json =
-                serde_json::to_string(&meta.last_membership).map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::write_state_machine(&e),
-                })?;
             self.persist_applied_tx(log_id, Some(&membership_json))?;
         } else {
-            *self.last_applied.lock() = meta.last_log_id;
+            self.db.with_conn(|conn| {
+                let tx = conn.unchecked_transaction().map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::write_state_machine(&e),
+                })?;
+                tx.execute(
+                    "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
+                     ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+                    params![membership_json],
+                )
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::write_state_machine(&e),
+                })?;
+                tx.execute("DELETE FROM raft_meta WHERE key='last_applied'", [])
+                    .map_err(|e| StorageError::IO {
+                        source: StorageIOError::<u64>::write_state_machine(&e),
+                    })?;
+                tx.commit().map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::write_state_machine(&e),
+                })?;
+                Ok::<(), StorageError<u64>>(())
+            })?;
+            *self.last_applied.lock() = None;
         }
         *self.current_snapshot.lock() = Some(StoredSnapshot {
             meta: meta.clone(),

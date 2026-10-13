@@ -204,6 +204,18 @@ impl ClusterManager {
 
         let joining = config.join.is_some();
         let join_action = check_join_reseed(&db, joining)?;
+        // Refuse resume-without-identity before binding control/media listeners
+        // or starting Raft-facing tasks (otherwise Err would leave them live).
+        if !config.bootstrap
+            && config.join.is_some()
+            && matches!(join_action, JoinReseedAction::ResumeExisting)
+            && db.setting_get(CLUSTER_ID_SETTING).is_none()
+        {
+            return Err("local Raft state exists but cluster_id is missing; \
+                 finish bootstrap with CLUSTER_BOOTSTRAP or reseed \
+                 with an empty DB (see docs/clustering.md#reseed)"
+                .into());
+        }
 
         let (tls_server, tls_client) = if config.tls_enabled {
             let server = build_server_tls(
@@ -611,6 +623,7 @@ impl ClusterManager {
         } else if let Some(ref join_addr) = config.join {
             match join_action {
                 JoinReseedAction::ResumeExisting => {
+                    // Missing cluster_id already rejected before listeners start.
                     mgr.refresh_topology_from_any(join_addr).await?;
                     // A resumed learner must stay publish-gated; only promotion
                     // to voter clears the gate (reconciled in
@@ -878,6 +891,10 @@ impl ClusterManager {
                 "node is draining; refusing new publish ownership".into(),
             ));
         }
+        // Snapshot before the Raft write: an apply-effect health tick can update
+        // the tracker while we wait, so a post-write get() may already see the
+        // new owner and skip the prior remote unsubscribe.
+        let previous = self.ownership.get(stream_id);
         let resp = match self.block_on_write(ClusterCommand::AcquireStreamOwner {
             stream_id: stream_id.to_string(),
             node_id,
@@ -902,7 +919,8 @@ impl ClusterManager {
         let epoch = resp.into_owner_epoch()?;
         self.ownership.set(stream_id, node_id, epoch);
         self.ownership.advance_past(epoch);
-        self.refresh_subscriptions_for(&[stream_id.to_string()]);
+        self.unsubscribe_captured_remote_owners(&[(stream_id.to_string(), previous)]);
+        self.resubscribe_active_players(&[stream_id.to_string()]);
         crate::log_info!("Cluster: stream {stream_id} acquired by node {node_id} epoch={epoch}");
         Ok(epoch)
     }
@@ -926,11 +944,19 @@ impl ClusterManager {
             .filter(|o| o.owner_node_id == node_id)
             .map(|o| o.stream_id)
             .collect();
+        // Snapshot prior owners before clear/hydrate so we can unsubscribe from
+        // the remote peers that actually held fan-out refs.
+        // Snapshot before the Raft write (same race as acquire_stream_owner).
+        let previous: Vec<(String, Option<(u64, u64)>)> = affected
+            .iter()
+            .map(|sid| (sid.clone(), self.ownership.get(sid)))
+            .collect();
         self.block_on_write(ClusterCommand::ReleaseOwnersForNode { node_id })?
             .into_coord_result()?;
         self.ownership.clear_for_node(node_id);
         self.ownership.hydrate_from(&self.db.stream_owner_list());
-        self.refresh_subscriptions_for(&affected);
+        self.unsubscribe_captured_remote_owners(&previous);
+        self.resubscribe_active_players(&affected);
         Ok(())
     }
 
@@ -2244,6 +2270,43 @@ impl ClusterManager {
         self.rt_handle.spawn(async move {
             media.unsubscribe_remote(owner_node, &app, &stream).await;
         });
+    }
+
+    /// Unsubscribe local players from previously-captured remote owners.
+    ///
+    /// Must run *after* the ownership tracker has been updated, using the
+    /// `(node, epoch)` values captured *before* the swap — looking the owner
+    /// up again would only see the new owner (see `sync_ownership_from_db`).
+    fn unsubscribe_captured_remote_owners(&self, previous: &[(String, Option<(u64, u64)>)]) {
+        for (stream_id, old_owner) in previous {
+            let Some((old_node, _)) = old_owner else {
+                continue;
+            };
+            if *old_node == self.config.node_id {
+                continue;
+            }
+            let app = match self.db.stream_get(stream_id) {
+                crate::db::DbLookup::Ok(s) => s.app,
+                _ => "live".to_string(),
+            };
+            let n = self
+                .db
+                .player_list(Some(stream_id.as_str()))
+                .iter()
+                .filter(|p| p.active)
+                .count();
+            if n == 0 {
+                continue;
+            }
+            let media = Arc::clone(&self.media);
+            let owner_node = *old_node;
+            let stream = stream_id.clone();
+            self.rt_handle.spawn(async move {
+                for _ in 0..n {
+                    media.unsubscribe_remote(owner_node, &app, &stream).await;
+                }
+            });
+        }
     }
 
     /// Re-subscribe local players after ownership epoch/node changes.
