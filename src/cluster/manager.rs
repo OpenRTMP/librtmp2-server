@@ -121,6 +121,14 @@ pub struct ClusterManager {
     export_q: Arc<ExportQueue>,
     rt_handle: tokio::runtime::Handle,
     last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
+    /// When `last_metrics` was last written. A peer whose addresses were
+    /// recorded by an accepted join *after* that snapshot is not contradicted
+    /// by it -- see `prune_topology_to_membership`.
+    last_metrics_at: Mutex<Option<Instant>>,
+    /// When each peer's addresses were last recorded by a join, so a prune
+    /// driven by a membership snapshot that predates the join cannot drop them
+    /// permanently (nothing else re-seeds a peer).
+    meta_recorded_at: Mutex<std::collections::HashMap<NodeId, Instant>>,
     tls_client: Option<Arc<ClientConfig>>,
     /// Optional hooks into HTTP/RTMP markers + live API bearer.
     session_hooks: Mutex<Option<SessionHooks>>,
@@ -348,6 +356,8 @@ impl ClusterManager {
             export_q,
             rt_handle,
             last_metrics: Mutex::new(None),
+            last_metrics_at: Mutex::new(None),
+            meta_recorded_at: Mutex::new(std::collections::HashMap::new()),
             tls_client: tls_client.clone(),
             session_hooks: Mutex::new(None),
             peer_session_counts: Mutex::new(std::collections::HashMap::new()),
@@ -1342,6 +1352,7 @@ impl ClusterManager {
         self.network.upsert_node(node_id, control_addr.to_string());
         self.meta
             .set_addrs(node_id, control_addr.to_string(), media_addr.to_string());
+        self.meta_recorded_at.lock().insert(node_id, Instant::now());
     }
 
     /// Forwards a join/rejoin to the current leader, which re-runs the same
@@ -1852,6 +1863,7 @@ impl ClusterManager {
         let Some(rm) = self.last_metrics.lock().clone() else {
             return;
         };
+        let snapshot_at = *self.last_metrics_at.lock();
         // Promoting a learner to voter changes Raft membership but the
         // node's own local health stays `Learner` (set once at join) unless
         // reconciled here; otherwise it keeps advertising/reporting itself
@@ -1898,6 +1910,20 @@ impl ClusterManager {
             if id == self.config.node_id || members.contains(&id) {
                 continue;
             }
+            // This snapshot predates a join this node already committed on the
+            // leader, so it does not say the peer is gone -- it is simply
+            // older than the membership update that adds it. Dropping the
+            // addresses here would lose them for good: nothing re-seeds a peer,
+            // and this node would stop heartbeating it (and never count its
+            // vote). The next metrics update decides on the real membership.
+            let recorded_after_snapshot = matches!(
+                (snapshot_at, self.meta_recorded_at.lock().get(&id).copied()),
+                (Some(snapshot_at), Some(recorded_at)) if recorded_at > snapshot_at
+            );
+            if recorded_after_snapshot {
+                continue;
+            }
+            self.meta_recorded_at.lock().remove(&id);
             self.meta.remove(id);
             self.health.remove(id);
             self.media.disconnect_peer(id);
@@ -2437,6 +2463,7 @@ impl ClusterManager {
                 );
             }
             *self.last_metrics.lock() = Some(m);
+            *self.last_metrics_at.lock() = Some(Instant::now());
             self.prune_topology_to_membership();
             if metrics.changed().await.is_err() {
                 break;
@@ -4168,6 +4195,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prune_keeps_a_peer_recorded_after_the_membership_snapshot() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+
+        // A join this node already committed on the leader records the peer's
+        // addresses immediately, while the cached membership snapshot can
+        // still predate that join. The prune must not drop them for good.
+        m.meta().set_addrs(9, dead_addr(), dead_addr());
+        *m.meta_recorded_at.lock() =
+            std::collections::HashMap::from([(9u64, std::time::Instant::now())]);
+        m.prune_topology_to_membership();
+        assert!(
+            m.meta().get(9).is_some(),
+            "a peer recorded after the cached membership snapshot must survive the prune"
+        );
+
+        // Once a snapshot newer than the record exists and still does not list
+        // the peer, the stale entry is pruned as before.
+        *m.last_metrics_at.lock() = Some(std::time::Instant::now() + Duration::from_secs(1));
+        m.prune_topology_to_membership();
+        assert!(m.meta().get(9).is_none());
+        assert!(!m.meta_recorded_at.lock().contains_key(&9));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn health_loop_recovers_quorum_and_releases_down_owners() {
         let n = bootstrap(1, |c| {
             c.bandwidth_interface = "lo".into();
@@ -4276,7 +4328,11 @@ mod tests {
                 == 2)
             .await
         );
-        assert!(n2.mgr.meta().get(3).is_some());
+        // The leader's metric reflects its own applied config; n2 only learns
+        // the new member through replication, which trails it. Wait for n2's
+        // own membership view instead of asserting it straight away, or the
+        // test fails whenever the replication lands after this line.
+        assert!(wait_until(Duration::from_secs(10), || n2.mgr.meta().get(3).is_some()).await);
 
         // Membership changes proposed on non-leaders are forwarded.
         promote(&n2.mgr, 2).await;
