@@ -1066,12 +1066,14 @@ fn apply_auth_completion(
                 && tracked.contains_key(&completion.conn_id)
             {
                 bump_publish_generation(completion.conn_id);
-            } else if completion.allow && was_pending && !applied {
-                if let Some(publisher_id) = completion.publisher_id.as_deref() {
-                    with_rtmp_bridge(|bridge| {
-                        bridge.release_publisher_if_id(completion.conn_id, publisher_id);
-                    });
-                }
+            } else if completion.allow
+                && was_pending
+                && !applied
+                && let Some(publisher_id) = completion.publisher_id.as_deref()
+            {
+                with_rtmp_bridge(|bridge| {
+                    bridge.release_publisher_if_id(completion.conn_id, publisher_id);
+                });
             }
         }
         AuthKind::Play => {
@@ -1096,12 +1098,14 @@ fn apply_auth_completion(
                             .as_ref()
                             .is_some_and(|stream| stream.is_playing)
                 });
-            if completion.allow && was_pending && !applied {
-                if let Some(player_id) = completion.player_id.as_deref() {
-                    with_rtmp_bridge(|bridge| {
-                        bridge.release_player_if_id(completion.conn_id, player_id);
-                    });
-                }
+            if completion.allow
+                && was_pending
+                && !applied
+                && let Some(player_id) = completion.player_id.as_deref()
+            {
+                with_rtmp_bridge(|bridge| {
+                    bridge.release_player_if_id(completion.conn_id, player_id);
+                });
             }
         }
     }
