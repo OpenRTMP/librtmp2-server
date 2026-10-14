@@ -3129,13 +3129,12 @@ mod tests {
         let play = bridge
             .try_fast_authorize_play(1, "live", &s.play_key)
             .expect("play admitted");
+        assert!(db.player_try_acquire(&play));
         let publish = bridge
             .try_fast_authorize_publish(1, "live", &s.publish_key)
             .expect("publish admitted");
-        bridge
-            .ownership_epochs
-            .lock()
-            .insert(1, ("s1".into(), 1));
+        assert!(db.publisher_try_acquire(&publish));
+        bridge.ownership_epochs.lock().insert(1, ("s1".into(), 1));
 
         bridge.release_publisher_if_id(1, "other-session");
         assert_eq!(
@@ -3158,6 +3157,7 @@ mod tests {
         let only_publish = bridge
             .try_fast_authorize_publish(2, "live", &s2.publish_key)
             .expect("publish admitted");
+        assert!(db.publisher_try_acquire(&only_publish));
         bridge.release_publisher_if_id(2, &only_publish.id);
         assert!(bridge.stream_id_for_conn(2).is_empty());
     }
@@ -3193,9 +3193,11 @@ mod tests {
         let publish = bridge
             .try_fast_authorize_publish(1, "live", &s.publish_key)
             .expect("publish admitted");
+        assert!(db.publisher_try_acquire(&publish));
         let play = bridge
             .try_fast_authorize_play(1, "live", &s.play_key)
             .expect("play admitted");
+        assert!(db.player_try_acquire(&play));
 
         bridge.release_player_if_id(1, "other-session");
         assert_eq!(
@@ -3219,6 +3221,7 @@ mod tests {
         let only_play = bridge
             .try_fast_authorize_play(2, "live", &s2.play_key)
             .expect("play admitted");
+        assert!(db.player_try_acquire(&only_play));
         bridge.release_player_if_id(2, &only_play.id);
         assert!(bridge.stream_id_for_conn(2).is_empty());
     }
