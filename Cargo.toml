@@ -95,9 +95,3 @@ required-features = ["cluster"]
 
 [profile.release]
 opt-level = 3
-
-# TEMPORARY: librtmp2 0.14.0 is not on crates.io yet. Build against the exact
-# commit that prepares the release so `--locked` works. Remove this section and
-# run `cargo update -p librtmp2` once 0.14.0 is published.
-[patch.crates-io]
-librtmp2 = { git = "https://github.com/OpenRTMP/librtmp2", rev = "bfab88fce44b2abfbf5116a91f8e41390cd2e790" }

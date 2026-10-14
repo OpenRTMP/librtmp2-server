@@ -28,8 +28,6 @@ begin at `1.0.0`.
   or empty AVC/HEVC (or multitrack) sequence-header configurations, so a bad
   header from one publisher cannot replace a valid cached one for late joiners,
   and a changed sequence header drops the stale cached keyframe.
-  Until 0.14.0 is on crates.io, `Cargo.toml` carries a temporary
-  `[patch.crates-io]` pin to the release commit.
 - The cluster init cache applies the same rule: a changed AVC sequence header
   drops the staged keyframe of the previous configuration, an identical repeat
   keeps it.
