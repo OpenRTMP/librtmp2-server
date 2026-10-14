@@ -106,6 +106,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/cluster/join-proof",
             post(handle_cluster_join_proof),
         )
+        // Innermost layer: runs before handler extractors, so an anonymous
+        // caller never gets a request body buffered or parsed.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_bearer_for_mutations,
+        ))
         .layer(DefaultBodyLimit::max(state.config.http_max_body_bytes))
         .layer(middleware::from_fn_with_state(
             limiter,
@@ -115,6 +121,31 @@ pub fn router(state: Arc<AppState>) -> Router {
         // stay readable cross-origin too.
         .layer(middleware::from_fn(public_stats_cors))
         .with_state(state)
+}
+
+/// Every state-changing request needs the admin Bearer token. The handlers
+/// check it too; this gate answers 401 before their `Json`/`Path` extractors
+/// run, so unauthenticated callers cannot probe body validation or make the
+/// server parse request bodies. The API has no cookie or other ambient
+/// credential, so a browser cannot attach this header cross-origin without a
+/// CORS preflight, which admin routes never grant (see `public_stats_cors`).
+async fn require_bearer_for_mutations(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) && !bearer_ok(&state, request.headers())
+    {
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "Missing or invalid token",
+        );
+    }
+    next.run(request).await
 }
 
 // ---------- CORS (public stats only) ----------
@@ -4730,6 +4761,150 @@ mod tests {
                 .headers()
                 .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS)
         );
+    }
+
+    /// Every state-changing admin route, as (method, uri).
+    const MUTATING_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/api/v1/streams"),
+        ("DELETE", "/api/v1/streams/1"),
+        ("POST", "/api/v1/streams/1/players"),
+        ("DELETE", "/api/v1/streams/1/players/1"),
+        ("POST", "/api/v1/cluster/nodes/1/drain"),
+        ("POST", "/api/v1/cluster/nodes/1/resume"),
+        ("POST", "/api/v1/cluster/nodes/1/promote"),
+        ("DELETE", "/api/v1/cluster/nodes/1"),
+        ("POST", "/api/v1/cluster/join-proof"),
+    ];
+
+    #[tokio::test]
+    async fn cross_origin_simple_requests_cannot_mutate_without_bearer() {
+        // The admin API is Bearer-only (no cookies / ambient credentials), so
+        // CSRF tokens do not apply; what must hold is that no request a
+        // browser can forge cross-origin -- "simple" content types, no
+        // Authorization header -- changes state or is granted CORS access.
+        let token = "a-strong-random-secret-value";
+        let state = test_state(token);
+        let body =
+            r#"{"app":"live","name":"csrf","node_id":9,"control_addr":"a:1","media_addr":"b:2"}"#;
+        let ambient: &[(&str, &str)] = &[
+            ("Cookie", "token=a-strong-random-secret-value; session=1"),
+            ("Authorization", "Basic YWRtaW46YWRtaW4="),
+            ("Authorization", "bearer a-strong-random-secret-value"),
+            ("Authorization", "Bearer"),
+            ("Authorization", "Bearer "),
+        ];
+        for (method, uri) in MUTATING_ROUTES {
+            for content_type in [
+                "text/plain",
+                "application/x-www-form-urlencoded",
+                "multipart/form-data; boundary=x",
+                "application/json",
+            ] {
+                for extra in std::iter::once(&("X-None", "")).chain(ambient.iter()) {
+                    for target in [uri.to_string(), format!("{uri}?token={token}")] {
+                        let mut req = Request::builder()
+                            .method(*method)
+                            .uri(&target)
+                            .header("Origin", "https://evil.example")
+                            .header("Content-Type", content_type);
+                        if !extra.1.is_empty() {
+                            req = req.header(extra.0, extra.1);
+                        }
+                        let resp = router(Arc::clone(&state))
+                            .oneshot(req.body(Body::from(body)).unwrap())
+                            .await
+                            .unwrap();
+                        let status = resp.status();
+                        assert!(
+                            !status.is_success(),
+                            "{method} {target} ({content_type}, {extra:?}) -> {status}"
+                        );
+                        assert_eq!(
+                            allow_origin(&resp),
+                            None,
+                            "{method} {target} must not be CORS-readable"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            state.db.stream_list().is_empty(),
+            "forged requests must not create streams"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_routes_answer_401_before_parsing_the_body() {
+        let state = test_state("a-strong-random-secret-value");
+        for (method, uri) in MUTATING_ROUTES {
+            for (content_type, body) in [("text/plain", "not json"), ("application/json", "{")] {
+                let resp = cors_request_with_body(
+                    Arc::clone(&state),
+                    Method::from_bytes(method.as_bytes()).unwrap(),
+                    uri,
+                    &[("Content-Type", content_type)],
+                    body,
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {uri} ({content_type}) must not reveal body validation to anonymous callers"
+                );
+            }
+        }
+    }
+
+    async fn cors_request_with_body(
+        state: Arc<AppState>,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &'static str,
+    ) -> Response {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        router(state)
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preflight_to_every_mutating_route_grants_nothing() {
+        let state = test_state("a-strong-random-secret-value");
+        for (method, uri) in MUTATING_ROUTES {
+            let resp = cors_request(
+                Arc::clone(&state),
+                Method::OPTIONS,
+                uri,
+                &[
+                    ("Origin", "https://evil.example"),
+                    ("Access-Control-Request-Method", method),
+                    (
+                        "Access-Control-Request-Headers",
+                        "authorization,content-type",
+                    ),
+                ],
+            )
+            .await;
+            assert_eq!(allow_origin(&resp), None, "{method} {uri}");
+            assert!(
+                !resp
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS),
+                "{method} {uri}"
+            );
+            assert!(
+                !resp
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                "{method} {uri}"
+            );
+        }
     }
 
     #[test]
