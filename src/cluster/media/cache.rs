@@ -81,7 +81,14 @@ impl InitCacheStore {
             };
         }
         match kind {
-            CacheFrameKind::VideoSequenceHeader => e.avc_header = Some(payload.to_vec()),
+            CacheFrameKind::VideoSequenceHeader => {
+                // A keyframe decodes only against the configuration it was
+                // produced with; a changed header makes the staged one stale.
+                if e.avc_header.as_deref() != Some(payload) {
+                    e.keyframe = None;
+                }
+                e.avc_header = Some(payload.to_vec());
+            }
             CacheFrameKind::VideoKeyframe => e.keyframe = Some((timestamp, payload.to_vec())),
             CacheFrameKind::AudioSequenceHeader => e.aac_header = Some(payload.to_vec()),
             CacheFrameKind::LiveOnly => {
@@ -161,6 +168,23 @@ mod tests {
     const AVC_INTER: &[u8] = &[0x27, 0x01, 0x00, 0x00, 0x00, 0x41];
     const AAC_SEQ: &[u8] = &[0xAF, 0x00, 0x12, 0x10];
     const AAC_RAW: &[u8] = &[0xAF, 0x01, 0x21, 0x00];
+
+    #[test]
+    fn changed_sequence_header_drops_staged_keyframe_identical_keeps_it() {
+        let store = InitCacheStore::new();
+        let other_seq: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x02];
+        store.update_from_frame("live", "s", 1, 1, 0, AVC_SEQ);
+        store.update_from_frame("live", "s", 1, 1, 10, AVC_KEY);
+        store.update_from_frame("live", "s", 1, 1, 10, AVC_SEQ);
+        assert!(store.get("live", "s").unwrap().keyframe.is_some());
+        store.update_from_frame("live", "s", 1, 1, 20, other_seq);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.avc_header.as_deref(), Some(other_seq));
+        assert!(
+            e.keyframe.is_none(),
+            "stale keyframe survived a config change"
+        );
+    }
 
     #[test]
     fn put_get_remove_are_keyed_by_app_and_stream() {
