@@ -69,7 +69,12 @@ jobs:
     env:
       KIND: ${{ inputs.tag && 'release' || (github.event_name == 'push' && 'main' || (github.event_name == 'pull_request' && 'pr' || 'manual')) }}
       TAG: ${{ inputs.tag }}
-      RUN_SWEEP: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.sweep) }}
+      # A release (called from release.yml) always runs the sweep. Inside a
+      # called workflow github.event_name is the caller's event, so a release
+      # started by hand reports workflow_dispatch while `inputs.sweep` does not
+      # exist there; judging by the event alone left RUN_SWEEP empty and
+      # silently skipped the sweep.
+      RUN_SWEEP: ${{ inputs.tag != '' || (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.sweep)) }}
       SWEEP_SERVERS: ${{ github.event_name == 'workflow_dispatch' && inputs.servers || 'lrtmp2-server nginx mediamtx srs liveforge' }}
       LOAD_VIEWERS: ${{ github.event_name == 'workflow_dispatch' && inputs.load_viewers || '500 1000 2000' }}
     steps:
