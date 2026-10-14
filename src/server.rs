@@ -1060,7 +1060,10 @@ fn apply_auth_completion(
                             .as_ref()
                             .is_some_and(|stream| stream.is_publishing)
                 });
-            if completion.allow && was_pending && applied && tracked.contains_key(&completion.conn_id)
+            if completion.allow
+                && was_pending
+                && applied
+                && tracked.contains_key(&completion.conn_id)
             {
                 bump_publish_generation(completion.conn_id);
             } else if completion.allow && was_pending && !applied {
@@ -3749,8 +3752,8 @@ mod tests {
             "an untracked connection's completion must not re-create generation state"
         );
 
-        // A completion for a connection that is still tracked bumps its
-        // publish generation (the line the untracked case above must skip).
+        // Tracked, but the connection is not publishing on this server, so
+        // the completion does not apply and must not bump generation.
         let mut tracked_with_conn: HashMap<u64, TrackedConn> = HashMap::new();
         tracked_with_conn.entry(999).or_default();
         let (tx2, rx2) = sync_channel(4);
@@ -3767,7 +3770,7 @@ mod tests {
             *guard = Some(rx2);
         }
         assert!(drain_auth_completions(&mut server, &tracked_with_conn));
-        assert_eq!(super::publisher_generation(999), 1);
+        assert_eq!(super::publisher_generation(999), 0);
         super::clear_publish_generation(999);
 
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {

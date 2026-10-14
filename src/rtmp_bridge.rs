@@ -788,7 +788,11 @@ impl DbRtmpBridge {
         let Some(cs) = guard.get_mut(&conn) else {
             return;
         };
-        if cs.publisher.as_ref().is_none_or(|publisher| publisher.id != publisher_id) {
+        if cs
+            .publisher
+            .as_ref()
+            .is_none_or(|publisher| publisher.id != publisher_id)
+        {
             return;
         }
         cs.publisher = None;
@@ -804,9 +808,9 @@ impl DbRtmpBridge {
     pub fn release_player_if_id(&self, conn: ConnId, player_id: &str) {
         let Some(mut row) = ({
             let guard = self.conns.lock();
-            guard.get(&conn).and_then(|cs| {
-                cs.player.clone().filter(|player| player.id == player_id)
-            })
+            guard
+                .get(&conn)
+                .and_then(|cs| cs.player.clone().filter(|player| player.id == player_id))
         }) else {
             return;
         };
@@ -822,7 +826,11 @@ impl DbRtmpBridge {
         let Some(cs) = guard.get_mut(&conn) else {
             return;
         };
-        if cs.player.as_ref().is_none_or(|player| player.id != player_id) {
+        if cs
+            .player
+            .as_ref()
+            .is_none_or(|player| player.id != player_id)
+        {
             return;
         }
         cs.player = None;
