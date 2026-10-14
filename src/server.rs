@@ -874,7 +874,7 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
             .map(|h| h.try_submit(kind, conn_id, app, stream_key))
     });
     match submitted {
-        Some(Ok(())) => AuthorizationResult::Pending,
+        Some(Ok(request_id)) => AuthorizationResult::Pending { request_id },
         _ => AuthorizationResult::Deny,
     }
 }
@@ -1039,13 +1039,74 @@ fn apply_auth_completion(
 ) {
     match completion.kind {
         AuthKind::Publish => {
-            if completion.allow && tracked.contains_key(&completion.conn_id) {
+            let was_pending = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| conn.has_pending_publish_authorization());
+            let _ = server.complete_publish_authorization(
+                completion.conn_id,
+                completion.request_id,
+                completion.allow,
+            );
+            let applied = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| {
+                    !conn.has_pending_publish_authorization()
+                        && conn
+                            .current_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.is_publishing)
+                });
+            if completion.allow
+                && was_pending
+                && applied
+                && tracked.contains_key(&completion.conn_id)
+            {
                 bump_publish_generation(completion.conn_id);
+            } else if completion.allow
+                && was_pending
+                && !applied
+                && let Some(publisher_id) = completion.publisher_id.as_deref()
+            {
+                with_rtmp_bridge(|bridge| {
+                    bridge.release_publisher_if_id(completion.conn_id, publisher_id);
+                });
             }
-            let _ = server.complete_publish_authorization(completion.conn_id, completion.allow);
         }
         AuthKind::Play => {
-            let _ = server.complete_play_authorization(completion.conn_id, completion.allow);
+            let was_pending = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| conn.has_pending_play_authorization());
+            let _ = server.complete_play_authorization(
+                completion.conn_id,
+                completion.request_id,
+                completion.allow,
+            );
+            let applied = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| {
+                    !conn.has_pending_play_authorization()
+                        && conn
+                            .current_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.is_playing)
+                });
+            if completion.allow
+                && was_pending
+                && !applied
+                && let Some(player_id) = completion.player_id.as_deref()
+            {
+                with_rtmp_bridge(|bridge| {
+                    bridge.release_player_if_id(completion.conn_id, player_id);
+                });
+            }
         }
     }
 }
@@ -3671,6 +3732,9 @@ mod tests {
             kind: AuthKind::Publish,
             conn_id: 999,
             allow: true,
+            request_id: 1,
+            publisher_id: None,
+            player_id: None,
         })
         .unwrap();
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
@@ -3692,8 +3756,8 @@ mod tests {
             "an untracked connection's completion must not re-create generation state"
         );
 
-        // A completion for a connection that is still tracked bumps its
-        // publish generation (the line the untracked case above must skip).
+        // Tracked, but the connection is not publishing on this server, so
+        // the completion does not apply and must not bump generation.
         let mut tracked_with_conn: HashMap<u64, TrackedConn> = HashMap::new();
         tracked_with_conn.entry(999).or_default();
         let (tx2, rx2) = sync_channel(4);
@@ -3701,13 +3765,16 @@ mod tests {
             kind: AuthKind::Publish,
             conn_id: 999,
             allow: true,
+            request_id: 1,
+            publisher_id: None,
+            player_id: None,
         })
         .unwrap();
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
             *guard = Some(rx2);
         }
         assert!(drain_auth_completions(&mut server, &tracked_with_conn));
-        assert_eq!(super::publisher_generation(999), 1);
+        assert_eq!(super::publisher_generation(999), 0);
         super::clear_publish_generation(999);
 
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
@@ -4090,6 +4157,9 @@ mod tests {
                     kind: AuthKind::Play,
                     conn_id: 5,
                     allow: true,
+                    request_id: 1,
+                    publisher_id: None,
+                    player_id: None,
                 })
                 .unwrap();
             *AUTH_COMPLETIONS_RX.lock().unwrap() = Some(global_rx);
@@ -4102,6 +4172,9 @@ mod tests {
                 kind: AuthKind::Play,
                 conn_id: 7,
                 allow: false,
+                request_id: 1,
+                publisher_id: None,
+                player_id: None,
             })
             .unwrap();
             assert!(drain_auth_completions(&mut server, &tracked));
@@ -4450,26 +4523,30 @@ mod tests {
         );
         assert!(bridge.has_player(2));
 
-        // Unknown keys go to the worker, which answers asynchronously.
+        // Unknown keys go to the worker, which answers asynchronously. The
+        // decision names the request it resolves.
         bridge.on_connect(3, "127.0.0.1:1003");
-        assert_eq!(
-            super::rtmp_publish_auth_cb(3, "live", "unknown_publish_key_long_enough_000"),
-            AuthorizationResult::Pending
-        );
+        let decision =
+            super::rtmp_publish_auth_cb(3, "live", "unknown_publish_key_long_enough_000");
+        let AuthorizationResult::Pending { request_id } = decision else {
+            panic!("an unknown key must be answered asynchronously, got {decision:?}");
+        };
         let done = completions.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             (done.conn_id, done.kind, done.allow),
             (3, AuthKind::Publish, false)
         );
-        assert_eq!(
-            super::rtmp_play_auth_cb(3, "live", "unknown_play_key_long_enough_00000"),
-            AuthorizationResult::Pending
-        );
+        assert_eq!(done.request_id, request_id);
+        let decision = super::rtmp_play_auth_cb(3, "live", "unknown_play_key_long_enough_00000");
+        let AuthorizationResult::Pending { request_id } = decision else {
+            panic!("an unknown key must be answered asynchronously, got {decision:?}");
+        };
         let done = completions.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             (done.conn_id, done.kind, done.allow),
             (3, AuthKind::Play, false)
         );
+        assert_eq!(done.request_id, request_id);
 
         // Media callbacks reach the bridge; non-A/V frames are accepted as-is.
         assert!(super::rtmp_media_cb(

@@ -233,7 +233,13 @@ impl SqliteStateMachine {
                 // Raft serializes the actual applies, so recheck here — the
                 // second one to apply must not leave the stream with zero
                 // usable play keys.
-                let viewers = self.db.viewer_list(stream_id);
+                let viewers = match self.db.viewer_list_checked(stream_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        crate::log_error!("DeleteViewer fence: {e}");
+                        return ClusterResponse::Error("db".into());
+                    }
+                };
                 let would_remove_last =
                     viewers.len() == 1 && viewers.iter().any(|v| v.id == *viewer_id);
                 if would_remove_last {
@@ -696,6 +702,11 @@ impl SqliteStateMachine {
                     params![token],
                 )
                 .map_err(|e| e.to_string())?;
+            } else {
+                // Snapshot without api_token must clear a follower's stale bearer,
+                // not leave the previous settings row intact.
+                tx.execute("DELETE FROM settings WHERE key='api_token'", [])
+                    .map_err(|e| e.to_string())?;
             }
             if let Some(cid) = &snap.cluster_id {
                 tx.execute(
@@ -705,6 +716,9 @@ impl SqliteStateMachine {
                 )
                 .map_err(|e| e.to_string())?;
             }
+            // Do not DELETE on None: `#[serde(default)]` makes a missing
+            // legacy `cluster_id` field deserialize as None, and wiping the
+            // row would erase this node's Raft identity on install.
             tx.commit().map_err(|e| e.to_string())?;
             Ok((revoke_viewers, drain_streams, dropped_player_viewers))
         })?;
@@ -722,9 +736,10 @@ impl SqliteStateMachine {
         for viewer_id in dropped_player_viewers {
             self.db.players_deactivate_for_viewer(&viewer_id);
         }
-        if let Some(token) = &snap.api_token {
-            self.emit_effect(StateEffect::ApiToken(token.clone()));
-        }
+        // Always refresh in-memory token: Some installs the snap value, None clears.
+        self.emit_effect(StateEffect::ApiToken(
+            snap.api_token.clone().unwrap_or_default(),
+        ));
         // Acquire/Release emit OwnershipChanged so process_state_effects can
         // refresh OwnershipTracker immediately; snapshot install must too,
         // including empty owner sets that clear prior rows — otherwise media
@@ -2116,8 +2131,36 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .all(|e| matches!(e, StateEffect::OwnershipChanged)),
-            "empty snapshot with default payload should only emit OwnershipChanged"
+                .any(|e| matches!(e, StateEffect::ApiToken(t) if t.is_empty())),
+            "empty snapshot must clear in-memory api_token (None → empty)"
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|e| matches!(e, StateEffect::OwnershipChanged | StateEffect::ApiToken(_))),
+            "empty snapshot with default payload should only emit OwnershipChanged + ApiToken clear"
+        );
+
+        // Legacy / omitted cluster_id (None) must not wipe a persisted identity.
+        // A snapshot that omits `cluster_id` (legacy payload) must not wipe a
+        // persisted identity, while an omitted `api_token` does clear.
+        let (mut sm_cid, _rx_cid) = sm_with_effects();
+        assert!(sm_cid.db().setting_set("cluster_id", "keep-cid").is_ok());
+        assert!(sm_cid.db().token_replace("stale-token").is_ok());
+        let empty_legacy = serde_json::to_vec(&AppSnapshot::default()).unwrap();
+        sm_cid
+            .install_snapshot(&meta, Box::new(Cursor::new(empty_legacy)))
+            .await
+            .unwrap();
+        assert_eq!(
+            sm_cid.db().setting_get("cluster_id").as_deref(),
+            Some("keep-cid"),
+            "omitted snapshot cluster_id must preserve the existing settings row"
+        );
+        assert_eq!(
+            sm_cid.db().token_get().unwrap(),
+            None,
+            "omitted snapshot api_token must clear the persisted bearer"
         );
 
         // Undecodable payload.

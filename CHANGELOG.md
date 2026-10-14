@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-10-14
+
 ### Added
 - CORS for the public stats endpoints: `/stats`, `/stats-nginx`, `/stat.xsl`
   and the `?key=` form of `/api/v1/streams/:id/stats` answer with
@@ -21,6 +23,15 @@ begin at `1.0.0`.
   overlays (e.g. an OBS browser source) can read stats from another origin
   without a reverse proxy. Admin API routes and Bearer requests to the
   per-stream stats route get no CORS headers.
+
+### Fixed
+- A viewer-list lookup failure during delete-viewer fencing is reported as an error instead of an empty viewer set.
+- An installed app snapshot that omits the API token clears the stored token. An omitted cluster id leaves the existing cluster identity in place.
+- Dropping a fast publisher while a player remains on the connection keeps that player's stream identity.
+- A membership snapshot that predates a join no longer deletes the peer addresses recorded by that join.
+
+### Changed
+- Depends on librtmp2 `0.13.0`. A deferred publish/play authorization now carries the request id from that release, and the completion is applied only to that request.
 
 ## [0.6.3] — 2026-10-10
 
@@ -960,7 +971,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.4...HEAD
+[0.6.4]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.0...v0.6.1
