@@ -1,0 +1,44 @@
+{
+ "schema": 1,
+ "repo": "OpenRTMP/librtmp2-server",
+ "kind": "release",
+ "version": "0.6.5",
+ "tag": "v0.6.5",
+ "commit": "e4cda10e99ecd19e63c3345b6dadfb35d1aeebfe",
+ "date": "2026-10-14T19:11:24Z",
+ "run_url": "https://github.com/OpenRTMP/librtmp2-server/actions/runs/38620572296",
+ "deps": {
+  "librtmp2": "0.14.0"
+ },
+ "environment": {
+  "cpu": "AMD EPYC 7763 64-Core Processor",
+  "vcpus": 4,
+  "ram_gib": 15.6,
+  "kernel": "Linux 6.17.0-1022-azure x86_64",
+  "rustc": "1.99.0",
+  "runner": "GitHub-hosted ubuntu24 (image 20261004.327.1)",
+  "shared_vm": true
+ },
+ "suites": {
+  "http_api": {
+   "http_api/create_stream": {
+    "ns": 293956.56206653395,
+    "ci_rel": 0.012397859051731427,
+    "bytes": null,
+    "elements": null
+   },
+   "http_api/health": {
+    "ns": 181884.5995163555,
+    "ci_rel": 0.02167148639029738,
+    "bytes": null,
+    "elements": null
+   },
+   "http_api/list_streams": {
+    "ns": 447638078.85,
+    "ci_rel": 0.0024782618563192168,
+    "bytes": null,
+    "elements": null
+   }
+  }
+ }
+}
