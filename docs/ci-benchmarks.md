@@ -11,6 +11,7 @@ GitHub-hosted runner and compares every run with the last release and the last
 | Merge to `main` | Microbenchmarks + sweep run, the *CI benchmarks* block in [`BENCHMARKS.md`](../BENCHMARKS.md) is rewritten (a `docs(bench)` commit by `github-actions[bot]`), the run is stored as `bench/latest.json` in the same commit | yes — `BENCHMARKS.md` + website "next release" preview |
 | Release | `release.yml` calls the workflow in its own job after the GitHub Release exists, so the Docker image never waits for it. Results are attached to the release as `bench-results-<tag>.json` and `BENCHMARKS-<tag>.md`, appended to the release notes, and recorded as `bench/releases/<tag>.json` on `main` | yes — on the release |
 | *Actions → Benchmarks → Run workflow* | Runs and shows the comparison in the **job summary** (and log). Nothing is committed, uploaded to a release, or recorded under `bench/`. Inputs: skip the sweep, pick servers, pick viewer counts | no |
+| *Actions → Benchmarks → Run workflow* with **`release_tag`** (e.g. `v0.6.5`) | Re-measures a published release: builds the tag, runs the full sweep, replaces the benchmark asset and block of the GitHub Release and `bench/releases/<tag>.json` (only if every sweep leg completed). Use it when a release was measured incompletely | yes — release notes + website |
 | Pull request | Microbenchmarks only, same as a manual run | no |
 
 ## What the sweep uses
@@ -49,7 +50,7 @@ Results are plain files on `main` (committed by
 
 ```
 bench/latest.json            newest run on main, overwritten on every merge
-bench/releases/<tag>.json    one file per release, never rewritten
+bench/releases/<tag>.json    one file per release; normal runs never rewrite it, a `release_tag` re-measurement with a complete sweep replaces it
 ```
 
 openrtmp.org reads `latest.json` (this repo and librtmp2) to offer the newest

@@ -13,6 +13,13 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Fixed
+- A release started by hand (`workflow_dispatch`) now runs the cross-server
+  benchmark sweep too; it used to be skipped and only the HTTP API
+  microbenchmarks were recorded.
+- The Benchmarks workflow has a `release_tag` input to re-measure an already
+  published release (asset, release notes and `bench/releases/<tag>.json`).
+
 ## [0.6.5] — 2026-10-14
 
 ### Security
