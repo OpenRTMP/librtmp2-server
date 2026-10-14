@@ -4232,6 +4232,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn api_token_queued_before_hooks_is_applied_on_register() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+
+        m.apply_api_token("live-token");
+        assert_eq!(n.hooks.token.read().as_str(), "live-token");
+        assert!(m.pending_api_token.lock().is_none());
+
+        *m.session_hooks.lock() = None;
+        m.apply_api_token("");
+        assert_eq!(m.pending_api_token.lock().as_deref(), Some(""));
+
+        let hooks = n.hooks.session_hooks();
+        *hooks.api_token.write() = "stale".into();
+        m.register_session_hooks(hooks);
+        assert_eq!(n.hooks.token.read().as_str(), "");
+        assert!(m.pending_api_token.lock().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn health_loop_recovers_quorum_and_releases_down_owners() {
         let n = bootstrap(1, |c| {
             c.bandwidth_interface = "lo".into();

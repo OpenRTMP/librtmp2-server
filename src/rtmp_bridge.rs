@@ -3114,4 +3114,129 @@ mod tests {
             "surviving player must keep stream_id after publish cancel"
         );
     }
+
+    #[test]
+    fn release_publisher_if_id_clears_only_the_named_session() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+
+        bridge.release_publisher_if_id(1, "missing");
+        bridge.release_publisher_if_id(99, "missing");
+
+        let play = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+        let publish = bridge
+            .try_fast_authorize_publish(1, "live", &s.publish_key)
+            .expect("publish admitted");
+        bridge
+            .ownership_epochs
+            .lock()
+            .insert(1, ("s1".into(), 1));
+
+        bridge.release_publisher_if_id(1, "other-session");
+        assert_eq!(
+            bridge.session_rows(1).0.as_ref().map(|row| row.id.as_str()),
+            Some(publish.id.as_str())
+        );
+
+        bridge.release_publisher_if_id(1, &publish.id);
+        assert!(bridge.session_rows(1).0.is_none());
+        assert_eq!(
+            bridge.session_rows(1).1.as_ref().map(|row| row.id.as_str()),
+            Some(play.id.as_str())
+        );
+        assert_eq!(bridge.stream_id_for_conn(1), "s1");
+        assert!(db.publisher_list(Some("s1")).is_empty());
+
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        db.refresh_key_cache();
+        bridge.on_connect(2, "127.0.0.1:1001");
+        let only_publish = bridge
+            .try_fast_authorize_publish(2, "live", &s2.publish_key)
+            .expect("publish admitted");
+        bridge.release_publisher_if_id(2, &only_publish.id);
+        assert!(bridge.stream_id_for_conn(2).is_empty());
+    }
+
+    #[test]
+    fn release_publisher_if_id_keeps_the_role_when_deactivation_fails() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
+        let publisher_id = bridge.session_rows(1).0.unwrap().id;
+        assert!(matches!(db.stream_delete("s1"), Some(true)));
+
+        bridge.release_publisher_if_id(1, &publisher_id);
+        assert_eq!(
+            bridge.session_rows(1).0.as_ref().map(|p| p.id.as_str()),
+            Some(publisher_id.as_str())
+        );
+    }
+
+    #[test]
+    fn release_player_if_id_clears_only_the_named_session() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+
+        bridge.release_player_if_id(1, "missing");
+        bridge.release_player_if_id(99, "missing");
+
+        let publish = bridge
+            .try_fast_authorize_publish(1, "live", &s.publish_key)
+            .expect("publish admitted");
+        let play = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+
+        bridge.release_player_if_id(1, "other-session");
+        assert_eq!(
+            bridge.session_rows(1).1.as_ref().map(|row| row.id.as_str()),
+            Some(play.id.as_str())
+        );
+
+        bridge.release_player_if_id(1, &play.id);
+        assert!(bridge.session_rows(1).1.is_none());
+        assert!(bridge.viewer_id_for_conn(1).is_empty());
+        assert_eq!(
+            bridge.session_rows(1).0.as_ref().map(|row| row.id.as_str()),
+            Some(publish.id.as_str())
+        );
+        assert_eq!(bridge.stream_id_for_conn(1), "s1");
+        assert!(db.player_list(Some("s1")).is_empty());
+
+        let s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        db.refresh_key_cache();
+        bridge.on_connect(2, "127.0.0.1:1001");
+        let only_play = bridge
+            .try_fast_authorize_play(2, "live", &s2.play_key)
+            .expect("play admitted");
+        bridge.release_player_if_id(2, &only_play.id);
+        assert!(bridge.stream_id_for_conn(2).is_empty());
+    }
+
+    #[test]
+    fn release_player_if_id_keeps_the_role_when_deactivation_fails() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
+        let player_id = bridge.session_rows(1).1.unwrap().id;
+        assert!(matches!(db.stream_delete("s1"), Some(true)));
+
+        bridge.release_player_if_id(1, &player_id);
+        assert_eq!(
+            bridge.session_rows(1).1.as_ref().map(|p| p.id.as_str()),
+            Some(player_id.as_str())
+        );
+    }
 }
