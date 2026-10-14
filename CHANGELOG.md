@@ -13,11 +13,26 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-10-14
+
+### Security
+- State-changing admin routes (`POST`/`DELETE`) now check the Bearer token
+  before any request body is read or parsed. Anonymous callers get `401`
+  immediately (previously a non-JSON body was answered with `415` after the
+  body had been buffered), so they can no longer probe body validation or make
+  the server parse bodies. Authenticated clients are unaffected. The admin API
+  still sends no CORS headers and has no cookie authentication.
+
 ### Changed
 - Requires `librtmp2` 0.14.0. Its init-frame cache no longer caches malformed
   or empty AVC/HEVC (or multitrack) sequence-header configurations, so a bad
   header from one publisher cannot replace a valid cached one for late joiners,
   and a changed sequence header drops the stale cached keyframe.
+  Until 0.14.0 is on crates.io, `Cargo.toml` carries a temporary
+  `[patch.crates-io]` pin to the release commit.
+- The cluster init cache applies the same rule: a changed AVC sequence header
+  drops the staged keyframe of the previous configuration, an identical repeat
+  keeps it.
 - Cluster init-cache test fixtures now use structurally valid AVC records.
 
 ## [0.6.4] — 2026-10-14
@@ -978,7 +993,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.4...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.5...HEAD
+[0.6.5]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.4...v0.6.5
 [0.6.4]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.1...v0.6.2
