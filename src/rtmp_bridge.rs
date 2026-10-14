@@ -745,6 +745,95 @@ impl DbRtmpBridge {
         cs.publisher_stats_reset_pending = true;
     }
 
+    /// Deactivate the publisher session `publisher_id` when it is still this
+    /// connection's publisher. A newer publish on the same connection has
+    /// another id and is left in place. Used when the protocol layer rejects
+    /// the completion that this session was created for.
+    pub fn release_publisher_if_id(&self, conn: ConnId, publisher_id: &str) {
+        let Some(mut row) = ({
+            let guard = self.conns.lock();
+            guard.get(&conn).and_then(|cs| {
+                cs.publisher
+                    .clone()
+                    .filter(|publisher| publisher.id == publisher_id)
+            })
+        }) else {
+            return;
+        };
+        row.active = false;
+        if !self.db.publisher_update(&row.id, &row) {
+            crate::log_error!(
+                "RTMP: failed to deactivate superseded publisher session={} conn={conn}",
+                row.id
+            );
+            return;
+        }
+        let still_current = self
+            .conns
+            .lock()
+            .get(&conn)
+            .and_then(|cs| cs.publisher.as_ref().map(|publisher| publisher.id.clone()));
+        if still_current.as_deref() != Some(publisher_id) {
+            return;
+        }
+        let owns_this_stream = self
+            .ownership_epochs
+            .lock()
+            .get(&conn)
+            .is_some_and(|(stream_id, _)| stream_id == &row.stream_id);
+        if owns_this_stream {
+            self.try_release_ownership_for_conn(conn);
+        }
+        let mut guard = self.conns.lock();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+        if cs.publisher.as_ref().is_none_or(|publisher| publisher.id != publisher_id) {
+            return;
+        }
+        cs.publisher = None;
+        if let Some(ref player) = cs.player {
+            cs.stream_id = player.stream_id.clone();
+        } else {
+            cs.stream_id.clear();
+        }
+    }
+
+    /// Deactivate the player session `player_id` when it is still this
+    /// connection's player. See [`Self::release_publisher_if_id`].
+    pub fn release_player_if_id(&self, conn: ConnId, player_id: &str) {
+        let Some(mut row) = ({
+            let guard = self.conns.lock();
+            guard.get(&conn).and_then(|cs| {
+                cs.player.clone().filter(|player| player.id == player_id)
+            })
+        }) else {
+            return;
+        };
+        row.active = false;
+        if !self.db.player_update(&row.id, &row) {
+            crate::log_error!(
+                "RTMP: failed to deactivate superseded player session={} conn={conn}",
+                row.id
+            );
+            return;
+        }
+        let mut guard = self.conns.lock();
+        let Some(cs) = guard.get_mut(&conn) else {
+            return;
+        };
+        if cs.player.as_ref().is_none_or(|player| player.id != player_id) {
+            return;
+        }
+        cs.player = None;
+        cs.viewer_id.clear();
+        if let Some(ref publisher) = cs.publisher {
+            cs.stream_id = publisher.stream_id.clone();
+        } else {
+            cs.stream_id.clear();
+        }
+    }
+
     /// Deactivate the player row for this connection without dropping
     /// ConnState. See `release_publisher` for why removal from `ConnState`
     /// is deferred until the DB deactivation succeeds.

@@ -85,6 +85,10 @@ pub struct AuthCompletion {
     pub allow: bool,
     /// The id the request was submitted with.
     pub request_id: u64,
+    /// Publisher session created for this request, if the bridge admitted it.
+    pub publisher_id: Option<String>,
+    /// Player session created for this request, if the bridge admitted it.
+    pub player_id: Option<String>,
 }
 
 /// Handle used by the RTMP `publish`/`play` callbacks to submit
@@ -214,11 +218,22 @@ fn run_jobs(bridge: &DbRtmpBridge, jobs: Vec<Job>) -> Vec<AuthCompletion> {
                         .authorize_play(req.conn_id, &req.app, &req.stream_key)
                         .is_ok(),
                 };
+                let (publisher_id, player_id) = if allow {
+                    let (publisher, player) = bridge.session_rows(req.conn_id);
+                    match req.kind {
+                        AuthKind::Publish => (publisher.map(|row| row.id), None),
+                        AuthKind::Play => (None, player.map(|row| row.id)),
+                    }
+                } else {
+                    (None, None)
+                };
                 completions.push(AuthCompletion {
                     kind: req.kind,
                     conn_id: req.conn_id,
                     allow,
                     request_id: req.request_id,
+                    publisher_id,
+                    player_id,
                 });
             }
         }

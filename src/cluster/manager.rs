@@ -121,14 +121,15 @@ pub struct ClusterManager {
     export_q: Arc<ExportQueue>,
     rt_handle: tokio::runtime::Handle,
     last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
-    /// When `last_metrics` was last written. A peer whose addresses were
-    /// recorded by an accepted join *after* that snapshot is not contradicted
-    /// by it -- see `prune_topology_to_membership`.
-    last_metrics_at: Mutex<Option<Instant>>,
-    /// When each peer's addresses were last recorded by a join, so a prune
-    /// driven by a membership snapshot that predates the join cannot drop them
-    /// permanently (nothing else re-seeds a peer).
-    meta_recorded_at: Mutex<std::collections::HashMap<NodeId, Instant>>,
+    /// Joins this node already accepted whose peer is not in the membership
+    /// snapshot yet. Pruning keeps them until a snapshot actually lists them;
+    /// ordering the two events by wall clock is not enough, because a stale
+    /// metrics notification can be observed after the join was recorded.
+    joins_awaiting_membership: Mutex<std::collections::HashSet<NodeId>>,
+    /// Latest API token from a snapshot/command that arrived before session
+    /// hooks existed. Applied when the hooks are registered, so a clear is not
+    /// dropped by the health loop in that window.
+    pending_api_token: Mutex<Option<String>>,
     tls_client: Option<Arc<ClientConfig>>,
     /// Optional hooks into HTTP/RTMP markers + live API bearer.
     session_hooks: Mutex<Option<SessionHooks>>,
@@ -356,8 +357,8 @@ impl ClusterManager {
             export_q,
             rt_handle,
             last_metrics: Mutex::new(None),
-            last_metrics_at: Mutex::new(None),
-            meta_recorded_at: Mutex::new(std::collections::HashMap::new()),
+            joins_awaiting_membership: Mutex::new(std::collections::HashSet::new()),
+            pending_api_token: Mutex::new(None),
             tls_client: tls_client.clone(),
             session_hooks: Mutex::new(None),
             peer_session_counts: Mutex::new(std::collections::HashMap::new()),
@@ -1352,7 +1353,7 @@ impl ClusterManager {
         self.network.upsert_node(node_id, control_addr.to_string());
         self.meta
             .set_addrs(node_id, control_addr.to_string(), media_addr.to_string());
-        self.meta_recorded_at.lock().insert(node_id, Instant::now());
+        self.joins_awaiting_membership.lock().insert(node_id);
     }
 
     /// Forwards a join/rejoin to the current leader, which re-runs the same
@@ -1634,6 +1635,9 @@ impl ClusterManager {
     }
 
     pub fn register_session_hooks(&self, hooks: SessionHooks) {
+        if let Some(token) = self.pending_api_token.lock().take() {
+            *hooks.api_token.write() = token;
+        }
         *self.session_hooks.lock() = Some(hooks);
         // A restarted node queued its stale ownership rows during `start` (a
         // follower cannot forward the release before the admin proof token
@@ -1810,6 +1814,9 @@ impl ClusterManager {
     fn apply_api_token(&self, token: &str) {
         if let Some(hooks) = self.session_hooks.lock().as_ref() {
             *hooks.api_token.write() = token.to_string();
+            self.pending_api_token.lock().take();
+        } else {
+            *self.pending_api_token.lock() = Some(token.to_string());
         }
     }
 
@@ -1863,7 +1870,6 @@ impl ClusterManager {
         let Some(rm) = self.last_metrics.lock().clone() else {
             return;
         };
-        let snapshot_at = *self.last_metrics_at.lock();
         // Promoting a learner to voter changes Raft membership but the
         // node's own local health stays `Learner` (set once at join) unless
         // reconciled here; otherwise it keeps advertising/reporting itself
@@ -1890,6 +1896,9 @@ impl ClusterManager {
         if members.is_empty() {
             return;
         }
+        self.joins_awaiting_membership
+            .lock()
+            .retain(|id| !members.contains(id));
         // If Raft membership no longer includes this node (another member
         // removed us), stop admitting and tear down local publishers — do not
         // keep serving after ownership can be reassigned elsewhere.
@@ -1910,20 +1919,10 @@ impl ClusterManager {
             if id == self.config.node_id || members.contains(&id) {
                 continue;
             }
-            // This snapshot predates a join this node already committed on the
-            // leader, so it does not say the peer is gone -- it is simply
-            // older than the membership update that adds it. Dropping the
-            // addresses here would lose them for good: nothing re-seeds a peer,
-            // and this node would stop heartbeating it (and never count its
-            // vote). The next metrics update decides on the real membership.
-            let recorded_after_snapshot = matches!(
-                (snapshot_at, self.meta_recorded_at.lock().get(&id).copied()),
-                (Some(snapshot_at), Some(recorded_at)) if recorded_at > snapshot_at
-            );
-            if recorded_after_snapshot {
+            // Accepted on the leader, not in this node's membership view yet.
+            if self.joins_awaiting_membership.lock().contains(&id) {
                 continue;
             }
-            self.meta_recorded_at.lock().remove(&id);
             self.meta.remove(id);
             self.health.remove(id);
             self.media.disconnect_peer(id);
@@ -2449,12 +2448,6 @@ impl ClusterManager {
     async fn metrics_loop(self: Arc<Self>) {
         let mut metrics = self.raft.metrics();
         loop {
-            // Stamp before the clone. A join can record a peer after this
-            // snapshot was read and before the loop stores it; that record
-            // must stay newer than the snapshot time, or the prune below
-            // treats the registration as older than a snapshot that does not
-            // list the peer yet and drops it.
-            let snapshot_at = Instant::now();
             let m = metrics.borrow().clone();
             let prev_leader = self
                 .last_metrics
@@ -2469,7 +2462,6 @@ impl ClusterManager {
                 );
             }
             *self.last_metrics.lock() = Some(m);
-            *self.last_metrics_at.lock() = Some(snapshot_at);
             self.prune_topology_to_membership();
             if metrics.changed().await.is_err() {
                 break;
@@ -4209,20 +4201,34 @@ mod tests {
         // addresses immediately, while the cached membership snapshot can
         // still predate that join. The prune must not drop them for good.
         m.meta().set_addrs(9, dead_addr(), dead_addr());
-        *m.meta_recorded_at.lock() =
-            std::collections::HashMap::from([(9u64, std::time::Instant::now())]);
+        m.joins_awaiting_membership.lock().insert(9);
         m.prune_topology_to_membership();
         assert!(
             m.meta().get(9).is_some(),
-            "a peer recorded after the cached membership snapshot must survive the prune"
+            "a joined peer must survive until a membership snapshot lists it"
         );
+        assert!(m.joins_awaiting_membership.lock().contains(&9));
 
-        // Once a snapshot newer than the record exists and still does not list
-        // the peer, the stale entry is pruned as before.
-        *m.last_metrics_at.lock() = Some(std::time::Instant::now() + Duration::from_secs(1));
+        // A snapshot that includes the peer ends the hold. A later snapshot
+        // that no longer lists it may prune.
+        let mut included = m.last_metrics.lock().clone().expect("metrics cached");
+        included.membership_config = Arc::new(openraft::StoredMembership::new(
+            None,
+            openraft::Membership::new(vec![BTreeSet::from([m.config.node_id, 9u64])], ()),
+        ));
+        *m.last_metrics.lock() = Some(included);
+        m.prune_topology_to_membership();
+        assert!(!m.joins_awaiting_membership.lock().contains(&9));
+        assert!(m.meta().get(9).is_some());
+
+        let mut without = m.last_metrics.lock().clone().unwrap();
+        without.membership_config = Arc::new(openraft::StoredMembership::new(
+            None,
+            openraft::Membership::new(vec![BTreeSet::from([m.config.node_id])], ()),
+        ));
+        *m.last_metrics.lock() = Some(without);
         m.prune_topology_to_membership();
         assert!(m.meta().get(9).is_none());
-        assert!(!m.meta_recorded_at.lock().contains_key(&9));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

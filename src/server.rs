@@ -1039,21 +1039,67 @@ fn apply_auth_completion(
 ) {
     match completion.kind {
         AuthKind::Publish => {
-            if completion.allow && tracked.contains_key(&completion.conn_id) {
-                bump_publish_generation(completion.conn_id);
-            }
+            let was_pending = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| conn.has_pending_publish_authorization());
             let _ = server.complete_publish_authorization(
                 completion.conn_id,
                 completion.request_id,
                 completion.allow,
             );
+            let applied = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| {
+                    !conn.has_pending_publish_authorization()
+                        && conn
+                            .current_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.is_publishing)
+                });
+            if completion.allow && was_pending && applied && tracked.contains_key(&completion.conn_id)
+            {
+                bump_publish_generation(completion.conn_id);
+            } else if completion.allow && was_pending && !applied {
+                if let Some(publisher_id) = completion.publisher_id.as_deref() {
+                    with_rtmp_bridge(|bridge| {
+                        bridge.release_publisher_if_id(completion.conn_id, publisher_id);
+                    });
+                }
+            }
         }
         AuthKind::Play => {
+            let was_pending = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| conn.has_pending_play_authorization());
             let _ = server.complete_play_authorization(
                 completion.conn_id,
                 completion.request_id,
                 completion.allow,
             );
+            let applied = server
+                .connections
+                .iter()
+                .find(|conn| conn.conn_id == completion.conn_id)
+                .is_some_and(|conn| {
+                    !conn.has_pending_play_authorization()
+                        && conn
+                            .current_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.is_playing)
+                });
+            if completion.allow && was_pending && !applied {
+                if let Some(player_id) = completion.player_id.as_deref() {
+                    with_rtmp_bridge(|bridge| {
+                        bridge.release_player_if_id(completion.conn_id, player_id);
+                    });
+                }
+            }
         }
     }
 }
@@ -3680,6 +3726,8 @@ mod tests {
             conn_id: 999,
             allow: true,
             request_id: 1,
+            publisher_id: None,
+            player_id: None,
         })
         .unwrap();
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
@@ -3711,6 +3759,8 @@ mod tests {
             conn_id: 999,
             allow: true,
             request_id: 1,
+            publisher_id: None,
+            player_id: None,
         })
         .unwrap();
         if let Ok(mut guard) = AUTH_COMPLETIONS_RX.lock() {
@@ -4101,6 +4151,8 @@ mod tests {
                     conn_id: 5,
                     allow: true,
                     request_id: 1,
+                    publisher_id: None,
+                    player_id: None,
                 })
                 .unwrap();
             *AUTH_COMPLETIONS_RX.lock().unwrap() = Some(global_rx);
@@ -4114,6 +4166,8 @@ mod tests {
                 conn_id: 7,
                 allow: false,
                 request_id: 1,
+                publisher_id: None,
+                player_id: None,
             })
             .unwrap();
             assert!(drain_auth_completions(&mut server, &tracked));
