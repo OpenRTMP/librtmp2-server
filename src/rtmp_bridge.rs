@@ -801,6 +801,10 @@ impl DbRtmpBridge {
         } else {
             cs.stream_id.clear();
         }
+        cs.publisher_last_stats_at = None;
+        cs.publisher_bytes_base = 0;
+        cs.publisher_bytes_at_last_stats = 0;
+        cs.publisher_stats_reset_pending = true;
     }
 
     /// Deactivate the player session `player_id` when it is still this
@@ -822,6 +826,11 @@ impl DbRtmpBridge {
             );
             return;
         }
+        #[cfg(feature = "cluster")]
+        {
+            let stream_id_for_unsub = row.stream_id.clone();
+            self.maybe_unsubscribe_remote_play(&stream_id_for_unsub);
+        }
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
             return;
@@ -840,6 +849,12 @@ impl DbRtmpBridge {
         } else {
             cs.stream_id.clear();
         }
+        cs.player_last_stats_at = None;
+        cs.player_bytes_base = 0;
+        cs.player_bytes_at_last_stats = 0;
+        cs.player_stats_reset_pending = true;
+        self.player_stats_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Deactivate the player row for this connection without dropping

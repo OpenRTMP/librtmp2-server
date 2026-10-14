@@ -60,6 +60,11 @@ const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
 /// under `network`'s 8s control round trip so a slow catch-up surfaces as
 /// this error on the joiner instead of a client-side round-trip timeout.
 const JOIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long a forwarded join stays out of prune before a membership snapshot
+/// lists that peer. Three catch-up intervals: long enough that a stale
+/// metrics notification cannot drop the peer, short enough that a reverted
+/// join is pruned.
+const JOIN_MEMBERSHIP_HOLD: Duration = Duration::from_secs(JOIN_CATCHUP_TIMEOUT.as_secs() * 3);
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -122,10 +127,11 @@ pub struct ClusterManager {
     rt_handle: tokio::runtime::Handle,
     last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
     /// Joins this node already accepted whose peer is not in the membership
-    /// snapshot yet. Pruning keeps them until a snapshot actually lists them;
-    /// ordering the two events by wall clock is not enough, because a stale
-    /// metrics notification can be observed after the join was recorded.
-    joins_awaiting_membership: Mutex<std::collections::HashSet<NodeId>>,
+    /// snapshot yet. Pruning keeps them until a snapshot lists them or
+    /// [`JOIN_MEMBERSHIP_HOLD`] elapses. Ordering the two events by wall
+    /// clock alone is not enough, because a stale metrics notification can
+    /// be observed after the join was recorded.
+    joins_awaiting_membership: Mutex<HashMap<NodeId, Instant>>,
     /// Latest API token from a snapshot/command that arrived before session
     /// hooks existed. Applied when the hooks are registered, so a clear is not
     /// dropped by the health loop in that window.
@@ -357,7 +363,7 @@ impl ClusterManager {
             export_q,
             rt_handle,
             last_metrics: Mutex::new(None),
-            joins_awaiting_membership: Mutex::new(std::collections::HashSet::new()),
+            joins_awaiting_membership: Mutex::new(HashMap::new()),
             pending_api_token: Mutex::new(None),
             tls_client: tls_client.clone(),
             session_hooks: Mutex::new(None),
@@ -1168,6 +1174,7 @@ impl ClusterManager {
         self.meta.remove(node_id);
         self.health.remove(node_id);
         self.network.nodes.write().remove(&node_id);
+        self.joins_awaiting_membership.lock().remove(&node_id);
         crate::log_info!("Cluster: removed node {node_id}");
         Ok(())
     }
@@ -1353,7 +1360,9 @@ impl ClusterManager {
         self.network.upsert_node(node_id, control_addr.to_string());
         self.meta
             .set_addrs(node_id, control_addr.to_string(), media_addr.to_string());
-        self.joins_awaiting_membership.lock().insert(node_id);
+        self.joins_awaiting_membership
+            .lock()
+            .insert(node_id, Instant::now());
     }
 
     /// Forwards a join/rejoin to the current leader, which re-runs the same
@@ -1896,9 +1905,13 @@ impl ClusterManager {
         if members.is_empty() {
             return;
         }
+        let now = Instant::now();
         self.joins_awaiting_membership
             .lock()
-            .retain(|id| !members.contains(id));
+            .retain(|id, recorded| {
+                !members.contains(id)
+                    && now.saturating_duration_since(*recorded) < JOIN_MEMBERSHIP_HOLD
+            });
         // If Raft membership no longer includes this node (another member
         // removed us), stop admitting and tear down local publishers — do not
         // keep serving after ownership can be reassigned elsewhere.
@@ -1920,7 +1933,7 @@ impl ClusterManager {
                 continue;
             }
             // Accepted on the leader, not in this node's membership view yet.
-            if self.joins_awaiting_membership.lock().contains(&id) {
+            if self.joins_awaiting_membership.lock().contains_key(&id) {
                 continue;
             }
             self.meta.remove(id);
@@ -4201,13 +4214,15 @@ mod tests {
         // addresses immediately, while the cached membership snapshot can
         // still predate that join. The prune must not drop them for good.
         m.meta().set_addrs(9, dead_addr(), dead_addr());
-        m.joins_awaiting_membership.lock().insert(9);
+        m.joins_awaiting_membership
+            .lock()
+            .insert(9, std::time::Instant::now());
         m.prune_topology_to_membership();
         assert!(
             m.meta().get(9).is_some(),
             "a joined peer must survive until a membership snapshot lists it"
         );
-        assert!(m.joins_awaiting_membership.lock().contains(&9));
+        assert!(m.joins_awaiting_membership.lock().contains_key(&9));
 
         // A snapshot that includes the peer ends the hold. A later snapshot
         // that no longer lists it may prune.
@@ -4218,7 +4233,7 @@ mod tests {
         ));
         *m.last_metrics.lock() = Some(included);
         m.prune_topology_to_membership();
-        assert!(!m.joins_awaiting_membership.lock().contains(&9));
+        assert!(!m.joins_awaiting_membership.lock().contains_key(&9));
         assert!(m.meta().get(9).is_some());
 
         let mut without = m.last_metrics.lock().clone().unwrap();
@@ -4229,6 +4244,19 @@ mod tests {
         *m.last_metrics.lock() = Some(without);
         m.prune_topology_to_membership();
         assert!(m.meta().get(9).is_none());
+
+        m.meta().set_addrs(8, dead_addr(), dead_addr());
+        m.joins_awaiting_membership.lock().insert(
+            8,
+            std::time::Instant::now()
+                .checked_sub(super::JOIN_MEMBERSHIP_HOLD + std::time::Duration::from_secs(1))
+                .expect("test instant"),
+        );
+        m.prune_topology_to_membership();
+        assert!(
+            m.meta().get(8).is_none(),
+            "an expired join hold must not keep a peer that membership never listed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
