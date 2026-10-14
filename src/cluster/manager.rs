@@ -2449,6 +2449,12 @@ impl ClusterManager {
     async fn metrics_loop(self: Arc<Self>) {
         let mut metrics = self.raft.metrics();
         loop {
+            // Stamp before the clone. A join can record a peer after this
+            // snapshot was read and before the loop stores it; that record
+            // must stay newer than the snapshot time, or the prune below
+            // treats the registration as older than a snapshot that does not
+            // list the peer yet and drops it.
+            let snapshot_at = Instant::now();
             let m = metrics.borrow().clone();
             let prev_leader = self
                 .last_metrics
@@ -2463,7 +2469,7 @@ impl ClusterManager {
                 );
             }
             *self.last_metrics.lock() = Some(m);
-            *self.last_metrics_at.lock() = Some(Instant::now());
+            *self.last_metrics_at.lock() = Some(snapshot_at);
             self.prune_topology_to_membership();
             if metrics.changed().await.is_err() {
                 break;
