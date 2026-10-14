@@ -13,6 +13,13 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- Requires `librtmp2` 0.14.0. Its init-frame cache no longer caches malformed
+  or empty AVC/HEVC (or multitrack) sequence-header configurations, so a bad
+  header from one publisher cannot replace a valid cached one for late joiners,
+  and a changed sequence header drops the stale cached keyframe.
+- Cluster init-cache test fixtures now use structurally valid AVC records.
+
 ## [0.6.4] — 2026-10-14
 
 ### Added

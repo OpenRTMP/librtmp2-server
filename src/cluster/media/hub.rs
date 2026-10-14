@@ -1624,7 +1624,15 @@ mod tests {
 
     const SECRET: &str = "test-cluster-secret-32-chars-min--";
     const WAIT: Duration = Duration::from_secs(5);
-    const AVC_SEQ: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01];
+    /// Legacy FLV AVC sequence header carrying a structurally valid
+    /// AVCDecoderConfigurationRecord (1 SPS, 1 PPS), so it is cacheable by
+    /// librtmp2's init-frame classifier.
+    const AVC_SEQ: &[u8] = &[
+        0x17, 0x00, 0x00, 0x00, 0x00, // FLV: key+AVC, sequence header, CT=0
+        0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1, // record, 1 SPS
+        0x00, 0x02, 0x67, 0x01, // SPS
+        0x01, 0x00, 0x02, 0x68, 0x01, // 1 PPS
+    ];
     const AVC_KEY: &[u8] = &[0x17, 0x01, 0x00, 0x00, 0x00, 0x65];
 
     struct Node {

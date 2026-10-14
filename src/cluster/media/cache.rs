@@ -163,7 +163,15 @@ mod tests {
     use super::*;
     use librtmp2::types::FrameType;
 
-    const AVC_SEQ: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x01];
+    /// Legacy FLV AVC sequence header carrying a structurally valid
+    /// AVCDecoderConfigurationRecord (1 SPS, 1 PPS), so it is cacheable by
+    /// librtmp2's init-frame classifier.
+    const AVC_SEQ: &[u8] = &[
+        0x17, 0x00, 0x00, 0x00, 0x00, // FLV: key+AVC, sequence header, CT=0
+        0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1, // record, 1 SPS
+        0x00, 0x02, 0x67, 0x01, // SPS
+        0x01, 0x00, 0x02, 0x68, 0x01, // 1 PPS
+    ];
     const AVC_KEY: &[u8] = &[0x17, 0x01, 0x00, 0x00, 0x00, 0x65];
     const AVC_INTER: &[u8] = &[0x27, 0x01, 0x00, 0x00, 0x00, 0x41];
     const AAC_SEQ: &[u8] = &[0xAF, 0x00, 0x12, 0x10];
@@ -172,7 +180,12 @@ mod tests {
     #[test]
     fn changed_sequence_header_drops_staged_keyframe_identical_keeps_it() {
         let store = InitCacheStore::new();
-        let other_seq: &[u8] = &[0x17, 0x00, 0x00, 0x00, 0x00, 0x02];
+        // A different, equally valid configuration (other SPS/PPS bytes).
+        let mut changed = AVC_SEQ.to_vec();
+        let n = changed.len();
+        changed[n - 1] = 0x02;
+        changed[n - 6] = 0x02;
+        let other_seq: &[u8] = &changed;
         store.update_from_frame("live", "s", 1, 1, 0, AVC_SEQ);
         store.update_from_frame("live", "s", 1, 1, 10, AVC_KEY);
         store.update_from_frame("live", "s", 1, 1, 10, AVC_SEQ);
