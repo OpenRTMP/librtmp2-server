@@ -66,6 +66,8 @@ env:
 jobs:
   bench:
     name: cargo bench + sweep
+    outputs:
+      sweep_complete: ${{ steps.sweep_state.outputs.complete }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     # A benchmark problem must never turn a finished release red.
@@ -244,6 +246,18 @@ jobs:
             scripts/run_rtmp_benchmarks.sh "$RUNNER_TEMP/sweep-work" 2>&1 | tee sweep.log
 
       # ---- results -------------------------------------------------------------
+      - name: Note whether the sweep ran to completion
+        id: sweep_state
+        if: always()
+        run: |
+          # A failed competitor leg keeps the finished legs (above), which is
+          # fine for a new release. It must not replace a published record.
+          if [ "$RUN_SWEEP" = "true" ] && [ "${{ steps.sweep.outcome }}" = "success" ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Collect results
         run: |
           python3 scripts/bench_report.py collect --suite http_api \
@@ -325,7 +339,8 @@ jobs:
   publish-release:
     name: attach to release
     needs: bench
-    if: (inputs.tag || inputs.release_tag) != ''
+    # A re-measurement replaces published data, so it needs a complete sweep.
+    if: (inputs.tag || inputs.release_tag) != '' && (inputs.release_tag == '' || needs.bench.outputs.sweep_complete == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: write
