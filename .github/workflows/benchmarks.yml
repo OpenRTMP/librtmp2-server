@@ -38,6 +38,13 @@ on:
         description: Viewer counts of the load test
         type: string
         default: 500 1000 2000
+      release_tag:
+        description: >-
+          Re-measure an already published release (e.g. v0.6.5) and replace its
+          benchmark data: the asset and benchmark block of the GitHub Release
+          and bench/releases/<tag>.json. Leave empty for a normal manual run.
+        type: string
+        default: ""
   workflow_call:
     inputs:
       tag:
@@ -62,20 +69,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     # A benchmark problem must never turn a finished release red.
-    continue-on-error: ${{ inputs.tag && true || false }}
+    continue-on-error: ${{ (inputs.tag || inputs.release_tag) && true || false }}
     concurrency:
-      group: bench-${{ inputs.tag || github.ref }}
+      group: bench-${{ (inputs.tag || inputs.release_tag) || github.ref }}
       cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
     env:
-      KIND: ${{ inputs.tag && 'release' || (github.event_name == 'push' && 'main' || (github.event_name == 'pull_request' && 'pr' || 'manual')) }}
-      TAG: ${{ inputs.tag }}
-      RUN_SWEEP: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.sweep) }}
+      KIND: ${{ (inputs.tag || inputs.release_tag) && 'release' || (github.event_name == 'push' && 'main' || (github.event_name == 'pull_request' && 'pr' || 'manual')) }}
+      TAG: ${{ (inputs.tag || inputs.release_tag) }}
+      # A release (called from release.yml) always runs the sweep. Inside a
+      # called workflow github.event_name is the caller's event, so a release
+      # started by hand reports workflow_dispatch while `inputs.sweep` does not
+      # exist there; judging by the event alone left RUN_SWEEP empty and
+      # silently skipped the sweep.
+      RUN_SWEEP: ${{ (inputs.tag || inputs.release_tag) != '' || (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.sweep)) }}
       SWEEP_SERVERS: ${{ github.event_name == 'workflow_dispatch' && inputs.servers || 'lrtmp2-server nginx mediamtx srs liveforge' }}
       LOAD_VIEWERS: ${{ github.event_name == 'workflow_dispatch' && inputs.load_viewers || '500 1000 2000' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.sha }}
+          ref: ${{ (inputs.tag || inputs.release_tag) || github.sha }}
           persist-credentials: false
 
       - name: Install Rust
@@ -279,7 +291,7 @@ jobs:
   publish-main:
     name: update BENCHMARKS.md and latest run
     needs: bench
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !(inputs.tag || inputs.release_tag)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -313,18 +325,19 @@ jobs:
   publish-release:
     name: attach to release
     needs: bench
-    if: inputs.tag != ''
+    if: (inputs.tag || inputs.release_tag) != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ (inputs.tag || inputs.release_tag) }}
+      REPLACE_RECORD: ${{ inputs.release_tag != '' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ (inputs.tag || inputs.release_tag) }}
           persist-credentials: false
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -357,8 +370,9 @@ jobs:
         working-directory: data
         run: |
           # Release results are immutable: a re-run must not change the
-          # baseline later runs are compared against.
-          if [ -e "bench/releases/$TAG.json" ]; then echo "bench/releases/$TAG.json already recorded"; exit 0; fi
+          # baseline later runs are compared against. Only an explicit
+          # re-measurement (release_tag input) replaces a recorded release.
+          if [ -e "bench/releases/$TAG.json" ] && [ "$REPLACE_RECORD" != "true" ]; then echo "bench/releases/$TAG.json already recorded"; exit 0; fi
           mkdir -p bench/releases
           cp ../results.json "bench/releases/$TAG.json"
           # Run the helper of main (data/), not the one of the tag: older tags do not have it.
