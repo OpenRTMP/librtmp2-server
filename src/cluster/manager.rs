@@ -2446,7 +2446,15 @@ impl ClusterManager {
         for sid in &ids {
             self.media.evict_init_cache_for_stream(sid);
         }
-        self.media.reset_timelines_for(&ids);
+        // Only drop timeline state for streams whose ownership row disappeared
+        // (stream removed). On an ownership move the remapper must survive so
+        // failover cannot reset player timelines.
+        let removed: Vec<String> = ids
+            .iter()
+            .filter(|sid| self.ownership.get(sid.as_str()).is_none())
+            .cloned()
+            .collect();
+        self.media.reset_timelines_for(&removed);
         self.resubscribe_active_players(&ids);
     }
 
