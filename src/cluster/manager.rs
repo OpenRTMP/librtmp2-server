@@ -1760,6 +1760,15 @@ impl ClusterManager {
                 // acquire has since taken the route — leave it alone.
                 continue;
             }
+            let local_publishers = self.db.publisher_list(Some(&stream_id));
+            if local_publishers.iter().any(|p| p.active) {
+                // A local publisher still holds the stream: the identity
+                // tuple is not unique (same node, same wall-clock second), so
+                // this match may be a live reservation of a same-second
+                // acquire — releasing it would drop ownership out from under
+                // that publisher.
+                continue;
+            }
             crate::log_warn!(
                 "Cluster: acquire for stream {stream_id} timed out client-side but later \
                  committed at epoch={}; releasing the unclaimed reservation",
