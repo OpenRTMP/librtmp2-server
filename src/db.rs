@@ -297,6 +297,18 @@ fn map_optional<T>(result: rusqlite::Result<T>) -> DbLookup<T> {
     }
 }
 
+/// FNV-1a 64-bit hash, used to fingerprint access keys in log lines without
+/// emitting any credential characters. Non-cryptographic: a collision only
+/// makes two log entries ambiguous for an operator, never an auth decision.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[allow(dead_code)]
 pub fn now_ts() -> i64 {
     SystemTime::now()
@@ -630,11 +642,11 @@ impl Db {
             count += 1;
             // Never log the raw credential: these keys are live publish/play/
             // stats secrets and the log sink is not permission-restricted
-            // (unlike the DB file). A short stable fingerprint (leading chars
-            // plus length) still lets an operator identify the key to rotate.
-            let prefix: String = key.chars().take(8).collect();
+            // (unlike the DB file). A stable non-reversible fingerprint (plus
+            // length) still lets an operator identify the key to rotate.
+            let key_fp = fnv1a64(key.as_bytes());
             crate::log_error!(
-                "SECURITY: access key=<redacted> (len {}, prefix '{prefix}') is shared across \
+                "SECURITY: access key=<redacted> (len {}, key_fp={key_fp:016x}) is shared across \
                  multiple streams (pre-existing collision from before global key uniqueness was \
                  enforced). RTMP publish auth resolves publish_key directly, so this may let a play \
                  credential on one stream publish on another. Rotate the affected key(s) via the \
