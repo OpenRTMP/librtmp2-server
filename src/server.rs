@@ -1067,7 +1067,6 @@ fn apply_auth_completion(
             {
                 bump_publish_generation(completion.conn_id);
             } else if completion.allow
-                && was_pending
                 && !applied
                 && let Some(publisher_id) = completion.publisher_id.as_deref()
             {
@@ -1077,11 +1076,6 @@ fn apply_auth_completion(
             }
         }
         AuthKind::Play => {
-            let was_pending = server
-                .connections
-                .iter()
-                .find(|conn| conn.conn_id == completion.conn_id)
-                .is_some_and(|conn| conn.has_pending_play_authorization());
             let _ = server.complete_play_authorization(
                 completion.conn_id,
                 completion.request_id,
@@ -1099,7 +1093,6 @@ fn apply_auth_completion(
                             .is_some_and(|stream| stream.is_playing)
                 });
             if completion.allow
-                && was_pending
                 && !applied
                 && let Some(player_id) = completion.player_id.as_deref()
             {
