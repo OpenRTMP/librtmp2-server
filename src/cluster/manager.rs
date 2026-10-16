@@ -948,8 +948,14 @@ impl ClusterManager {
             epoch,
         })?
         .into_coord_result()?;
-        self.ownership.clear(stream_id);
-        self.refresh_subscriptions_for(&[stream_id.to_string()]);
+        // The state machine treats a release whose epoch no longer matches the
+        // stored row as an idempotent success, so only drop the tracker entry
+        // while it still records the epoch this release targeted — a delayed
+        // or retried release of a superseded epoch must not clear a newer
+        // owner's entry.
+        if self.ownership.clear_if_epoch(stream_id, epoch) {
+            self.refresh_subscriptions_for(&[stream_id.to_string()]);
+        }
         Ok(())
     }
 
