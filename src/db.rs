@@ -8,7 +8,7 @@
 use parking_lot::{Mutex, ReentrantMutex};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1170,6 +1170,41 @@ impl Db {
         stmt.query_map([], Self::load_stream_row)
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
+    }
+
+    /// Returns the ids of every stream. Callers testing many ids for
+    /// existence (e.g. pruning stale media timelines) can do so with one
+    /// query instead of a `stream_get` per id. `Failed` on any read/decode
+    /// error so callers can fail safe rather than treat every id as deleted.
+    pub fn stream_ids(&self) -> DbLookup<HashSet<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare("SELECT id FROM streams") {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("stream_ids: prepare failed: {e}");
+                return DbLookup::Failed;
+            }
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                crate::log_error!("stream_ids: query failed: {e}");
+                return DbLookup::Failed;
+            }
+        };
+        let mut ids = HashSet::new();
+        for row in rows {
+            match row {
+                Ok(id) => {
+                    ids.insert(id);
+                }
+                Err(e) => {
+                    crate::log_error!("stream_ids: row decode failed: {e}");
+                    return DbLookup::Failed;
+                }
+            }
+        }
+        DbLookup::Ok(ids)
     }
 
     // ==================== STREAM VIEWERS (configured play keys) ====================

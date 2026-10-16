@@ -2398,11 +2398,16 @@ impl ClusterManager {
         // entry to report, so its remapper would otherwise leak.
         let timeline_ids = self.media.timeline_stream_ids();
         if !timeline_ids.is_empty() {
-            let gone: Vec<String> = timeline_ids
-                .into_iter()
-                .filter(|sid| matches!(self.db.stream_get(sid), crate::db::DbLookup::Missing))
-                .collect();
-            self.media.reset_timelines_for(&gone);
+            // One query for every timeline id instead of a `stream_get` per
+            // id per tick. A DB error skips pruning this tick (fail-safe)
+            // rather than treating every stream as gone.
+            if let crate::db::DbLookup::Ok(existing) = self.db.stream_ids() {
+                let gone: Vec<String> = timeline_ids
+                    .into_iter()
+                    .filter(|sid| !existing.contains(sid))
+                    .collect();
+                self.media.reset_timelines_for(&gone);
+            }
         }
         if changed.is_empty() {
             return;
