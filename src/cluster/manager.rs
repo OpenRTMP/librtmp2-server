@@ -1882,7 +1882,16 @@ impl ClusterManager {
         while let Ok(effect) = rx.try_recv() {
             match effect {
                 StateEffect::DrainStream(id) => self.mark_stream_draining(&id),
-                StateEffect::ClearDrainStream(id) => self.mark_stream_drain_clear(&id),
+                StateEffect::ClearDrainStream(id) => {
+                    self.mark_stream_drain_clear(&id);
+                    // `ClearDrainStream` is emitted only when a finalize
+                    // actually removed the stream row, and a stream deleted
+                    // after its publisher already released ownership emits no
+                    // later `OwnershipChanged`, so drop its timeline remapper
+                    // here instead of waiting for the next
+                    // `sync_ownership_from_db` prune to be triggered.
+                    self.media.reset_timelines_for(std::slice::from_ref(&id));
+                }
                 StateEffect::RevokeViewer(id) => self.mark_viewer_revoked(&id),
                 StateEffect::ApiToken(token) => self.apply_api_token(&token),
                 StateEffect::OwnershipChanged => self.sync_ownership_from_db(),
