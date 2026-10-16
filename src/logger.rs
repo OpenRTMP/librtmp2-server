@@ -124,7 +124,7 @@ fn write_line(level: Level, prefix: &str, msg: &str) {
         }
     } else {
         drop(guard);
-        eprint!("{line}");
+        let _ = std::io::stderr().write_all(line.as_bytes());
         let _ = std::io::stderr().flush();
     }
 }
