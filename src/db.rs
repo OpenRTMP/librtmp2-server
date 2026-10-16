@@ -2549,6 +2549,27 @@ impl Db {
         updated
     }
 
+    /// True when any players row with this id still exists (active or not).
+    /// Lets callers distinguish a vanished row from a failed update and treat
+    /// the slot as already released — see `HlsSessionRegistry::deactivate`.
+    pub fn player_exists(&self, id: &str) -> bool {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT 1 FROM players WHERE id=? LIMIT 1",
+            params![id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                crate::log_error!("player_exists failed: {e}");
+                // Fail closed: treat as present so a failed release keeps
+                // retrying until the DB is readable again.
+                true
+            }
+        }
+    }
+
     /// Periodic stats/RTT flush for an already-active player.
     ///
     /// See [`Self::publisher_update_stats`]: never writes `active`, and only

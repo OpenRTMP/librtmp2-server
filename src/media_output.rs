@@ -1445,6 +1445,12 @@ impl HlsSessionRegistry {
     fn deactivate(db: &Db, session: &HlsViewerSession) -> bool {
         let mut player = session.player.clone();
         player.active = false;
+        if !db.player_exists(&player.id) {
+            // Row already gone (e.g. dropped by a cluster snapshot install):
+            // the slot is released, so let the caller drop the entry instead
+            // of retrying the failed update forever.
+            return true;
+        }
         if db.player_update(&player.id, &player) {
             true
         } else {
