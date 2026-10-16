@@ -186,6 +186,7 @@ pub fn set_bind_port(bind: &str, new_port: u16) -> String {
 }
 
 fn port_of(bind: &str, default: u16) -> u16 {
+    let bind = bind.trim();
     if let Some(bracket_end) = bind.rfind(']') {
         return bind[bracket_end + 1..]
             .strip_prefix(':')
