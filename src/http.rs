@@ -1649,6 +1649,20 @@ async fn handle_stream_player_create(
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
     let path = format!("/api/v1/streams/{id}/players");
+    if state.deleted_streams.lock().contains(&id) {
+        log_http_access(
+            "POST",
+            &path,
+            &peer,
+            StatusCode::CONFLICT,
+            "stream is being deleted",
+        );
+        return err_json(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "Stream is being deleted; try again shortly",
+        );
+    }
     let stream = match state.db.stream_get(&id) {
         DbLookup::Ok(s) => s,
         DbLookup::Missing => {
