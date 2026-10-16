@@ -2329,40 +2329,60 @@ impl Db {
 
     const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active";
 
+    /// Infallible wrapper around [`Self::publisher_list_checked`] for callers
+    /// that treat a DB error as "no publishers". Prefer the checked variant
+    /// when an empty list must not be confused with a failed lookup.
     pub fn publisher_list(&self, stream_id: Option<&str>) -> Vec<Publisher> {
+        match self.publisher_list_checked(stream_id) {
+            DbLookup::Ok(list) => list,
+            DbLookup::Missing | DbLookup::Failed => Vec::new(),
+        }
+    }
+
+    /// Fallible variant of [`Self::publisher_list`]: `Failed` on any
+    /// prepare/query/row-decode error so callers can fail safe instead of
+    /// treating an empty list as "no publisher". Never `Missing` — no rows
+    /// is `Ok(vec![])`.
+    pub fn publisher_list_checked(&self, stream_id: Option<&str>) -> DbLookup<Vec<Publisher>> {
         let conn = self.conn.lock();
-        match stream_id {
-            Some(sid) => {
-                let mut stmt = match conn.prepare(&format!(
-                    "SELECT {} FROM publishers WHERE stream_id=? AND active=1",
-                    Self::PUBLISHER_COLS
-                )) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        crate::log_error!("publisher_list: prepare failed: {e}");
-                        return Vec::new();
-                    }
-                };
-                stmt.query_map(params![sid], Self::load_publisher_row)
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
+        let sql = match stream_id {
+            Some(_) => format!(
+                "SELECT {} FROM publishers WHERE stream_id=? AND active=1",
+                Self::PUBLISHER_COLS
+            ),
+            None => format!(
+                "SELECT {} FROM publishers WHERE active=1",
+                Self::PUBLISHER_COLS
+            ),
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("publisher_list_checked: prepare failed: {e}");
+                return DbLookup::Failed;
             }
-            None => {
-                let mut stmt = match conn.prepare(&format!(
-                    "SELECT {} FROM publishers WHERE active=1",
-                    Self::PUBLISHER_COLS
-                )) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        crate::log_error!("publisher_list: prepare failed: {e}");
-                        return Vec::new();
-                    }
-                };
-                stmt.query_map([], Self::load_publisher_row)
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params_from_iter(stream_id),
+            Self::load_publisher_row,
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                crate::log_error!("publisher_list_checked: query failed: {e}");
+                return DbLookup::Failed;
+            }
+        };
+        let mut publishers = Vec::new();
+        for row in rows {
+            match row {
+                Ok(p) => publishers.push(p),
+                Err(e) => {
+                    crate::log_error!("publisher_list_checked: row decode failed: {e}");
+                    return DbLookup::Failed;
+                }
             }
         }
+        DbLookup::Ok(publishers)
     }
 
     pub fn publisher_list_all(&self) -> Vec<Publisher> {

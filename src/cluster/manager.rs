@@ -1766,13 +1766,31 @@ impl ClusterManager {
                 // acquire has since taken the route — leave it alone.
                 continue;
             }
-            let local_publishers = self.db.publisher_list(Some(&stream_id));
+            let local_publishers = match self.db.publisher_list_checked(Some(&stream_id)) {
+                crate::db::DbLookup::Ok(list) => list,
+                crate::db::DbLookup::Missing => Vec::new(),
+                crate::db::DbLookup::Failed => {
+                    // Do not read a failed lookup as "no publisher": releasing
+                    // now could drop ownership out from under a live
+                    // publisher. Keep the record and retry next tick.
+                    self.pending_ambiguous_acquires
+                        .lock()
+                        .push((stream_id, node_id, acquired_at));
+                    continue;
+                }
+            };
             if local_publishers.iter().any(|p| p.active) {
-                // A local publisher still holds the stream: the identity
-                // tuple is not unique (same node, same wall-clock second), so
-                // this match may be a live reservation of a same-second
-                // acquire — releasing it would drop ownership out from under
-                // that publisher.
+                // A local publisher still holds the stream: either it is
+                // publishing under a genuine same-second acquire — its own
+                // epoch-matched release frees the row, so the retry below
+                // becomes a no-op — or it is a restored old publisher whose
+                // row is a ghost for the committed newer epoch. Keep the
+                // record so the release is retried once the publisher
+                // disconnects, instead of dropping it (which would leave a
+                // ghost owner no node reconciles).
+                self.pending_ambiguous_acquires
+                    .lock()
+                    .push((stream_id, node_id, acquired_at));
                 continue;
             }
             crate::log_warn!(
