@@ -628,11 +628,18 @@ impl Db {
         let mut count = 0u32;
         for key in rows.flatten() {
             count += 1;
+            // Never log the raw credential: these keys are live publish/play/
+            // stats secrets and the log sink is not permission-restricted
+            // (unlike the DB file). A short stable fingerprint (leading chars
+            // plus length) still lets an operator identify the key to rotate.
+            let prefix: String = key.chars().take(8).collect();
             crate::log_error!(
-                "SECURITY: access key '{key}' is shared across multiple streams (pre-existing \
-                 collision from before global key uniqueness was enforced). RTMP publish auth \
-                 resolves publish_key directly, so this may let a play credential on one stream \
-                 publish on another. Rotate the affected key(s) via the admin API."
+                "SECURITY: access key=<redacted> (len {}, prefix '{prefix}') is shared across \
+                 multiple streams (pre-existing collision from before global key uniqueness was \
+                 enforced). RTMP publish auth resolves publish_key directly, so this may let a play \
+                 credential on one stream publish on another. Rotate the affected key(s) via the \
+                 admin API.",
+                key.len()
             );
         }
         if count > 0 {
