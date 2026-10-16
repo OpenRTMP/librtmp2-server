@@ -2446,6 +2446,7 @@ impl ClusterManager {
         for sid in &ids {
             self.media.evict_init_cache_for_stream(sid);
         }
+        self.media.reset_timelines_for(&ids);
         self.resubscribe_active_players(&ids);
     }
 
