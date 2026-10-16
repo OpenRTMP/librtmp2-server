@@ -221,6 +221,9 @@ impl SqliteStateMachine {
             ClusterCommand::CreateViewer { viewer } => match self.db.viewer_add(viewer) {
                 Ok(()) => ClusterResponse::Ok,
                 Err(ViewerAddError::Duplicate) => ClusterResponse::Duplicate,
+                // A CreateViewer ordered after BeginDeleteStream must not
+                // resurrect a play key on a stream that is mid-delete.
+                Err(ViewerAddError::ParentUnavailable) => ClusterResponse::Conflict,
                 Err(ViewerAddError::Db) => ClusterResponse::Error("db".into()),
             },
             ClusterCommand::DeleteViewer {
@@ -324,7 +327,11 @@ impl SqliteStateMachine {
                 for v in viewers {
                     match self.db.viewer_add(v) {
                         Ok(()) | Err(ViewerAddError::Duplicate) => {}
-                        Err(ViewerAddError::Db) => {
+                        // Streams are seeded before viewers with
+                        // `pending_delete` cleared, so an unavailable parent
+                        // here means the seed data itself is inconsistent:
+                        // fail rather than silently drop the viewer row.
+                        Err(ViewerAddError::ParentUnavailable) | Err(ViewerAddError::Db) => {
                             return ClusterResponse::Error(
                                 "viewer_add failed during SeedFromStandalone".into(),
                             );

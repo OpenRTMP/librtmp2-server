@@ -136,6 +136,7 @@ impl StateCoordinator {
             StateCoordinator::Standalone(db) => match db.viewer_add(viewer) {
                 Ok(()) => Ok(()),
                 Err(crate::db::ViewerAddError::Duplicate) => Err(CoordError::Duplicate),
+                Err(crate::db::ViewerAddError::ParentUnavailable) => Err(CoordError::Conflict),
                 Err(crate::db::ViewerAddError::Db) => Err(CoordError::Db),
             },
             #[cfg(feature = "cluster")]

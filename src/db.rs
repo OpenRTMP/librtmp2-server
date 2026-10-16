@@ -266,6 +266,9 @@ pub enum StreamAddError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewerAddError {
     Duplicate,
+    /// The parent stream row is missing or mid-delete (`pending_delete=1`),
+    /// so no viewer may be attached to it.
+    ParentUnavailable,
     Db,
 }
 
@@ -1223,18 +1226,25 @@ impl Db {
         } else if Self::key_globally_in_use_locked(&conn, &v.play_key) {
             return Err(ViewerAddError::Duplicate);
         }
+        // The parent check is part of the INSERT itself so a delete starting
+        // after the caller's read cannot slip a viewer in behind it:
+        // `stream_disable` sets `pending_delete=1` in its own write, and this
+        // statement sees either that write or none of it. Zero rows also
+        // means the parent row is gone entirely.
         match conn.execute(
             "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
-             VALUES (?,?,?,?,?,?)",
+             SELECT ?,?,?,?,?,? FROM streams WHERE id=? AND pending_delete=0",
             params![
                 v.id,
                 v.stream_id,
                 v.name,
                 v.play_key,
                 v.enabled,
-                v.created_at
+                v.created_at,
+                v.stream_id
             ],
         ) {
+            Ok(0) => Err(ViewerAddError::ParentUnavailable),
             Ok(_) => Ok(()),
             Err(e) => {
                 crate::log_error!("viewer_add insert failed for {}: {e}", v.id);

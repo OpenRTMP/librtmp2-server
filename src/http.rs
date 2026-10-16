@@ -1796,6 +1796,23 @@ async fn handle_stream_player_create(
             );
             return err_json(StatusCode::CONFLICT, "CONFLICT", "play_key already in use");
         }
+        // The DB-side guard rejects a parent that went pending-delete after
+        // the marker check above, so the delete race still ends in the same
+        // 409 the marker check returns.
+        Err(CoordError::Conflict) => {
+            log_http_access(
+                "POST",
+                &path,
+                &peer,
+                StatusCode::CONFLICT,
+                "stream is being deleted",
+            );
+            return err_json(
+                StatusCode::CONFLICT,
+                "CONFLICT",
+                "Stream is being deleted; try again shortly",
+            );
+        }
         Err(_) => {
             log_http_access(
                 "POST",
