@@ -1493,10 +1493,16 @@ impl MediaHub {
         self.subs.peers_for_stream(app, stream)
     }
 
-    /// Reset timeline remappers for streams whose ownership epoch changed.
+    /// Reset timeline remappers for the given streams.
     pub fn reset_timelines_for(&self, stream_ids: &[String]) {
         let mut maps = self.timelines.lock();
         maps.retain(|(_app, sid), _| !stream_ids.iter().any(|s| s == sid));
+    }
+
+    /// Stream ids that currently have timeline remappers.
+    pub fn timeline_stream_ids(&self) -> Vec<String> {
+        let maps = self.timelines.lock();
+        maps.keys().map(|(_app, sid)| sid.clone()).collect()
     }
 
     pub fn evict_init_cache(&self, app: &str, stream: &str) {

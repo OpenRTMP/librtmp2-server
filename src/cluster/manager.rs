@@ -2393,6 +2393,17 @@ impl ClusterManager {
     fn sync_ownership_from_db(&self) {
         let owners = self.db.stream_owner_list();
         let changed = self.ownership.sync_from(&owners);
+        // Reclaim timeline state for deleted streams even when the ownership
+        // sync reports no change: a locally released stream has no tracker
+        // entry to report, so its remapper would otherwise leak.
+        let timeline_ids = self.media.timeline_stream_ids();
+        if !timeline_ids.is_empty() {
+            let gone: Vec<String> = timeline_ids
+                .into_iter()
+                .filter(|sid| matches!(self.db.stream_get(sid), crate::db::DbLookup::Missing))
+                .collect();
+            self.media.reset_timelines_for(&gone);
+        }
         if changed.is_empty() {
             return;
         }
@@ -2446,15 +2457,6 @@ impl ClusterManager {
         for sid in &ids {
             self.media.evict_init_cache_for_stream(sid);
         }
-        // Only drop timeline state for streams whose ownership row disappeared
-        // (stream removed). On an ownership move the remapper must survive so
-        // failover cannot reset player timelines.
-        let removed: Vec<String> = ids
-            .iter()
-            .filter(|sid| self.ownership.get(sid.as_str()).is_none())
-            .cloned()
-            .collect();
-        self.media.reset_timelines_for(&removed);
         self.resubscribe_active_players(&ids);
     }
 
