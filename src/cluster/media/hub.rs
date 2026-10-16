@@ -1261,6 +1261,14 @@ impl MediaHub {
             return;
         };
         for (app, stream) in self.subs.streams_for_peer(peer_id) {
+            // A refcount can also come from this peer's own inbound Subscribe
+            // (owner-side fan-out state); replaying it as an outbound Subscribe
+            // asks the peer to serve a stream this node owns, which it must
+            // deny — and the denial's give-up path would then clear the inbound
+            // refcount and stop fanout. Skip streams this node owns locally.
+            if self.ownership.get(&stream).is_some_and(|(node, _)| node == self.local_id) {
+                continue;
+            }
             let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
             // Soft control: if the queue rejects, leave the refcount in place
             // for a later reconnect/resubscribe — this path is only entered
