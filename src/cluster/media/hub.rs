@@ -1261,6 +1261,18 @@ impl MediaHub {
             return;
         };
         for (app, stream) in self.subs.streams_for_peer(peer_id) {
+            // A refcount can also come from this peer's own inbound Subscribe
+            // (owner-side fan-out state); replaying it as an outbound Subscribe
+            // asks the peer to serve a stream this node owns, which it must
+            // deny — and the denial's give-up path would then clear the inbound
+            // refcount and stop fanout. Skip streams this node owns locally.
+            if self
+                .ownership
+                .get(&stream)
+                .is_some_and(|(node, _)| node == self.local_id)
+            {
+                continue;
+            }
             let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
             // Soft control: if the queue rejects, leave the refcount in place
             // for a later reconnect/resubscribe — this path is only entered
@@ -1481,10 +1493,16 @@ impl MediaHub {
         self.subs.peers_for_stream(app, stream)
     }
 
-    /// Reset timeline remappers for streams whose ownership epoch changed.
+    /// Reset timeline remappers for the given streams.
     pub fn reset_timelines_for(&self, stream_ids: &[String]) {
         let mut maps = self.timelines.lock();
         maps.retain(|(_app, sid), _| !stream_ids.iter().any(|s| s == sid));
+    }
+
+    /// Stream ids that currently have timeline remappers.
+    pub fn timeline_stream_ids(&self) -> Vec<String> {
+        let maps = self.timelines.lock();
+        maps.keys().map(|(_app, sid)| sid.clone()).collect()
     }
 
     pub fn evict_init_cache(&self, app: &str, stream: &str) {
@@ -2677,6 +2695,42 @@ mod tests {
             "failed first Subscribe must roll back the refcount"
         );
         assert_eq!(n.hub.sub_gen(2, "live", "s"), gen_before + 1);
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn resubscribe_skips_locally_owned_streams() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        // Two refcounts for peer 2: one for a stream this node owns locally
+        // (owner-side inbound fan-out state) and one for a remotely owned
+        // stream that genuinely needs an outbound Subscribe.
+        n.hub.subs.add(2, "live", "owned");
+        n.hub.subs.add(2, "live", "remote");
+        n.ownership.set("owned", 1, 0); // local_id == 1
+        n.ownership.set("remote", 2, 0);
+
+        // A fresh connection replays every refcount via `resubscribe_peer_locked`.
+        n.hub.connect_peer(2, &addr).await.unwrap();
+        let mut s = accept_from_hub(&listener, 2).await;
+
+        // Only the remotely owned stream is replayed.
+        match next(&mut s).await {
+            MediaMessage::Subscribe { stream, .. } => assert_eq!(stream, "remote"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Nothing may be queued for the locally owned stream: replaying it
+        // would ask the peer to serve a stream this node owns.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next(&mut s))
+                .await
+                .is_err(),
+            "a locally owned stream must not produce an outbound Subscribe"
+        );
+        // Only the wire replay was suppressed; the refcount is preserved.
+        assert_eq!(n.hub.subscribed_nodes_for("live", "owned"), vec![2]);
         n.hub.shutdown();
     }
 

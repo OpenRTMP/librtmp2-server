@@ -136,6 +136,7 @@ impl StateCoordinator {
             StateCoordinator::Standalone(db) => match db.viewer_add(viewer) {
                 Ok(()) => Ok(()),
                 Err(crate::db::ViewerAddError::Duplicate) => Err(CoordError::Duplicate),
+                Err(crate::db::ViewerAddError::ParentUnavailable) => Err(CoordError::Conflict),
                 Err(crate::db::ViewerAddError::Db) => Err(CoordError::Db),
             },
             #[cfg(feature = "cluster")]
@@ -217,5 +218,61 @@ impl StateCoordinator {
             StateCoordinator::Cluster(mgr) => Some(mgr),
             StateCoordinator::Standalone(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Db, Stream};
+
+    fn sample_stream(id: &str) -> Stream {
+        Stream {
+            id: id.to_string(),
+            name: format!("Stream {id}"),
+            app: "live".to_string(),
+            publish_key: format!("pub_{id}_key_with_sufficient_length_here"),
+            play_key: format!("play_{id}_key_with_sufficient_length_here"),
+            stats_key: format!("st_{id}_key_with_sufficient_length_here"),
+            enabled: true,
+            created_at: 0,
+        }
+    }
+
+    fn sample_viewer(stream_id: &str, id: &str, play_key: &str) -> StreamViewer {
+        StreamViewer {
+            id: id.to_string(),
+            stream_id: stream_id.to_string(),
+            name: "Guest".to_string(),
+            play_key: crate::keygen::test_pad_access_key(play_key),
+            enabled: true,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn create_viewer_maps_pending_delete_parent_to_conflict() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let coordinator = StateCoordinator::standalone(Arc::clone(&db));
+        db.stream_add(&sample_stream("sv")).unwrap();
+        assert_eq!(db.stream_disable("sv"), Some(true));
+
+        let viewer = sample_viewer("sv", "viewer_pending", "viewer_pending_key");
+        assert_eq!(
+            coordinator.create_viewer(&viewer),
+            Err(CoordError::Conflict),
+            "a viewer for a mid-delete parent must be a conflict, not a db error"
+        );
+    }
+
+    #[test]
+    fn create_viewer_succeeds_for_a_live_parent() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let coordinator = StateCoordinator::standalone(Arc::clone(&db));
+        db.stream_add(&sample_stream("svlive")).unwrap();
+
+        let viewer = sample_viewer("svlive", "viewer_live", "viewer_live_key");
+        assert_eq!(coordinator.create_viewer(&viewer), Ok(()));
+        assert_eq!(db.viewer_list("svlive").len(), 2);
     }
 }

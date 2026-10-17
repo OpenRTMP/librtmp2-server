@@ -8,7 +8,7 @@
 use parking_lot::{Mutex, ReentrantMutex};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -266,6 +266,9 @@ pub enum StreamAddError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewerAddError {
     Duplicate,
+    /// The parent stream row is missing or mid-delete (`pending_delete=1`),
+    /// so no viewer may be attached to it.
+    ParentUnavailable,
     Db,
 }
 
@@ -295,6 +298,18 @@ fn map_optional<T>(result: rusqlite::Result<T>) -> DbLookup<T> {
             DbLookup::Failed
         }
     }
+}
+
+/// FNV-1a 64-bit hash, used to fingerprint access keys in log lines without
+/// emitting any credential characters. Non-cryptographic: a collision only
+/// makes two log entries ambiguous for an operator, never an auth decision.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[allow(dead_code)]
@@ -628,11 +643,18 @@ impl Db {
         let mut count = 0u32;
         for key in rows.flatten() {
             count += 1;
+            // Never log the raw credential: these keys are live publish/play/
+            // stats secrets and the log sink is not permission-restricted
+            // (unlike the DB file). A stable non-reversible fingerprint (plus
+            // length) still lets an operator identify the key to rotate.
+            let key_fp = fnv1a64(key.as_bytes());
             crate::log_error!(
-                "SECURITY: access key '{key}' is shared across multiple streams (pre-existing \
-                 collision from before global key uniqueness was enforced). RTMP publish auth \
-                 resolves publish_key directly, so this may let a play credential on one stream \
-                 publish on another. Rotate the affected key(s) via the admin API."
+                "SECURITY: access key=<redacted> (len {}, key_fp={key_fp:016x}) is shared across \
+                 multiple streams (pre-existing collision from before global key uniqueness was \
+                 enforced). RTMP publish auth resolves publish_key directly, so this may let a play \
+                 credential on one stream publish on another. Rotate the affected key(s) via the \
+                 admin API.",
+                key.len()
             );
         }
         if count > 0 {
@@ -1150,6 +1172,41 @@ impl Db {
             .unwrap_or_default()
     }
 
+    /// Returns the ids of every stream. Callers testing many ids for
+    /// existence (e.g. pruning stale media timelines) can do so with one
+    /// query instead of a `stream_get` per id. `Failed` on any read/decode
+    /// error so callers can fail safe rather than treat every id as deleted.
+    pub fn stream_ids(&self) -> DbLookup<HashSet<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare("SELECT id FROM streams") {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("stream_ids: prepare failed: {e}");
+                return DbLookup::Failed;
+            }
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                crate::log_error!("stream_ids: query failed: {e}");
+                return DbLookup::Failed;
+            }
+        };
+        let mut ids = HashSet::new();
+        for row in rows {
+            match row {
+                Ok(id) => {
+                    ids.insert(id);
+                }
+                Err(e) => {
+                    crate::log_error!("stream_ids: row decode failed: {e}");
+                    return DbLookup::Failed;
+                }
+            }
+        }
+        DbLookup::Ok(ids)
+    }
+
     // ==================== STREAM VIEWERS (configured play keys) ====================
 
     fn load_viewer_row(row: &rusqlite::Row) -> rusqlite::Result<StreamViewer> {
@@ -1204,18 +1261,25 @@ impl Db {
         } else if Self::key_globally_in_use_locked(&conn, &v.play_key) {
             return Err(ViewerAddError::Duplicate);
         }
+        // The parent check is part of the INSERT itself so a delete starting
+        // after the caller's read cannot slip a viewer in behind it:
+        // `stream_disable` sets `pending_delete=1` in its own write, and this
+        // statement sees either that write or none of it. Zero rows also
+        // means the parent row is gone entirely.
         match conn.execute(
             "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
-             VALUES (?,?,?,?,?,?)",
+             SELECT ?,?,?,?,?,? FROM streams WHERE id=? AND pending_delete=0",
             params![
                 v.id,
                 v.stream_id,
                 v.name,
                 v.play_key,
                 v.enabled,
-                v.created_at
+                v.created_at,
+                v.stream_id
             ],
         ) {
+            Ok(0) => Err(ViewerAddError::ParentUnavailable),
             Ok(_) => Ok(()),
             Err(e) => {
                 crate::log_error!("viewer_add insert failed for {}: {e}", v.id);
@@ -2265,40 +2329,60 @@ impl Db {
 
     const PUBLISHER_COLS: &'static str = "id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active";
 
+    /// Infallible wrapper around [`Self::publisher_list_checked`] for callers
+    /// that treat a DB error as "no publishers". Prefer the checked variant
+    /// when an empty list must not be confused with a failed lookup.
     pub fn publisher_list(&self, stream_id: Option<&str>) -> Vec<Publisher> {
+        match self.publisher_list_checked(stream_id) {
+            DbLookup::Ok(list) => list,
+            DbLookup::Missing | DbLookup::Failed => Vec::new(),
+        }
+    }
+
+    /// Fallible variant of [`Self::publisher_list`]: `Failed` on any
+    /// prepare/query/row-decode error so callers can fail safe instead of
+    /// treating an empty list as "no publisher". Never `Missing` — no rows
+    /// is `Ok(vec![])`.
+    pub fn publisher_list_checked(&self, stream_id: Option<&str>) -> DbLookup<Vec<Publisher>> {
         let conn = self.conn.lock();
-        match stream_id {
-            Some(sid) => {
-                let mut stmt = match conn.prepare(&format!(
-                    "SELECT {} FROM publishers WHERE stream_id=? AND active=1",
-                    Self::PUBLISHER_COLS
-                )) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        crate::log_error!("publisher_list: prepare failed: {e}");
-                        return Vec::new();
-                    }
-                };
-                stmt.query_map(params![sid], Self::load_publisher_row)
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
+        let sql = match stream_id {
+            Some(_) => format!(
+                "SELECT {} FROM publishers WHERE stream_id=? AND active=1",
+                Self::PUBLISHER_COLS
+            ),
+            None => format!(
+                "SELECT {} FROM publishers WHERE active=1",
+                Self::PUBLISHER_COLS
+            ),
+        };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log_error!("publisher_list_checked: prepare failed: {e}");
+                return DbLookup::Failed;
             }
-            None => {
-                let mut stmt = match conn.prepare(&format!(
-                    "SELECT {} FROM publishers WHERE active=1",
-                    Self::PUBLISHER_COLS
-                )) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        crate::log_error!("publisher_list: prepare failed: {e}");
-                        return Vec::new();
-                    }
-                };
-                stmt.query_map([], Self::load_publisher_row)
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params_from_iter(stream_id),
+            Self::load_publisher_row,
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                crate::log_error!("publisher_list_checked: query failed: {e}");
+                return DbLookup::Failed;
+            }
+        };
+        let mut publishers = Vec::new();
+        for row in rows {
+            match row {
+                Ok(p) => publishers.push(p),
+                Err(e) => {
+                    crate::log_error!("publisher_list_checked: row decode failed: {e}");
+                    return DbLookup::Failed;
+                }
             }
         }
+        DbLookup::Ok(publishers)
     }
 
     pub fn publisher_list_all(&self) -> Vec<Publisher> {
@@ -2540,6 +2624,27 @@ impl Db {
             self.player_count_decr(&p.viewer_id);
         }
         updated
+    }
+
+    /// True when any players row with this id still exists (active or not).
+    /// Lets callers distinguish a vanished row from a failed update and treat
+    /// the slot as already released — see `HlsSessionRegistry::deactivate`.
+    pub fn player_exists(&self, id: &str) -> bool {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT 1 FROM players WHERE id=? LIMIT 1",
+            params![id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                crate::log_error!("player_exists failed: {e}");
+                // Fail closed: treat as present so a failed release keeps
+                // retrying until the DB is readable again.
+                true
+            }
+        }
     }
 
     /// Periodic stats/RTT flush for an already-active player.
@@ -4072,5 +4177,177 @@ mod tests {
             db.stream_find_by_stats_key("c"),
             DbLookup::Missing
         ));
+    }
+
+    #[test]
+    fn stream_ids_returns_empty_then_every_id() {
+        let db = Db::open(":memory:").unwrap();
+        assert!(matches!(db.stream_ids(), DbLookup::Ok(ids) if ids.is_empty()));
+
+        db.stream_add(&sample_stream(
+            "ids_one",
+            "pub_ids_1",
+            "play_ids_1",
+            "st_ids_1",
+        ))
+        .unwrap();
+        db.stream_add(&sample_stream(
+            "ids_two",
+            "pub_ids_2",
+            "play_ids_2",
+            "st_ids_2",
+        ))
+        .unwrap();
+
+        let DbLookup::Ok(ids) = db.stream_ids() else {
+            panic!("stream_ids must succeed");
+        };
+        assert_eq!(
+            ids,
+            HashSet::from(["ids_one".to_string(), "ids_two".to_string()])
+        );
+    }
+
+    #[test]
+    fn stream_ids_fails_when_streams_table_is_missing() {
+        let db = Db::open(":memory:").unwrap();
+        db.with_conn(|c| c.execute("DROP TABLE streams", []))
+            .unwrap();
+        assert!(
+            matches!(db.stream_ids(), DbLookup::Failed),
+            "a failed stream-id read must be reported, not treated as empty"
+        );
+    }
+
+    #[test]
+    fn publisher_list_checked_covers_empty_row_decode_and_prepare_failures() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+
+        // No publisher rows: the checked variant is Ok(empty), not Failed, and
+        // the infallible wrapper is empty as well.
+        assert!(matches!(
+            db.publisher_list_checked(Some("stream1")),
+            DbLookup::Ok(ref list) if list.is_empty()
+        ));
+        assert!(matches!(
+            db.publisher_list_checked(None),
+            DbLookup::Ok(ref list) if list.is_empty()
+        ));
+        assert!(db.publisher_list(Some("stream1")).is_empty());
+
+        assert!(db.publisher_try_acquire(&Publisher {
+            id: "pub_plc".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+        let DbLookup::Ok(list) = db.publisher_list_checked(Some("stream1")) else {
+            panic!("checked publisher list must succeed");
+        };
+        assert_eq!(list.len(), 1);
+
+        // A row whose bytes_in cannot be decoded fails the whole lookup rather
+        // than returning a truncated list, and publisher_list then reports
+        // "no publishers" for the same row.
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO publishers \
+                 (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,\
+                  video_height,fps,audio_sample_rate,audio_channels,bytes_in,\
+                  bitrate_kbps,rtt_ms,connected_at,active) \
+                 VALUES ('pub_bad','stream1','live','x','h264','aac',0,0,0,0,0,-1,0,0,0,1)",
+                [],
+            )
+        })
+        .unwrap();
+        assert!(matches!(
+            db.publisher_list_checked(Some("stream1")),
+            DbLookup::Failed
+        ));
+        assert!(db.publisher_list(Some("stream1")).is_empty());
+
+        // With the table gone, prepare fails and both variants degrade safely.
+        db.with_conn(|c| c.execute("DROP TABLE publishers", []))
+            .unwrap();
+        assert!(matches!(db.publisher_list_checked(None), DbLookup::Failed));
+        assert!(db.publisher_list(None).is_empty());
+    }
+
+    #[test]
+    fn player_exists_detects_absent_rows_and_fails_closed_on_error() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert!(db.player_try_acquire(&Player {
+            id: "pl_exists".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id,
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+
+        assert!(db.player_exists("pl_exists"));
+        assert!(!db.player_exists("pl_missing"));
+
+        db.with_conn(|c| c.execute("DROP TABLE players", []))
+            .unwrap();
+        assert!(
+            db.player_exists("pl_exists"),
+            "a failed lookup must fail closed so a release keeps retrying"
+        );
+    }
+
+    #[test]
+    fn viewer_add_rejects_pending_delete_and_missing_parent() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "parent",
+            "pub_pending_parent_key_with_sufficient_length",
+            "pl_pending_parent_key_with_sufficient_length",
+            "st_pending_parent_key_with_sufficient_length",
+        ))
+        .unwrap();
+        assert_eq!(db.stream_disable("parent"), Some(true));
+
+        // A viewer that does not share the parent's play key reaches the
+        // parent-guarded INSERT and is rejected while the stream is mid-delete.
+        let pending = StreamViewer {
+            id: "viewer_pending".to_string(),
+            stream_id: "parent".to_string(),
+            name: "Pending".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_pending_key"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&pending),
+            Err(ViewerAddError::ParentUnavailable)
+        );
+
+        // A stream id with no row at all is ParentUnavailable too.
+        let orphan = StreamViewer {
+            id: "viewer_orphan".to_string(),
+            stream_id: "no_such_stream".to_string(),
+            name: "Orphan".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_orphan_key"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&orphan),
+            Err(ViewerAddError::ParentUnavailable)
+        );
     }
 }

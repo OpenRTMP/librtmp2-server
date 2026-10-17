@@ -39,6 +39,20 @@ impl OwnershipTracker {
         self.owners.lock().remove(stream_id);
     }
 
+    /// Remove the entry only when it still records `epoch`; returns whether it
+    /// was removed. The state machine reports success for a release whose epoch
+    /// no longer matches (idempotent no-op), so a delayed or retried release of
+    /// a superseded epoch must not clear a newer owner's entry.
+    pub fn clear_if_epoch(&self, stream_id: &str, epoch: u64) -> bool {
+        let mut g = self.owners.lock();
+        if g.get(stream_id).map(|(_, e)| *e) == Some(epoch) {
+            g.remove(stream_id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn clear_for_node(&self, node_id: u64) {
         self.owners.lock().retain(|_, (nid, _)| *nid != node_id);
     }
@@ -122,5 +136,29 @@ impl OwnershipTracker {
             Some((n, e)) => *n == node_id && *e == epoch,
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_if_epoch_removes_only_the_matching_epoch() {
+        let t = OwnershipTracker::new();
+
+        // Matching epoch: removed and reported.
+        t.set("s", 1, 7);
+        assert!(t.clear_if_epoch("s", 7));
+        assert!(t.get("s").is_none());
+
+        // A delayed/retried release of a superseded epoch must not clear the
+        // newer owner's entry, and reports that nothing was removed.
+        t.set("s", 2, 9);
+        assert!(!t.clear_if_epoch("s", 7));
+        assert_eq!(t.get("s"), Some((2, 9)));
+
+        // Unknown stream: nothing to remove.
+        assert!(!t.clear_if_epoch("missing", 9));
     }
 }

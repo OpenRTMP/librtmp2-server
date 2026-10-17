@@ -221,6 +221,9 @@ impl SqliteStateMachine {
             ClusterCommand::CreateViewer { viewer } => match self.db.viewer_add(viewer) {
                 Ok(()) => ClusterResponse::Ok,
                 Err(ViewerAddError::Duplicate) => ClusterResponse::Duplicate,
+                // A CreateViewer ordered after BeginDeleteStream must not
+                // resurrect a play key on a stream that is mid-delete.
+                Err(ViewerAddError::ParentUnavailable) => ClusterResponse::Conflict,
                 Err(ViewerAddError::Db) => ClusterResponse::Error("db".into()),
             },
             ClusterCommand::DeleteViewer {
@@ -324,7 +327,11 @@ impl SqliteStateMachine {
                 for v in viewers {
                     match self.db.viewer_add(v) {
                         Ok(()) | Err(ViewerAddError::Duplicate) => {}
-                        Err(ViewerAddError::Db) => {
+                        // Streams are seeded before viewers with
+                        // `pending_delete` cleared, so an unavailable parent
+                        // here means the seed data itself is inconsistent:
+                        // fail rather than silently drop the viewer row.
+                        Err(ViewerAddError::ParentUnavailable) | Err(ViewerAddError::Db) => {
                             return ClusterResponse::Error(
                                 "viewer_add failed during SeedFromStandalone".into(),
                             );
@@ -1434,6 +1441,36 @@ mod tests {
             [StateEffect::RevokeViewer(id)] if id == "v2"
         ));
         assert_eq!(sm.db().viewer_list("sv").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_viewer_after_begin_delete_conflicts() {
+        let (mut sm, _rx) = sm_with_effects();
+        let s = stream("sd");
+        apply_one(&mut sm, 1, create(&s)).await.unwrap();
+
+        // The delete flow's first step disables the parent and marks it
+        // `pending_delete=1` while RTMP sessions drain.
+        assert_eq!(sm.db().stream_disable("sd"), Some(true));
+        assert_eq!(sm.db().stream_pending_delete("sd"), Some(true));
+
+        // A CreateViewer ordered after BeginDeleteStream must not resurrect a
+        // play key on the mid-delete stream: the parent-guarded insert reports
+        // ParentUnavailable, which maps to Conflict.
+        assert_eq!(
+            apply_one(
+                &mut sm,
+                2,
+                ClusterCommand::CreateViewer {
+                    viewer: extra_viewer("sd", "v-del")
+                }
+            )
+            .await
+            .unwrap(),
+            ClusterResponse::Conflict
+        );
+        // Only the default viewer remains; nothing was inserted.
+        assert_eq!(sm.db().viewer_list("sd").len(), 1);
     }
 
     #[tokio::test]

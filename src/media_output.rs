@@ -1445,6 +1445,12 @@ impl HlsSessionRegistry {
     fn deactivate(db: &Db, session: &HlsViewerSession) -> bool {
         let mut player = session.player.clone();
         player.active = false;
+        if !db.player_exists(&player.id) {
+            // Row already gone (e.g. dropped by a cluster snapshot install):
+            // the slot is released, so let the caller drop the entry instead
+            // of retrying the failed update forever.
+            return true;
+        }
         if db.player_update(&player.id, &player) {
             true
         } else {
@@ -3438,6 +3444,39 @@ mod tests {
         // Expired after the stream was deleted: the entry is simply dropped.
         assert!(sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0));
         assert_eq!(db.stream_delete("s1"), Some(true));
+        sessions.purge_stale(&db, Duration::ZERO);
+        assert!(sessions.inner.lock().is_empty());
+    }
+
+    #[test]
+    fn hls_deactivate_drops_session_whose_player_row_is_gone() {
+        let db = Db::open(":memory:").unwrap();
+        let viewer = add_stream(&db, "s1", "cam", 'a', true);
+        let DbLookup::Ok(stream) = db.stream_get("s1") else {
+            panic!("stream missing");
+        };
+        let sessions = HlsSessionRegistry::default();
+        let client = IpAddr::from([192, 0, 2, 7]);
+        let ttl = Duration::from_secs(30);
+        assert!(sessions.reserve_or_renew(&db, &viewer, &stream, client, ttl, 0));
+        let session = sessions
+            .inner
+            .lock()
+            .get(&viewer.id)
+            .and_then(|m| m.get(&client))
+            .cloned()
+            .expect("session registered");
+
+        // The players row is gone (e.g. dropped by a cluster snapshot
+        // install): the slot is already released, so deactivate must report
+        // success instead of a retryable failure.
+        assert!(db.player_remove(&session.player.id));
+        assert!(
+            HlsSessionRegistry::deactivate(&db, &session),
+            "a missing players row must report the slot as released"
+        );
+
+        // The stale entry is therefore dropped rather than retried forever.
         sessions.purge_stale(&db, Duration::ZERO);
         assert!(sessions.inner.lock().is_empty());
     }

@@ -1649,6 +1649,20 @@ async fn handle_stream_player_create(
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
     let path = format!("/api/v1/streams/{id}/players");
+    if state.deleted_streams.lock().contains(&id) {
+        log_http_access(
+            "POST",
+            &path,
+            &peer,
+            StatusCode::CONFLICT,
+            "stream is being deleted",
+        );
+        return err_json(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "Stream is being deleted; try again shortly",
+        );
+    }
     let stream = match state.db.stream_get(&id) {
         DbLookup::Ok(s) => s,
         DbLookup::Missing => {
@@ -1781,6 +1795,23 @@ async fn handle_stream_player_create(
                 "play key already in use",
             );
             return err_json(StatusCode::CONFLICT, "CONFLICT", "play_key already in use");
+        }
+        // The DB-side guard rejects a parent that went pending-delete after
+        // the marker check above, so the delete race still ends in the same
+        // 409 the marker check returns.
+        Err(CoordError::Conflict) => {
+            log_http_access(
+                "POST",
+                &path,
+                &peer,
+                StatusCode::CONFLICT,
+                "stream is being deleted",
+            );
+            return err_json(
+                StatusCode::CONFLICT,
+                "CONFLICT",
+                "Stream is being deleted; try again shortly",
+            );
         }
         Err(_) => {
             log_http_access(
@@ -4195,6 +4226,62 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(error_code(&body), "CONFLICT");
         assert!(body.contains("play_key already in use"));
+    }
+
+    #[tokio::test]
+    async fn player_create_conflicts_while_stream_marker_set() {
+        let state = roomy_state();
+        add_stream(&state, "pcmark");
+        // The delete drain owns this stream: the marker check must reject the
+        // request before it ever reads or writes the DB.
+        state.deleted_streams.lock().insert("pcmark".to_string());
+        let app = router(state.clone());
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/pcmark/players",
+            true,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "CONFLICT");
+        assert!(body.contains("Stream is being deleted; try again shortly"));
+        assert_eq!(
+            state.db.viewer_list("pcmark").len(),
+            1,
+            "no play key may be added to a stream that is being deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn player_create_conflicts_when_parent_is_pending_delete() {
+        let state = roomy_state();
+        add_stream(&state, "pcguard");
+        // Mark the parent mid-delete directly in the DB, without the in-memory
+        // marker, so the request passes the marker check and reaches
+        // viewer_add's parent guard.
+        assert_eq!(state.db.stream_disable("pcguard"), Some(true));
+        assert!(!state.deleted_streams.lock().contains("pcguard"));
+        let app = router(state.clone());
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/pcguard/players",
+            true,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "CONFLICT");
+        assert!(body.contains("Stream is being deleted; try again shortly"));
+        assert_eq!(
+            state.db.viewer_list("pcguard").len(),
+            1,
+            "the DB-side guard must stop the viewer insert"
+        );
     }
 
     #[tokio::test]
