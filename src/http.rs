@@ -4229,6 +4229,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn player_create_conflicts_while_stream_marker_set() {
+        let state = roomy_state();
+        add_stream(&state, "pcmark");
+        // The delete drain owns this stream: the marker check must reject the
+        // request before it ever reads or writes the DB.
+        state.deleted_streams.lock().insert("pcmark".to_string());
+        let app = router(state.clone());
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/pcmark/players",
+            true,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "CONFLICT");
+        assert!(body.contains("Stream is being deleted; try again shortly"));
+        assert_eq!(
+            state.db.viewer_list("pcmark").len(),
+            1,
+            "no play key may be added to a stream that is being deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn player_create_conflicts_when_parent_is_pending_delete() {
+        let state = roomy_state();
+        add_stream(&state, "pcguard");
+        // Mark the parent mid-delete directly in the DB, without the in-memory
+        // marker, so the request passes the marker check and reaches
+        // viewer_add's parent guard.
+        assert_eq!(state.db.stream_disable("pcguard"), Some(true));
+        assert!(!state.deleted_streams.lock().contains("pcguard"));
+        let app = router(state.clone());
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/pcguard/players",
+            true,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "CONFLICT");
+        assert!(body.contains("Stream is being deleted; try again shortly"));
+        assert_eq!(
+            state.db.viewer_list("pcguard").len(),
+            1,
+            "the DB-side guard must stop the viewer insert"
+        );
+    }
+
+    #[tokio::test]
     async fn player_delete_validation_errors() {
         let state = roomy_state();
         let only_viewer = add_stream(&state, "pd");

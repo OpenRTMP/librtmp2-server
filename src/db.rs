@@ -4178,4 +4178,176 @@ mod tests {
             DbLookup::Missing
         ));
     }
+
+    #[test]
+    fn stream_ids_returns_empty_then_every_id() {
+        let db = Db::open(":memory:").unwrap();
+        assert!(matches!(db.stream_ids(), DbLookup::Ok(ids) if ids.is_empty()));
+
+        db.stream_add(&sample_stream(
+            "ids_one",
+            "pub_ids_1",
+            "play_ids_1",
+            "st_ids_1",
+        ))
+        .unwrap();
+        db.stream_add(&sample_stream(
+            "ids_two",
+            "pub_ids_2",
+            "play_ids_2",
+            "st_ids_2",
+        ))
+        .unwrap();
+
+        let DbLookup::Ok(ids) = db.stream_ids() else {
+            panic!("stream_ids must succeed");
+        };
+        assert_eq!(
+            ids,
+            HashSet::from(["ids_one".to_string(), "ids_two".to_string()])
+        );
+    }
+
+    #[test]
+    fn stream_ids_fails_when_streams_table_is_missing() {
+        let db = Db::open(":memory:").unwrap();
+        db.with_conn(|c| c.execute("DROP TABLE streams", []))
+            .unwrap();
+        assert!(
+            matches!(db.stream_ids(), DbLookup::Failed),
+            "a failed stream-id read must be reported, not treated as empty"
+        );
+    }
+
+    #[test]
+    fn publisher_list_checked_covers_empty_row_decode_and_prepare_failures() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+
+        // No publisher rows: the checked variant is Ok(empty), not Failed, and
+        // the infallible wrapper is empty as well.
+        assert!(matches!(
+            db.publisher_list_checked(Some("stream1")),
+            DbLookup::Ok(ref list) if list.is_empty()
+        ));
+        assert!(matches!(
+            db.publisher_list_checked(None),
+            DbLookup::Ok(ref list) if list.is_empty()
+        ));
+        assert!(db.publisher_list(Some("stream1")).is_empty());
+
+        assert!(db.publisher_try_acquire(&Publisher {
+            id: "pub_plc".to_string(),
+            stream_id: "stream1".to_string(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+        let DbLookup::Ok(list) = db.publisher_list_checked(Some("stream1")) else {
+            panic!("checked publisher list must succeed");
+        };
+        assert_eq!(list.len(), 1);
+
+        // A row whose bytes_in cannot be decoded fails the whole lookup rather
+        // than returning a truncated list, and publisher_list then reports
+        // "no publishers" for the same row.
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO publishers \
+                 (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,\
+                  video_height,fps,audio_sample_rate,audio_channels,bytes_in,\
+                  bitrate_kbps,rtt_ms,connected_at,active) \
+                 VALUES ('pub_bad','stream1','live','x','h264','aac',0,0,0,0,0,-1,0,0,0,1)",
+                [],
+            )
+        })
+        .unwrap();
+        assert!(matches!(
+            db.publisher_list_checked(Some("stream1")),
+            DbLookup::Failed
+        ));
+        assert!(db.publisher_list(Some("stream1")).is_empty());
+
+        // With the table gone, prepare fails and both variants degrade safely.
+        db.with_conn(|c| c.execute("DROP TABLE publishers", []))
+            .unwrap();
+        assert!(matches!(db.publisher_list_checked(None), DbLookup::Failed));
+        assert!(db.publisher_list(None).is_empty());
+    }
+
+    #[test]
+    fn player_exists_detects_absent_rows_and_fails_closed_on_error() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert!(db.player_try_acquire(&Player {
+            id: "pl_exists".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id,
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+
+        assert!(db.player_exists("pl_exists"));
+        assert!(!db.player_exists("pl_missing"));
+
+        db.with_conn(|c| c.execute("DROP TABLE players", []))
+            .unwrap();
+        assert!(
+            db.player_exists("pl_exists"),
+            "a failed lookup must fail closed so a release keeps retrying"
+        );
+    }
+
+    #[test]
+    fn viewer_add_rejects_pending_delete_and_missing_parent() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "parent",
+            "pub_pending_parent_key_with_sufficient_length",
+            "pl_pending_parent_key_with_sufficient_length",
+            "st_pending_parent_key_with_sufficient_length",
+        ))
+        .unwrap();
+        assert_eq!(db.stream_disable("parent"), Some(true));
+
+        // A viewer that does not share the parent's play key reaches the
+        // parent-guarded INSERT and is rejected while the stream is mid-delete.
+        let pending = StreamViewer {
+            id: "viewer_pending".to_string(),
+            stream_id: "parent".to_string(),
+            name: "Pending".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_pending_key"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&pending),
+            Err(ViewerAddError::ParentUnavailable)
+        );
+
+        // A stream id with no row at all is ParentUnavailable too.
+        let orphan = StreamViewer {
+            id: "viewer_orphan".to_string(),
+            stream_id: "no_such_stream".to_string(),
+            name: "Orphan".to_string(),
+            play_key: crate::keygen::test_pad_access_key("viewer_orphan_key"),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        assert_eq!(
+            db.viewer_add(&orphan),
+            Err(ViewerAddError::ParentUnavailable)
+        );
+    }
 }
