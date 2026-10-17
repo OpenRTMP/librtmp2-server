@@ -1741,6 +1741,10 @@ impl ClusterManager {
                 if let Some(hooks) = self.session_hooks.lock().as_ref() {
                     hooks.deleted_streams.lock().remove(&stream_id);
                 }
+                // Sessions are gone, so no further frame can recreate the
+                // remapper: complete the deferred timeline reset.
+                self.media
+                    .reset_timelines_for(std::slice::from_ref(&stream_id));
             }
         }
     }
@@ -1890,7 +1894,15 @@ impl ClusterManager {
                     // later `OwnershipChanged`, so drop its timeline remapper
                     // here instead of waiting for the next
                     // `sync_ownership_from_db` prune to be triggered.
-                    self.media.reset_timelines_for(std::slice::from_ref(&id));
+                    //
+                    // Only once no local session can still emit frames for the
+                    // stream: otherwise a frame processed after this point
+                    // would recreate the remapper, and the prune would reset it
+                    // again on every tick while sessions remain. The deferred
+                    // reset happens in `retry_pending_drain_clears`.
+                    if self.local_live_sessions(&id) == 0 {
+                        self.media.reset_timelines_for(std::slice::from_ref(&id));
+                    }
                 }
                 StateEffect::RevokeViewer(id) => self.mark_viewer_revoked(&id),
                 StateEffect::ApiToken(token) => self.apply_api_token(&token),
@@ -2429,10 +2441,20 @@ impl ClusterManager {
             // id per tick. A DB error skips pruning this tick (fail-safe)
             // rather than treating every stream as gone.
             if let crate::db::DbLookup::Ok(existing) = self.db.stream_ids() {
-                let gone: Vec<String> = timeline_ids
-                    .into_iter()
-                    .filter(|sid| !existing.contains(sid))
-                    .collect();
+                let mut gone: Vec<String> = Vec::new();
+                for sid in timeline_ids {
+                    if existing.contains(&sid) {
+                        continue;
+                    }
+                    if self.local_live_sessions(&sid) == 0 {
+                        gone.push(sid);
+                    } else {
+                        // Local sessions can still emit frames for this
+                        // deleted stream; defer the reset (and the repeated
+                        // prune) until they drain.
+                        self.pending_drain_clears.lock().insert(sid);
+                    }
+                }
                 self.media.reset_timelines_for(&gone);
             }
         }
@@ -3823,6 +3845,28 @@ mod tests {
             !ids.iter().any(|s| s == "gone"),
             "a timeline whose stream row is gone must be pruned"
         );
+
+        // A deleted stream that still has local sessions is deferred: its
+        // remapper is kept (frames can still arrive) and the reset runs once
+        // the sessions drain.
+        n.hooks.sessions.store(1, Ordering::SeqCst);
+        m.media().fanout_local_frame(frame("gone")).await;
+        m.sync_ownership_from_db();
+        let ids = m.media().timeline_stream_ids();
+        assert!(
+            ids.iter().any(|s| s == "gone"),
+            "a deleted stream with live local sessions must keep its timeline"
+        );
+        assert!(m.pending_drain_clears.lock().contains("gone"));
+
+        n.hooks.sessions.store(0, Ordering::SeqCst);
+        m.retry_pending_drain_clears();
+        let ids = m.media().timeline_stream_ids();
+        assert!(
+            !ids.iter().any(|s| s == "gone"),
+            "the deferred reset must run once the sessions drain"
+        );
+        assert!(!m.pending_drain_clears.lock().contains("gone"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3998,6 +4042,18 @@ mod tests {
         let n = bootstrap(1, |_| {}).await;
         let m = &n.mgr;
         m.create_stream(&stream("busy")).unwrap();
+        // Register a timeline remapper for the stream.
+        m.media()
+            .fanout_local_frame(ExportedFrame {
+                app: "live".into(),
+                stream: "busy".into(),
+                epoch: 1,
+                frame_type: 1,
+                timestamp: 0,
+                hint: librtmp2::DeliveryHint::Droppable,
+                payload: vec![0x17, 0x01],
+            })
+            .await;
         n.hooks.sessions.store(2, Ordering::SeqCst);
         m.begin_delete_stream("busy").unwrap();
         m.finalize_delete_stream("busy").unwrap();
@@ -4009,14 +4065,22 @@ mod tests {
                 .contains("busy"))
             .await
         );
-        // Still has live sessions: the marker must stay set.
+        // Still has live sessions: the marker and the timeline must stay set.
         m.retry_pending_drain_clears();
         assert!(n.hooks.deleted.lock().contains("busy"));
+        assert!(
+            m.media().timeline_stream_ids().iter().any(|s| s == "busy"),
+            "the timeline reset must be deferred while local sessions remain"
+        );
 
         n.hooks.sessions.store(0, Ordering::SeqCst);
         m.retry_pending_drain_clears();
         assert!(!m.pending_drain_clears.lock().contains("busy"));
         assert!(!n.hooks.deleted.lock().contains("busy"));
+        assert!(
+            !m.media().timeline_stream_ids().iter().any(|s| s == "busy"),
+            "the deferred timeline reset must run once sessions drain"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
