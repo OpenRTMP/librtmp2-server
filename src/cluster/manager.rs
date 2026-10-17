@@ -3728,6 +3728,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_keeps_pending_acquire_when_publisher_lookup_fails() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("fx")).unwrap();
+        let epoch = m.acquire_stream_owner("fx", 1, 0, 21).unwrap();
+
+        // Force `publisher_list_checked` to report Failed: a failed lookup must
+        // not read as "no publisher", or the release below would drop
+        // ownership out from under a possibly-live publisher.
+        m.db()
+            .with_conn(|c| c.execute_batch("DROP TABLE publishers"))
+            .unwrap();
+
+        m.pending_ambiguous_acquires
+            .lock()
+            .push(("fx".into(), 1, 21));
+        m.reconcile_ambiguous_acquires();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || m
+                .pending_ambiguous_acquires
+                .lock()
+                .iter()
+                .any(|(s, nid, at)| s == "fx" && *nid == 1 && *at == 21))
+            .await,
+            "a failed publisher lookup must keep the ambiguous acquire pending"
+        );
+        assert!(
+            m.db()
+                .stream_owner_get("fx")
+                .is_some_and(|o| o.epoch == epoch),
+            "the owner row must not be released on a failed lookup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_keeps_pending_acquire_while_local_publisher_is_active() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("act")).unwrap();
+        let epoch = m.acquire_stream_owner("act", 1, 0, 33).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-act", "act")));
+
+        m.pending_ambiguous_acquires
+            .lock()
+            .push(("act".into(), 1, 33));
+        m.reconcile_ambiguous_acquires();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || m
+                .pending_ambiguous_acquires
+                .lock()
+                .iter()
+                .any(|(s, nid, at)| s == "act" && *nid == 1 && *at == 33))
+            .await,
+            "a live local publisher must keep the ambiguous acquire pending"
+        );
+        assert!(
+            m.db()
+                .stream_owner_get("act")
+                .is_some_and(|o| o.epoch == epoch),
+            "the owner row must not be released while a local publisher holds the stream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_ownership_prunes_timelines_for_deleted_streams() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("keep")).unwrap();
+
+        // Local fan-out registers a timeline remapper per (app, stream).
+        let frame = |s: &str| ExportedFrame {
+            app: "live".into(),
+            stream: s.into(),
+            epoch: 1,
+            frame_type: 1,
+            timestamp: 0,
+            hint: librtmp2::DeliveryHint::Droppable,
+            payload: vec![0x17, 0x01],
+        };
+        m.media().fanout_local_frame(frame("keep")).await;
+        m.media().fanout_local_frame(frame("gone")).await;
+
+        // `gone` has no row in `streams`; `keep` does.
+        m.sync_ownership_from_db();
+        let ids = m.media().timeline_stream_ids();
+        assert!(
+            ids.iter().any(|s| s == "keep"),
+            "a live stream's timeline must survive the prune"
+        );
+        assert!(
+            !ids.iter().any(|s| s == "gone"),
+            "a timeline whose stream row is gone must be pruned"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn drain_resume_and_admin_proofs() {
         let n = bootstrap(1, |_| {}).await;
         let m = &n.mgr;

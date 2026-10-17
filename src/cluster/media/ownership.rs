@@ -138,3 +138,27 @@ impl OwnershipTracker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_if_epoch_removes_only_the_matching_epoch() {
+        let t = OwnershipTracker::new();
+
+        // Matching epoch: removed and reported.
+        t.set("s", 1, 7);
+        assert!(t.clear_if_epoch("s", 7));
+        assert!(t.get("s").is_none());
+
+        // A delayed/retried release of a superseded epoch must not clear the
+        // newer owner's entry, and reports that nothing was removed.
+        t.set("s", 2, 9);
+        assert!(!t.clear_if_epoch("s", 7));
+        assert_eq!(t.get("s"), Some((2, 9)));
+
+        // Unknown stream: nothing to remove.
+        assert!(!t.clear_if_epoch("missing", 9));
+    }
+}

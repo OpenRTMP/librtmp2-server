@@ -1444,6 +1444,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_viewer_after_begin_delete_conflicts() {
+        let (mut sm, _rx) = sm_with_effects();
+        let s = stream("sd");
+        apply_one(&mut sm, 1, create(&s)).await.unwrap();
+
+        // The delete flow's first step disables the parent and marks it
+        // `pending_delete=1` while RTMP sessions drain.
+        assert_eq!(sm.db().stream_disable("sd"), Some(true));
+        assert_eq!(sm.db().stream_pending_delete("sd"), Some(true));
+
+        // A CreateViewer ordered after BeginDeleteStream must not resurrect a
+        // play key on the mid-delete stream: the parent-guarded insert reports
+        // ParentUnavailable, which maps to Conflict.
+        assert_eq!(
+            apply_one(
+                &mut sm,
+                2,
+                ClusterCommand::CreateViewer {
+                    viewer: extra_viewer("sd", "v-del")
+                }
+            )
+            .await
+            .unwrap(),
+            ClusterResponse::Conflict
+        );
+        // Only the default viewer remains; nothing was inserted.
+        assert_eq!(sm.db().viewer_list("sd").len(), 1);
+    }
+
+    #[tokio::test]
     async fn token_and_cluster_id_commands() {
         let (mut sm, rx) = sm_with_effects();
         assert_eq!(

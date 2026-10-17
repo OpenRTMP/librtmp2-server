@@ -2699,6 +2699,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resubscribe_skips_locally_owned_streams() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        // Two refcounts for peer 2: one for a stream this node owns locally
+        // (owner-side inbound fan-out state) and one for a remotely owned
+        // stream that genuinely needs an outbound Subscribe.
+        n.hub.subs.add(2, "live", "owned");
+        n.hub.subs.add(2, "live", "remote");
+        n.ownership.set("owned", 1, 0); // local_id == 1
+        n.ownership.set("remote", 2, 0);
+
+        // A fresh connection replays every refcount via `resubscribe_peer_locked`.
+        n.hub.connect_peer(2, &addr).await.unwrap();
+        let mut s = accept_from_hub(&listener, 2).await;
+
+        // Only the remotely owned stream is replayed.
+        match next(&mut s).await {
+            MediaMessage::Subscribe { stream, .. } => assert_eq!(stream, "remote"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Nothing may be queued for the locally owned stream: replaying it
+        // would ask the peer to serve a stream this node owns.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next(&mut s))
+                .await
+                .is_err(),
+            "a locally owned stream must not produce an outbound Subscribe"
+        );
+        // Only the wire replay was suppressed; the refcount is preserved.
+        assert_eq!(n.hub.subscribed_nodes_for("live", "owned"), vec![2]);
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
     async fn disconnect_peer_clears_state_and_bumps_generations() {
         let n = node(1);
         let owner = node(2);
