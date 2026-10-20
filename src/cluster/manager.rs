@@ -1224,6 +1224,7 @@ impl ClusterManager {
     /// addresses are validated literal socket addresses, so this is a plain
     /// comparison against the topology this node already trusts.
     fn is_member_source_ip(&self, ip: std::net::IpAddr) -> bool {
+        let ip = ip.to_canonical();
         let ours = [
             self.config.advertise_control(),
             self.config.advertise_media(),
@@ -1237,7 +1238,7 @@ impl ClusterManager {
             )
             .any(|addr| {
                 addr.parse::<std::net::SocketAddr>()
-                    .is_ok_and(|sa| sa.ip() == ip)
+                    .is_ok_and(|sa| sa.ip().to_canonical() == ip)
             })
     }
 
@@ -4332,6 +4333,7 @@ mod tests {
         m.meta()
             .set_addrs(2, "10.0.0.2:1940".into(), "10.0.0.2:1941".into());
         assert!(m.is_member_source_ip("10.0.0.2".parse().unwrap()));
+        assert!(m.is_member_source_ip("::ffff:10.0.0.2".parse().unwrap()));
         assert!(!m.is_member_source_ip("203.0.113.9".parse().unwrap()));
     }
 

@@ -201,6 +201,9 @@ async fn write_frame_v2<W: AsyncWrite + Unpin>(w: &mut W, msg: &MediaMessage) ->
         }
         other => {
             let json = serde_json::to_vec(other).map_err(Error::other)?;
+            if 1 + json.len() > MAX_CONTROL_FRAME as usize {
+                return Err(Error::other("media control frame too large"));
+            }
             let body_len = frame_len(1 + json.len())?;
             let mut buf = Vec::with_capacity(5 + json.len());
             buf.extend_from_slice(&body_len.to_be_bytes());
@@ -888,6 +891,24 @@ mod tests {
         assert!(err.to_string().contains("control frame too large"), "{err}");
         // Only the kind byte was charged; the body was never read.
         assert_eq!(charged.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_control_frame_is_refused_before_writing() {
+        let msg = MediaMessage::Error {
+            code: "x".into(),
+            message: "y".repeat(MAX_CONTROL_FRAME as usize),
+            generation: 0,
+        };
+        let mut out = Vec::new();
+        let err = write_frame(&mut out, &msg, MEDIA_PROTOCOL_VERSION)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("control frame too large"), "{err}");
+        assert!(
+            out.is_empty(),
+            "no bytes may be written for a rejected frame"
+        );
     }
 
     #[tokio::test]

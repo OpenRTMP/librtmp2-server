@@ -85,19 +85,33 @@ fn evict_oldest_cluster_auth_ip(guard: &mut HashMap<IpAddr, Vec<Instant>>, now: 
     true
 }
 
+/// Collapse IPv6 sources to their routed `/64` prefix for auth-failure
+/// accounting. A single host can otherwise mint one bucket per address inside
+/// its prefix and saturate the tracker; IPv4 keys stay unchanged.
+fn cluster_auth_bucket(peer: IpAddr) -> IpAddr {
+    match peer.to_canonical() {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
 /// True when `peer` has exceeded the cluster auth failure budget.
 ///
 /// Only a source that already exhausted its own budget is refused. A source
 /// with no bucket is always allowed to attempt the handshake: the tracker is
 /// keyed solely by failures and is never populated by successful handshakes,
 /// so every legitimate member is an "unseen" IP by construction. Refusing
-/// unseen sources once the map is saturated (an attacker can fill 10,000
-/// buckets from a routed /64) would turn the per-IP brute-force budget into a
-/// cluster-wide control-plane denial of service. The budget is still spent on
-/// actual failed attempts: a source whose own bucket hit the limit keeps being
-/// refused before the challenge, so failing from a fresh address does not reset
-/// an already-throttled one (buckets are keyed per source IP).
+/// unseen sources once the map is saturated would turn the per-IP brute-force
+/// budget into a cluster-wide control-plane denial of service. The budget is
+/// still spent on actual failed attempts: IPv6 sources share one bucket per
+/// routed `/64`, so filling the tracker requires many distinct prefixes, and a
+/// saturated tracker evicts the oldest bucket rather than admitting an
+/// unbounded number of new ones.
 pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
+    let peer = cluster_auth_bucket(peer);
     let mut guard = CLUSTER_AUTH_FAILURES.lock();
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
@@ -111,6 +125,7 @@ pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
 
 /// Record a failed cluster auth handshake attempt from `peer`.
 pub fn record_cluster_auth_failure(peer: IpAddr) {
+    let peer = cluster_auth_bucket(peer);
     let mut guard = CLUSTER_AUTH_FAILURES.lock();
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
@@ -129,7 +144,9 @@ pub fn record_cluster_auth_failure(peer: IpAddr) {
 
 /// Clear auth failures after a successful cluster auth handshake.
 pub fn clear_cluster_auth_failures(peer: IpAddr) {
-    CLUSTER_AUTH_FAILURES.lock().remove(&peer);
+    CLUSTER_AUTH_FAILURES
+        .lock()
+        .remove(&cluster_auth_bucket(peer));
 }
 
 /// RAII guard for a reserved slice of a global in-flight byte budget.
@@ -624,6 +641,27 @@ mod tests {
             "a bucket that exhausted its failure budget must stay throttled"
         );
 
+        super::CLUSTER_AUTH_FAILURES.lock().clear();
+    }
+
+    #[test]
+    #[serial]
+    fn cluster_auth_ipv6_addresses_share_a_slash_64_bucket() {
+        use std::net::IpAddr;
+
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::2".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        super::CLUSTER_AUTH_FAILURES.lock().clear();
+
+        for _ in 0..super::CLUSTER_AUTH_MAX_FAILURES {
+            super::record_cluster_auth_failure(a);
+        }
+        assert!(super::cluster_auth_rate_limited(b));
+        assert!(!super::cluster_auth_rate_limited(other));
+
+        super::clear_cluster_auth_failures(b);
+        assert!(!super::cluster_auth_rate_limited(a));
         super::CLUSTER_AUTH_FAILURES.lock().clear();
     }
 

@@ -20,7 +20,8 @@ begin at `1.0.0`.
   bucket per `/64` so a single host cannot mint one bucket per address.
 - Hardened cluster authentication throttling so a saturated failure tracker
   cannot deny legitimate control-plane peers; an unseen source is now throttled
-  only after its own failure budget is exhausted.
+  only after its own failure budget is exhausted, and IPv6 sources share one
+  bucket per routed `/64`.
 - Hardened the cluster media read budget and v2 control-frame validation so a
   single peer cannot monopolize shared read capacity.
 - A plaintext cluster no longer trusts a peer's advertised `DOWN`/`ISOLATED`
@@ -96,6 +97,11 @@ begin at `1.0.0`.
   (overridable with `OPENRTMP_SRC_ROOT`) instead of a hard-coded path, and
   fails loudly when the source tree is missing, so the suite can no longer run
   silently against a stale destination copy.
+- V2 media control frames are capped at 256 KiB on the write path as well as
+  the read path, so a large control message is rejected locally instead of
+  being sent and terminating the peer's media connection. Member-source
+  pre-auth exemptions canonicalize IPv4-mapped addresses, so a dual-stack
+  listener still recognizes plain IPv4 peers.
 - Adversarial review fixes across auth, cluster, HLS, config, and media paths:
   superseded auth sessions are released independently of their pending state,
   player creation is rejected for a stream that is being deleted, the logger

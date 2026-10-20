@@ -806,11 +806,13 @@ impl MediaSession {
 
     fn abort(mut self, reason: &str, config: &MediaOutputConfig) {
         // The session may already have announced itself through
-        // `MEDIA_EXEC_PUBLISH`; emit the matching end event after the sinks are
-        // disabled so the documented publish/publish_done pair is never left
-        // half-open and completion hooks see closed outputs.
-        for mut sink in std::mem::take(&mut self.sinks) {
-            sink.disable(reason);
+        // `MEDIA_EXEC_PUBLISH`; finalise the sinks and only then emit the
+        // matching end event so completion hooks never see an unterminated
+        // recording or a live HLS playlist. This path runs on the overflow
+        // worker (or the session reaper) rather than the RTMP poll thread.
+        let sinks = std::mem::take(&mut self.sinks);
+        for sink in sinks {
+            sink.stop();
         }
         self.teardown_hooks(config);
         crate::log_warn!(
