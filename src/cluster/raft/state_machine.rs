@@ -1139,6 +1139,16 @@ mod tests {
         LogId::new(CommittedLeaderId::new(1, 1), index)
     }
 
+    #[test]
+    fn log_id_ahead_of_boundary_orders_optional_log_ids() {
+        assert!(!log_id_ahead_of_boundary(None, None));
+        assert!(log_id_ahead_of_boundary(Some(log_id(3)), None));
+        assert!(!log_id_ahead_of_boundary(None, Some(log_id(1))));
+        assert!(!log_id_ahead_of_boundary(Some(log_id(2)), Some(log_id(2))));
+        assert!(log_id_ahead_of_boundary(Some(log_id(3)), Some(log_id(2))));
+        assert!(!log_id_ahead_of_boundary(Some(log_id(2)), Some(log_id(3))));
+    }
+
     fn normal(index: u64, cmd: ClusterCommand) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(index),
