@@ -11,7 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 While in alpha the project stays on `0.x`; semantic-versioning guarantees only
 begin at `1.0.0`.
 
-## [Unreleased]
+## [0.6.6] — 2026-10-21
 
 ### Security
 - Hardened RTMP publish/play authentication throttling so a saturated
@@ -96,6 +96,27 @@ begin at `1.0.0`.
   (overridable with `OPENRTMP_SRC_ROOT`) instead of a hard-coded path, and
   fails loudly when the source tree is missing, so the suite can no longer run
   silently against a stale destination copy.
+- Adversarial review fixes across auth, cluster, HLS, config, and media paths:
+  superseded auth sessions are released independently of their pending state,
+  player creation is rejected for a stream that is being deleted, the logger
+  has a non-panicking stderr fallback, bind strings are trimmed before port
+  parsing, ambiguous ownership acquires held by a local publisher are skipped,
+  ownership tracking is cleared only for the released epoch, the startup key
+  collision audit logs a non-reversible fingerprint, a vanished player row
+  releases its HLS viewer slot, locally owned streams are skipped when a media
+  peer resubscribes, and media timelines are reset only after local sessions
+  drain.
+- Raft snapshot capture now rejects stale captures when an apply advances
+  during serialization and retries with bounded locked serialization, so a
+  lagging follower cannot install a snapshot behind the leader and miss
+  compacted log entries.
+
+### Changed
+- Internal control-plane listener configuration is bundled into a struct
+  (`ControlPlaneListenerConfig`), and the cluster test script derives its
+  source root instead of duplicating path literals. No behavior change.
+- Dependency updates: tokio 1.54, libc 0.2.191, rustls-webpki 0.103.16, and
+  the pinned CI toolchain/install-action revisions.
 
 ## [0.6.5] — 2026-10-14
 
