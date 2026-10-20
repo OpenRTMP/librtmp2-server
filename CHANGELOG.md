@@ -91,8 +91,11 @@ begin at `1.0.0`.
   updates still replace the entry.
 - A full media-output retirement queue no longer aborts the excess session on
   the RTMP poll thread (which could block it for the hook's SIGTERM grace plus
-  `child.wait()`). A dedicated overflow worker owns those teardowns, so the
-  poll thread never waits and at most one overflow teardown runs at a time.
+  `child.wait()`). A dedicated overflow worker owns those teardowns with a
+  bounded backlog, so the poll thread never waits; when the backlog is full the
+  excess session's sinks are disabled without emitting `publish_done`, and a
+  sink worker that misses its shutdown timeout suppresses the completion hook
+  rather than announcing an unflushed recording or playlist.
 - `scripts/docker_cluster_ha.py` derives `SRC_ROOT` from its own checkout
   (overridable with `OPENRTMP_SRC_ROOT`) instead of a hard-coded path, and
   fails loudly when the source tree is missing, so the suite can no longer run

@@ -30,6 +30,11 @@ use tokio_util::io::ReaderStream;
 const DEFAULT_QUEUE_MB: usize = 32;
 const SINK_QUEUE_MESSAGES: usize = 512;
 const RETIRED_SESSION_QUEUE: usize = 16;
+/// Bounded backlog for overflow teardowns. The RTMP poll thread never blocks;
+/// when this backlog is full the excess session's sinks are disabled in place
+/// (no join, no completion hook) so a publish/route-change loop cannot grow an
+/// unbounded set of live sessions, child processes, or queued media.
+const OVERFLOW_SESSION_QUEUE: usize = 64;
 /// Minimum gap between two same-connection republish restarts on one publisher
 /// connection. Each restart rebuilds every media sink (an FFmpeg child plus
 /// sink/monitor threads), so a publisher that walks its RTMP timestamps
@@ -288,10 +293,10 @@ pub struct MediaOutputManager {
     retire_tx: Option<mpsc::SyncSender<MediaSession>>,
     reaper: Option<thread::JoinHandle<()>>,
     /// Overflow path for sessions the bounded retirement queue could not take.
-    /// The sender is unbounded, so the RTMP poll thread never blocks here; a
-    /// dedicated worker (at most one overflow teardown at a time) owns the
-    /// actual abort so the poll thread never waits on a hook child.
-    overflow_tx: Option<mpsc::Sender<(MediaSession, &'static str)>>,
+    /// The sender is bounded, so the RTMP poll thread never blocks; a dedicated
+    /// worker (at most one overflow teardown at a time) owns the actual abort so
+    /// the poll thread never waits on a hook child.
+    overflow_tx: Option<mpsc::SyncSender<(MediaSession, &'static str)>>,
     overflow_worker: Option<thread::JoinHandle<()>>,
     overflow_retirements: AtomicUsize,
 }
@@ -329,7 +334,8 @@ impl MediaOutputManager {
         // the poll thread freezes every connection on the shard. The overflow
         // queue is unbounded (a send never blocks) and one dedicated worker
         // bounds concurrent overflow teardowns to one session.
-        let (overflow_tx, overflow_rx) = mpsc::channel::<(MediaSession, &'static str)>();
+        let (overflow_tx, overflow_rx) =
+            mpsc::sync_channel::<(MediaSession, &'static str)>(OVERFLOW_SESSION_QUEUE);
         let overflow_config = config.clone();
         let overflow_worker = thread::Builder::new()
             .name("media-session-overflow".to_string())
@@ -400,11 +406,23 @@ impl MediaOutputManager {
             session.stream_id
         );
         let session = match self.overflow_tx.as_ref() {
-            // The overflow channel is unbounded, so this send cannot block; it
-            // only fails once the worker is gone.
-            Some(tx) => match tx.send((session, reason)) {
+            // The overflow channel is bounded: never block the poll thread.
+            Some(tx) => match tx.try_send((session, reason)) {
                 Ok(()) => return,
-                Err(mpsc::SendError((session, _))) => session,
+                Err(mpsc::TrySendError::Full((session, _))) => {
+                    // Backlog is full. Disable the sinks without joining or
+                    // emitting publish_done, so no unbounded live session can
+                    // accumulate and a completion hook never sees a partially
+                    // flushed output.
+                    crate::log_error!(
+                        "Media outputs: overflow teardown backlog full; dropping stream='{}' \
+                         reason='{reason}'",
+                        session.stream_id
+                    );
+                    session.drop_incomplete(reason, &self.config);
+                    return;
+                }
+                Err(mpsc::TrySendError::Disconnected((session, _))) => session,
             },
             None => session,
         };
@@ -780,9 +798,16 @@ impl MediaSession {
     /// `publish` always emits `publish_done`, and runs only after the output
     /// workers have flushed/closed their files so a completion hook never sees
     /// an unterminated recording or a live HLS playlist.
-    fn teardown_hooks(&mut self, config: &MediaOutputConfig) {
+    fn teardown_hooks(&mut self, config: &MediaOutputConfig, emit_done: bool) {
         if let Some(mut child) = self.publish_exec.take() {
             terminate_hook_child(&mut child);
+        }
+        if !emit_done {
+            crate::log_warn!(
+                "Media outputs: suppressing publish_done for '{}' because sink shutdown was incomplete",
+                self.stream_id
+            );
+            return;
         }
         if config.exec_publish_done.trim().is_empty() {
             return;
@@ -811,14 +836,37 @@ impl MediaSession {
         // recording or a live HLS playlist. This path runs on the overflow
         // worker (or the session reaper) rather than the RTMP poll thread.
         let sinks = std::mem::take(&mut self.sinks);
+        let mut complete = true;
         for sink in sinks {
-            sink.stop();
+            complete &= sink.stop();
         }
-        self.teardown_hooks(config);
+        self.teardown_hooks(config, complete);
         crate::log_warn!(
             "Media outputs: publisher session cancelled stream='{}' reason='{reason}'",
             self.stream_id
         );
+    }
+
+    /// Drop a session whose overflow backlog is full: disable its sinks without
+    /// joining (the caller may be the RTMP poll thread) and never emit
+    /// `publish_done`, because the outputs were not flushed.
+    fn drop_incomplete(mut self, reason: &str, _config: &MediaOutputConfig) {
+        for mut sink in std::mem::take(&mut self.sinks) {
+            sink.disable(reason);
+        }
+        // Terminating the long-running publish child can wait for its SIGTERM
+        // grace period; do it off the poll thread.
+        if let Some(mut child) = self.publish_exec.take() {
+            let spawned = thread::Builder::new()
+                .name("media-session-drop".to_string())
+                .spawn(move || terminate_hook_child(&mut child));
+            if let Err(e) = spawned {
+                crate::log_error!(
+                    "Media outputs: failed to spawn publish-child teardown for '{}': {e}",
+                    self.stream_id
+                );
+            }
+        }
     }
 
     fn stop(mut self, config: &MediaOutputConfig) {
@@ -826,10 +874,11 @@ impl MediaSession {
         // the recording or HLS output must not observe a file that is still
         // being written.
         let sinks = std::mem::take(&mut self.sinks);
+        let mut complete = true;
         for sink in sinks {
-            sink.stop();
+            complete &= sink.stop();
         }
-        self.teardown_hooks(config);
+        self.teardown_hooks(config, complete);
         crate::log_info!(
             "Media outputs: publisher session stopped stream='{}'",
             self.stream_id
@@ -876,10 +925,10 @@ impl SinkSender {
         self.tx = None;
     }
 
-    fn stop(mut self) {
+    fn stop(mut self) -> bool {
         self.tx = None;
         let Some(worker) = self.worker.take() else {
-            return;
+            return true;
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while !worker.is_finished() && Instant::now() < deadline {
@@ -891,7 +940,9 @@ impl SinkSender {
                     "Media output '{}' worker panicked during shutdown",
                     self.label
                 );
+                return false;
             }
+            true
         } else {
             // The monitor only kills the FFmpeg child once `failed` is set;
             // without it a worker blocked on a stalled child would leak both
@@ -901,6 +952,7 @@ impl SinkSender {
                 "Media output '{}' worker did not stop within 5s; continuing shutdown",
                 self.label
             );
+            false
         }
     }
 }
@@ -2985,6 +3037,32 @@ mod tests {
             elapsed < Duration::from_millis(400),
             "retire blocked the poll thread for {elapsed:?}; the session must be \
              torn down off-thread"
+        );
+        manager.stop_all();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn full_overflow_backlog_drops_without_blocking_or_completion_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: tmp.path().join("rec"),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        manager.ensure_publisher(9, "s1", 1);
+        let session = manager.sessions.remove(&9).unwrap();
+
+        // Rendezvous channel with no receiver: the overflow backlog is full.
+        let (full_tx, _full_rx) = mpsc::sync_channel(0);
+        manager.overflow_tx = Some(full_tx);
+
+        let started = Instant::now();
+        manager.retire_overflow(session, "test backlog full");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "a full overflow backlog must not block the poll thread"
         );
         manager.stop_all();
     }
