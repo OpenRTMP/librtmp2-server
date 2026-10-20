@@ -766,14 +766,16 @@ fn log_id_ahead_of_boundary(current: Option<LogId<u64>>, boundary: Option<LogId<
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        // `apply_lock` serializes capture/install with `apply`, but it is not
-        // held across JSON serialization. Re-check `last_applied` before publish:
-        // a concurrent apply can advance the state machine while we encode, and
-        // shipping a snapshot whose `last_log_id` lags durable state lets log
-        // compaction drop mutations a lagging follower never replays.
+        // Usually serialize outside apply_lock to keep apply latency low.
+        // After repeated concurrent advances, hold the lock through encoding
+        // so sustained writes cannot starve snapshot creation indefinitely.
+        // Publication still checks last_applied under the same lock, ensuring
+        // no snapshot is published behind the current durable state.
+        const MAX_UNLOCKED_ATTEMPTS: usize = 2;
+        let mut retries = 0;
         loop {
+            let mut apply_guard = Some(self.apply_lock.lock());
             let (data, captured_applied, last_membership) = {
-                let _apply = self.apply_lock.lock();
                 let applied = *self.last_applied.lock();
                 let data = self
                     .build_app_snapshot(applied)
@@ -784,6 +786,10 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                     })?;
                 (data, applied, self.last_membership.lock().clone())
             };
+            if retries < MAX_UNLOCKED_ATTEMPTS {
+                // Optimistic capture: release the lock for expensive encoding.
+                apply_guard = None;
+            }
             let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
                 source: StorageIOError::<u64>::read_state_machine(&e),
             })?;
@@ -797,7 +803,9 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 last_membership,
                 snapshot_id,
             };
-            let _apply = self.apply_lock.lock();
+            // In the bounded fallback this is the original capture lock:
+            // nothing can apply between capture, encoding and publication.
+            let _apply = apply_guard.unwrap_or_else(|| self.apply_lock.lock());
             if let Some(existing) = self.current_snapshot.lock().clone()
                 && existing.meta.last_log_id > meta.last_log_id
             {
@@ -811,6 +819,7 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
             }
             let current_applied = *self.last_applied.lock();
             if log_id_ahead_of_boundary(current_applied, meta.last_log_id) {
+                retries += 1;
                 continue;
             }
             *self.current_snapshot.lock() = Some(StoredSnapshot {
@@ -1951,6 +1960,66 @@ mod tests {
     // Holding `apply_lock` across the await is the point: the install must
     // block on it.
     #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn snapshot_build_completes_during_continuous_apply() {
+        use std::sync::atomic::AtomicBool;
+
+        let (mut sm, _rx) = sm_with_effects();
+        // Make encoding nontrivial while an independent writer keeps advancing
+        // the applied index. Completion must not require a quiet write window.
+        for index in 1..=128_u64 {
+            apply_one(&mut sm, index, create(&stream(&format!("stress-{index}"))))
+                .await
+                .unwrap();
+        }
+
+        let writing = Arc::new(AtomicBool::new(true));
+        let stop_writer = Arc::clone(&writing);
+        let mut writer_sm = sm.clone();
+        let writer = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut index = 129_u64;
+                while stop_writer.load(Ordering::Relaxed) {
+                    writer_sm
+                        .apply(vec![Entry {
+                            log_id: log_id(index),
+                            payload: EntryPayload::Blank,
+                        }])
+                        .await
+                        .unwrap();
+                    index += 1;
+                }
+            });
+        });
+
+        let mut builder = sm.get_snapshot_builder().await;
+        let build = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(builder.build_snapshot())
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), build).await;
+        writing.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let snapshot = result
+            .expect("snapshot must finish despite concurrent apply")
+            .unwrap()
+            .unwrap();
+        let data: AppSnapshot = serde_json::from_slice(snapshot.snapshot.get_ref()).unwrap();
+        assert_eq!(data.streams.len(), 128);
+        assert_eq!(
+            data.last_applied_index,
+            snapshot.meta.last_log_id.map(|id| id.index)
+        );
+    }
+
     #[tokio::test]
     async fn install_snapshot_serializes_with_apply_lock() {
         let (sm, _rx) = sm_with_effects();
