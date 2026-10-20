@@ -13,7 +13,36 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- Hardened cluster authentication throttling so a saturated failure tracker
+  cannot deny legitimate control-plane peers; an unseen source is now throttled
+  only after its own failure budget is exhausted.
+- Hardened the cluster media read budget and v2 control-frame validation so a
+  single peer cannot monopolize shared read capacity.
+- Repeated `publish` commands on one RTMP connection no longer force a full
+  media-output rebuild per command. A generation-only change (duplicate
+  publish on the same route) now keeps the running recording/HLS/push/exec
+  session and only records the new generation; real republishes still restart
+  via the route change or the debounced timestamp-rewind boundary.
+
 ### Fixed
+- `MEDIA_EXEC_PUBLISH_DONE` is now emitted for sessions torn down through the
+  abort path (retirement queue full, reaper unavailable/disconnected) and
+  before sink shutdown, so the documented publish/publish_done pair is always
+  closed and a session's end event precedes the next session's `publish`.
+- The `list_streams` benchmark uses its own server and a fixed seeded dataset
+  (1,000 streams) instead of the rows the preceding `create_stream` benchmark
+  happened to insert, so its published number no longer depends on host speed.
+- `DELETE /api/v1/streams/{id}/players/{player_id}` now refuses to delete the
+  default viewer, whose `play_key` equals `streams.play_key` (`409`), and the
+  Raft `DeleteViewer` apply enforces the same invariant. Previously the stream
+  kept advertising a play key that no longer authorized playback and could
+  never be re-created (it stayed reserved by `streams.play_key`).
+- Removing a cluster node now drops its heartbeat-derived caches
+  (`peer_session_counts`, per-stream/per-viewer player maps, rejected peer
+  addresses), and the cached session sums ignore peers the health tracker no
+  longer knows. A removed node's frozen viewer counts could otherwise keep that
+  viewer from playing on the surviving node until the process restarted.
 - A release started by hand (`workflow_dispatch`) now runs the cross-server
   benchmark sweep too; it used to be skipped and only the HTTP API
   microbenchmarks were recorded.

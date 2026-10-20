@@ -329,7 +329,7 @@ impl MediaOutputManager {
 
     fn retire(&mut self, session: MediaSession) {
         let Some(tx) = self.retire_tx.as_ref() else {
-            session.abort("session reaper unavailable");
+            session.abort("session reaper unavailable", &self.config);
             return;
         };
         match tx.try_send(session) {
@@ -338,11 +338,11 @@ impl MediaOutputManager {
                 crate::log_warn!(
                     "Media session retirement queue full; cancelling excess session immediately"
                 );
-                session.abort("session retirement queue full");
+                session.abort("session retirement queue full", &self.config);
             }
             Err(mpsc::TrySendError::Disconnected(session)) => {
                 crate::log_warn!("Media session reaper disconnected; cancelling session");
-                session.abort("session reaper disconnected");
+                session.abort("session reaper disconnected", &self.config);
             }
         }
     }
@@ -366,10 +366,28 @@ impl MediaOutputManager {
         if !self.config.enabled() || stream_id.is_empty() {
             return;
         }
-        if self.sessions.get(&conn_id).is_some_and(|session| {
-            session.stream_id == stream_id && session.generation == generation
-        }) {
-            return;
+        if let Some(session) = self.sessions.get_mut(&conn_id) {
+            if session.stream_id == stream_id && session.generation == generation {
+                return;
+            }
+            if session.stream_id == stream_id {
+                // Every accepted `publish` command bumps the connection's
+                // generation, including a duplicate publish on a connection
+                // that already has this publisher (librtmp2 admits a repeat
+                // publish and the bridge re-claims the same route). Rebuilding
+                // the session for such a change is unbounded work driven by a
+                // ~30-byte command: a new recording file, a new HLS session
+                // directory plus FFmpeg child, one FFmpeg per push target and
+                // a `MEDIA_EXEC_PUBLISH` child, all on the RTMP poll thread.
+                // Keep the running session and only record the new generation.
+                // A genuinely new publish session still restarts: a route
+                // switch changes `stream_id`, and a real republish inside the
+                // same route resets the RTMP timestamps, which `handle_frame`
+                // treats as a boundary (debounced per connection by
+                // `REPUBLISH_RESTART_MIN_INTERVAL`).
+                session.generation = generation;
+                return;
+            }
         }
         if let Some(old) = self.sessions.remove(&conn_id) {
             self.retire(old);
@@ -653,12 +671,45 @@ impl MediaSession {
         }
     }
 
-    fn abort(mut self, reason: &str) {
-        for mut sink in std::mem::take(&mut self.sinks) {
-            sink.disable(reason);
-        }
+    /// Stop the session's hook effects before its sinks go away: terminate the
+    /// `MEDIA_EXEC_PUBLISH` child and announce `MEDIA_EXEC_PUBLISH_DONE`.
+    ///
+    /// Shared by [`Self::stop`] and [`Self::abort`] so a session that emitted
+    /// `publish` always emits `publish_done`, and runs before sink shutdown so
+    /// session N's end event is ordered before session N+1's `publish` during
+    /// a republish burst.
+    fn teardown_hooks(&mut self, config: &MediaOutputConfig) {
         if let Some(mut child) = self.publish_exec.take() {
             terminate_hook_child(&mut child);
+        }
+        if config.exec_publish_done.trim().is_empty() {
+            return;
+        }
+        let env = ExecEnv {
+            conn_id: self.conn_id,
+            stream_id: &self.stream_id,
+            stream_name: &self.stream_name,
+            app: &self.app,
+            recording_file: self.recording_file.as_deref(),
+            hls_playlist: self.hls_playlist.as_deref(),
+        };
+        match spawn_hook(&config.exec_publish_done, "publish_done", &env) {
+            Ok(child) => reap_child_async(child, format!("publish_done:{}", self.stream_id)),
+            Err(e) => crate::log_error!(
+                "Media outputs: publish_done exec failed for '{}': {e}",
+                self.stream_id
+            ),
+        }
+    }
+
+    fn abort(mut self, reason: &str, config: &MediaOutputConfig) {
+        // The session may already have announced itself through
+        // `MEDIA_EXEC_PUBLISH`; emit the matching end event before the sinks
+        // are disabled so the documented publish/publish_done pair is never
+        // left half-open.
+        self.teardown_hooks(config);
+        for mut sink in std::mem::take(&mut self.sinks) {
+            sink.disable(reason);
         }
         crate::log_warn!(
             "Media outputs: publisher session cancelled stream='{}' reason='{reason}'",
@@ -667,29 +718,12 @@ impl MediaSession {
     }
 
     fn stop(mut self, config: &MediaOutputConfig) {
+        // Emit the end event before the (up to 5s per sink) shutdown path so a
+        // republish burst cannot deliver it after the next session's publish.
+        self.teardown_hooks(config);
         let sinks = std::mem::take(&mut self.sinks);
         for sink in sinks {
             sink.stop();
-        }
-        if let Some(mut child) = self.publish_exec.take() {
-            terminate_hook_child(&mut child);
-        }
-        if !config.exec_publish_done.trim().is_empty() {
-            let env = ExecEnv {
-                conn_id: self.conn_id,
-                stream_id: &self.stream_id,
-                stream_name: &self.stream_name,
-                app: &self.app,
-                recording_file: self.recording_file.as_deref(),
-                hls_playlist: self.hls_playlist.as_deref(),
-            };
-            match spawn_hook(&config.exec_publish_done, "publish_done", &env) {
-                Ok(child) => reap_child_async(child, format!("publish_done:{}", self.stream_id)),
-                Err(e) => crate::log_error!(
-                    "Media outputs: publish_done exec failed for '{}': {e}",
-                    self.stream_id
-                ),
-            }
         }
         crate::log_info!(
             "Media outputs: publisher session stopped stream='{}'",
@@ -2668,7 +2702,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_restarts_sessions_on_route_generation_and_timestamp_changes() {
+    fn manager_keeps_sessions_on_generation_and_restarts_on_route_and_timestamp_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("recordings");
         let config = MediaOutputConfig {
@@ -2699,10 +2733,14 @@ mod tests {
         manager.handle_frame(&video(0), "s1", 1);
         assert_ne!(current_file(&manager), first);
 
-        // A new generation replaces the session too.
+        // A generation bump alone (a duplicate `publish` on the same route)
+        // keeps the running session and only records the new generation: it
+        // must not rebuild every sink.
         next_ms();
+        let before = current_file(&manager);
         manager.ensure_publisher(3, "s1", 2);
         assert_eq!(manager.sessions[&3].generation, 2);
+        assert_eq!(current_file(&manager), before);
 
         // Switching the route retires the old stream's session.
         manager.handle_frame(&video(100), "s2", 2);
@@ -2715,10 +2753,39 @@ mod tests {
         assert!(manager.sessions.is_empty());
         manager.stop_all();
 
-        assert_eq!(files_with_extension(&root.join("s1"), "flv").len(), 3);
+        assert_eq!(files_with_extension(&root.join("s1"), "flv").len(), 2);
         let s2 = files_with_extension(&root.join("s2"), "flv");
         assert_eq!(s2.len(), 1);
         assert!(fs::read(&s2[0]).unwrap().starts_with(flv_header()));
+    }
+
+    #[test]
+    fn duplicate_publish_generations_do_not_rebuild_media_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("recordings");
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: root.clone(),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+
+        manager.ensure_publisher(8, "s1", 1);
+        let file = manager.sessions[&8].recording_file.clone();
+        assert!(file.is_some());
+
+        // A publisher repeating `publish` (as librtmp2 admits) bumps the
+        // generation on every accepted command. Each bump used to retire the
+        // session and spawn a fresh recording/HLS/push/exec session.
+        for generation in 2..=500 {
+            manager.ensure_publisher(8, "s1", generation);
+            assert_eq!(manager.sessions[&8].generation, generation);
+            assert_eq!(manager.sessions[&8].recording_file, file);
+        }
+        assert_eq!(manager.sessions.len(), 1);
+
+        manager.stop_all();
+        assert_eq!(files_with_extension(&root.join("s1"), "flv").len(), 1);
     }
 
     #[test]
@@ -2731,24 +2798,24 @@ mod tests {
         };
         let mut manager = MediaOutputManager::new(config, test_db());
 
-        // No reaper: sessions are cancelled inline.
+        // No reaper: sessions are cancelled inline when the route changes.
         let saved_tx = manager.retire_tx.take();
         manager.ensure_publisher(1, "s1", 1);
-        manager.ensure_publisher(1, "s1", 2);
-        assert_eq!(manager.sessions[&1].generation, 2);
+        manager.ensure_publisher(1, "s2", 2);
+        assert_eq!(manager.sessions[&1].stream_id, "s2");
 
         // Retirement queue full (rendezvous channel nobody receives on).
         let (full_tx, _full_rx) = mpsc::sync_channel(0);
         manager.retire_tx = Some(full_tx);
         manager.ensure_publisher(1, "s1", 3);
-        assert_eq!(manager.sessions[&1].generation, 3);
+        assert_eq!(manager.sessions[&1].stream_id, "s1");
 
         // Reaper disconnected.
         let (gone_tx, gone_rx) = mpsc::sync_channel(1);
         drop(gone_rx);
         manager.retire_tx = Some(gone_tx);
-        manager.ensure_publisher(1, "s1", 4);
-        assert_eq!(manager.sessions[&1].generation, 4);
+        manager.ensure_publisher(1, "s2", 4);
+        assert_eq!(manager.sessions[&1].stream_id, "s2");
 
         drop(saved_tx);
         manager.stop_all();
@@ -2932,8 +2999,33 @@ mod tests {
         assert!(session.publish_exec.is_some());
         assert_eq!(session.sinks.len(), 1);
         let started = Instant::now();
-        session.abort("test");
+        session.abort("test", &config);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abort_emits_publish_done_for_a_session_that_announced_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let publish_env = tmp.path().join("publish.env");
+        let done_env = tmp.path().join("done.env");
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: tmp.path().join("rec"),
+            exec_publish: dump_env_command(&publish_env),
+            exec_publish_done: dump_env_command(&done_env),
+            ..Default::default()
+        };
+        let session = MediaSession::start(6, 1, "s3", "cam3", "live", &config);
+        assert!(wait_until(Duration::from_secs(5), || publish_env.exists()));
+        // `abort` is the teardown taken when the retirement queue is full or
+        // the reaper is gone, so it must close the publish/publish_done pair.
+        session.abort("test abort", &config);
+        assert!(wait_until(Duration::from_secs(5), || done_env.exists()));
+        let done = read_env_dump(&done_env);
+        assert_eq!(done["OPENRTMP_EVENT"], "publish_done");
+        assert_eq!(done["OPENRTMP_STREAM_ID"], "s3");
+        assert_eq!(done["OPENRTMP_STREAM_NAME"], "cam3");
     }
 
     // ---- FFmpeg-backed sinks ---------------------------------------------

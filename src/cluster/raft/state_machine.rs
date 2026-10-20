@@ -248,6 +248,31 @@ impl SqliteStateMachine {
                 if would_remove_last {
                     return ClusterResponse::Conflict;
                 }
+                // The default viewer row is created with the stream's own
+                // play_key, which `streams.play_key` keeps advertising. The
+                // HTTP layer pre-checks this too, but the check is not
+                // serialized with this apply, so re-assert it here: deleting
+                // that row would leave an advertised key that no longer
+                // authorizes playback and can never be re-created.
+                match self.db.stream_get(stream_id) {
+                    crate::db::DbLookup::Ok(stream) => {
+                        if viewers
+                            .iter()
+                            .any(|v| v.id == *viewer_id && v.play_key == stream.play_key)
+                        {
+                            crate::log_warn!(
+                                "DeleteViewer fence: refusing to delete the default play key of \
+                                 stream {stream_id}"
+                            );
+                            return ClusterResponse::Conflict;
+                        }
+                    }
+                    crate::db::DbLookup::Missing => {}
+                    crate::db::DbLookup::Failed => {
+                        crate::log_error!("DeleteViewer fence: failed to load stream {stream_id}");
+                        return ClusterResponse::Error("db".into());
+                    }
+                }
                 match self.db.viewer_delete(stream_id, viewer_id) {
                     Some(true) => {
                         self.db.players_deactivate_for_viewer(viewer_id);
@@ -1404,6 +1429,20 @@ mod tests {
             apply_one(
                 &mut sm,
                 4,
+                ClusterCommand::DeleteViewer {
+                    stream_id: "sv".into(),
+                    viewer_id: dv.id.clone(),
+                }
+            )
+            .await
+            .unwrap(),
+            ClusterResponse::Conflict,
+            "the default viewer holds streams.play_key and must not be deleted"
+        );
+        assert_eq!(
+            apply_one(
+                &mut sm,
+                5,
                 ClusterCommand::CreateViewer { viewer: v2.clone() }
             )
             .await
@@ -1413,7 +1452,7 @@ mod tests {
         assert_eq!(
             apply_one(
                 &mut sm,
-                5,
+                6,
                 ClusterCommand::DeleteViewer {
                     stream_id: "sv".into(),
                     viewer_id: "ghost".into()
@@ -1426,7 +1465,7 @@ mod tests {
         assert_eq!(
             apply_one(
                 &mut sm,
-                6,
+                7,
                 ClusterCommand::DeleteViewer {
                     stream_id: "sv".into(),
                     viewer_id: "v2".into()

@@ -1181,8 +1181,26 @@ impl ClusterManager {
         self.health.remove(node_id);
         self.network.nodes.write().remove(&node_id);
         self.joins_awaiting_membership.lock().remove(&node_id);
+        self.drop_peer_heartbeat_caches(node_id);
         crate::log_info!("Cluster: removed node {node_id}");
         Ok(())
+    }
+
+    /// Drop every heartbeat-derived per-peer cache for `node_id`.
+    ///
+    /// These maps are keyed by node id only and are not covered by the other
+    /// cleanup paths: `prune_topology_to_membership` iterates `meta` (already
+    /// pruned by the time this runs), and the leader DOWN-grace sweep needs a
+    /// `down_since` entry that `HealthTracker::remove` deletes. Without this
+    /// the removed node's last counts keep counting against cluster-wide
+    /// session/viewer limits and stats until the process restarts.
+    fn drop_peer_heartbeat_caches(&self, node_id: NodeId) {
+        self.peer_session_counts.lock().remove(&node_id);
+        self.peer_stream_players.lock().remove(&node_id);
+        self.peer_viewer_players.lock().remove(&node_id);
+        self.rejected_peer_addrs
+            .lock()
+            .retain(|(id, _), _| *id != node_id);
     }
 
     pub async fn promote_learner(&self, node_id: NodeId) -> Result<(), String> {
@@ -1994,11 +2012,7 @@ impl ClusterManager {
             self.health.remove(id);
             self.media.disconnect_peer(id);
             self.network.nodes.write().remove(&id);
-            self.peer_session_counts.lock().remove(&id);
-            self.peer_stream_players.lock().remove(&id);
-            self.peer_viewer_players.lock().remove(&id);
-            self.rejected_peer_addrs.lock().remove(&(id, 0));
-            self.rejected_peer_addrs.lock().remove(&(id, 1));
+            self.drop_peer_heartbeat_caches(id);
             crate::log_info!("Cluster: pruned removed node {id} from local topology caches");
         }
     }
@@ -2154,22 +2168,39 @@ impl ClusterManager {
         self.recover_missing_media_addrs().await;
     }
 
+    /// Node ids whose heartbeat-derived counts may be summed. A node that was
+    /// removed from the cluster is dropped from the health tracker as well as
+    /// from its caches; filtering here is belt-and-braces so a leftover cache
+    /// entry can never keep counting against session/viewer limits.
+    fn cached_count_peer_ids(&self) -> std::collections::HashSet<NodeId> {
+        self.health
+            .peers_snapshot()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| *id != self.config.node_id)
+            .collect()
+    }
+
     /// Sum active play sessions for `viewer_id` across peers (excludes local).
     pub fn remote_viewer_session_count_cached(&self, viewer_id: &str) -> u64 {
+        let peers = self.cached_count_peer_ids();
         let counts = self.peer_viewer_players.lock();
         counts
-            .values()
-            .map(|m| m.get(viewer_id).copied().unwrap_or(0))
+            .iter()
+            .filter(|(id, _)| peers.contains(*id))
+            .map(|(_, m)| m.get(viewer_id).copied().unwrap_or(0))
             .sum()
     }
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
     /// Uses heartbeat-cached per-stream player counts to avoid control-plane RPC storms.
     pub fn remote_stream_session_count_cached(&self, stream_id: &str) -> u64 {
+        let peers = self.cached_count_peer_ids();
         let counts = self.peer_stream_players.lock();
         counts
-            .values()
-            .map(|m| m.get(stream_id).copied().unwrap_or(0))
+            .iter()
+            .filter(|(id, _)| peers.contains(*id))
+            .map(|(_, m)| m.get(stream_id).copied().unwrap_or(0))
             .sum()
     }
 
@@ -2595,9 +2626,7 @@ impl ClusterManager {
                     match self.release_owners_for_node(id) {
                         Ok(()) => {
                             self.health.mark_ownership_released(id);
-                            self.peer_session_counts.lock().remove(&id);
-                            self.peer_stream_players.lock().remove(&id);
-                            self.peer_viewer_players.lock().remove(&id);
+                            self.drop_peer_heartbeat_caches(id);
                         }
                         Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
                     }
@@ -4150,6 +4179,18 @@ mod tests {
         assert!(streams[0].owner_node_id.is_none());
         assert_eq!(m.remote_stream_session_count_cached("st"), 4);
         assert_eq!(m.remote_viewer_session_count_cached(&dv.id), 3);
+        // A leftover cache entry for a node the health tracker no longer knows
+        // (e.g. one removed by `remove_peer`) must not keep counting.
+        m.peer_stream_players
+            .lock()
+            .insert(42, HashMap::from([("st".to_string(), 7)]));
+        m.peer_viewer_players
+            .lock()
+            .insert(42, HashMap::from([(dv.id.clone(), 7)]));
+        assert_eq!(m.remote_stream_session_count_cached("st"), 4);
+        assert_eq!(m.remote_viewer_session_count_cached(&dv.id), 3);
+        m.peer_stream_players.lock().remove(&42);
+        m.peer_viewer_players.lock().remove(&42);
         // No peer control addresses: live count is local-only.
         assert_eq!(m.remote_stream_session_count("st").await, 0);
 
@@ -4768,9 +4809,52 @@ mod tests {
         );
 
         // Remove node 3; every remaining member prunes it from its caches.
+        // Seed every per-peer cache for node 3 so the removal must clear them:
+        // they are keyed by node id only and would otherwise outlive the
+        // removed node (and keep counting against session limits).
+        n1.mgr.peer_session_counts.lock().insert(3, (2, 4));
+        n1.mgr
+            .peer_stream_players
+            .lock()
+            .insert(3, HashMap::from([("stale".to_string(), 4)]));
+        n1.mgr
+            .peer_viewer_players
+            .lock()
+            .insert(3, HashMap::from([("vw-stale".to_string(), 4)]));
+        n1.mgr
+            .rejected_peer_addrs
+            .lock()
+            .insert((3, 0), "bad-addr".into());
         n1.mgr.remove_peer(3).await.unwrap();
         assert!(n1.mgr.meta().get(3).is_none());
         assert!(n1.mgr.pending_node_cleanups.lock().is_empty());
+        // A later heartbeat can re-populate zeroed/empty entries while the
+        // membership view catches up, but the seeded stale values must be gone.
+        assert!(
+            n1.mgr
+                .peer_session_counts
+                .lock()
+                .get(&3)
+                .is_none_or(|c| *c == (0, 0)),
+            "removed node's publisher/player counts must be dropped"
+        );
+        assert!(
+            n1.mgr
+                .peer_stream_players
+                .lock()
+                .get(&3)
+                .is_none_or(|m| m.is_empty())
+        );
+        assert!(
+            n1.mgr
+                .peer_viewer_players
+                .lock()
+                .get(&3)
+                .is_none_or(|m| m.is_empty())
+        );
+        assert!(!n1.mgr.rejected_peer_addrs.lock().contains_key(&(3, 0)));
+        assert_eq!(n1.mgr.remote_stream_session_count_cached("stale"), 0);
+        assert_eq!(n1.mgr.remote_viewer_session_count_cached("vw-stale"), 0);
         assert!(wait_until(Duration::from_secs(10), || n2.mgr.meta().get(3).is_none()).await);
 
         // Losing the only other voter drops the leader into ISOLATED.

@@ -69,20 +69,23 @@ fn evict_oldest_eligible_cluster_auth_ip(
 
 /// True when `peer` has exceeded the cluster auth failure budget.
 ///
-/// When the tracker is at capacity, only peers whose buckets are actively
-/// throttled cause fail-closed behaviour for new source IPs — mirroring the
-/// HTTP rate limiter so a scan with many one-off failures cannot deny
-/// legitimate cluster joins that present a valid CLUSTER_SECRET.
+/// Only a source that already exhausted its own budget is refused. A source
+/// with no bucket is always allowed to attempt the handshake: the tracker is
+/// keyed solely by failures and is never populated by successful handshakes,
+/// so every legitimate member is an "unseen" IP by construction. Refusing
+/// unseen sources once the map is saturated (an attacker can fill 10,000
+/// buckets from a routed /64) would turn the per-IP brute-force budget into a
+/// cluster-wide control-plane denial of service. The budget is still spent on
+/// actual failed attempts: a source whose own bucket hit the limit keeps being
+/// refused before the challenge, so failing from a fresh address does not reset
+/// an already-throttled one (buckets are keyed per source IP).
 pub fn cluster_auth_rate_limited(peer: IpAddr) -> bool {
     let mut guard = CLUSTER_AUTH_FAILURES.lock();
     let now = Instant::now();
     purge_expired_cluster_auth_failures(&mut guard, now);
     let Some(entries) = guard.get_mut(&peer) else {
-        if guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS
-            && !evict_oldest_eligible_cluster_auth_ip(&mut guard, now)
-        {
-            return true;
-        }
+        // Unknown source: let it prove possession of CLUSTER_SECRET. Failed
+        // attempts are recorded below (best effort while the tracker is full).
         return false;
     };
     active_cluster_auth_failure_count(entries, now) >= CLUSTER_AUTH_MAX_FAILURES
@@ -110,7 +113,35 @@ pub fn clear_cluster_auth_failures(peer: IpAddr) {
 /// RAII guard for a reserved slice of a global in-flight byte budget.
 pub struct InflightByteBudgetGuard {
     counter: &'static AtomicUsize,
+    max: usize,
     bytes: usize,
+}
+
+impl InflightByteBudgetGuard {
+    /// Reserve `additional` more bytes from the same budget, growing this
+    /// guard (released together with it on drop).
+    ///
+    /// Incremental readers use this to charge only the bytes they have
+    /// actually consumed, instead of the whole length a peer announced.
+    pub fn grow(&mut self, additional: usize) -> Result<(), ()> {
+        if additional == 0 {
+            return Ok(());
+        }
+        loop {
+            let cur = self.counter.load(Ordering::Acquire);
+            if cur.saturating_add(additional) > self.max {
+                return Err(());
+            }
+            if self
+                .counter
+                .compare_exchange(cur, cur + additional, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.bytes += additional;
+                return Ok(());
+            }
+        }
+    }
 }
 
 impl Drop for InflightByteBudgetGuard {
@@ -130,7 +161,11 @@ pub fn try_reserve_inflight_bytes(
     len: usize,
 ) -> Result<InflightByteBudgetGuard, ()> {
     if len == 0 {
-        return Ok(InflightByteBudgetGuard { counter, bytes: 0 });
+        return Ok(InflightByteBudgetGuard {
+            counter,
+            max,
+            bytes: 0,
+        });
     }
     loop {
         let cur = counter.load(Ordering::Acquire);
@@ -143,6 +178,7 @@ pub fn try_reserve_inflight_bytes(
         {
             return Ok(InflightByteBudgetGuard {
                 counter,
+                max,
                 bytes: len,
             });
         }
@@ -513,36 +549,57 @@ mod tests {
 
         assert!(
             !super::cluster_auth_rate_limited(fresh),
-            "a new peer must be admitted after evicting an eligible bucket"
+            "a new peer must be admitted while the tracker is at capacity"
         );
         assert!(
             super::cluster_auth_rate_limited(limited),
             "actively throttled bucket must not be reset by eviction"
         );
 
+        // Recording a failure for a new source must evict an eligible bucket
+        // (keeping the map bounded) without freeing the throttled one.
+        super::record_cluster_auth_failure(fresh);
+        {
+            let guard = super::CLUSTER_AUTH_FAILURES.lock();
+            assert!(
+                guard.contains_key(&fresh),
+                "the new failure must be tracked"
+            );
+            assert_eq!(guard.len(), super::MAX_TRACKED_CLUSTER_AUTH_IPS);
+            assert!(guard.contains_key(&limited));
+        }
+        assert!(!super::cluster_auth_rate_limited(fresh));
+
         super::CLUSTER_AUTH_FAILURES.lock().clear();
     }
 
     #[test]
     #[serial]
-    fn cluster_auth_tracker_fails_closed_when_every_bucket_is_throttled() {
+    fn cluster_auth_tracker_admits_unseen_ip_when_every_bucket_is_throttled() {
         use std::net::{IpAddr, Ipv4Addr};
 
         let now = Instant::now();
         let fresh: IpAddr = "203.0.113.9".parse().unwrap();
+        let throttled: IpAddr = "198.51.100.0".parse().unwrap();
 
         {
             let mut guard = super::CLUSTER_AUTH_FAILURES.lock();
             guard.clear();
-            for i in 0..super::MAX_TRACKED_CLUSTER_AUTH_IPS {
+            for i in 1..super::MAX_TRACKED_CLUSTER_AUTH_IPS {
                 let ip = IpAddr::V4(Ipv4Addr::from(i as u32));
                 guard.insert(ip, vec![now; super::CLUSTER_AUTH_MAX_FAILURES]);
             }
+            guard.insert(throttled, vec![now; super::CLUSTER_AUTH_MAX_FAILURES]);
         }
 
         assert!(
-            super::cluster_auth_rate_limited(fresh),
-            "new peer must be denied when every tracked bucket is throttled"
+            !super::cluster_auth_rate_limited(fresh),
+            "an unseen source must not be denied just because the tracker is saturated; \
+             it still has to prove the secret"
+        );
+        assert!(
+            super::cluster_auth_rate_limited(throttled),
+            "a bucket that exhausted its failure budget must stay throttled"
         );
 
         super::CLUSTER_AUTH_FAILURES.lock().clear();
@@ -561,6 +618,23 @@ mod tests {
         let third = super::try_reserve_inflight_bytes(&TEST_BUDGET, 100, 50);
         assert!(third.is_ok());
         drop(third);
+        assert_eq!(TEST_BUDGET.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn inflight_byte_budget_guards_can_grow_incrementally() {
+        use std::sync::atomic::AtomicUsize;
+
+        static TEST_BUDGET: AtomicUsize = AtomicUsize::new(0);
+        let mut guard = super::try_reserve_inflight_bytes(&TEST_BUDGET, 100, 0).unwrap();
+        assert_eq!(TEST_BUDGET.load(Ordering::Acquire), 0);
+        guard.grow(30).unwrap();
+        guard.grow(20).unwrap();
+        assert_eq!(TEST_BUDGET.load(Ordering::Acquire), 50);
+        // Growth past the cap is refused and leaves the reservation intact.
+        assert!(guard.grow(60).is_err());
+        assert_eq!(TEST_BUDGET.load(Ordering::Acquire), 50);
+        drop(guard);
         assert_eq!(TEST_BUDGET.load(Ordering::Acquire), 0);
     }
 }
