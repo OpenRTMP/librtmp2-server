@@ -116,7 +116,7 @@ OBS / FFmpeg / App
 `librtmp2-server` uses the published `librtmp2` 0.14.0 release from crates.io:
 
 ```toml
-librtmp2 = { version = "0.14.0", features = ["tls"] }
+librtmp2 = { version = "0.15.0", features = ["tls"] }
 ```
 
 ```bash

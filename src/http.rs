@@ -1348,22 +1348,37 @@ const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often to re-query peers for live sessions while draining. Local counts
+/// are cheap and checked every 50 ms, but each remote query is a fresh
+/// authenticated control-plane round trip per peer, so it is paced instead of
+/// being issued on every local iteration.
+const REMOTE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Remote RTMP sessions for `id`, or 0 outside cluster mode.
+#[cfg(feature = "cluster")]
+async fn remote_stream_sessions(state: &AppState, id: &str) -> u64 {
+    match state.coordinator.cluster_manager() {
+        Some(mgr) => mgr.remote_stream_session_count(id).await,
+        None => 0,
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn remote_stream_sessions(_state: &AppState, _id: &str) -> u64 {
+    0
+}
 
 async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
     let started = Instant::now();
     let mut last_warn = started;
+    let mut last_remote_poll = started;
+    let mut remote = remote_stream_sessions(&state, &id).await;
     loop {
         let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
-        #[cfg(feature = "cluster")]
-        let remote = {
-            if let Some(mgr) = state.coordinator.cluster_manager() {
-                mgr.remote_stream_session_count(&id).await
-            } else {
-                0
-            }
-        };
-        #[cfg(not(feature = "cluster"))]
-        let remote = 0u64;
+        if last_remote_poll.elapsed() >= REMOTE_DRAIN_POLL_INTERVAL {
+            remote = remote_stream_sessions(&state, &id).await;
+            last_remote_poll = Instant::now();
+        }
         if local == 0 && remote == 0 {
             break;
         }
@@ -1525,16 +1540,7 @@ async fn handle_stream_delete(
     }
 
     let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
-    #[cfg(feature = "cluster")]
-    let remote = {
-        if let Some(mgr) = state.coordinator.cluster_manager() {
-            mgr.remote_stream_session_count(&id).await
-        } else {
-            0
-        }
-    };
-    #[cfg(not(feature = "cluster"))]
-    let remote = 0u64;
+    let remote = remote_stream_sessions(&state, &id).await;
     if local == 0 && remote == 0 {
         return match finalize_stream_delete(&state, &id).await {
             Ok(()) => {
@@ -1884,7 +1890,7 @@ async fn handle_stream_player_delete(
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid player id");
     }
     let path = format!("/api/v1/streams/{id}/players/{player_id}");
-    match state.db.stream_get(&id) {
+    let stream = match state.db.stream_get(&id) {
         DbLookup::Missing => {
             log_http_access(
                 "DELETE",
@@ -1909,9 +1915,9 @@ async fn handle_stream_player_delete(
                 "Failed to load stream",
             );
         }
-        DbLookup::Ok(_) => {}
-    }
-    match state.db.viewer_get(&id, &player_id) {
+        DbLookup::Ok(stream) => stream,
+    };
+    let viewer = match state.db.viewer_get(&id, &player_id) {
         DbLookup::Missing => {
             log_http_access(
                 "DELETE",
@@ -1936,8 +1942,8 @@ async fn handle_stream_player_delete(
                 "Failed to load player",
             );
         }
-        DbLookup::Ok(_) => {}
-    }
+        DbLookup::Ok(viewer) => viewer,
+    };
     if state.db.viewer_list(&id).len() <= 1 {
         log_http_access(
             "DELETE",
@@ -1950,6 +1956,26 @@ async fn handle_stream_player_delete(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
             "Cannot delete the last play key for a stream",
+        );
+    }
+    // The default viewer row is created with the stream's own play_key, and
+    // `streams.play_key` keeps advertising that value to API clients. Deleting
+    // the row would make the advertised key unusable for playback while
+    // `streams.play_key` keeps it reserved globally (and `POST .../players`
+    // refuses to re-create it), permanently breaking the stream's default
+    // credential. Refuse instead of leaving that inconsistent state.
+    if viewer.play_key == stream.play_key {
+        log_http_access(
+            "DELETE",
+            &path,
+            &peer,
+            StatusCode::CONFLICT,
+            "cannot delete default play key",
+        );
+        return err_json(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "Cannot delete the stream's default play key",
         );
     }
     match state.coordinator.delete_viewer(&id, &player_id) {
@@ -4335,13 +4361,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn player_delete_refuses_default_play_key() {
+        let state = roomy_state();
+        let default_viewer = add_stream(&state, "pddefault");
+        let app = router(state.clone());
+        // A second key makes the "last play key" guard pass, leaving only the
+        // default-key invariant to stop the delete.
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/pddefault/players",
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let uri = format!("/api/v1/streams/pddefault/players/{default_viewer}");
+        let (status, body) = send(&app, "DELETE", &uri, true, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "CONFLICT");
+        assert!(body.contains("default play key"));
+
+        // The row survives and the advertised key still authorizes playback.
+        let viewers = state.db.viewer_list("pddefault");
+        assert_eq!(viewers.len(), 2);
+        assert!(viewers.iter().any(|v| v.id == default_viewer));
+        let DbLookup::Ok(stream) = state.db.stream_get("pddefault") else {
+            panic!("stream must still exist");
+        };
+        assert!(matches!(
+            state.db.viewer_find_by_play_key(&stream.play_key),
+            DbLookup::Ok(_)
+        ));
+        assert!(state.revoked_viewers.lock().is_empty());
+
+        // Deleting a secondary key is still permitted.
+        let secondary = viewers
+            .iter()
+            .find(|v| v.id != default_viewer)
+            .expect("secondary viewer")
+            .id
+            .clone();
+        let (status, _) = send(
+            &app,
+            "DELETE",
+            &format!("/api/v1/streams/pddefault/players/{secondary}"),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.db.viewer_list("pddefault").len(), 1);
+    }
+
+    #[tokio::test]
     async fn player_delete_reports_db_failures() {
         let state = roomy_state();
         let first = add_stream(&state, "pddb");
         let app = router(state.clone());
         let (status, _) = send(&app, "POST", "/api/v1/streams/pddb/players", true, None).await;
         assert_eq!(status, StatusCode::CREATED);
-        let player_uri = format!("/api/v1/streams/pddb/players/{first}");
+        // The default viewer shares `streams.play_key` and is refused by the
+        // dedicated guard, so drive the DB-error paths through a secondary key.
+        let second = state
+            .db
+            .viewer_list("pddb")
+            .into_iter()
+            .find(|v| v.id != first)
+            .expect("secondary viewer")
+            .id;
+        let player_uri = format!("/api/v1/streams/pddb/players/{second}");
 
         exec_sql(
             &state,

@@ -96,13 +96,14 @@ async fn read_media_frame_max<R: AsyncReadExt + Unpin>(
         r,
         version,
         max,
-        |len| {
-            try_reserve_inflight_bytes(
-                &MEDIA_READ_BYTES_INFLIGHT,
-                MAX_MEDIA_READ_BYTES_INFLIGHT,
-                len,
-            )
-            .map_err(|_| std::io::Error::other("media read memory budget exceeded"))
+        |_declared| {
+            // The body is charged incrementally as it arrives (see
+            // `wire::FrameBudget`), so a peer that announces a large frame and
+            // stalls cannot reserve the entire budget and fail every other
+            // peer's next read. The guard still bounds total resident media
+            // frame bytes.
+            try_reserve_inflight_bytes(&MEDIA_READ_BYTES_INFLIGHT, MAX_MEDIA_READ_BYTES_INFLIGHT, 0)
+                .map_err(|_| std::io::Error::other("media read memory budget exceeded"))
         },
         body_timeout,
     )

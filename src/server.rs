@@ -2521,7 +2521,8 @@ fn start_shard_server(
         max_pending_tls_per_addr: shared.max_pending_tls_per_addr,
         max_connections_per_addr: shared.max_connections_per_addr,
     };
-    let mut server = RtmpServer::new(cfg).map_err(|e| format!("RTMP server init failed: {e}"))?;
+    let mut server =
+        RtmpServer::from_config(cfg, None).map_err(|e| format!("RTMP server init failed: {e}"))?;
     if let Some(base) = conn_id_base {
         server.set_conn_id_base(base);
     }
@@ -3227,7 +3228,7 @@ mod tests {
             max_pending_tls_per_addr: i32::MAX,
             max_connections_per_addr: i32::MAX,
         };
-        librtmp2::server::Server::new(cfg).unwrap()
+        librtmp2::server::Server::from_config(cfg, None).unwrap()
     }
 
     fn listening_rtmp_server(max_connections: i32, port: u16) -> librtmp2::server::Server {
@@ -3709,7 +3710,7 @@ mod tests {
             max_pending_tls_per_addr: i32::MAX,
             max_connections_per_addr: i32::MAX,
         };
-        let mut server = librtmp2::server::Server::new(cfg).unwrap();
+        let mut server = librtmp2::server::Server::from_config(cfg, None).unwrap();
         let tracked: HashMap<u64, TrackedConn> = HashMap::new();
 
         // Nothing queued: the poll loop must not force a fast follow-up tick.

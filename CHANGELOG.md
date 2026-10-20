@@ -11,14 +11,124 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 While in alpha the project stays on `0.x`; semantic-versioning guarantees only
 begin at `1.0.0`.
 
-## [Unreleased]
+## [0.6.6] — 2026-10-21
+
+### Security
+- Hardened RTMP publish/play authentication throttling so a saturated
+  failure tracker can no longer refuse clients it has never seen fail; only a
+  source's own failed attempts spend its budget, and IPv6 sources share one
+  bucket per `/64` so a single host cannot mint one bucket per address.
+- Hardened cluster authentication throttling so a saturated failure tracker
+  cannot deny legitimate control-plane peers; an unseen source is now throttled
+  only after its own failure budget is exhausted, and IPv6 sources share one
+  bucket per routed `/64`.
+- Hardened the cluster media read budget and v2 control-frame validation so a
+  single peer cannot monopolize shared read capacity.
+- A plaintext cluster no longer trusts a peer's advertised `DOWN`/`ISOLATED`
+  health as liveness: `DOWN` is derived locally from heartbeat timeliness and
+  quorum state from the local voter view, so a forged heartbeat can no longer
+  arm an ownership release or fake quorum loss. Advertised admission states,
+  load and session counts are still accepted as hints.
+- The control plane's pre-auth connection budget now reserves capacity for
+  configured member/peer source addresses, so an unauthenticated flood of
+  half-open connections can only exhaust the non-member budget instead of
+  starving heartbeats/Raft traffic and fencing live nodes.
+- Repeated `publish` commands on one RTMP connection no longer force a full
+  media-output rebuild per command. Rapid generation bumps are coalesced within
+  a short per-connection window; a genuine republish after that window still
+  starts a new recording/HLS/push/exec session.
 
 ### Fixed
+- An async stream delete no longer polls every peer every 50 ms: remote session
+  counts are queried at a slower cadence and peers that are DOWN or have missed
+  the liveness window are neither dialed nor counted from their last heartbeat
+  cache, so a dead peer can no longer pin the drain for the full timeout.
+- A same-id rejoin that lands inside the leader's DOWN-to-ownership-release
+  grace now still releases the previous incarnation's `stream_owners` rows
+  instead of cancelling the queued release and stranding ghost owners.
+- Cluster media subscriptions now track inbound fan-out refs and outbound
+  (local viewer) refs separately, with the wire state of each outbound
+  subscription held per connection. An ownership handoff no longer leaves a
+  viewer subscribed with no `Subscribe` on the wire, and releasing an outbound
+  ref no longer disturbs the peer's inbound subscription.
+- A fresh-connection replay of cluster media subscriptions now retries control
+  sends rejected by queue backpressure (bounded) instead of silently truncating
+  the replay while keeping the refs.
+- A transient control-plane failure while authorizing an inbound cluster media
+  subscription is now reported as retryable and is no longer treated as an
+  authorization denial: it does not consume the denial budget and never drops
+  the subscriber's local subscription refs.
+- Releasing a publisher now releases only the stream ownership that belongs to
+  the row being released, so a stream switch in flight on the same connection no
+  longer drops the new stream's fencing; releasing a superseded player session
+  no longer drops the replacement session's remote-play subscription.
+- `MEDIA_EXEC_PUBLISH_DONE` is now emitted for sessions torn down through the
+  abort path (retirement queue full, reaper unavailable/disconnected) and only
+  after the output sinks have finished, so the documented publish/publish_done
+  pair is always closed and a completion hook never sees an unterminated
+  recording or a live HLS playlist.
+- The `list_streams` benchmark uses its own server and a fixed seeded dataset
+  (1,000 streams) instead of the rows the preceding `create_stream` benchmark
+  happened to insert, so its published number no longer depends on host speed.
+- `DELETE /api/v1/streams/{id}/players/{player_id}` now refuses to delete the
+  default viewer, whose `play_key` equals `streams.play_key` (`409`), and the
+  Raft `DeleteViewer` apply enforces the same invariant. Previously the stream
+  kept advertising a play key that no longer authorized playback and could
+  never be re-created (it stayed reserved by `streams.play_key`).
+- Removing a cluster node now drops its heartbeat-derived caches
+  (`peer_session_counts`, per-stream/per-viewer player maps, rejected peer
+  addresses), and the cached session sums ignore peers the health tracker no
+  longer knows. A removed node's frozen viewer counts could otherwise keep that
+  viewer from playing on the surviving node until the process restarted.
 - A release started by hand (`workflow_dispatch`) now runs the cross-server
   benchmark sweep too; it used to be skipped and only the HTTP API
   microbenchmarks were recorded.
 - The Benchmarks workflow has a `release_tag` input to re-measure an already
   published release (asset, release notes and `bench/releases/<tag>.json`).
+- A cluster init cache entry received over the wire is now fenced by its epoch:
+  an owner superseded by a failover can no longer replace the current owner's
+  staged metadata/headers/keyframe with its older-epoch copy. Same-epoch
+  updates still replace the entry.
+- A full media-output retirement queue no longer aborts the excess session on
+  the RTMP poll thread (which could block it for the hook's SIGTERM grace plus
+  `child.wait()`). A dedicated overflow worker owns those teardowns with a
+  bounded backlog, so the poll thread never waits; when the backlog is full the
+  excess session's sinks are disabled without emitting `publish_done`, and a
+  sink worker that misses its shutdown timeout suppresses the completion hook
+  rather than announcing an unflushed recording or playlist.
+- `scripts/docker_cluster_ha.py` derives `SRC_ROOT` from its own checkout
+  (overridable with `OPENRTMP_SRC_ROOT`) instead of a hard-coded path, and
+  fails loudly when the source tree is missing, so the suite can no longer run
+  silently against a stale destination copy.
+- V2 media control frames are capped at 256 KiB on the write path as well as
+  the read path, so a large control message is rejected locally instead of
+  being sent and terminating the peer's media connection. Member-source
+  pre-auth exemptions canonicalize IPv4-mapped addresses, so a dual-stack
+  listener still recognizes plain IPv4 peers.
+- Adversarial review fixes across auth, cluster, HLS, config, and media paths:
+  superseded auth sessions are released independently of their pending state,
+  player creation is rejected for a stream that is being deleted, the logger
+  has a non-panicking stderr fallback, bind strings are trimmed before port
+  parsing, ambiguous ownership acquires held by a local publisher are skipped,
+  ownership tracking is cleared only for the released epoch, the startup key
+  collision audit logs a non-reversible fingerprint, a vanished player row
+  releases its HLS viewer slot, locally owned streams are skipped when a media
+  peer resubscribes, and media timelines are reset only after local sessions
+  drain.
+- Raft snapshot capture now rejects stale captures when an apply advances
+  during serialization and retries with bounded locked serialization, so a
+  lagging follower cannot install a snapshot behind the leader and miss
+  compacted log entries.
+
+### Changed
+- Requires `librtmp2` 0.15.0, which provides the safe server-construction path
+  (`Server::from_config`), the E-RTMP v2 ModEx parser, and the protocol/client
+  fixes documented in that release.
+- Internal control-plane listener configuration is bundled into a struct
+  (`ControlPlaneListenerConfig`), and the cluster test script derives its
+  source root instead of duplicating path literals. No behavior change.
+- Dependency updates: tokio 1.54, libc 0.2.191, rustls-webpki 0.103.16, and
+  the pinned CI toolchain/install-action revisions.
 
 ## [0.6.5] — 2026-10-14
 

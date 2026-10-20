@@ -55,6 +55,15 @@ use crate::cluster::media::protocol::{MEDIA_PROTOCOL_MIN_VERSION, MEDIA_PROTOCOL
 /// Hard cap on one frame (v1 JSON or v2 binary), also bounds every
 /// allocation made from a peer-supplied length.
 pub const MAX_FRAME: u32 = 32 * 1024 * 1024;
+/// Hard cap on a v2 control frame. Control messages carry names and small
+/// JSON (`Subscribe`, `StreamStart`, `Error`, `StatsResp`), never media
+/// payload, so their declared length is capped well below [`MAX_FRAME`] and
+/// refused before any body bytes are read or reserved.
+pub const MAX_CONTROL_FRAME: u32 = 256 * 1024;
+/// Frame-body bytes reserved against the read budget per read step. A peer
+/// that announces a large frame and then stalls only ever charges this much,
+/// rather than the whole declared length.
+pub(crate) const READ_BUDGET_CHUNK: usize = 256 * 1024;
 /// Longest `app` accepted on the wire.
 pub const MAX_APP_LEN: usize = 255;
 /// Longest `stream` accepted on the wire.
@@ -192,6 +201,9 @@ async fn write_frame_v2<W: AsyncWrite + Unpin>(w: &mut W, msg: &MediaMessage) ->
         }
         other => {
             let json = serde_json::to_vec(other).map_err(Error::other)?;
+            if 1 + json.len() > MAX_CONTROL_FRAME as usize {
+                return Err(Error::other("media control frame too large"));
+            }
             let body_len = frame_len(1 + json.len())?;
             let mut buf = Vec::with_capacity(5 + json.len());
             buf.extend_from_slice(&body_len.to_be_bytes());
@@ -232,12 +244,37 @@ fn frame_len(len: usize) -> Result<u32, Error> {
     Ok(len as u32)
 }
 
+/// Grows the shared read-budget reservation while a frame body is consumed.
+///
+/// [`read_frame`] charges the body in [`READ_BUDGET_CHUNK`] steps as the bytes
+/// actually arrive (released when the frame's guard drops) instead of
+/// reserving the whole peer-declared length up front: a peer that sends only a
+/// length prefix and stalls must not be able to hold the entire process-wide
+/// media read budget, which would fail every other peer's next frame read.
+pub trait FrameBudget {
+    fn reserve_body(&mut self, additional: usize) -> Result<(), Error>;
+}
+
+impl FrameBudget for () {
+    fn reserve_body(&mut self, _additional: usize) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl FrameBudget for crate::cluster::security::InflightByteBudgetGuard {
+    fn reserve_body(&mut self, additional: usize) -> Result<(), Error> {
+        self.grow(additional)
+            .map_err(|_| Error::other("media read memory budget exceeded"))
+    }
+}
+
 /// Read one frame in the given protocol `version`. `max` caps the frame
 /// length (a smaller cap applies before authentication completes);
-/// `reserve` accounts the frame's bytes against the shared read budget and
-/// is held until the frame was read. `body_timeout` bounds only the body
-/// read, after the length prefix has arrived, so an idle peer waiting to
-/// send its next frame is never timed out.
+/// `reserve` creates the budget guard for the frame, which [`FrameBudget`]
+/// grows as body bytes are consumed and which is released when the frame was
+/// read (or the read failed). `body_timeout` bounds only the body read, after
+/// the length prefix has arrived, so an idle peer waiting to send its next
+/// frame is never timed out.
 pub async fn read_frame<R, G>(
     r: &mut R,
     version: u16,
@@ -247,17 +284,26 @@ pub async fn read_frame<R, G>(
 ) -> Result<MediaMessage, Error>
 where
     R: AsyncRead + Unpin,
+    G: FrameBudget,
 {
     let len = r.read_u32().await?;
     if len > max {
         return Err(Error::other("media frame too large"));
     }
-    let _budget = reserve(len as usize)?;
+    let mut budget = reserve(len as usize)?;
     let body = async {
         if version >= 2 {
-            read_body_v2(r, len as usize).await
+            if len == 0 {
+                return Err(invalid("empty v2 frame"));
+            }
+            budget.reserve_body(1)?;
+            let kind = r.read_u8().await?;
+            if kind == KIND_CONTROL && len > MAX_CONTROL_FRAME {
+                return Err(Error::other("media control frame too large"));
+            }
+            read_body_v2(r, kind, len as usize - 1, &mut budget).await
         } else {
-            let buf = read_vec(r, len as usize).await?;
+            let buf = read_vec(r, len as usize, &mut budget).await?;
             let msg: MediaMessage = serde_json::from_slice(&buf).map_err(Error::other)?;
             check_message_names(&msg)?;
             Ok(msg)
@@ -271,15 +317,15 @@ where
     }
 }
 
-async fn read_body_v2<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<MediaMessage, Error> {
-    if len < 1 {
-        return Err(invalid("empty v2 frame"));
-    }
-    let kind = r.read_u8().await?;
-    let rest = len - 1;
+async fn read_body_v2<R: AsyncRead + Unpin, G: FrameBudget>(
+    r: &mut R,
+    kind: u8,
+    rest: usize,
+    budget: &mut G,
+) -> Result<MediaMessage, Error> {
     match kind {
         KIND_CONTROL => {
-            let buf = read_vec(r, rest).await?;
+            let buf = read_vec(r, rest, budget).await?;
             let msg: MediaMessage = serde_json::from_slice(&buf).map_err(Error::other)?;
             // The binary kinds are the only encoding of these two messages
             // in v2; a JSON copy would give one message two spellings.
@@ -292,8 +338,8 @@ async fn read_body_v2<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<Med
             check_message_names(&msg)?;
             Ok(msg)
         }
-        KIND_MEDIA_FRAME => read_media_frame_v2(r, rest).await,
-        KIND_INIT_CACHE => read_init_cache_v2(r, rest).await,
+        KIND_MEDIA_FRAME => read_media_frame_v2(r, rest, budget).await,
+        KIND_INIT_CACHE => read_init_cache_v2(r, rest, budget).await,
         // A v1 frame is JSON: its body starts with '{' (struct variants) or
         // '"' (unit variants), neither of which is a v2 kind. Reported as
         // `Unsupported` so a dialer can tell "the peer answered in v1" (a
@@ -306,15 +352,26 @@ async fn read_body_v2<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<Med
     }
 }
 
-async fn read_media_frame_v2<R: AsyncRead + Unpin>(
+/// Read exactly `len` bytes into a stack buffer, charging the budget first.
+async fn read_exact_budgeted<R: AsyncRead + Unpin, G: FrameBudget>(
+    r: &mut R,
+    buf: &mut [u8],
+    budget: &mut G,
+) -> Result<(), Error> {
+    budget.reserve_body(buf.len())?;
+    r.read_exact(buf).await.map(|_| ())
+}
+
+async fn read_media_frame_v2<R: AsyncRead + Unpin, G: FrameBudget>(
     r: &mut R,
     rest: usize,
+    budget: &mut G,
 ) -> Result<MediaMessage, Error> {
     if rest < MEDIA_FIXED_LEN {
         return Err(invalid("truncated v2 media header"));
     }
     let mut h = [0u8; MEDIA_FIXED_LEN];
-    r.read_exact(&mut h).await?;
+    read_exact_budgeted(r, &mut h, budget).await?;
     let hint = DeliveryHint::from_u8(h[0]).ok_or_else(|| invalid("unknown delivery hint"))?;
     let frame_type = h[1];
     if MediaMessage::frame_type_to_librtmp2(frame_type).is_none() {
@@ -343,11 +400,12 @@ async fn read_media_frame_v2<R: AsyncRead + Unpin>(
     if expected != rest {
         return Err(invalid("v2 media length mismatch"));
     }
-    let app = read_string(r, app_len).await?;
-    let stream = read_string(r, stream_len).await?;
+    let app = read_string(r, app_len, budget).await?;
+    let stream = read_string(r, stream_len, budget).await?;
     // Allocated only now that payload_len is proven to fit the (capped,
-    // budget-reserved) frame; read straight into the final buffer.
-    let payload = read_vec(r, payload_len).await?;
+    // budget-charged as it arrives) frame; read straight into the final
+    // buffer.
+    let payload = read_vec(r, payload_len, budget).await?;
     Ok(MediaMessage::MediaFrame {
         app,
         stream,
@@ -360,15 +418,16 @@ async fn read_media_frame_v2<R: AsyncRead + Unpin>(
     })
 }
 
-async fn read_init_cache_v2<R: AsyncRead + Unpin>(
+async fn read_init_cache_v2<R: AsyncRead + Unpin, G: FrameBudget>(
     r: &mut R,
     rest: usize,
+    budget: &mut G,
 ) -> Result<MediaMessage, Error> {
     if rest < INIT_FIXED_LEN {
         return Err(invalid("truncated v2 init-cache header"));
     }
     let mut h = [0u8; INIT_FIXED_LEN];
-    r.read_exact(&mut h).await?;
+    read_exact_budgeted(r, &mut h, budget).await?;
     let presence = h[0];
     if presence & !0x0F != 0 {
         return Err(invalid("unknown init-cache parts"));
@@ -386,8 +445,8 @@ async fn read_init_cache_v2<R: AsyncRead + Unpin>(
         .checked_add(stream_len)
         .filter(|n| *n <= remaining)
         .ok_or_else(|| invalid("truncated v2 init-cache names"))?;
-    let app = read_string(r, app_len).await?;
-    let stream = read_string(r, stream_len).await?;
+    let app = read_string(r, app_len, budget).await?;
+    let stream = read_string(r, stream_len, budget).await?;
     remaining -= names;
     let mut parts: [Option<Vec<u8>>; 4] = [None, None, None, None];
     for (i, slot) in parts.iter_mut().enumerate() {
@@ -397,12 +456,16 @@ async fn read_init_cache_v2<R: AsyncRead + Unpin>(
         if remaining < 4 {
             return Err(invalid("truncated v2 init-cache part"));
         }
-        let len = r.read_u32().await? as usize;
+        let len = {
+            let mut len = [0u8; 4];
+            read_exact_budgeted(r, &mut len, budget).await?;
+            u32::from_be_bytes(len) as usize
+        };
         remaining -= 4;
         if len > remaining {
             return Err(invalid("v2 init-cache part exceeds frame"));
         }
-        let buf = read_vec(r, len).await?;
+        let buf = read_vec(r, len, budget).await?;
         remaining -= len;
         *slot = Some(buf);
     }
@@ -423,22 +486,33 @@ async fn read_init_cache_v2<R: AsyncRead + Unpin>(
 
 /// Read exactly `len` bytes. The buffer grows as data actually arrives
 /// instead of being sized up front from a peer-supplied length, so a peer
-/// that announces a large frame and sends nothing cannot make us allocate it.
-async fn read_vec<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<Vec<u8>, Error> {
-    const INITIAL_CAP: usize = 64 * 1024;
-    let mut buf = Vec::with_capacity(len.min(INITIAL_CAP));
-    let got = r.take(len as u64).read_to_end(&mut buf).await?;
-    if got != len {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "truncated media frame",
-        ));
+/// that announces a large frame and sends nothing cannot make us allocate it,
+/// and only the bytes reserved for the chunk being read are charged against
+/// the read budget.
+async fn read_vec<R: AsyncRead + Unpin, G: FrameBudget>(
+    r: &mut R,
+    len: usize,
+    budget: &mut G,
+) -> Result<Vec<u8>, Error> {
+    let mut buf = Vec::with_capacity(len.min(READ_BUDGET_CHUNK));
+    let mut remaining = len;
+    while remaining > 0 {
+        let step = remaining.min(READ_BUDGET_CHUNK);
+        budget.reserve_body(step)?;
+        let start = buf.len();
+        buf.resize(start + step, 0);
+        r.read_exact(&mut buf[start..]).await?;
+        remaining -= step;
     }
     Ok(buf)
 }
 
-async fn read_string<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<String, Error> {
-    let buf = read_vec(r, len).await?;
+async fn read_string<R: AsyncRead + Unpin, G: FrameBudget>(
+    r: &mut R,
+    len: usize,
+    budget: &mut G,
+) -> Result<String, Error> {
+    let buf = read_vec(r, len, budget).await?;
     String::from_utf8(buf).map_err(|_| invalid("name is not UTF-8"))
 }
 
@@ -732,21 +806,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_budget_is_checked_before_the_body_is_read() {
+    async fn read_budget_is_charged_before_the_body_is_read() {
         let mut r: &[u8] = &(1000u32).to_be_bytes();
         let err = read_frame(
             &mut r,
             2,
             MAX_FRAME,
-            |n| {
-                assert_eq!(n, 1000);
-                Err::<(), _>(Error::other("budget exceeded"))
-            },
+            |_declared| Ok::<_, Error>(FailingBudget),
             None,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("budget"));
+    }
+
+    /// Budget that refuses every reservation (no body byte may be charged).
+    struct FailingBudget;
+
+    impl FrameBudget for FailingBudget {
+        fn reserve_body(&mut self, _additional: usize) -> Result<(), Error> {
+            Err(Error::other("budget exceeded"))
+        }
+    }
+
+    /// Budget that records everything charged to it.
+    struct RecordingBudget(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl FrameBudget for RecordingBudget {
+        fn reserve_body(&mut self, additional: usize) -> Result<(), Error> {
+            self.0.set(self.0.get() + additional);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_body_only_charges_the_declared_length_in_chunks() {
+        // Announce a ~4 MiB v2 media frame whose header is consistent, but
+        // send only its header plus a few payload bytes before EOF. The old
+        // code reserved the whole declared length up front; a peer could park
+        // the entire process-wide budget that way.
+        let payload_len = 4 * 1024 * 1024 - 1 - MEDIA_FIXED_LEN;
+        let declared = (1 + MEDIA_FIXED_LEN + payload_len) as u32;
+        let mut bytes = declared.to_be_bytes().to_vec();
+        bytes.push(KIND_MEDIA_FRAME);
+        let mut header = vec![0u8; MEDIA_FIXED_LEN];
+        header[22..26].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&[0u8; 64]);
+        let mut r: &[u8] = &bytes;
+        let charged = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let err = read_frame(
+            &mut r,
+            MEDIA_PROTOCOL_VERSION,
+            MAX_FRAME,
+            |_declared| Ok::<_, Error>(RecordingBudget(std::rc::Rc::clone(&charged))),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert!(
+            charged.get() <= READ_BUDGET_CHUNK + MEDIA_FIXED_LEN + 1,
+            "charged {} bytes for a stalled {declared}-byte frame",
+            charged.get()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_control_frame_is_refused_before_its_body() {
+        let declared = MAX_CONTROL_FRAME + 1;
+        let mut bytes = declared.to_be_bytes().to_vec();
+        bytes.push(KIND_CONTROL);
+        let mut r: &[u8] = &bytes;
+        let charged = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let err = read_frame(
+            &mut r,
+            MEDIA_PROTOCOL_VERSION,
+            MAX_FRAME,
+            |_declared| Ok::<_, Error>(RecordingBudget(std::rc::Rc::clone(&charged))),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("control frame too large"), "{err}");
+        // Only the kind byte was charged; the body was never read.
+        assert_eq!(charged.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_control_frame_is_refused_before_writing() {
+        let msg = MediaMessage::Error {
+            code: "x".into(),
+            message: "y".repeat(MAX_CONTROL_FRAME as usize),
+            generation: 0,
+        };
+        let mut out = Vec::new();
+        let err = write_frame(&mut out, &msg, MEDIA_PROTOCOL_VERSION)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("control frame too large"), "{err}");
+        assert!(
+            out.is_empty(),
+            "no bytes may be written for a rejected frame"
+        );
     }
 
     #[tokio::test]
