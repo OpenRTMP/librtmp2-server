@@ -747,7 +747,7 @@ impl MediaHub {
         send_retries: u8,
         delay: Duration,
     ) {
-        if let Some(hub) = self.self_weak.get().and_then(|w| w.upgrade()) {
+        if let Some(hub) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
             hub.schedule_subscribe_retry(peer_id, app, stream, generation, send_retries, delay);
         }
     }

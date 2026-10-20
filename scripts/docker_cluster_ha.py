@@ -20,6 +20,7 @@ DEST = Path(
     os.environ.get("OPENRTMP_DEST") or Path(tempfile.gettempdir()) / "openrtmp-build2"
 ).resolve()
 LOG_NAME = "cargo-cluster-ha.log"
+CARGO_MANIFEST = "Cargo.toml"
 
 
 def require_source_tree(name: str) -> Path:
@@ -31,7 +32,7 @@ def require_source_tree(name: str) -> Path:
     current tree.
     """
     path = SRC_ROOT / name
-    if not (path / "Cargo.toml").is_file():
+    if not (path / CARGO_MANIFEST).is_file():
         raise SystemExit(
             f"source tree missing or incomplete: {path}\n"
             "set OPENRTMP_SRC_ROOT to the OpenRTMP checkout "
@@ -56,7 +57,7 @@ def sync_server() -> None:
     # Ensure librtmp2 present
     lib_src = require_source_tree("librtmp2")
     lib_dst = DEST / "librtmp2"
-    if not (lib_dst / "Cargo.toml").is_file():
+    if not (lib_dst / CARGO_MANIFEST).is_file():
         shutil.copytree(
             lib_src,
             lib_dst,
@@ -70,7 +71,7 @@ def main() -> int:
     server_src = require_source_tree("librtmp2-server")
     lib_src = require_source_tree("librtmp2")
     DEST.mkdir(parents=True, exist_ok=True)
-    if not (DEST / "librtmp2-server" / "Cargo.toml").is_file():
+    if not (DEST / "librtmp2-server" / CARGO_MANIFEST).is_file():
         for src, name in ((server_src, "librtmp2-server"), (lib_src, "librtmp2")):
             d = DEST / name
             if d.exists():

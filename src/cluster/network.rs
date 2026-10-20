@@ -718,6 +718,36 @@ pub struct HeartbeatInfo {
     pub viewer_players: Vec<(String, u64)>,
 }
 
+/// Wiring shared by every control-plane listener entry point.
+///
+/// The accept loop needs a lot of collaborators; bundling them keeps the
+/// listener signatures small and means a new callback is threaded through one
+/// type instead of every entry point.
+pub struct ControlPlaneListenerConfig {
+    /// Shared cluster secret used to authenticate peers.
+    pub secret: String,
+    /// This node's id, announced during the handshake.
+    pub local_id: NodeId,
+    /// Raft handle for dispatching membership RPCs.
+    pub raft: Raft,
+    /// Handles a join request from a prospective member.
+    pub on_join: JoinAcceptFn,
+    /// Records a peer heartbeat.
+    pub on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
+    /// Handles an authenticated admin control message.
+    pub on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
+    /// Renders local stream stats for a stats request.
+    pub on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+    /// Returns true when a node id is in the current Raft membership.
+    pub is_member: MembershipFn,
+    /// Verifies HTTP-API-signed membership changes.
+    pub verify_admin_proof: AdminProofFn,
+    /// Leader-forward context for inter-node `ClientWrite` on followers.
+    pub write_forward: Option<ClientWriteForwardCtx>,
+    /// TLS acceptor config when inter-node TLS is enabled.
+    pub tls_server: Option<Arc<ServerConfig>>,
+}
+
 /// Accept control-plane connections and dispatch Raft / admin messages.
 pub async fn serve_control_plane(
     bind: SocketAddr,
@@ -772,18 +802,20 @@ pub async fn serve_control_plane_listener(
 ) -> Result<(), std::io::Error> {
     serve_control_plane_listener_with_member_sources(
         listener,
-        secret,
-        local_id,
-        raft,
-        on_join,
-        on_heartbeat,
-        on_admin,
-        on_stats,
-        is_member,
-        verify_admin_proof,
-        write_forward,
+        ControlPlaneListenerConfig {
+            secret,
+            local_id,
+            raft,
+            on_join,
+            on_heartbeat,
+            on_admin,
+            on_stats,
+            is_member,
+            verify_admin_proof,
+            write_forward,
+            tls_server,
+        },
         Arc::new(|_ip: IpAddr| false),
-        tls_server,
     )
     .await
 }
@@ -798,19 +830,22 @@ pub async fn serve_control_plane_listener(
 /// exhaust the non-member budget.
 pub async fn serve_control_plane_listener_with_member_sources(
     listener: TcpListener,
-    secret: String,
-    local_id: NodeId,
-    raft: Raft,
-    on_join: JoinAcceptFn,
-    on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
-    on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
-    on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
-    is_member: MembershipFn,
-    verify_admin_proof: AdminProofFn,
-    write_forward: Option<ClientWriteForwardCtx>,
+    config: ControlPlaneListenerConfig,
     is_member_source: MemberSourceFn,
-    tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
+    let ControlPlaneListenerConfig {
+        secret,
+        local_id,
+        raft,
+        on_join,
+        on_heartbeat,
+        on_admin,
+        on_stats,
+        is_member,
+        verify_admin_proof,
+        write_forward,
+        tls_server,
+    } = config;
     let acceptor = tls_server.map(TlsAcceptor::from);
     let tls_required = acceptor.is_some();
     let preauth_budget = PreauthBudget::new();

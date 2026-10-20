@@ -444,18 +444,20 @@ impl ClusterManager {
             tokio::spawn(async move {
                 if let Err(e) = network::serve_control_plane_listener_with_member_sources(
                     listener,
-                    secret,
-                    local_id,
-                    raft_c,
-                    on_join,
-                    on_heartbeat,
-                    on_admin,
-                    on_stats,
-                    is_member,
-                    verify_admin_proof,
-                    Some(write_forward),
+                    network::ControlPlaneListenerConfig {
+                        secret,
+                        local_id,
+                        raft: raft_c,
+                        on_join,
+                        on_heartbeat,
+                        on_admin,
+                        on_stats,
+                        is_member,
+                        verify_admin_proof,
+                        write_forward: Some(write_forward),
+                        tls_server: tls_srv,
+                    },
                     is_member_source,
-                    tls_srv,
                 )
                 .await
                 {
