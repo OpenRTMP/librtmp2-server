@@ -1957,9 +1957,6 @@ mod tests {
         assert!(reopened.get_current_snapshot().await.unwrap().is_some());
     }
 
-    // Holding `apply_lock` across the await is the point: the install must
-    // block on it.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn snapshot_build_completes_during_continuous_apply() {
         use std::sync::atomic::AtomicBool;
@@ -2020,6 +2017,9 @@ mod tests {
         );
     }
 
+    // Holding `apply_lock` across the await is the point: the install must
+    // block on it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn install_snapshot_serializes_with_apply_lock() {
         let (sm, _rx) = sm_with_effects();
