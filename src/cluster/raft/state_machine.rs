@@ -756,76 +756,90 @@ impl SqliteStateMachine {
     }
 }
 
+fn log_id_ahead_of_boundary(
+    current: Option<LogId<u64>>,
+    boundary: Option<LogId<u64>>,
+) -> bool {
+    match (current, boundary) {
+        (Some(c), Some(b)) => c > b,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        // `apply_lock` serializes this builder with `apply` and
-        // `install_snapshot`, but it is held only around state access, not
-        // around the size-dependent serialization of the snapshot payload:
-        // - the capture reads the rows, `last_applied` and `last_membership`
-        //   under the lock, so the payload and its indices are a consistent
-        //   prefix of the log, and
-        // - the publication reacquires it and refuses to overwrite a snapshot
-        //   an installation (or a newer build) has since superseded, so a
-        //   builder that paused after its capture cannot regress the stored
-        //   snapshot below `last_applied`.
-        let (data, last_applied, last_membership) = {
+        // `apply_lock` serializes capture/install with `apply`, but it is not
+        // held across JSON serialization. Re-check `last_applied` before publish:
+        // a concurrent apply can advance the state machine while we encode, and
+        // shipping a snapshot whose `last_log_id` lags durable state lets log
+        // compaction drop mutations a lagging follower never replays.
+        loop {
+            let (data, captured_applied, last_membership) = {
+                let _apply = self.apply_lock.lock();
+                let applied = *self.last_applied.lock();
+                let data = self
+                    .build_app_snapshot(applied)
+                    .map_err(|e| StorageError::IO {
+                        source: StorageIOError::<u64>::read_state_machine(
+                            &std::io::Error::other(e),
+                        ),
+                    })?;
+                (data, applied, self.last_membership.lock().clone())
+            };
+            let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
+                source: StorageIOError::<u64>::read_state_machine(&e),
+            })?;
+            let idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
+            let snapshot_id = match captured_applied {
+                Some(last) => format!("{}-{}-{}", last.leader_id, last.index, idx),
+                None => format!("--{idx}"),
+            };
+            let meta = SnapshotMeta {
+                last_log_id: captured_applied,
+                last_membership,
+                snapshot_id,
+            };
             let _apply = self.apply_lock.lock();
-            let applied = self.last_applied.lock();
-            let data = self
-                .build_app_snapshot(*applied)
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(e)),
-                })?;
-            (data, *applied, self.last_membership.lock().clone())
-        };
-        let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::read_state_machine(&e),
-        })?;
-        let idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot_id = match last_applied {
-            Some(last) => format!("{}-{}-{}", last.leader_id, last.index, idx),
-            None => format!("--{idx}"),
-        };
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
-            snapshot_id,
-        };
-        let _apply = self.apply_lock.lock();
-        if let Some(existing) = self.current_snapshot.lock().clone()
-            && existing.meta.last_log_id > meta.last_log_id
-        {
-            // An install (or a newer build) superseded this snapshot while
-            // it was being serialized. Return the newer one instead of
-            // regressing the stored copies.
-            return Ok(Snapshot {
-                meta: existing.meta,
-                snapshot: Box::new(Cursor::new(existing.data)),
+            if let Some(existing) = self.current_snapshot.lock().clone()
+                && existing.meta.last_log_id > meta.last_log_id
+            {
+                // An install (or a newer build) superseded this snapshot while
+                // it was being serialized. Return the newer one instead of
+                // regressing the stored copies.
+                return Ok(Snapshot {
+                    meta: existing.meta,
+                    snapshot: Box::new(Cursor::new(existing.data)),
+                });
+            }
+            let current_applied = *self.last_applied.lock();
+            if log_id_ahead_of_boundary(current_applied, meta.last_log_id) {
+                continue;
+            }
+            *self.current_snapshot.lock() = Some(StoredSnapshot {
+                meta: meta.clone(),
+                data: bytes.clone(),
             });
-        }
-        *self.current_snapshot.lock() = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data: bytes.clone(),
-        });
-        // Persist snapshot blob for crash recovery.
-        let meta_json = serde_json::to_string(&meta).map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_snapshot(None, &e),
-        })?;
-        self.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO raft_snapshots(id, meta_json, data) VALUES(1, ?, ?) \
-                 ON CONFLICT(id) DO UPDATE SET meta_json=excluded.meta_json, data=excluded.data",
-                params![meta_json, bytes],
-            )
-            .map_err(|e| StorageError::IO {
+            // Persist snapshot blob for crash recovery.
+            let meta_json = serde_json::to_string(&meta).map_err(|e| StorageError::IO {
                 source: StorageIOError::<u64>::write_snapshot(None, &e),
             })?;
-            Ok::<(), StorageError<u64>>(())
-        })?;
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(bytes)),
-        })
+            self.db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO raft_snapshots(id, meta_json, data) VALUES(1, ?, ?) \
+                     ON CONFLICT(id) DO UPDATE SET meta_json=excluded.meta_json, data=excluded.data",
+                    params![meta_json, bytes],
+                )
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::<u64>::write_snapshot(None, &e),
+                })?;
+                Ok::<(), StorageError<u64>>(())
+            })?;
+            return Ok(Snapshot {
+                meta,
+                snapshot: Box::new(Cursor::new(bytes)),
+            });
+        }
     }
 }
 
@@ -857,6 +871,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
             // the command commits — a crash between would skip the mutation.
             match entry.payload {
                 EntryPayload::Blank => {
+                    let _apply = self.apply_lock.lock();
                     self.persist_applied_tx(entry.log_id, None)?;
                     responses.push(ClusterResponse::Ok);
                 }
