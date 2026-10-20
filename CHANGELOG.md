@@ -20,16 +20,16 @@ begin at `1.0.0`.
 - Hardened the cluster media read budget and v2 control-frame validation so a
   single peer cannot monopolize shared read capacity.
 - Repeated `publish` commands on one RTMP connection no longer force a full
-  media-output rebuild per command. A generation-only change (duplicate
-  publish on the same route) now keeps the running recording/HLS/push/exec
-  session and only records the new generation; real republishes still restart
-  via the route change or the debounced timestamp-rewind boundary.
+  media-output rebuild per command. Rapid generation bumps are coalesced within
+  a short per-connection window; a genuine republish after that window still
+  starts a new recording/HLS/push/exec session.
 
 ### Fixed
 - `MEDIA_EXEC_PUBLISH_DONE` is now emitted for sessions torn down through the
-  abort path (retirement queue full, reaper unavailable/disconnected) and
-  before sink shutdown, so the documented publish/publish_done pair is always
-  closed and a session's end event precedes the next session's `publish`.
+  abort path (retirement queue full, reaper unavailable/disconnected) and only
+  after the output sinks have finished, so the documented publish/publish_done
+  pair is always closed and a completion hook never sees an unterminated
+  recording or a live HLS playlist.
 - The `list_streams` benchmark uses its own server and a fixed seeded dataset
   (1,000 streams) instead of the rows the preceding `create_stream` benchmark
   happened to insert, so its published number no longer depends on host speed.

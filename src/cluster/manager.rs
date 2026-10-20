@@ -520,6 +520,16 @@ impl ClusterManager {
                         .peer_viewer_players
                         .lock()
                         .insert(info.node_id, info.viewer_players.into_iter().collect());
+                    // `remove_peer` may have run after the membership check at
+                    // the top of this callback: it commits the membership
+                    // change, then clears `meta` and the caches. If this
+                    // heartbeat inserted its caches after that cleanup, the
+                    // id is no longer in membership and the entries would
+                    // otherwise survive unprunable (the topology prune only
+                    // walks `meta`). Re-check and drop them.
+                    if !counts_hb.peer_in_membership(info.node_id) {
+                        counts_hb.drop_peer_heartbeat_caches(info.node_id);
+                    }
                 },
             );
             let mgr_admin = Arc::clone(&mgr);

@@ -374,25 +374,30 @@ impl MediaOutputManager {
                 // Every accepted `publish` command bumps the connection's
                 // generation, including a duplicate publish on a connection
                 // that already has this publisher (librtmp2 admits a repeat
-                // publish and the bridge re-claims the same route). Rebuilding
-                // the session for such a change is unbounded work driven by a
-                // ~30-byte command: a new recording file, a new HLS session
-                // directory plus FFmpeg child, one FFmpeg per push target and
-                // a `MEDIA_EXEC_PUBLISH` child, all on the RTMP poll thread.
-                // Keep the running session and only record the new generation.
-                // A genuinely new publish session still restarts: a route
-                // switch changes `stream_id`, and a real republish inside the
-                // same route resets the RTMP timestamps, which `handle_frame`
-                // treats as a boundary (debounced per connection by
-                // `REPUBLISH_RESTART_MIN_INTERVAL`).
-                session.generation = generation;
-                return;
+                // publish and the bridge re-claims the same route). Restarting
+                // on every bump is unbounded work driven by a ~30-byte command
+                // (new recording file, HLS session directory plus FFmpeg child,
+                // one FFmpeg per push target and a `MEDIA_EXEC_PUBLISH` child,
+                // all on the RTMP poll thread). Coalesce rapid bumps, but still
+                // start a new session for a genuine republish once the debounce
+                // window has elapsed so two logical publish sessions are never
+                // merged into one recording/HLS session.
+                if session
+                    .restarted_at
+                    .is_some_and(|at| at.elapsed() < REPUBLISH_RESTART_MIN_INTERVAL)
+                {
+                    session.generation = generation;
+                    return;
+                }
             }
         }
         if let Some(old) = self.sessions.remove(&conn_id) {
             self.retire(old);
         }
         self.start_session(conn_id, stream_id, generation);
+        if let Some(session) = self.sessions.get_mut(&conn_id) {
+            session.restarted_at = Some(Instant::now());
+        }
     }
 
     pub fn handle_frame(&mut self, frame: &RelayFrame, stream_id: &str, generation: u64) {
@@ -671,13 +676,13 @@ impl MediaSession {
         }
     }
 
-    /// Stop the session's hook effects before its sinks go away: terminate the
-    /// `MEDIA_EXEC_PUBLISH` child and announce `MEDIA_EXEC_PUBLISH_DONE`.
+    /// Stop the session's hook effects after its sinks have finished: terminate
+    /// the `MEDIA_EXEC_PUBLISH` child and announce `MEDIA_EXEC_PUBLISH_DONE`.
     ///
     /// Shared by [`Self::stop`] and [`Self::abort`] so a session that emitted
-    /// `publish` always emits `publish_done`, and runs before sink shutdown so
-    /// session N's end event is ordered before session N+1's `publish` during
-    /// a republish burst.
+    /// `publish` always emits `publish_done`, and runs only after the output
+    /// workers have flushed/closed their files so a completion hook never sees
+    /// an unterminated recording or a live HLS playlist.
     fn teardown_hooks(&mut self, config: &MediaOutputConfig) {
         if let Some(mut child) = self.publish_exec.take() {
             terminate_hook_child(&mut child);
@@ -704,13 +709,13 @@ impl MediaSession {
 
     fn abort(mut self, reason: &str, config: &MediaOutputConfig) {
         // The session may already have announced itself through
-        // `MEDIA_EXEC_PUBLISH`; emit the matching end event before the sinks
-        // are disabled so the documented publish/publish_done pair is never
-        // left half-open.
-        self.teardown_hooks(config);
+        // `MEDIA_EXEC_PUBLISH`; emit the matching end event after the sinks are
+        // disabled so the documented publish/publish_done pair is never left
+        // half-open and completion hooks see closed outputs.
         for mut sink in std::mem::take(&mut self.sinks) {
             sink.disable(reason);
         }
+        self.teardown_hooks(config);
         crate::log_warn!(
             "Media outputs: publisher session cancelled stream='{}' reason='{reason}'",
             self.stream_id
@@ -718,13 +723,14 @@ impl MediaSession {
     }
 
     fn stop(mut self, config: &MediaOutputConfig) {
-        // Emit the end event before the (up to 5s per sink) shutdown path so a
-        // republish burst cannot deliver it after the next session's publish.
-        self.teardown_hooks(config);
+        // Finalise the sinks first: a completion hook that archives/transcodes
+        // the recording or HLS output must not observe a file that is still
+        // being written.
         let sinks = std::mem::take(&mut self.sinks);
         for sink in sinks {
             sink.stop();
         }
+        self.teardown_hooks(config);
         crate::log_info!(
             "Media outputs: publisher session stopped stream='{}'",
             self.stream_id
@@ -2786,6 +2792,34 @@ mod tests {
 
         manager.stop_all();
         assert_eq!(files_with_extension(&root.join("s1"), "flv").len(), 1);
+    }
+
+    #[test]
+    fn genuine_republish_after_debounce_starts_new_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("recordings");
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: root.clone(),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        let current_file = |m: &MediaOutputManager| m.sessions[&9].recording_file.clone();
+
+        manager.ensure_publisher(9, "s1", 1);
+        let first = current_file(&manager);
+        assert!(first.is_some());
+
+        // A republish after the debounce window is a new logical session and
+        // must start a new recording instead of appending to the old one.
+        manager.sessions.get_mut(&9).unwrap().restarted_at =
+            Some(Instant::now() - REPUBLISH_RESTART_MIN_INTERVAL - Duration::from_millis(1));
+        manager.ensure_publisher(9, "s1", 2);
+        assert_eq!(manager.sessions[&9].generation, 2);
+        assert_ne!(current_file(&manager), first);
+
+        manager.stop_all();
+        assert_eq!(files_with_extension(&root.join("s1"), "flv").len(), 2);
     }
 
     #[test]

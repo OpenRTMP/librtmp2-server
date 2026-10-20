@@ -67,6 +67,24 @@ fn evict_oldest_eligible_cluster_auth_ip(
     true
 }
 
+/// Remove the least-recently-active IP bucket unconditionally.
+///
+/// Used only when the per-IP failure budget is saturated and every existing
+/// bucket is already throttled: the caller has admitted an unseen source, so
+/// its failure must still be recorded. Evicting the oldest bucket keeps the
+/// map bounded; the evicted address simply has to accumulate failures again.
+fn evict_oldest_cluster_auth_ip(guard: &mut HashMap<IpAddr, Vec<Instant>>, now: Instant) -> bool {
+    let Some(oldest_key) = guard
+        .iter()
+        .min_by_key(|(_, entries)| entries.last().copied().unwrap_or(now))
+        .map(|(key, _)| *key)
+    else {
+        return false;
+    };
+    guard.remove(&oldest_key);
+    true
+}
+
 /// True when `peer` has exceeded the cluster auth failure budget.
 ///
 /// Only a source that already exhausted its own budget is refused. A source
@@ -99,7 +117,11 @@ pub fn record_cluster_auth_failure(peer: IpAddr) {
     if !guard.contains_key(&peer)
         && guard.len() >= MAX_TRACKED_CLUSTER_AUTH_IPS
         && !evict_oldest_eligible_cluster_auth_ip(&mut guard, now)
+        && !evict_oldest_cluster_auth_ip(&mut guard, now)
     {
+        // The map is full and even the fallback eviction failed (it cannot
+        // fail while the map is non-empty); do not admit the attempt without
+        // recording it, or an unseen source could retry forever.
         return;
     }
     guard.entry(peer).or_default().push(now);
@@ -600,6 +622,40 @@ mod tests {
         assert!(
             super::cluster_auth_rate_limited(throttled),
             "a bucket that exhausted its failure budget must stay throttled"
+        );
+
+        super::CLUSTER_AUTH_FAILURES.lock().clear();
+    }
+
+    #[test]
+    #[serial]
+    fn cluster_auth_tracker_records_failures_when_every_bucket_is_throttled() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let now = Instant::now();
+        let fresh: IpAddr = "203.0.113.10".parse().unwrap();
+        {
+            let mut guard = super::CLUSTER_AUTH_FAILURES.lock();
+            guard.clear();
+            for i in 1..=super::MAX_TRACKED_CLUSTER_AUTH_IPS {
+                let ip = IpAddr::V4(Ipv4Addr::from(i as u32));
+                guard.insert(ip, vec![now; super::CLUSTER_AUTH_MAX_FAILURES]);
+            }
+        }
+        assert!(!super::cluster_auth_rate_limited(fresh));
+
+        // Even with every existing bucket throttled, failures from an admitted
+        // unseen source must be recorded, otherwise it could retry forever.
+        for _ in 0..super::CLUSTER_AUTH_MAX_FAILURES {
+            super::record_cluster_auth_failure(fresh);
+        }
+        assert!(
+            super::cluster_auth_rate_limited(fresh),
+            "recorded failures must throttle the admitted source"
+        );
+        assert!(
+            super::CLUSTER_AUTH_FAILURES.lock().len() <= super::MAX_TRACKED_CLUSTER_AUTH_IPS,
+            "the tracker must stay bounded"
         );
 
         super::CLUSTER_AUTH_FAILURES.lock().clear();
