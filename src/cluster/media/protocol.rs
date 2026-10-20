@@ -16,6 +16,11 @@ pub const MEDIA_PROTOCOL_VERSION: u16 = 2;
 pub const MEDIA_PROTOCOL_MIN_VERSION: u16 = 1;
 /// `Error.code` when an inbound `Subscribe` is rejected after the gate window.
 pub const SUBSCRIBE_DENIED: &str = "subscribe_denied";
+/// `Error.code` when the inbound `Subscribe` gate could not complete because
+/// of a transient failure (control RPC unreachable, topology still
+/// converging). Retryable — it is not an authorization verdict, so the
+/// subscriber must not count it as a NACK or drop its subscription refs.
+pub const SUBSCRIBE_UNAVAILABLE: &str = "subscribe_unavailable";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MediaMessage {

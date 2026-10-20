@@ -28,6 +28,13 @@ const RTMP_AUTH_MAX_FAILURES: usize = 10;
 /// grow `auth_failures` without bound, mirroring `rate_limit::MAX_TRACKED_KEYS`.
 const MAX_TRACKED_AUTH_FAILURE_KEYS: usize = 10_000;
 
+/// Test-only callback used by
+/// [`DbRtmpBridge::release_player_if_id`]'s regression test to replace the
+/// connection's player between its deactivation write and its still-current
+/// check.
+#[cfg(all(test, feature = "cluster"))]
+type PlayerReleaseHook = Box<dyn Fn(&DbRtmpBridge, ConnId) + Send + Sync + 'static>;
+
 /// Classifies publish/play auth rejections for logging and rate limiting.
 /// `Credential` and `RecognizedKey` both consume the per-IP auth-failure
 /// budget so a remote peer cannot probe whether a key exists by observing
@@ -163,6 +170,11 @@ pub struct DbRtmpBridge {
     /// per abandoned local play role).
     #[cfg(all(test, feature = "cluster"))]
     remote_play_unsubscribes: std::sync::atomic::AtomicUsize,
+    /// Test hook: runs after the deactivation write in
+    /// [`DbRtmpBridge::release_player_if_id`] and before its still-current
+    /// check, so a test can interleave a replacement player session.
+    #[cfg(all(test, feature = "cluster"))]
+    player_release_after_update_hook: Mutex<Option<PlayerReleaseHook>>,
 }
 
 /// Strip the port from a `host:port` / `[host]:port` remote address string,
@@ -241,6 +253,8 @@ impl DbRtmpBridge {
             pending_force_close: Mutex::new(HashSet::new()),
             #[cfg(all(test, feature = "cluster"))]
             remote_play_unsubscribes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "cluster"))]
+            player_release_after_update_hook: Mutex::new(None),
         }
     }
 
@@ -322,6 +336,23 @@ impl DbRtmpBridge {
             .map_or((None, None), |cs| (cs.publisher.clone(), cs.player.clone()))
     }
 
+    /// Aggregated source identity for an auth-failure bucket. IPv4 sources are
+    /// used as-is; an IPv6 source is masked to its /64 so a host that holds a
+    /// routed prefix cannot mint one bucket per address it controls.
+    fn auth_failure_source(remote_ip: &str) -> String {
+        match remote_ip.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_string(),
+                None => {
+                    let mut octets = v6.octets();
+                    octets[8..].fill(0);
+                    format!("[{}]", std::net::Ipv6Addr::from(octets))
+                }
+            },
+            _ => remote_ip.to_string(),
+        }
+    }
+
     /// Auth-failure bucket key. The role is part of the key so a successful
     /// publish cannot clear a play-failure window (and vice versa) from the
     /// same IP, which would otherwise let one legitimate role defeat
@@ -333,30 +364,27 @@ impl DbRtmpBridge {
             // still bounding brute-force attempts per TCP session.
             format!("conn:{conn}:{role}")
         } else {
-            format!("{remote_ip}:{role}")
+            format!("{}:{role}", Self::auth_failure_source(remote_ip))
         }
     }
 
-    fn is_auth_rate_limited(&self, remote_ip: &str) -> bool {
+    /// True when `rate_key` (see [`Self::auth_rate_key`]) has exhausted its
+    /// failure budget. A source without a bucket is never pre-emptively
+    /// rejected: it still gets its credential verification, and only a failed
+    /// attempt spends budget. A saturated map therefore cannot turn this
+    /// per-source limiter into a node-wide fail-closed gate.
+    fn is_auth_rate_limited(&self, rate_key: &str) -> bool {
         let mut guard = self.auth_failures.lock();
         let now = Instant::now();
-        let Some(entries) = guard.get_mut(remote_ip) else {
-            // The map is full and every tracked bucket is actively
-            // throttled, so `record_auth_failure` cannot make room to track
-            // this new IP (see the eviction guard there). Treat it as
-            // rate-limited too rather than letting it bypass the
-            // auth-failure limit entirely while the map is saturated.
-            return guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS
-                && guard
-                    .values()
-                    .all(|e| Self::active_auth_failure_count(e, now) >= RTMP_AUTH_MAX_FAILURES);
+        let Some(entries) = guard.get_mut(rate_key) else {
+            return false;
         };
         entries.retain(|t| {
             now.checked_duration_since(*t)
                 .is_none_or(|age| age < RTMP_AUTH_FAILURE_WINDOW)
         });
         if entries.is_empty() {
-            guard.remove(remote_ip);
+            guard.remove(rate_key);
             return false;
         }
         Self::active_auth_failure_count(entries, now) >= RTMP_AUTH_MAX_FAILURES
@@ -415,8 +443,11 @@ impl DbRtmpBridge {
             if guard.len() >= MAX_TRACKED_AUTH_FAILURE_KEYS
                 && !Self::evict_oldest_eligible_auth_failure_bucket(&mut guard, now)
             {
-                // Every tracked IP is actively rate-limited; skip tracking this
-                // new source rather than freeing a throttled bucket.
+                // Every tracked source is actively rate-limited; keep their
+                // buckets and leave this new source untracked. It is still
+                // subject to credential verification (the limiter never denies
+                // a source without a bucket), so a saturated map cannot become
+                // a global gate, and the map stays bounded.
                 return;
             }
         }
@@ -717,7 +748,19 @@ impl DbRtmpBridge {
             pub_row.id
         );
 
-        self.try_release_ownership_for_conn(conn);
+        // Release ownership only for the stream this publisher row owns. The
+        // connection may already have acquired ownership of a new stream (a
+        // same-connection stream switch installs its ownership entry before it
+        // swaps `ConnState.publisher`), and releasing that entry here would
+        // strip fencing from a live publisher.
+        let owns_this_stream = self
+            .ownership_epochs
+            .lock()
+            .get(&conn)
+            .is_some_and(|(stream_id, _)| stream_id == &pub_row.stream_id);
+        if owns_this_stream {
+            self.try_release_ownership_for_conn(conn);
+        }
 
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -824,6 +867,24 @@ impl DbRtmpBridge {
                 "RTMP: failed to deactivate superseded player session={} conn={conn}",
                 row.id
             );
+            return;
+        }
+        #[cfg(all(test, feature = "cluster"))]
+        {
+            // Deterministic interleave point for the regression test: runs
+            // before the still-current check, like a replacement session
+            // installed while the write above was in flight.
+            let hook = self.player_release_after_update_hook.lock().take();
+            if let Some(hook) = hook {
+                hook(self, conn);
+            }
+        }
+        let still_current = self
+            .conns
+            .lock()
+            .get(&conn)
+            .and_then(|cs| cs.player.as_ref().map(|player| player.id.clone()));
+        if still_current.as_deref() != Some(player_id) {
             return;
         }
         #[cfg(feature = "cluster")]
@@ -2160,8 +2221,9 @@ mod tests {
     }
 
     #[test]
-    fn new_ip_is_rejected_when_auth_failure_map_is_fully_saturated_and_throttled() {
+    fn saturated_auth_failure_map_does_not_gate_unseen_sources() {
         let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(db);
         let now = Instant::now();
 
@@ -2172,14 +2234,71 @@ mod tests {
             }
         }
 
-        let overflow_ip = "203.0.113.200";
-        bridge.on_connect(9_999, &format!("{overflow_ip}:1935"));
+        // A source without a bucket is not pre-emptively throttled...
+        let unseen_ip = "203.0.113.200";
+        bridge.on_connect(9_999, &format!("{unseen_ip}:1935"));
         assert!(
-            bridge.is_auth_rate_limited(&format!("{overflow_ip}:publish")),
-            "an untracked IP must be rejected, not silently let through, \
-             while every bucket in a full auth-failure map is actively throttled"
+            !bridge.is_auth_rate_limited(&format!("{unseen_ip}:publish")),
+            "a full auth-failure map must not fail closed for unseen sources"
         );
-        assert!(bridge.authorize_publish(9_999, "live", "bogus").is_err());
+        // ...so its credentials are still verified: a valid key is admitted
+        // even while the tracker is saturated and every bucket is throttled.
+        assert!(
+            bridge
+                .authorize_publish(9_999, "live", &s.publish_key)
+                .is_ok(),
+            "a valid publisher must not be denied because the failure map is full"
+        );
+
+        // A failed attempt from another unseen source is still rejected by the
+        // credential check and does not evict an actively throttled bucket.
+        bridge.on_connect(10_000, "203.0.113.201:1935");
+        assert!(bridge.authorize_publish(10_000, "live", "bogus").is_err());
+        assert_eq!(
+            bridge.auth_failures.lock().len(),
+            MAX_TRACKED_AUTH_FAILURE_KEYS,
+            "saturation must not evict buckets that are still throttled"
+        );
+    }
+
+    #[test]
+    fn ipv6_auth_failures_aggregate_per_slash_64() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(db);
+        let first = "[2001:db8:1:2::1]:1935";
+        for conn in 0..RTMP_AUTH_MAX_FAILURES as u64 {
+            bridge.on_connect(conn, first);
+            assert!(bridge.authorize_publish(conn, "live", "bogus").is_err());
+        }
+
+        // A different address inside the same /64 shares the bucket, so even a
+        // valid key is refused there...
+        let same_prefix = "[2001:db8:1:2:abcd::9]:1935";
+        let same_prefix_ip = remote_ip_of(same_prefix);
+        let same_prefix_key = DbRtmpBridge::auth_rate_key(100, &same_prefix_ip, "publish");
+        bridge.on_connect(100, same_prefix);
+        assert!(
+            bridge.is_auth_rate_limited(&same_prefix_key),
+            "IPv6 sources must be aggregated per /64"
+        );
+        assert!(
+            bridge
+                .authorize_publish(100, "live", &s.publish_key)
+                .is_err()
+        );
+
+        // ...while another /64 is unaffected and can still publish.
+        let other_prefix = "[2001:db8:1:3::1]:1935";
+        let other_prefix_ip = remote_ip_of(other_prefix);
+        let other_prefix_key = DbRtmpBridge::auth_rate_key(101, &other_prefix_ip, "publish");
+        bridge.on_connect(101, other_prefix);
+        assert!(!bridge.is_auth_rate_limited(&other_prefix_key));
+        assert!(
+            bridge
+                .authorize_publish(101, "live", &s.publish_key)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2792,6 +2911,35 @@ mod tests {
         assert_eq!(db.player_active_count_for_viewer(&row.viewer_id), 0);
     }
 
+    /// Free loopback port for a test cluster's control/media listener.
+    #[cfg(feature = "cluster")]
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Start a single-node cluster manager on `db` and return it.
+    #[cfg(feature = "cluster")]
+    async fn start_test_cluster(db: Arc<Db>) -> Arc<crate::cluster::ClusterManager> {
+        let config = crate::cluster::ClusterConfig {
+            enabled: true,
+            node_id: 1,
+            bind: format!("127.0.0.1:{}", free_port()),
+            media_bind: format!("127.0.0.1:{}", free_port()),
+            bootstrap: true,
+            secret: "test-cluster-secret-0123456789abcd".to_string(),
+            heartbeat: Duration::from_millis(100),
+            allow_loopback_peer_addrs: true,
+            ..Default::default()
+        };
+        crate::cluster::ClusterManager::start(config, db, tokio::runtime::Handle::current())
+            .await
+            .expect("start cluster manager")
+    }
+
     #[cfg(feature = "cluster")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandon_roles_issues_one_remote_unsubscribe_per_abandoned_play() {
@@ -2829,31 +2977,7 @@ mod tests {
              have been counted"
         );
 
-        let free_port = || {
-            std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        };
-        let config = crate::cluster::ClusterConfig {
-            enabled: true,
-            node_id: 1,
-            bind: format!("127.0.0.1:{}", free_port()),
-            media_bind: format!("127.0.0.1:{}", free_port()),
-            bootstrap: true,
-            secret: "test-cluster-secret-0123456789abcd".to_string(),
-            heartbeat: Duration::from_millis(100),
-            allow_loopback_peer_addrs: true,
-            ..Default::default()
-        };
-        let mgr = crate::cluster::ClusterManager::start(
-            config,
-            Arc::clone(&db),
-            tokio::runtime::Handle::current(),
-        )
-        .await
-        .expect("start cluster manager");
+        let mgr = start_test_cluster(Arc::clone(&db)).await;
         bridge.set_coordinator(Arc::new(StateCoordinator::cluster(Arc::clone(&mgr))));
 
         // One remote subscription ref per local play role, as the peer's media
@@ -3195,6 +3319,51 @@ mod tests {
     }
 
     #[test]
+    fn release_publisher_keeps_ownership_acquired_for_a_newer_stream() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s1 = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let _s2 = add_stream_with_player(&db, "s2", "pub_k2", "pl_k2");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.set_coordinator(Arc::new(StateCoordinator::standalone(Arc::clone(&db))));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+
+        let publish_a = bridge
+            .try_fast_authorize_publish(1, "live", &s1.publish_key)
+            .expect("publish admitted");
+        assert!(db.publisher_try_acquire(&publish_a));
+        assert_eq!(
+            bridge.ownership_epochs.lock().get(&1).cloned(),
+            Some(("s1".to_string(), 1))
+        );
+
+        // A same-connection switch to s2 is in flight: the auth worker has
+        // already acquired s2's ownership and recorded it, but has not swapped
+        // `ConnState.publisher` yet. Releasing the s1 row must leave it alone.
+        bridge
+            .ownership_epochs
+            .lock()
+            .insert(1, ("s2".to_string(), 7));
+
+        bridge.release_publisher(1);
+
+        assert_eq!(
+            bridge.ownership_epochs.lock().get(&1).cloned(),
+            Some(("s2".to_string(), 7)),
+            "releasing the old publisher row must not release the new stream's ownership"
+        );
+        assert_eq!(
+            bridge.ownership_epoch_for_conn(1),
+            Some(7),
+            "the in-flight stream must keep its fencing epoch for frame export"
+        );
+        assert!(
+            bridge.session_rows(1).0.is_none(),
+            "the released publisher session itself is still cleared"
+        );
+    }
+
+    #[test]
     fn release_player_if_id_clears_only_the_named_session() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
@@ -3255,6 +3424,68 @@ mod tests {
         assert_eq!(
             bridge.session_rows(1).1.as_ref().map(|p| p.id.as_str()),
             Some(player_id.as_str())
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_player_if_id_does_not_unsubscribe_a_superseded_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(Db::open(dir.path().join("bridge.db").to_str().unwrap()).unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        // Admit before the coordinator exists, then persist the row, so the
+        // play role holds exactly one remote subscription ref.
+        let player = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+        bridge.persist_fast_play(1, &player);
+
+        let mgr = start_test_cluster(Arc::clone(&db)).await;
+        bridge.set_coordinator(Arc::new(StateCoordinator::cluster(Arc::clone(&mgr))));
+        mgr.media().subscribe_remote("", 2, "live", "s1", 1).await;
+
+        // A same-stream replay replaces the session while the release of the
+        // old one sits between its DB write and its still-current check.
+        let replacement_id = "replacement-player-session".to_string();
+        let replacement_stream = s.id.clone();
+        let replacement_viewer = player.viewer_id.clone();
+        *bridge.player_release_after_update_hook.lock() =
+            Some(Box::new(move |bridge: &DbRtmpBridge, conn: ConnId| {
+                let mut guard = bridge.conns.lock();
+                if let Some(cs) = guard.get_mut(&conn) {
+                    cs.player = Some(Player {
+                        id: replacement_id.clone(),
+                        stream_id: replacement_stream.clone(),
+                        viewer_id: replacement_viewer.clone(),
+                        app: "live".to_string(),
+                        active: true,
+                        ..Default::default()
+                    });
+                }
+            }));
+
+        bridge.release_player_if_id(1, &player.id);
+
+        assert_eq!(
+            bridge
+                .remote_play_unsubscribes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a release that lost its session to a replacement must not drop the \
+             replacement's remote-play subscription"
+        );
+        assert_eq!(
+            bridge.session_rows(1).1.map(|row| row.id),
+            Some("replacement-player-session".to_string()),
+            "the replacement session must stay installed"
+        );
+        assert_eq!(
+            mgr.media().subscribed_nodes_for("live", "s1").len(),
+            1,
+            "the remote subscription ref is owned by the replacement session"
         );
     }
 }

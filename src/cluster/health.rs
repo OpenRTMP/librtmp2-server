@@ -46,6 +46,26 @@ impl NodeHealthState {
             _ => None,
         }
     }
+
+    /// Health to record for a peer from its heartbeat advertisement.
+    ///
+    /// `DOWN` and `ISOLATED` are deliberately *not* taken from the wire:
+    /// liveness is derived locally from heartbeat timeliness (`sweep_stale`)
+    /// and quorum state from this node's own voter view. Accepting a peer's
+    /// claim would let a heartbeat with `health=DOWN` arm `down_since` (and
+    /// thus the leader's ownership release) or drop a live voter out of
+    /// `alive_voters`, forging quorum loss — on a plaintext cluster any holder
+    /// of `CLUSTER_SECRET` can send such a heartbeat for a member id. Benign
+    /// admission states (`READY`, `DRAINING`, `JOINING`, `LEARNER`, `LEAVING`)
+    /// are still kept as hints.
+    pub fn from_heartbeat(advertised: &str) -> Self {
+        match Self::parse(advertised) {
+            Some(NodeHealthState::Down | NodeHealthState::Isolated) | None => {
+                NodeHealthState::Ready
+            }
+            Some(other) => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,10 +127,13 @@ impl HealthTracker {
         entry.load = load;
         entry.last_seen = Instant::now();
         if state == NodeHealthState::Down {
-            // A peer that advertises itself DOWN must be armed here too:
-            // `sweep_stale` skips peers that are already Down, so this is the
-            // only place `down_since` can be set for it -- and
-            // `peers_ready_for_ownership_release` reads nothing else.
+            // A locally derived DOWN (sweep_stale, admin fencing) arms the
+            // delayed ownership release here too: `sweep_stale` skips peers
+            // that are already Down, so this is the only place `down_since`
+            // can be set for them -- and `peers_ready_for_ownership_release`
+            // reads nothing else. Heartbeat advertisements are sanitized by
+            // [`NodeHealthState::from_heartbeat`] before reaching this method,
+            // so a peer cannot arm its own release.
             self.down_since.lock().entry(id).or_insert(Instant::now());
         } else {
             self.down_since.lock().remove(&id);
@@ -165,6 +188,24 @@ impl HealthTracker {
         self.ownership_released.lock().insert(id);
     }
 
+    /// Health last recorded for `id`, if this node has heard from it.
+    pub fn peer_state(&self, id: NodeId) -> Option<NodeHealthState> {
+        self.peers.lock().get(&id).map(|p| p.state)
+    }
+
+    /// Whether heartbeat-derived data for `id` is too old to trust.
+    ///
+    /// A peer that is DOWN (or that has missed the liveness window) is no
+    /// longer refreshing its cached session counts: its heartbeats have
+    /// stopped and nothing else clears the cache, so callers that wait for
+    /// those counts to reach zero would wait forever. Callers must skip both
+    /// the RPC and the cached fallback for such a peer.
+    pub fn peer_report_stale(&self, id: NodeId) -> bool {
+        self.peers.lock().get(&id).is_some_and(|p| {
+            p.state == NodeHealthState::Down || p.last_seen.elapsed() > self.miss_limit
+        })
+    }
+
     pub fn peers_snapshot(&self) -> Vec<(NodeId, PeerHealth)> {
         self.peers
             .lock()
@@ -199,5 +240,77 @@ impl HealthTracker {
             }
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forged_down_or_isolated_heartbeat_cannot_arm_ownership_release() {
+        let tracker = HealthTracker::new(Duration::from_millis(200));
+
+        // A heartbeat advertising DOWN must be recorded as a benign state:
+        // liveness is derived locally from `last_seen`.
+        tracker.note_peer(2, NodeHealthState::from_heartbeat("DOWN"), 0.0, None, None);
+        assert_eq!(tracker.peer_state(2), Some(NodeHealthState::Ready));
+        assert!(
+            tracker
+                .peers_ready_for_ownership_release(Duration::ZERO)
+                .is_empty(),
+            "a forged DOWN must not queue an ownership release"
+        );
+        assert_eq!(tracker.alive_voters(&[1, 2], 1), 2);
+
+        // ISOLATED is likewise this node's own verdict, not the peer's.
+        tracker.note_peer(
+            3,
+            NodeHealthState::from_heartbeat("ISOLATED"),
+            0.0,
+            None,
+            None,
+        );
+        assert_eq!(tracker.peer_state(3), Some(NodeHealthState::Ready));
+        assert_eq!(tracker.alive_voters(&[1, 2, 3], 1), 3);
+
+        // Benign admission states are still kept as hints, and a genuinely
+        // locally derived DOWN still arms the delayed release.
+        for state in ["READY", "DRAINING", "JOINING", "LEARNER", "LEAVING"] {
+            assert_eq!(
+                NodeHealthState::from_heartbeat(state),
+                NodeHealthState::parse(state).unwrap()
+            );
+        }
+        assert_eq!(
+            NodeHealthState::from_heartbeat("not-a-state"),
+            NodeHealthState::Ready
+        );
+        tracker.note_peer(4, NodeHealthState::Down, 0.0, None, None);
+        assert_eq!(
+            tracker.peers_ready_for_ownership_release(Duration::ZERO),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn down_or_aged_peer_reports_stale_counts() {
+        let tracker = HealthTracker::new(Duration::from_millis(1));
+        assert!(!tracker.peer_report_stale(9), "unknown peers are dialed");
+        tracker.note_peer(2, NodeHealthState::Ready, 0.0, None, None);
+        assert!(!tracker.peer_report_stale(2));
+        tracker.note_peer(2, NodeHealthState::Down, 0.0, None, None);
+        assert!(tracker.peer_report_stale(2));
+        // A fresh heartbeat from a recovered peer makes its counts usable again.
+        tracker.note_peer(2, NodeHealthState::Ready, 0.0, None, None);
+        assert!(!tracker.peer_report_stale(2));
+
+        // `last_seen` older than the miss limit is stale even before
+        // `sweep_stale` flips the state to DOWN. The tracker floors the miss
+        // limit at 2s, so wait a little past it.
+        let tracker = HealthTracker::new(Duration::from_millis(1));
+        tracker.note_peer(3, NodeHealthState::Ready, 0.0, None, None);
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(tracker.peer_report_stale(3));
     }
 }

@@ -17,10 +17,14 @@ use crate::cluster::media::cache::{InitCacheEntry, InitCacheStore};
 use crate::cluster::media::live_queue::{LiveQueueConfig, LiveQueueSnapshot};
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::media::peer::{self, InboundMediaSink, MediaPeer, PeerMediaStats};
-use crate::cluster::media::protocol::{MEDIA_PROTOCOL_VERSION, MediaMessage, SUBSCRIBE_DENIED};
-use crate::cluster::media::subscription::SubscriptionTable;
+use crate::cluster::media::protocol::{
+    MEDIA_PROTOCOL_VERSION, MediaMessage, SUBSCRIBE_DENIED, SUBSCRIBE_UNAVAILABLE,
+};
+use crate::cluster::media::subscription::{OutboundSubscriptions, SubscriptionTable};
 use crate::cluster::media::timeline::TimelineRemapper;
-use crate::cluster::media::{InboundSubscribeGateFn, MediaMembershipFn};
+use crate::cluster::media::{
+    InboundSubscribeGateFn, InboundSubscribeVerdict, InboundSubscribeVerdictFn, MediaMembershipFn,
+};
 
 const MEDIA_INBOUND_QUEUE: usize = 4096;
 /// Cap concurrent authenticated inbound media connections (frame reader tasks).
@@ -38,6 +42,19 @@ const SUBSCRIBE_GATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SUBSCRIBE_NACK_RETRY: Duration = Duration::from_millis(200);
 const SUBSCRIBE_NACK_MAX: u8 = 3;
 const SUBSCRIBE_NACK_SEND_RETRIES: u8 = 3;
+/// Retry budget for a transient (retryable) inbound-Subscribe failure. These
+/// are not authorization verdicts, so they neither consume the NACK ladder nor
+/// drop refs; the delay is longer because the cause is usually a restarted or
+/// overloaded control listener.
+const SUBSCRIBE_TRANSIENT_RETRY: Duration = Duration::from_secs(1);
+/// Maximum transient `subscribe_unavailable` rounds per owner+stream. Each
+/// round may re-send once; without a cap a permanently unreachable control
+/// plane would re-arm a fresh retry chain forever (one Subscribe per second).
+const SUBSCRIBE_TRANSIENT_MAX_ATTEMPTS: u8 = 6;
+/// Bounded retries for a fresh-connection replay whose control enqueue hit the
+/// per-peer queue bound. Without them a replay burst larger than the queue
+/// would be silently truncated while the refs stay.
+const SUBSCRIBE_REPLAY_SEND_RETRIES: u8 = 16;
 /// Bounded retries, and the delay between them, for the InitCache enqueue that
 /// registers an inbound Subscribe. The wire has no Subscribe ACK, so a
 /// registration dropped on momentary queue pressure is never retried by the
@@ -449,6 +466,8 @@ pub struct MediaHub {
     queue_mb: u32,
     /// Age bound of the per-peer live-media queues in ms (`0` = default).
     media_max_age_ms: AtomicU32,
+    /// Test seam for the per-peer queue message bound (`0` = default).
+    media_max_messages: AtomicUsize,
     /// Configured standby replica slots (cluster inventory); MediaFrame fanout
     /// is subscriber-only so this is unused for continuous media push.
     #[allow(dead_code)]
@@ -459,6 +478,8 @@ pub struct MediaHub {
     inbound_sinks: Mutex<HashMap<NodeId, Arc<InboundMediaSink>>>,
     /// Per-(owner, app, stream) NACK retries after `subscribe_denied`.
     subscribe_nacks: Mutex<HashMap<(NodeId, String, String), u8>>,
+    /// Rounds of retryable `subscribe_unavailable` responses already spent.
+    transient_sub_retries: Mutex<HashMap<(NodeId, String, String), u8>>,
     /// Generation per owner+stream so delayed NACK retries cannot fire after
     /// unsubscribe/resubscribe and double the owner's Subscribe refcount.
     subscribe_gens: Mutex<HashMap<(NodeId, String, String), u64>>,
@@ -472,7 +493,10 @@ pub struct MediaHub {
     /// snapshot and have it sent twice (once by the fresh-peer resubscribe,
     /// once by the caller's direct send).
     subscribe_lock: Mutex<()>,
+    /// Owner-side inbound fan-out refs (remote peers subscribed to us).
     subs: SubscriptionTable,
+    /// Subscriber-side refs for local viewers, with per-connection wire state.
+    outbound: OutboundSubscriptions,
     cache: InitCacheStore,
     timelines: Mutex<HashMap<(String, String), TimelineRemapper>>,
     inject: Arc<InjectQueue>,
@@ -486,7 +510,15 @@ pub struct MediaHub {
     peer_reconnect_tx: mpsc::UnboundedSender<NodeId>,
     is_peer_allowed: MediaMembershipFn,
     /// Optional authorization for inbound `Subscribe` (cluster owner nodes).
+    /// Boolean form, kept for compatibility; the verdict form below is
+    /// preferred when both are set.
     inbound_subscribe_gate: parking_lot::Mutex<Option<InboundSubscribeGateFn>>,
+    /// Optional inbound `Subscribe` gate that separates a transient failure
+    /// from an authorization verdict.
+    inbound_subscribe_verdict_gate: parking_lot::Mutex<Option<InboundSubscribeVerdictFn>>,
+    /// Weak self handle so `&self` methods (fresh-peer replay) can spawn a
+    /// bounded retry task. A [`MediaHub`] is always created as an `Arc`.
+    self_weak: std::sync::OnceLock<std::sync::Weak<MediaHub>>,
 }
 
 impl MediaHub {
@@ -509,17 +541,20 @@ impl MediaHub {
             secret,
             queue_mb,
             media_max_age_ms: AtomicU32::new(0),
+            media_max_messages: AtomicUsize::new(0),
             replicas,
             ownership,
             peers: Mutex::new(HashMap::new()),
             inbound_sinks: Mutex::new(HashMap::new()),
             subscribe_nacks: Mutex::new(HashMap::new()),
+            transient_sub_retries: Mutex::new(HashMap::new()),
             subscribe_gens: Mutex::new(HashMap::new()),
             // Starts at 1: 0 is the "no generation recorded" sentinel on the
             // wire and must never be handed out as a real generation.
             next_sub_gen: AtomicU64::new(1),
             subscribe_lock: Mutex::new(()),
             subs: SubscriptionTable::new(),
+            outbound: OutboundSubscriptions::new(),
             cache: InitCacheStore::new(),
             timelines: Mutex::new(HashMap::new()),
             inject,
@@ -530,7 +565,10 @@ impl MediaHub {
             peer_reconnect_tx,
             is_peer_allowed,
             inbound_subscribe_gate: parking_lot::Mutex::new(None),
+            inbound_subscribe_verdict_gate: parking_lot::Mutex::new(None),
+            self_weak: std::sync::OnceLock::new(),
         });
+        let _ = hub.self_weak.set(Arc::downgrade(&hub));
         let hub_c = Arc::clone(&hub);
         tokio::spawn(async move {
             while let Some((peer_id, msg)) = inbound_rx.recv().await {
@@ -577,7 +615,11 @@ impl MediaHub {
         self.subscribe_nacks
             .lock()
             .retain(|(owner, _, _), _| *owner != peer_id);
-        let streams = self.subs.streams_for_peer(peer_id);
+        let streams = {
+            let mut streams = self.subs.streams_for_peer(peer_id);
+            streams.extend(self.outbound.streams_for_peer(peer_id));
+            streams
+        };
         {
             let mut gens = self.subscribe_gens.lock();
             for key in nack_keys {
@@ -593,6 +635,10 @@ impl MediaHub {
             }
         }
         self.subs.clear_peer(peer_id);
+        self.outbound.clear_peer(peer_id);
+        self.transient_sub_retries
+            .lock()
+            .retain(|(owner, _, _), _| *owner != peer_id);
     }
 
     fn sub_key(peer_id: NodeId, app: &str, stream: &str) -> (NodeId, String, String) {
@@ -615,6 +661,12 @@ impl MediaHub {
             .unwrap_or(0)
     }
 
+    /// Whether this node holds any subscription ref for `(peer, app, stream)`
+    /// in either direction.
+    fn has_subscription(&self, peer_id: NodeId, app: &str, stream: &str) -> bool {
+        self.subs.has(peer_id, app, stream) || self.outbound.has(peer_id, app, stream)
+    }
+
     /// Allocate a generation no other owner+stream has ever held and record it
     /// for `peer_id`'s `app`/`stream`; returns the value stored, so a caller
     /// that fences on it never re-reads the map and can never capture the 0 an
@@ -633,14 +685,16 @@ impl MediaHub {
             // generation can equal, so a pruned key is a dead fence.
             let nacks = self.subscribe_nacks.lock();
             gens.retain(|key, _| {
-                nacks.contains_key(key)
-                    || self.subs.peers_for_stream(&key.1, &key.2).contains(&key.0)
+                nacks.contains_key(key) || self.has_subscription(key.0, &key.1, &key.2)
             });
         }
         generation
     }
 
     fn clear_subscribe_nacks(&self, peer_id: NodeId, app: &str, stream: &str) {
+        self.transient_sub_retries
+            .lock()
+            .remove(&Self::sub_key(peer_id, app, stream));
         let had = self
             .subscribe_nacks
             .lock()
@@ -673,13 +727,29 @@ impl MediaHub {
         stream: String,
         generation: u64,
         send_retries: u8,
+        delay: Duration,
     ) {
         let hub = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(SUBSCRIBE_NACK_RETRY).await;
-            hub.run_subscribe_retry(peer_id, app, stream, generation, send_retries)
+            tokio::time::sleep(delay).await;
+            hub.run_subscribe_retry(peer_id, app, stream, generation, send_retries, delay)
                 .await;
         });
+    }
+
+    /// [`Self::schedule_subscribe_retry`] for `&self` callers.
+    fn schedule_subscribe_retry_for(
+        &self,
+        peer_id: NodeId,
+        app: String,
+        stream: String,
+        generation: u64,
+        send_retries: u8,
+        delay: Duration,
+    ) {
+        if let Some(hub) = self.self_weak.get().and_then(|w| w.upgrade()) {
+            hub.schedule_subscribe_retry(peer_id, app, stream, generation, send_retries, delay);
+        }
     }
 
     async fn run_subscribe_retry(
@@ -689,6 +759,7 @@ impl MediaHub {
         stream: String,
         generation: u64,
         send_retries: u8,
+        delay: Duration,
     ) {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
@@ -696,7 +767,14 @@ impl MediaHub {
         if self.sub_gen(peer_id, &app, &stream) != generation {
             return;
         }
-        if !self.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
+        // Only outbound refs ask a remote owner to serve a stream; inbound
+        // fan-out refs must never turn into a wire `Subscribe`.
+        if !self.outbound.has(peer_id, &app, &stream) {
+            return;
+        }
+        // Another attempt (a replay after reconnect, or a retry that already
+        // won) put the Subscribe on this connection.
+        if self.outbound.is_wired(peer_id, &app, &stream) {
             return;
         }
         let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
@@ -704,11 +782,19 @@ impl MediaHub {
             return;
         };
         let msg = self.subscribe_message(peer_id, &app, &stream, epoch);
-        if peer.try_send(msg.clone()).is_ok() || peer.try_send(msg).is_ok() {
+        if peer.try_send(msg.clone()).is_ok() {
+            self.outbound.set_wired(peer_id, &app, &stream, true);
             return;
         }
         if send_retries > 0 {
-            self.schedule_subscribe_retry(peer_id, app, stream, generation, send_retries - 1);
+            self.schedule_subscribe_retry(
+                peer_id,
+                app,
+                stream,
+                generation,
+                send_retries - 1,
+                delay,
+            );
         }
     }
 
@@ -716,13 +802,44 @@ impl MediaHub {
         *self.inbound_subscribe_gate.lock() = Some(gate);
     }
 
-    /// Retry a transient Subscribe denial for a bounded interval. This is
+    /// Set the inbound `Subscribe` gate that reports transient failures
+    /// distinctly from authorization verdicts. Takes precedence over the
+    /// boolean gate above.
+    pub fn set_inbound_subscribe_verdict_gate(&self, gate: InboundSubscribeVerdictFn) {
+        *self.inbound_subscribe_verdict_gate.lock() = Some(gate);
+    }
+
+    /// Retry a transient Subscribe check for a bounded interval. This is
     /// needed because the media protocol has no Subscribe ACK: dropping the
     /// first request while Raft membership converges would otherwise leave the
     /// caller's retained subscription refcount with no wire-level subscription.
-    async fn inbound_subscribe_allowed(&self, peer_id: NodeId, app: &str, stream: &str) -> bool {
+    async fn inbound_subscribe_verdict(
+        &self,
+        peer_id: NodeId,
+        app: &str,
+        stream: &str,
+    ) -> InboundSubscribeVerdict {
+        let verdict_gate = self.inbound_subscribe_verdict_gate.lock().clone();
+        if let Some(gate) = verdict_gate {
+            let app = app.to_string();
+            let stream = stream.to_string();
+            let retry = async move {
+                loop {
+                    match gate(peer_id, app.clone(), stream.clone()).await {
+                        InboundSubscribeVerdict::Transient => {}
+                        verdict => return verdict,
+                    }
+                    tokio::time::sleep(SUBSCRIBE_GATE_RETRY_DELAY).await;
+                }
+            };
+            // Still transient after the window: report it as such instead of
+            // turning a control-plane outage into an authorization denial.
+            return tokio::time::timeout(SUBSCRIBE_GATE_RETRY_WINDOW, retry)
+                .await
+                .unwrap_or(InboundSubscribeVerdict::Transient);
+        }
         let Some(gate) = self.inbound_subscribe_gate.lock().clone() else {
-            return true;
+            return InboundSubscribeVerdict::Allow;
         };
         let app = app.to_string();
         let stream = stream.to_string();
@@ -734,9 +851,14 @@ impl MediaHub {
                 tokio::time::sleep(SUBSCRIBE_GATE_RETRY_DELAY).await;
             }
         };
-        tokio::time::timeout(SUBSCRIBE_GATE_RETRY_WINDOW, retry)
+        if tokio::time::timeout(SUBSCRIBE_GATE_RETRY_WINDOW, retry)
             .await
             .unwrap_or(false)
+        {
+            InboundSubscribeVerdict::Allow
+        } else {
+            InboundSubscribeVerdict::Deny
+        }
     }
 
     pub async fn serve(self: Arc<Self>, bind: SocketAddr) -> Result<(), std::io::Error> {
@@ -849,17 +971,36 @@ impl MediaHub {
                         epoch: _,
                         generation,
                     } => {
-                        if !self.inbound_subscribe_allowed(peer_id, &app, &stream).await {
-                            tracing::warn!(
-                                peer = peer_id,
-                                %app,
-                                %stream,
-                                "media subscribe rejected: peer not authorized"
-                            );
-                            let _ = sink
-                                .send(subscribe_denied_error(&app, &stream, generation))
-                                .await;
-                            continue;
+                        match self.inbound_subscribe_verdict(peer_id, &app, &stream).await {
+                            InboundSubscribeVerdict::Allow => {}
+                            InboundSubscribeVerdict::Transient => {
+                                // A transient gate failure is not an
+                                // authorization verdict: answer with a
+                                // retryable code so the subscriber retries
+                                // without counting a NACK or dropping refs.
+                                tracing::warn!(
+                                    peer = peer_id,
+                                    %app,
+                                    %stream,
+                                    "media subscribe check unavailable; asking peer to retry"
+                                );
+                                let _ = sink
+                                    .send(subscribe_unavailable_error(&app, &stream, generation))
+                                    .await;
+                                continue;
+                            }
+                            InboundSubscribeVerdict::Deny => {
+                                tracing::warn!(
+                                    peer = peer_id,
+                                    %app,
+                                    %stream,
+                                    "media subscribe rejected: peer not authorized"
+                                );
+                                let _ = sink
+                                    .send(subscribe_denied_error(&app, &stream, generation))
+                                    .await;
+                                continue;
+                            }
                         }
                         let init_msg = if let Some(cache) = self.cache.get(&app, &stream) {
                             Some(MediaMessage::InitCache {
@@ -1079,17 +1220,50 @@ impl MediaHub {
                 message,
                 generation: req_gen,
             } => {
-                if code != SUBSCRIBE_DENIED {
+                let transient = code == SUBSCRIBE_UNAVAILABLE;
+                if !transient && code != SUBSCRIBE_DENIED {
                     return;
                 }
                 let Some((app, stream)) = parse_subscribe_denied(&message) else {
                     return;
                 };
-                if !self.subs.peers_for_stream(&app, &stream).contains(&peer_id) {
+                // Only an outbound ref asks this peer to serve the stream.
+                if !self.outbound.has(peer_id, &app, &stream) {
                     return;
                 }
                 let generation = self.sub_gen(peer_id, &app, &stream);
                 if req_gen != 0 && req_gen != generation {
+                    return;
+                }
+                // The owner did not accept this attempt: no wire subscription
+                // is established on this connection, so a later reader must
+                // not take the "already subscribed" fast path.
+                self.outbound.set_wired(peer_id, &app, &stream, false);
+                if transient {
+                    // Control-plane failure, not an authorization verdict:
+                    // retry with a bounded number of rounds and exponential
+                    // backoff, never touching the NACK ladder or local refs.
+                    // A fresh round is not re-armed indefinitely: otherwise a
+                    // permanently unreachable owner would keep sending one
+                    // Subscribe per second forever.
+                    let key = (peer_id, app.clone(), stream.clone());
+                    let attempt = {
+                        let mut rounds = self.transient_sub_retries.lock();
+                        let spent = rounds.entry(key).or_insert(0);
+                        if *spent >= SUBSCRIBE_TRANSIENT_MAX_ATTEMPTS {
+                            return;
+                        }
+                        *spent = spent.saturating_add(1);
+                        *spent
+                    };
+                    let backoff = SUBSCRIBE_TRANSIENT_RETRY
+                        .saturating_mul(1u32 << u32::from(attempt.saturating_sub(1)).min(5));
+                    let generation = if generation == 0 {
+                        self.bump_sub_gen(peer_id, &app, &stream)
+                    } else {
+                        generation
+                    };
+                    self.schedule_subscribe_retry(peer_id, app, stream, generation, 2, backoff);
                     return;
                 }
                 // Register the NACK before allocating the generation the retry
@@ -1113,14 +1287,18 @@ impl MediaHub {
                     generation
                 };
                 if n > SUBSCRIBE_NACK_MAX {
+                    // Exhausted the retry ladder. Keep the local refs: a
+                    // denial the owner produced after a transient control
+                    // failure must not turn into a permanent per-stream
+                    // outage. The next player subscribe, retry, reconnect or
+                    // ownership change repairs the wire state.
                     self.clear_subscribe_nacks(peer_id, &app, &stream);
                     self.bump_sub_gen(peer_id, &app, &stream);
-                    self.subs.clear_entry(peer_id, &app, &stream);
                     tracing::warn!(
                         peer = peer_id,
                         %app,
                         %stream,
-                        "media subscribe denied after retries — dropping local refs"
+                        "media subscribe denied after retries — keeping local refs for a later attempt"
                     );
                     return;
                 }
@@ -1130,6 +1308,7 @@ impl MediaHub {
                     stream,
                     generation,
                     SUBSCRIBE_NACK_SEND_RETRIES,
+                    SUBSCRIBE_NACK_RETRY,
                 );
             }
             _ => {}
@@ -1260,12 +1439,13 @@ impl MediaHub {
         let Some(peer) = self.peers.lock().get(&peer_id).cloned() else {
             return;
         };
-        for (app, stream) in self.subs.streams_for_peer(peer_id) {
-            // A refcount can also come from this peer's own inbound Subscribe
-            // (owner-side fan-out state); replaying it as an outbound Subscribe
-            // asks the peer to serve a stream this node owns, which it must
-            // deny — and the denial's give-up path would then clear the inbound
-            // refcount and stop fanout. Skip streams this node owns locally.
+        // A fresh connection carries no wire subscriptions: whatever was
+        // enqueued on the previous one is gone.
+        self.outbound.clear_wired(peer_id);
+        for (app, stream) in self.outbound.streams_for_peer(peer_id) {
+            // Ownership may have moved to this node while the outbound ref
+            // lingers; asking the peer to serve a stream we own would be
+            // denied. Skip it (the ref stays until the manager releases it).
             if self
                 .ownership
                 .get(&stream)
@@ -1274,10 +1454,32 @@ impl MediaHub {
                 continue;
             }
             let epoch = self.ownership.epoch_of(&app, &stream).unwrap_or(0);
-            // Soft control: if the queue rejects, leave the refcount in place
-            // for a later reconnect/resubscribe — this path is only entered
-            // after a fresh connection already exists.
-            let _ = peer.try_send(self.subscribe_message(peer_id, &app, &stream, epoch));
+            // A retry must capture a generation no other state can recycle
+            // (0 is the "never recorded" sentinel): allocate one if the key
+            // has none yet.
+            let generation = match self.sub_gen(peer_id, &app, &stream) {
+                0 => self.bump_sub_gen(peer_id, &app, &stream),
+                generation => generation,
+            };
+            // Honest about backpressure: a replay burst can exceed the
+            // per-peer control-message bound, so a rejected control send is
+            // retried instead of silently dropped (the ref would otherwise
+            // stay with no wire subscription until the next reconnect).
+            if peer
+                .try_send(self.subscribe_message(peer_id, &app, &stream, epoch))
+                .is_ok()
+            {
+                self.outbound.set_wired(peer_id, &app, &stream, true);
+            } else {
+                self.schedule_subscribe_retry_for(
+                    peer_id,
+                    app,
+                    stream,
+                    generation,
+                    SUBSCRIBE_REPLAY_SEND_RETRIES,
+                    SUBSCRIBE_NACK_RETRY,
+                );
+            }
         }
     }
 
@@ -1298,8 +1500,16 @@ impl MediaHub {
         // cannot be added between the peer-map insert and the snapshot (which
         // would send that stream's Subscribe twice).
         let _guard = self.subscribe_lock.lock();
-        if !self.subs.add(peer_id, app, stream) {
-            return true; // already subscribed (refcount)
+        // Only an outbound ref decides the wire fast path; the peer's own
+        // inbound Subscribe for the same key lives in `subs` and says nothing
+        // about a `Subscribe` written on this connection.
+        let first_ref = self.outbound.add(peer_id, app, stream);
+        // A new local viewer (first outbound ref) re-arms the bounded transient
+        // retry budget for this key; an existing ref does not.
+        if first_ref {
+            self.transient_sub_retries
+                .lock()
+                .remove(&Self::sub_key(peer_id, app, stream));
         }
         if media_addr.is_empty() {
             // Owner address not learned yet (e.g. just after a restart). Keep
@@ -1307,24 +1517,42 @@ impl MediaHub {
             // not spawn a peer that would dial an empty address forever.
             return true;
         }
-        let (peer, fresh) = self.ensure_peer_locked(peer_id, media_addr);
-        // A fresh connection already resent every tracked subscription for
-        // this peer, including the one just added above — sending it again
-        // here would just double the owner's per-connection subscribe tally.
-        if !fresh {
-            let ok = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
-            if ok.is_err() {
-                // Sole first-subscriber: roll back so a later player retries.
-                // Concurrent holders already saw add==false and expect wire
-                // Subscribe — keep our refcount and retry the send instead of
-                // leaving them with refs and no owner fan-out.
-                if !self.subs.remove_if_sole(peer_id, app, stream) {
-                    let _ = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
-                } else {
-                    self.bump_sub_gen(peer_id, app, stream);
-                    return false;
+        let (peer, _fresh) = self.ensure_peer_locked(peer_id, media_addr);
+        // A fresh connection already replayed every outbound ref for this
+        // peer, including the one just added above. A successful earlier send
+        // (or replay) also already wrote the Subscribe; a second one would
+        // double the owner's per-connection tally.
+        if self.outbound.is_wired(peer_id, app, stream) {
+            return true;
+        }
+        if self
+            .ownership
+            .get(stream)
+            .is_some_and(|(node, _)| node == self.local_id)
+        {
+            // The stream is ours now; a Subscribe would be denied and could
+            // clear fan-out state. Keep the ref for the manager to release.
+            return true;
+        }
+        let ok = peer.try_send(self.subscribe_message(peer_id, app, stream, epoch));
+        if ok.is_err() {
+            // Sole first-subscriber: roll back so a later player retries.
+            // Concurrent holders already saw their ref and expect a wire
+            // Subscribe — keep the ref and retry the send instead of leaving
+            // them with refs and no owner fan-out.
+            if !self.outbound.remove_if_sole(peer_id, app, stream) {
+                if peer
+                    .try_send(self.subscribe_message(peer_id, app, stream, epoch))
+                    .is_ok()
+                {
+                    self.outbound.set_wired(peer_id, app, stream, true);
                 }
+            } else {
+                self.bump_sub_gen(peer_id, app, stream);
+                return false;
             }
+        } else {
+            self.outbound.set_wired(peer_id, app, stream, true);
         }
         true
     }
@@ -1335,13 +1563,18 @@ impl MediaHub {
         // Unsubscribe (the owner would keep a phantom subscription). No `.await`
         // is held across the guard.
         let _guard = self.subscribe_lock.lock();
-        if !self.subs.remove(peer_id, app, stream) {
+        // Release only this node's outbound ref; the peer's own inbound ref
+        // for the same key is owner-side fan-out state and must stay.
+        if !self.outbound.remove(peer_id, app, stream) {
             return;
         }
         self.bump_sub_gen(peer_id, app, stream);
         self.subscribe_nacks
             .lock()
             .remove(&(peer_id, app.to_string(), stream.to_string()));
+        self.transient_sub_retries
+            .lock()
+            .remove(&Self::sub_key(peer_id, app, stream));
         if let Some(peer) = self.peers.lock().get(&peer_id) {
             let _ = peer.try_send(MediaMessage::Unsubscribe {
                 app: app.to_string(),
@@ -1442,7 +1675,20 @@ impl MediaHub {
     }
 
     fn queue_cfg(&self) -> LiveQueueConfig {
-        LiveQueueConfig::new(self.queue_mb, self.media_max_age_ms.load(Ordering::Relaxed))
+        let mut cfg =
+            LiveQueueConfig::new(self.queue_mb, self.media_max_age_ms.load(Ordering::Relaxed));
+        let max_messages = self.media_max_messages.load(Ordering::Relaxed);
+        if max_messages > 0 {
+            cfg.max_messages = max_messages;
+        }
+        cfg
+    }
+
+    /// Test seam: shrink the per-peer queue message bound so replay
+    /// backpressure is reachable without thousands of refs.
+    #[cfg(test)]
+    fn set_media_max_messages_for_test(&self, max: usize) {
+        self.media_max_messages.store(max, Ordering::Relaxed);
     }
 
     /// Set the age bound of the per-peer live-media queues (`0` = default).
@@ -1486,11 +1732,18 @@ impl MediaHub {
     }
 
     pub fn subscription_count(&self) -> usize {
-        self.subs.count()
+        self.subs.count() + self.outbound.count()
     }
 
     pub fn subscribed_nodes_for(&self, app: &str, stream: &str) -> Vec<NodeId> {
-        self.subs.peers_for_stream(app, stream)
+        let mut peers = self.subs.peers_for_stream(app, stream);
+        for peer in self.outbound.peers_for_stream(app, stream) {
+            if !peers.contains(&peer) {
+                peers.push(peer);
+            }
+        }
+        peers.sort_unstable();
+        peers
     }
 
     /// Reset timeline remappers for the given streams.
@@ -1539,6 +1792,14 @@ impl MediaHub {
 fn subscribe_denied_error(app: &str, stream: &str, generation: u64) -> MediaMessage {
     MediaMessage::Error {
         code: SUBSCRIBE_DENIED.to_string(),
+        message: subscribe_denied_payload(app, stream),
+        generation,
+    }
+}
+
+fn subscribe_unavailable_error(app: &str, stream: &str, generation: u64) -> MediaMessage {
+    MediaMessage::Error {
+        code: SUBSCRIBE_UNAVAILABLE.to_string(),
         message: subscribe_denied_payload(app, stream),
         generation,
     }
@@ -2396,6 +2657,62 @@ mod tests {
         owner.hub.shutdown();
     }
 
+    #[tokio::test]
+    async fn transient_inbound_subscribe_gate_failure_is_reported_as_retryable() {
+        let owner = node(1);
+        owner
+            .hub
+            .set_inbound_subscribe_verdict_gate(Arc::new(move |_peer, _app, stream| {
+                Box::pin(async move {
+                    if stream == "transient" {
+                        InboundSubscribeVerdict::Transient
+                    } else {
+                        InboundSubscribeVerdict::Deny
+                    }
+                })
+            }));
+        let addr = listen(&owner.hub).await;
+        let mut c = dial_hub(addr, 2).await;
+
+        for (stream, expected) in [
+            ("transient", SUBSCRIBE_UNAVAILABLE),
+            ("deny", SUBSCRIBE_DENIED),
+        ] {
+            send(
+                &mut c,
+                MediaMessage::Subscribe {
+                    app: "live".into(),
+                    stream: stream.into(),
+                    epoch: 0,
+                    generation: 5,
+                },
+            )
+            .await;
+            let reply = tokio::time::timeout(
+                WAIT,
+                peer::read_media_frame_v(&mut c, MEDIA_PROTOCOL_VERSION),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            match reply {
+                MediaMessage::Error {
+                    code,
+                    message,
+                    generation,
+                } => {
+                    assert_eq!(code, expected);
+                    assert_eq!(message, format!("live\t{stream}"));
+                    assert_eq!(generation, 5);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            // Neither outcome registers an inbound fan-out ref.
+            assert!(owner.hub.subscribed_nodes_for("live", stream).is_empty());
+        }
+        owner.hub.shutdown();
+    }
+
     // ---- outbound (subscriber-side) handling -----------------------------
 
     #[tokio::test]
@@ -2515,7 +2832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_denied_nacks_retry_then_give_up() {
+    async fn subscribe_denied_nacks_retry_then_keeps_refs() {
         let n = node(1);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let owner_addr = listener.local_addr().unwrap().to_string();
@@ -2553,6 +2870,10 @@ mod tests {
         // key reads back as), so it can never match a pruned or re-created key.
         let generation = n.hub.sub_gen(2, "live", "s");
         n.hub.handle_inbound(2, denied(generation));
+        assert!(
+            !n.hub.outbound.is_wired(2, "live", "s"),
+            "a denied attempt must not stay wired"
+        );
         match next(&mut s).await {
             MediaMessage::Subscribe { generation: g, .. } => {
                 assert_ne!(g, 0, "a retry must not capture the prunable generation 0");
@@ -2561,12 +2882,65 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
 
-        // Exhausting the retry budget drops the local refs entirely.
-        for _ in 0..SUBSCRIBE_NACK_MAX {
+        // Exhausting the retry budget stops the retry ladder but keeps the
+        // local refs: dropping them made one denial permanently dark for
+        // every local viewer.
+        for _ in 0..(SUBSCRIBE_NACK_MAX + 2) {
             n.hub.handle_inbound(2, denied(0));
+            if n.hub.subscribe_nacks.lock().is_empty() {
+                break;
+            }
         }
-        assert!(n.hub.subscribed_nodes_for("live", "s").is_empty());
+        assert_eq!(n.hub.subscribed_nodes_for("live", "s"), vec![2]);
         assert!(n.hub.subscribe_nacks.lock().is_empty());
+
+        // A later player subscribe (the ref is not wired) repairs the wire.
+        n.hub.subscribe_remote(&owner_addr, 2, "live", "s", 0).await;
+        match next(&mut s).await {
+            MediaMessage::Subscribe { stream, .. } => assert_eq!(stream, "s"),
+            other => panic!("unexpected {other:?}"),
+        }
+        n.hub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn transient_subscribe_failure_is_not_a_nack_and_keeps_refs() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_addr = listener.local_addr().unwrap().to_string();
+        n.hub.subscribe_remote(&owner_addr, 2, "live", "s", 0).await;
+        let mut s = accept_from_hub(&listener, 2).await;
+        assert!(matches!(next(&mut s).await, MediaMessage::Subscribe { .. }));
+
+        // The owner could not complete its control-plane check: retryable,
+        // not an authorization verdict.
+        n.hub.handle_inbound(
+            2,
+            MediaMessage::Error {
+                code: SUBSCRIBE_UNAVAILABLE.into(),
+                message: "live\ts".into(),
+                generation: 0,
+            },
+        );
+        assert!(
+            n.hub.subscribe_nacks.lock().is_empty(),
+            "a transient failure must not consume the NACK budget"
+        );
+        assert_eq!(
+            n.hub.subscribed_nodes_for("live", "s"),
+            vec![2],
+            "a transient failure must never drop local refs"
+        );
+        // Retried after the longer transient backoff.
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            peer::read_media_frame_v(&mut s, MEDIA_PROTOCOL_VERSION),
+        )
+        .await
+        {
+            Ok(Ok(MediaMessage::Subscribe { stream, .. })) => assert_eq!(stream, "s"),
+            other => panic!("expected a retried Subscribe, got {other:?}"),
+        }
         n.hub.shutdown();
     }
 
@@ -2575,16 +2949,16 @@ mod tests {
         let n = node(1);
         // Not subscribed at all.
         Arc::clone(&n.hub)
-            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0, SUBSCRIBE_NACK_RETRY)
             .await;
         // Subscribed but no peer connection known.
         n.hub.subscribe_remote("", 2, "live", "s", 0).await;
         Arc::clone(&n.hub)
-            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0, SUBSCRIBE_NACK_RETRY)
             .await;
         // Generation moved on.
         Arc::clone(&n.hub)
-            .run_subscribe_retry(2, "live".into(), "s".into(), 5, 0)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 5, 0, SUBSCRIBE_NACK_RETRY)
             .await;
 
         // Peer whose queue is full: the retry reschedules while budget remains.
@@ -2595,17 +2969,26 @@ mod tests {
         n.hub.connect_peer(2, &dead).await.unwrap();
         let p = n.hub.peers.lock().get(&2).cloned().unwrap();
         while p.try_send(MediaMessage::AuthOk).is_ok() {}
+        // Simulate an attempt the owner did not accept.
+        n.hub.outbound.set_wired(2, "live", "s", false);
         Arc::clone(&n.hub)
-            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 1)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 1, SUBSCRIBE_NACK_RETRY)
             .await;
         Arc::clone(&n.hub)
-            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0, SUBSCRIBE_NACK_RETRY)
+            .await;
+
+        // A successfully wired key is not sent twice.
+        n.hub.outbound.set_wired(2, "live", "s", true);
+        Arc::clone(&n.hub)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 1, SUBSCRIBE_NACK_RETRY)
             .await;
 
         // After shutdown, retries are no-ops.
+        n.hub.outbound.set_wired(2, "live", "s", false);
         n.hub.shutdown();
         Arc::clone(&n.hub)
-            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 1)
+            .run_subscribe_retry(2, "live".into(), "s".into(), 0, 1, SUBSCRIBE_NACK_RETRY)
             .await;
         assert_eq!(n.hub.subscribed_nodes_for("live", "s"), vec![2]);
     }
@@ -2704,15 +3087,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
 
-        // Two refcounts for peer 2: one for a stream this node owns locally
-        // (owner-side inbound fan-out state) and one for a remotely owned
-        // stream that genuinely needs an outbound Subscribe.
-        n.hub.subs.add(2, "live", "owned");
-        n.hub.subs.add(2, "live", "remote");
-        n.ownership.set("owned", 1, 0); // local_id == 1
+        // Refs for peer 2: an inbound fan-out ref (the peer subscribed to a
+        // stream this node owns), and outbound refs — one for another stream
+        // this node owns locally and one for a remotely owned stream that
+        // genuinely needs an outbound Subscribe.
+        n.hub.subs.add(2, "live", "inbound");
+        n.hub.outbound.add(2, "live", "owned");
+        n.hub.outbound.add(2, "live", "remote");
+        n.ownership.set("inbound", 1, 0); // local_id == 1
+        n.ownership.set("owned", 1, 0);
         n.ownership.set("remote", 2, 0);
 
-        // A fresh connection replays every refcount via `resubscribe_peer_locked`.
+        // A fresh connection replays every outbound ref via
+        // `resubscribe_peer_locked`; inbound fan-out refs are not replayed.
         n.hub.connect_peer(2, &addr).await.unwrap();
         let mut s = accept_from_hub(&listener, 2).await;
 
@@ -2731,6 +3118,94 @@ mod tests {
         );
         // Only the wire replay was suppressed; the refcount is preserved.
         assert_eq!(n.hub.subscribed_nodes_for("live", "owned"), vec![2]);
+        n.hub.shutdown();
+    }
+
+    /// Ownership handoff: the old owner's local viewers re-subscribe to the
+    /// new owner while the same peer still holds the old owner-side inbound
+    /// fan-out ref for that key. Both directions are keyed by
+    /// `(peer, app, stream)`, so an outbound send must be decided from the
+    /// outbound ref's wire state, not from "some ref exists".
+    #[tokio::test]
+    async fn ownership_handoff_resubscribes_when_an_inbound_ref_shares_the_key() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        // Peer 2 subscribed to a stream this node owned before the handoff.
+        assert!(n.hub.subs.add(2, "live", "s"));
+        // Ownership of "s" moved to peer 2: this node's viewers re-subscribe.
+        n.ownership.set("s", 2, 7);
+        assert!(n.hub.subscribe_remote(&addr, 2, "live", "s", 7).await);
+
+        let mut s = accept_from_hub(&listener, 2).await;
+        match next(&mut s).await {
+            MediaMessage::Subscribe { stream, epoch, .. } => {
+                assert_eq!(stream, "s");
+                assert_eq!(epoch, 7);
+            }
+            other => panic!("handoff must write a wire Subscribe, got {other:?}"),
+        }
+
+        // A second local viewer only bumps the outbound ref.
+        assert!(n.hub.subscribe_remote(&addr, 2, "live", "s", 7).await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next(&mut s))
+                .await
+                .is_err(),
+            "an already-wired outbound ref must not write a second Subscribe"
+        );
+
+        // The peer tearing down its old inbound subscription must not release
+        // this node's outbound ref.
+        assert!(n.hub.subs.remove(2, "live", "s"));
+        assert_eq!(n.hub.subscribed_nodes_for("live", "s"), vec![2]);
+
+        // First release keeps the wire subscription, the last sends
+        // Unsubscribe.
+        n.hub.unsubscribe_remote(2, "live", "s").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next(&mut s))
+                .await
+                .is_err()
+        );
+        n.hub.unsubscribe_remote(2, "live", "s").await;
+        assert!(
+            matches!(next(&mut s).await, MediaMessage::Unsubscribe { ref stream, .. } if stream == "s")
+        );
+        n.hub.shutdown();
+    }
+
+    /// A fresh-connection replay larger than the per-peer queue bound must not
+    /// be silently truncated: rejected control sends are retried.
+    #[tokio::test]
+    async fn fresh_peer_replay_retries_instead_of_dropping_past_the_queue_bound() {
+        let n = node(1);
+        n.hub.set_media_max_messages_for_test(4);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        for i in 0..16 {
+            n.hub.outbound.add(2, "live", &format!("s{i}"));
+        }
+        n.hub.connect_peer(2, &addr).await.unwrap();
+        let mut s = accept_from_hub(&listener, 2).await;
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                WAIT,
+                peer::read_media_frame_v(&mut s, MEDIA_PROTOCOL_VERSION),
+            )
+            .await
+            {
+                Ok(Ok(MediaMessage::Subscribe { stream, .. })) => {
+                    seen.insert(stream);
+                }
+                other => panic!("replay truncated after {} of 16: {other:?}", seen.len()),
+            }
+        }
+        assert_eq!(seen.len(), 16);
         n.hub.shutdown();
     }
 

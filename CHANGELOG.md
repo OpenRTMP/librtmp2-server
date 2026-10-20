@@ -14,17 +14,53 @@ begin at `1.0.0`.
 ## [Unreleased]
 
 ### Security
+- Hardened RTMP publish/play authentication throttling so a saturated
+  failure tracker can no longer refuse clients it has never seen fail; only a
+  source's own failed attempts spend its budget, and IPv6 sources share one
+  bucket per `/64` so a single host cannot mint one bucket per address.
 - Hardened cluster authentication throttling so a saturated failure tracker
   cannot deny legitimate control-plane peers; an unseen source is now throttled
   only after its own failure budget is exhausted.
 - Hardened the cluster media read budget and v2 control-frame validation so a
   single peer cannot monopolize shared read capacity.
+- A plaintext cluster no longer trusts a peer's advertised `DOWN`/`ISOLATED`
+  health as liveness: `DOWN` is derived locally from heartbeat timeliness and
+  quorum state from the local voter view, so a forged heartbeat can no longer
+  arm an ownership release or fake quorum loss. Advertised admission states,
+  load and session counts are still accepted as hints.
+- The control plane's pre-auth connection budget now reserves capacity for
+  configured member/peer source addresses, so an unauthenticated flood of
+  half-open connections can only exhaust the non-member budget instead of
+  starving heartbeats/Raft traffic and fencing live nodes.
 - Repeated `publish` commands on one RTMP connection no longer force a full
   media-output rebuild per command. Rapid generation bumps are coalesced within
   a short per-connection window; a genuine republish after that window still
   starts a new recording/HLS/push/exec session.
 
 ### Fixed
+- An async stream delete no longer polls every peer every 50 ms: remote session
+  counts are queried at a slower cadence and peers that are DOWN or have missed
+  the liveness window are neither dialed nor counted from their last heartbeat
+  cache, so a dead peer can no longer pin the drain for the full timeout.
+- A same-id rejoin that lands inside the leader's DOWN-to-ownership-release
+  grace now still releases the previous incarnation's `stream_owners` rows
+  instead of cancelling the queued release and stranding ghost owners.
+- Cluster media subscriptions now track inbound fan-out refs and outbound
+  (local viewer) refs separately, with the wire state of each outbound
+  subscription held per connection. An ownership handoff no longer leaves a
+  viewer subscribed with no `Subscribe` on the wire, and releasing an outbound
+  ref no longer disturbs the peer's inbound subscription.
+- A fresh-connection replay of cluster media subscriptions now retries control
+  sends rejected by queue backpressure (bounded) instead of silently truncating
+  the replay while keeping the refs.
+- A transient control-plane failure while authorizing an inbound cluster media
+  subscription is now reported as retryable and is no longer treated as an
+  authorization denial: it does not consume the denial budget and never drops
+  the subscriber's local subscription refs.
+- Releasing a publisher now releases only the stream ownership that belongs to
+  the row being released, so a stream switch in flight on the same connection no
+  longer drops the new stream's fencing; releasing a superseded player session
+  no longer drops the replacement session's remote-play subscription.
 - `MEDIA_EXEC_PUBLISH_DONE` is now emitted for sessions torn down through the
   abort path (retirement queue full, reaper unavailable/disconnected) and only
   after the output sinks have finished, so the documented publish/publish_done
@@ -48,6 +84,18 @@ begin at `1.0.0`.
   microbenchmarks were recorded.
 - The Benchmarks workflow has a `release_tag` input to re-measure an already
   published release (asset, release notes and `bench/releases/<tag>.json`).
+- A cluster init cache entry received over the wire is now fenced by its epoch:
+  an owner superseded by a failover can no longer replace the current owner's
+  staged metadata/headers/keyframe with its older-epoch copy. Same-epoch
+  updates still replace the entry.
+- A full media-output retirement queue no longer aborts the excess session on
+  the RTMP poll thread (which could block it for the hook's SIGTERM grace plus
+  `child.wait()`). A dedicated overflow worker owns those teardowns, so the
+  poll thread never waits and at most one overflow teardown runs at a time.
+- `scripts/docker_cluster_ha.py` derives `SRC_ROOT` from its own checkout
+  (overridable with `OPENRTMP_SRC_ROOT`) instead of a hard-coded path, and
+  fails loudly when the source tree is missing, so the suite can no longer run
+  silently against a stale destination copy.
 
 ## [0.6.5] — 2026-10-14
 

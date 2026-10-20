@@ -287,6 +287,13 @@ pub struct MediaOutputManager {
     sessions: HashMap<u64, MediaSession>,
     retire_tx: Option<mpsc::SyncSender<MediaSession>>,
     reaper: Option<thread::JoinHandle<()>>,
+    /// Overflow path for sessions the bounded retirement queue could not take.
+    /// The sender is unbounded, so the RTMP poll thread never blocks here; a
+    /// dedicated worker (at most one overflow teardown at a time) owns the
+    /// actual abort so the poll thread never waits on a hook child.
+    overflow_tx: Option<mpsc::Sender<(MediaSession, &'static str)>>,
+    overflow_worker: Option<thread::JoinHandle<()>>,
+    overflow_retirements: AtomicUsize,
 }
 
 impl MediaOutputManager {
@@ -314,12 +321,40 @@ impl MediaOutputManager {
                 (None, None)
             }
         };
+
+        // When the bounded retirement queue is full (or the reaper is gone) a
+        // session must still be torn down off the RTMP poll thread: `abort`
+        // terminates a `MEDIA_EXEC_PUBLISH` child, waiting up to 500 ms for
+        // SIGTERM before SIGKILL, plus `child.wait()`. Running that inline on
+        // the poll thread freezes every connection on the shard. The overflow
+        // queue is unbounded (a send never blocks) and one dedicated worker
+        // bounds concurrent overflow teardowns to one session.
+        let (overflow_tx, overflow_rx) = mpsc::channel::<(MediaSession, &'static str)>();
+        let overflow_config = config.clone();
+        let overflow_worker = thread::Builder::new()
+            .name("media-session-overflow".to_string())
+            .spawn(move || {
+                while let Ok((session, reason)) = overflow_rx.recv() {
+                    session.abort(reason, &overflow_config);
+                }
+            });
+        let (overflow_tx, overflow_worker) = match overflow_worker {
+            Ok(handle) => (Some(overflow_tx), Some(handle)),
+            Err(e) => {
+                crate::log_error!("Failed to start media session overflow teardown worker: {e}");
+                (None, None)
+            }
+        };
+
         Self {
             config,
             db,
             sessions: HashMap::new(),
             retire_tx,
             reaper,
+            overflow_tx,
+            overflow_worker,
+            overflow_retirements: AtomicUsize::new(0),
         }
     }
 
@@ -328,21 +363,75 @@ impl MediaOutputManager {
     }
 
     fn retire(&mut self, session: MediaSession) {
-        let Some(tx) = self.retire_tx.as_ref() else {
-            session.abort("session reaper unavailable", &self.config);
-            return;
-        };
-        match tx.try_send(session) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(session)) => {
-                crate::log_warn!(
-                    "Media session retirement queue full; cancelling excess session immediately"
-                );
-                session.abort("session retirement queue full", &self.config);
+        if let Some(tx) = self.retire_tx.as_ref() {
+            match tx.try_send(session) {
+                Ok(()) => return,
+                Err(mpsc::TrySendError::Full(session)) => {
+                    crate::log_warn!(
+                        "Media session retirement queue full; moving excess session to the overflow teardown worker"
+                    );
+                    self.retire_overflow(session, "session retirement queue full");
+                    return;
+                }
+                Err(mpsc::TrySendError::Disconnected(session)) => {
+                    crate::log_warn!(
+                        "Media session reaper disconnected; moving session to the overflow teardown worker"
+                    );
+                    self.retire_overflow(session, "session reaper disconnected");
+                    return;
+                }
             }
-            Err(mpsc::TrySendError::Disconnected(session)) => {
-                crate::log_warn!("Media session reaper disconnected; cancelling session");
-                session.abort("session reaper disconnected", &self.config);
+        }
+        crate::log_warn!(
+            "Media session reaper unavailable; moving session to the overflow teardown worker"
+        );
+        self.retire_overflow(session, "session reaper unavailable");
+    }
+
+    /// Hand a session to the dedicated overflow teardown worker. Never blocks
+    /// and never runs the abort on the caller's (RTMP poll) thread.
+    fn retire_overflow(&self, session: MediaSession, reason: &'static str) {
+        let total = self
+            .overflow_retirements
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        crate::log_warn!(
+            "Media outputs: overflow teardown #{total} queued stream='{}' reason='{reason}'",
+            session.stream_id
+        );
+        let session = match self.overflow_tx.as_ref() {
+            // The overflow channel is unbounded, so this send cannot block; it
+            // only fails once the worker is gone.
+            Some(tx) => match tx.send((session, reason)) {
+                Ok(()) => return,
+                Err(mpsc::SendError((session, _))) => session,
+            },
+            None => session,
+        };
+        // The overflow worker could not be started (or has exited). Keep the
+        // teardown off the poll thread by detaching it; concurrent detaches are
+        // only possible in this degraded case.
+        self.abort_detached(session, reason);
+    }
+
+    /// Last-resort non-blocking teardown used when no overflow worker exists.
+    fn abort_detached(&self, session: MediaSession, reason: &'static str) {
+        let slot = Arc::new(ParkingMutex::new(Some(session)));
+        let worker_slot = Arc::clone(&slot);
+        let config = self.config.clone();
+        let spawned = thread::Builder::new()
+            .name("media-session-overflow".to_string())
+            .spawn(move || {
+                if let Some(session) = worker_slot.lock().take() {
+                    session.abort(reason, &config);
+                }
+            });
+        if let Err(e) = spawned {
+            crate::log_error!("Failed to spawn media session overflow teardown thread: {e}");
+            // Recover the session from the dropped closure rather than leaking
+            // its hook child. Thread creation failing is already exceptional.
+            if let Some(session) = slot.lock().take() {
+                session.abort(reason, &self.config);
             }
         }
     }
@@ -496,6 +585,14 @@ impl MediaOutputManager {
             && reaper.join().is_err()
         {
             crate::log_warn!("Media session reaper panicked during shutdown");
+        }
+        // Closing the overflow queue lets its worker drain the sessions still
+        // queued and exit; join so shutdown does not leave teardowns running.
+        self.overflow_tx.take();
+        if let Some(worker) = self.overflow_worker.take()
+            && worker.join().is_err()
+        {
+            crate::log_warn!("Media session overflow worker panicked during shutdown");
         }
     }
 }
@@ -2852,6 +2949,41 @@ mod tests {
         assert_eq!(manager.sessions[&1].stream_id, "s2");
 
         drop(saved_tx);
+        manager.stop_all();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn full_retirement_queue_does_not_block_the_poll_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MediaOutputConfig {
+            // Ignoring SIGTERM keeps `terminate_hook_child` inside its full
+            // 500 ms grace period, so an inline abort would be visible here.
+            exec_publish: "trap '' TERM; sleep 30".to_string(),
+            recording_enabled: true,
+            recording_path: tmp.path().join("rec"),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+        manager.ensure_publisher(7, "s1", 1);
+
+        // Rendezvous channel with no receiver: `try_send` always reports Full.
+        let (full_tx, _full_rx) = mpsc::sync_channel(0);
+        manager.retire_tx = Some(full_tx);
+
+        let started = Instant::now();
+        manager.ensure_publisher(7, "s2", 2);
+        let elapsed = started.elapsed();
+        assert_eq!(manager.sessions[&7].stream_id, "s2");
+        assert!(
+            manager.overflow_retirements.load(Ordering::Relaxed) >= 1,
+            "the session should have been handed to the overflow worker"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "retire blocked the poll thread for {elapsed:?}; the session must be \
+             torn down off-thread"
+        );
         manager.stop_all();
     }
 

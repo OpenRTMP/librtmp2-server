@@ -19,6 +19,7 @@ use crate::cluster::admission::{
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::health::{HealthTracker, NodeHealthState};
+use crate::cluster::media::InboundSubscribeVerdict;
 use crate::cluster::media::hub::{
     ExportQueue, ExportedFrame, InjectQueue, InjectedFrame, MediaHub,
 };
@@ -384,10 +385,10 @@ impl ClusterManager {
 
         let mgr_gate = Arc::clone(&mgr);
         mgr.media
-            .set_inbound_subscribe_gate(Arc::new(move |peer_id, app, stream| {
+            .set_inbound_subscribe_verdict_gate(Arc::new(move |peer_id, app, stream| {
                 let mgr = Arc::clone(&mgr_gate);
                 Box::pin(async move {
-                    mgr.authorize_inbound_media_subscribe(peer_id, &app, &stream)
+                    mgr.inbound_media_subscribe_verdict(peer_id, &app, &stream)
                         .await
                 })
             }));
@@ -403,135 +404,9 @@ impl ClusterManager {
                     })
                 })
             });
-            let health_hb = Arc::clone(&mgr.health);
-            let meta_hb = Arc::clone(&mgr.meta);
-            let media_hb = Arc::clone(&mgr.media);
-            let network_hb = Arc::clone(&mgr.network);
             let counts_hb = Arc::clone(&mgr);
-            let on_heartbeat: Arc<dyn Fn(network::HeartbeatInfo) + Send + Sync> = Arc::new(
-                move |info: network::HeartbeatInfo| {
-                    if !counts_hb.peer_in_membership(info.node_id) {
-                        return;
-                    }
-                    let state =
-                        NodeHealthState::parse(&info.health).unwrap_or(NodeHealthState::Ready);
-                    let known_addrs = meta_hb.get(info.node_id);
-                    let (ctrl, media_a) = heartbeat_routing_addrs(
-                        counts_hb.config.tls_enabled,
-                        &info.control_addr,
-                        &info.media_addr,
-                        known_addrs.as_ref().map(|(c, m)| (c.as_str(), m.as_str())),
-                    );
-                    health_hb.note_peer(
-                        info.node_id,
-                        state,
-                        info.load,
-                        ctrl.clone(),
-                        media_a.clone(),
-                    );
-                    if counts_hb.config.tls_enabled
-                        && let (Some(c), Some(m)) = (ctrl.as_ref(), media_a.as_ref())
-                    {
-                        let allow_loopback = counts_hb.config.allow_loopback_peer_addrs;
-                        match (
-                            crate::cluster::security::validate_cluster_peer_addr(c, allow_loopback),
-                            crate::cluster::security::validate_cluster_peer_addr(m, allow_loopback),
-                        ) {
-                            (Ok(()), Ok(())) => {
-                                counts_hb
-                                    .rejected_peer_addrs
-                                    .lock()
-                                    .remove(&(info.node_id, 0));
-                                meta_hb.set_addrs(info.node_id, c.clone(), m.clone());
-                                network_hb.upsert_node(info.node_id, c.clone());
-                            }
-                            (control, media) => {
-                                let signature = format!("{c}|{m}");
-                                if note_rejected_peer_addr(
-                                    &counts_hb.rejected_peer_addrs,
-                                    info.node_id,
-                                    0,
-                                    &signature,
-                                ) {
-                                    if let Err(reason) = &control {
-                                        crate::log_warn!(
-                                            "Cluster: ignoring heartbeat control address for node {}: {}",
-                                            info.node_id,
-                                            reason
-                                        );
-                                    }
-                                    if let Err(reason) = &media {
-                                        crate::log_warn!(
-                                            "Cluster: ignoring heartbeat media address for node {}: {}",
-                                            info.node_id,
-                                            reason
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Dial known membership media addrs in both TLS and plaintext.
-                    // Plaintext still must not `set_addrs` from advertised values;
-                    // `media_a` is already the trusted join/topology address.
-                    if let Some(m) = media_a {
-                        let allow_loopback = counts_hb.config.allow_loopback_peer_addrs;
-                        if let Err(reason) =
-                            crate::cluster::security::validate_cluster_peer_addr(&m, allow_loopback)
-                        {
-                            if note_rejected_peer_addr(
-                                &counts_hb.rejected_peer_addrs,
-                                info.node_id,
-                                1,
-                                &m,
-                            ) {
-                                crate::log_warn!(
-                                    "Cluster: skipping media dial for node {}: {}",
-                                    info.node_id,
-                                    reason
-                                );
-                            }
-                        } else {
-                            counts_hb
-                                .rejected_peer_addrs
-                                .lock()
-                                .remove(&(info.node_id, 1));
-                            let hub = Arc::clone(&media_hb);
-                            let mid = info.node_id;
-                            tokio::spawn(async move {
-                                let _ = hub.connect_peer(mid, &m).await;
-                            });
-                        }
-                    }
-                    // Plaintext clustering explicitly uses possession of CLUSTER_SECRET
-                    // plus Raft membership as its trust boundary; mTLS strengthens that
-                    // boundary with per-node certificate identity. Keep session counts in
-                    // both modes because cluster-wide stats, viewer limits and drain/delete
-                    // accounting depend on these heartbeat caches.
-                    counts_hb
-                        .peer_session_counts
-                        .lock()
-                        .insert(info.node_id, (info.publishers, info.players));
-                    counts_hb
-                        .peer_stream_players
-                        .lock()
-                        .insert(info.node_id, info.stream_players.into_iter().collect());
-                    counts_hb
-                        .peer_viewer_players
-                        .lock()
-                        .insert(info.node_id, info.viewer_players.into_iter().collect());
-                    // `remove_peer` may have run after the membership check at
-                    // the top of this callback: it commits the membership
-                    // change, then clears `meta` and the caches. If this
-                    // heartbeat inserted its caches after that cleanup, the
-                    // id is no longer in membership and the entries would
-                    // otherwise survive unprunable (the topology prune only
-                    // walks `meta`). Re-check and drop them.
-                    if !counts_hb.peer_in_membership(info.node_id) {
-                        counts_hb.drop_peer_heartbeat_caches(info.node_id);
-                    }
-                },
-            );
+            let on_heartbeat: Arc<dyn Fn(network::HeartbeatInfo) + Send + Sync> =
+                Arc::new(move |info: network::HeartbeatInfo| counts_hb.note_peer_heartbeat(info));
             let mgr_admin = Arc::clone(&mgr);
             let on_admin: Arc<
                 dyn Fn(network::ControlMessage) -> network::ControlMessage + Send + Sync,
@@ -554,6 +429,9 @@ impl ClusterManager {
             let mgr_member = Arc::clone(&mgr);
             let is_member: network::MembershipFn =
                 Arc::new(move |id| mgr_member.peer_in_membership(id));
+            let mgr_sources = Arc::clone(&mgr);
+            let is_member_source: network::MemberSourceFn =
+                Arc::new(move |ip| mgr_sources.is_member_source_ip(ip));
             let mgr_proof = Arc::clone(&mgr);
             let verify_admin_proof: network::AdminProofFn =
                 Arc::new(move |proof, payload| mgr_proof.verify_admin_proof(proof, payload));
@@ -564,7 +442,7 @@ impl ClusterManager {
                 tls_client: tls_client.clone(),
             };
             tokio::spawn(async move {
-                if let Err(e) = network::serve_control_plane_listener(
+                if let Err(e) = network::serve_control_plane_listener_with_member_sources(
                     listener,
                     secret,
                     local_id,
@@ -576,6 +454,7 @@ impl ClusterManager {
                     is_member,
                     verify_admin_proof,
                     Some(write_forward),
+                    is_member_source,
                     tls_srv,
                 )
                 .await
@@ -1213,6 +1092,153 @@ impl ClusterManager {
             .retain(|(id, _), _| *id != node_id);
     }
 
+    /// Apply a peer heartbeat payload.
+    ///
+    /// Liveness is *not* taken from the peer's advertised `health`: a
+    /// heartbeat claiming `DOWN`/`ISOLATED` would otherwise arm `down_since`
+    /// (and thus the leader's ownership release) or drop a live voter from
+    /// `alive_voters`. Both are derived locally — DOWN from heartbeat
+    /// timeliness in [`HealthTracker::sweep_stale`], ISOLATED from this
+    /// node's own voter view. On a plaintext cluster the authenticated peer
+    /// identity is only the `node_id` the client claims, so a
+    /// `CLUSTER_SECRET` holder could forge either. Benign admission states,
+    /// load and session counts are still accepted as hints (counts are
+    /// filtered for freshness by [`Self::remote_stream_session_count`]).
+    fn note_peer_heartbeat(&self, info: network::HeartbeatInfo) {
+        if !self.peer_in_membership(info.node_id) {
+            return;
+        }
+        let state = NodeHealthState::from_heartbeat(&info.health);
+        let known_addrs = self.meta.get(info.node_id);
+        let (ctrl, media_a) = heartbeat_routing_addrs(
+            self.config.tls_enabled,
+            &info.control_addr,
+            &info.media_addr,
+            known_addrs.as_ref().map(|(c, m)| (c.as_str(), m.as_str())),
+        );
+        self.health.note_peer(
+            info.node_id,
+            state,
+            info.load,
+            ctrl.clone(),
+            media_a.clone(),
+        );
+        if self.config.tls_enabled
+            && let (Some(c), Some(m)) = (ctrl.as_ref(), media_a.as_ref())
+        {
+            let allow_loopback = self.config.allow_loopback_peer_addrs;
+            match (
+                crate::cluster::security::validate_cluster_peer_addr(c, allow_loopback),
+                crate::cluster::security::validate_cluster_peer_addr(m, allow_loopback),
+            ) {
+                (Ok(()), Ok(())) => {
+                    self.rejected_peer_addrs.lock().remove(&(info.node_id, 0));
+                    self.meta.set_addrs(info.node_id, c.clone(), m.clone());
+                    self.network.upsert_node(info.node_id, c.clone());
+                }
+                (control, media) => {
+                    let signature = format!("{c}|{m}");
+                    if note_rejected_peer_addr(
+                        &self.rejected_peer_addrs,
+                        info.node_id,
+                        0,
+                        &signature,
+                    ) {
+                        if let Err(reason) = &control {
+                            crate::log_warn!(
+                                "Cluster: ignoring heartbeat control address for node {}: {}",
+                                info.node_id,
+                                reason
+                            );
+                        }
+                        if let Err(reason) = &media {
+                            crate::log_warn!(
+                                "Cluster: ignoring heartbeat media address for node {}: {}",
+                                info.node_id,
+                                reason
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Dial known membership media addrs in both TLS and plaintext.
+        // Plaintext still must not `set_addrs` from advertised values;
+        // `media_a` is already the trusted join/topology address.
+        if let Some(m) = media_a {
+            let allow_loopback = self.config.allow_loopback_peer_addrs;
+            if let Err(reason) =
+                crate::cluster::security::validate_cluster_peer_addr(&m, allow_loopback)
+            {
+                if note_rejected_peer_addr(&self.rejected_peer_addrs, info.node_id, 1, &m) {
+                    crate::log_warn!(
+                        "Cluster: skipping media dial for node {}: {}",
+                        info.node_id,
+                        reason
+                    );
+                }
+            } else {
+                self.rejected_peer_addrs.lock().remove(&(info.node_id, 1));
+                let hub = Arc::clone(&self.media);
+                let mid = info.node_id;
+                tokio::spawn(async move {
+                    let _ = hub.connect_peer(mid, &m).await;
+                });
+            }
+        }
+        // Plaintext clustering explicitly uses possession of CLUSTER_SECRET
+        // plus Raft membership as its trust boundary; mTLS strengthens that
+        // boundary with per-node certificate identity. Keep session counts in
+        // both modes because cluster-wide stats, viewer limits and drain/delete
+        // accounting depend on these heartbeat caches. They are hints: the
+        // delete drain in the HTTP layer ignores stale peers (see
+        // `remote_stream_session_count`) and liveness never depends on them.
+        self.peer_session_counts
+            .lock()
+            .insert(info.node_id, (info.publishers, info.players));
+        self.peer_stream_players
+            .lock()
+            .insert(info.node_id, info.stream_players.into_iter().collect());
+        self.peer_viewer_players
+            .lock()
+            .insert(info.node_id, info.viewer_players.into_iter().collect());
+        // `remove_peer` may have run after the membership check at the top of
+        // this callback: it commits the membership change, then clears `meta`
+        // and the caches. If this heartbeat inserted its caches after that
+        // cleanup, the id is no longer in membership and the entries would
+        // otherwise survive unprunable (the topology prune only walks `meta`).
+        if !self.peer_in_membership(info.node_id) {
+            self.drop_peer_heartbeat_caches(info.node_id);
+        }
+    }
+
+    /// True when `ip` is the source address of a configured cluster
+    /// member/peer.
+    ///
+    /// Control-plane RPCs each open a fresh connection, so the pre-auth
+    /// connection budget must reserve capacity for member traffic: a flood of
+    /// half-open unauthenticated sockets would otherwise consume every accept
+    /// slot, stall heartbeats/Raft and fence live nodes. Advertised and join
+    /// addresses are validated literal socket addresses, so this is a plain
+    /// comparison against the topology this node already trusts.
+    fn is_member_source_ip(&self, ip: std::net::IpAddr) -> bool {
+        let ours = [
+            self.config.advertise_control(),
+            self.config.advertise_media(),
+        ];
+        let peers = self.meta.all();
+        ours.iter()
+            .chain(
+                peers
+                    .iter()
+                    .flat_map(|(_, control, media)| [control, media]),
+            )
+            .any(|addr| {
+                addr.parse::<std::net::SocketAddr>()
+                    .is_ok_and(|sa| sa.ip() == ip)
+            })
+    }
+
     pub async fn promote_learner(&self, node_id: NodeId) -> Result<(), String> {
         self.change_membership_forwarded(ChangeMembers::AddVoterIds(
             std::collections::BTreeSet::from([node_id]),
@@ -1564,6 +1590,37 @@ impl ClusterManager {
                     return Err(format!(
                         "add_learner: node {node_id} did not catch up within {JOIN_CATCHUP_TIMEOUT:?}"
                     ));
+                }
+            }
+        }
+
+        if in_membership {
+            // The previous incarnation had to be fenced DOWN/LEAVING for the
+            // rejoin above to be accepted, so any `stream_owners` rows still
+            // attributed to this id are unreachable: the replacement usually
+            // arrives with a reseeded, empty database and cannot release them
+            // itself. Queue the release in the retried cleanup set *before*
+            // `note_peer(Learner)` below clears `down_since` — the leader's
+            // DOWN-grace release only reads `down_since`, so a rejoin landing
+            // inside that grace would otherwise cancel the queued release and
+            // strand ghost owners for a publisher-less incarnation. The queued
+            // cleanup is retried on every health tick independently of peer
+            // health and does not depend on this node staying leader.
+            //
+            // Release synchronously *before* `note_peer(Learner)` clears
+            // `down_since`: a queued release could otherwise run after the new
+            // incarnation re-acquired a stream and delete its live row.
+            let released = tokio::task::block_in_place(|| self.release_owners_for_node(node_id));
+            match released {
+                Ok(()) => {
+                    self.pending_node_cleanups.lock().remove(&node_id);
+                }
+                Err(e) => {
+                    crate::log_warn!(
+                        "Cluster: releasing owners for rejoining node {node_id} failed ({e:?}); \
+                         queuing cleanup for the next health tick"
+                    );
+                    self.pending_node_cleanups.lock().insert(node_id);
                 }
             }
         }
@@ -2220,29 +2277,46 @@ impl ClusterManager {
     pub async fn authorize_inbound_media_subscribe(
         &self,
         peer_id: NodeId,
-        _app: &str,
+        app: &str,
         stream_id: &str,
     ) -> bool {
+        self.inbound_media_subscribe_verdict(peer_id, app, stream_id)
+            .await
+            == InboundSubscribeVerdict::Allow
+    }
+
+    /// Like [`Self::authorize_inbound_media_subscribe`], but reports a
+    /// transient control-plane/topology failure separately from an
+    /// authorization verdict so the media plane can retry it instead of
+    /// treating it as a permanent denial.
+    pub async fn inbound_media_subscribe_verdict(
+        &self,
+        peer_id: NodeId,
+        _app: &str,
+        stream_id: &str,
+    ) -> InboundSubscribeVerdict {
         if peer_id == self.config.node_id {
-            return false;
+            return InboundSubscribeVerdict::Deny;
         }
         if !self.peer_in_membership(peer_id) {
-            return false;
+            return InboundSubscribeVerdict::Deny;
         }
         let Some(owner) = self.db.stream_owner_get(stream_id) else {
-            return false;
+            return InboundSubscribeVerdict::Deny;
         };
         if owner.owner_node_id != self.config.node_id {
-            return false;
+            return InboundSubscribeVerdict::Deny;
         }
         if self
             .standby_candidates(Some(self.config.node_id), &[])
             .contains(&peer_id)
         {
-            return true;
+            return InboundSubscribeVerdict::Allow;
         }
+        // No control address yet is a topology/timing condition, not proof
+        // that the peer may not subscribe.
         let Some((ctrl, _)) = self.meta.get(peer_id) else {
-            return false;
+            return InboundSubscribeVerdict::Transient;
         };
         match network::send_session_count(
             &ctrl,
@@ -2253,18 +2327,26 @@ impl ClusterManager {
         )
         .await
         {
-            Ok(count) => count > 0,
-            Err(_) => false,
+            Ok(count) if count > 0 => InboundSubscribeVerdict::Allow,
+            Ok(_) => InboundSubscribeVerdict::Deny,
+            Err(_) => InboundSubscribeVerdict::Transient,
         }
     }
 
     /// Sum live RTMP sessions for `stream_id` across peers (excludes local).
+    ///
+    /// Peers whose heartbeat report is stale are skipped entirely: their RPC
+    /// cannot succeed and their cached count would never be refreshed, so
+    /// counting either would let a dead peer pin a delete drain forever.
     pub async fn remote_stream_session_count(&self, stream_id: &str) -> u64 {
         let cached = self.peer_stream_players.lock().clone();
         let mut total = 0u64;
         let mut rpc_peers = 0u64;
         for (id, ctrl, _) in self.meta.all() {
             if id == self.config.node_id {
+                continue;
+            }
+            if self.health.peer_report_stale(id) {
                 continue;
             }
             rpc_peers += 1;
@@ -2280,6 +2362,7 @@ impl ClusterManager {
                 Ok(n) => total = total.saturating_add(n),
                 // Per-peer fallback: a reachable peer returning zero must not
                 // discard the last heartbeat count for an unreachable peer.
+                // Only used while the peer's report is fresh (checked above).
                 Err(_) => {
                     let n = cached
                         .get(&id)
@@ -3550,6 +3633,21 @@ mod tests {
         }
     }
 
+    /// A peer heartbeat payload with the given advertised health.
+    fn heartbeat(node_id: NodeId, health: &str) -> network::HeartbeatInfo {
+        network::HeartbeatInfo {
+            node_id,
+            health: health.into(),
+            load: 0.0,
+            control_addr: String::new(),
+            media_addr: String::new(),
+            publishers: 0,
+            players: 0,
+            stream_players: Vec::new(),
+            viewer_players: Vec::new(),
+        }
+    }
+
     /// Retry a membership change while a previous one is still in flight.
     async fn promote(mgr: &ClusterManager, id: NodeId) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -4226,6 +4324,101 @@ mod tests {
         assert!(!metrics.is_leader && metrics.leader_id.is_none());
         assert_eq!(m.nodes_info()[0].role, "follower");
         *m.last_metrics.lock() = saved;
+
+        // Configured member addresses are recognised as member source IPs and
+        // therefore exempt from the shared pre-auth connection budget.
+        m.meta()
+            .set_addrs(2, "10.0.0.2:1940".into(), "10.0.0.2:1941".into());
+        assert!(m.is_member_source_ip("10.0.0.2".parse().unwrap()));
+        assert!(!m.is_member_source_ip("203.0.113.9".parse().unwrap()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forged_down_heartbeat_cannot_fence_or_release_ownership() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        add_dead_learner(m, 2, true).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || m.peer_in_membership(2)).await,
+            "learner 2 never appeared in membership"
+        );
+        // A stream owned by node 2, which the leader would release once it is
+        // fenced DOWN for the grace window.
+        m.create_stream(&stream("ghost")).unwrap();
+        raw_write(m, raw_acquire("ghost", 2)).await;
+        m.poll_side_effects();
+        assert_eq!(
+            m.db().stream_owner_get("ghost").map(|o| o.owner_node_id),
+            Some(2)
+        );
+
+        // A heartbeat claiming DOWN must not arm `down_since` or the ownership
+        // release: liveness is derived locally from `last_seen`.
+        m.note_peer_heartbeat(heartbeat(2, "DOWN"));
+        assert_eq!(m.health().peer_state(2), Some(NodeHealthState::Ready));
+        assert!(
+            m.health()
+                .peers_ready_for_ownership_release(Duration::ZERO)
+                .is_empty(),
+            "a forged DOWN heartbeat must not queue an ownership release"
+        );
+        assert_eq!(
+            m.db().stream_owner_get("ghost").map(|o| o.owner_node_id),
+            Some(2)
+        );
+
+        // ISOLATED is this node's own verdict, not the peer's: it must not
+        // drop a reachable voter out of `alive_voters`.
+        m.note_peer_heartbeat(heartbeat(2, "ISOLATED"));
+        assert_eq!(m.health().peer_state(2), Some(NodeHealthState::Ready));
+        assert_eq!(m.health().alive_voters(&[1, 2], 1), 2);
+
+        // Benign admission states are still recorded.
+        m.note_peer_heartbeat(heartbeat(2, "DRAINING"));
+        assert_eq!(m.health().peer_state(2), Some(NodeHealthState::Draining));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rejoin_inside_down_grace_still_releases_previous_incarnation_owners() {
+        // Long enough that the DOWN -> release grace cannot fire during the
+        // test: only the rejoin's queued cleanup can release the rows.
+        let n = bootstrap(1, |c| c.heartbeat = Duration::from_secs(2)).await;
+        let m = &n.mgr;
+        add_dead_learner(m, 2, true).await;
+        assert!(wait_until(Duration::from_secs(5), || m.peer_in_membership(2)).await);
+
+        m.create_stream(&stream("stale-owned")).unwrap();
+        raw_write(m, raw_acquire("stale-owned", 2)).await;
+        m.poll_side_effects();
+        assert_eq!(
+            m.db()
+                .stream_owner_get("stale-owned")
+                .map(|o| o.owner_node_id),
+            Some(2)
+        );
+
+        // Fence the previous incarnation DOWN and immediately rejoin the same
+        // id (reseeded replacement). The rejoin must not cancel the release.
+        m.health()
+            .note_peer(2, NodeHealthState::Down, 0.0, None, None);
+        m.accept_join(2, dead_addr(), dead_addr(), "rejoin-proof".into())
+            .await
+            .expect("rejoin accepted");
+        assert_eq!(m.health().peer_state(2), Some(NodeHealthState::Learner));
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("stale-owned")
+                .is_none())
+            .await,
+            "the previous incarnation's owner rows must still be released"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                !m.pending_node_cleanups.lock().contains(&2)
+            })
+            .await
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4277,7 +4470,19 @@ mod tests {
         m.peer_stream_players
             .lock()
             .insert(5, HashMap::from([("rep".to_string(), 2)]));
+        // The cached fallback is only used while the peer's heartbeat report
+        // is fresh (peer 5 never actually answers, so the health loop would
+        // fence it DOWN after the miss limit).
+        m.health()
+            .note_peer(5, NodeHealthState::Ready, 0.0, None, None);
         assert_eq!(m.remote_stream_session_count("rep").await, 2);
+        // A fenced peer's cache is stale forever: it must neither be dialed
+        // nor counted, or a delete drain would wait on it until it times out.
+        m.health()
+            .note_peer(5, NodeHealthState::Down, 0.0, None, None);
+        assert_eq!(m.remote_stream_session_count("rep").await, 0);
+        m.health()
+            .note_peer(5, NodeHealthState::Ready, 0.0, None, None);
         m.broadcast_drain_stream("rep").await;
         assert!(n.hooks.deleted.lock().contains("rep"));
         m.broadcast_revoke_viewer("vx").await;
@@ -4340,12 +4545,21 @@ mod tests {
         assert!(m.authorize_inbound_media_subscribe(5, "live", "rep").await);
         // Peer 6 is not a standby; its session-count RPC fails -> refused.
         assert!(!m.authorize_inbound_media_subscribe(6, "live", "rep").await);
+        // ... and it is reported as a transient failure, not a verdict.
+        assert_eq!(
+            m.inbound_media_subscribe_verdict(6, "live", "rep").await,
+            crate::cluster::media::InboundSubscribeVerdict::Transient
+        );
         // Peer 7 has no known control address.
         m.health()
             .note_peer(5, NodeHealthState::Down, 0.0, None, None);
         m.health()
             .note_peer(6, NodeHealthState::Down, 0.0, None, None);
         assert!(!m.authorize_inbound_media_subscribe(7, "live", "rep").await);
+        assert_eq!(
+            m.inbound_media_subscribe_verdict(7, "live", "rep").await,
+            crate::cluster::media::InboundSubscribeVerdict::Transient
+        );
         m.release_owners_for_node(1).unwrap();
         m.acquire_stream_owner("rep", 5, 0, 5).unwrap();
         assert!(!m.authorize_inbound_media_subscribe(5, "live", "rep").await);

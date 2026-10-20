@@ -27,6 +27,33 @@ pub type InboundSubscribeGateFn = Arc<
         + Sync,
 >;
 
+/// Outcome of the inbound `Subscribe` gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundSubscribeVerdict {
+    /// Authorized: register the subscription and fan out.
+    Allow,
+    /// Authorization verdict: the peer may not subscribe, retrying will not
+    /// help.
+    Deny,
+    /// The check could not be completed (control RPC/topology failure). Not
+    /// an authorization verdict: the subscriber retries and keeps its refs.
+    Transient,
+}
+
+/// Async gate for inbound `Subscribe` that separates a transient failure from
+/// an authorization verdict. Preferred over [`InboundSubscribeGateFn`] when
+/// set.
+pub type InboundSubscribeVerdictFn = Arc<
+    dyn Fn(
+            NodeId,
+            String,
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = InboundSubscribeVerdict> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub use hub::MediaHub;
 pub use ownership::OwnershipTracker;
 pub use protocol::{MEDIA_PROTOCOL_MIN_VERSION, MEDIA_PROTOCOL_VERSION, MediaMessage};

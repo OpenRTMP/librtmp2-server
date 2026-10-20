@@ -63,43 +63,91 @@ static CONTROL_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// consume the capacity required by ordinary Raft/control traffic.
 const MAX_SNAPSHOT_READ_BYTES_INFLIGHT: usize = 192 * 1024 * 1024;
 static SNAPSHOT_READ_BYTES_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static CONTROL_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Preserve a global cap on half-open TLS/auth handshakes before spawning work.
 const MAX_PREAUTH_CONN_INFLIGHT: usize = 512;
 /// Cap half-open auth handshakes per source IP so one source cannot consume
 /// the entire global pre-authentication budget.
 const MAX_PREAUTH_CONN_PER_IP: usize = 16;
-static CONTROL_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-static PREAUTH_CONN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-static PREAUTH_CONN_PER_IP: Mutex<BTreeMap<IpAddr, usize>> = Mutex::new(BTreeMap::new());
+/// Slots reserved for configured cluster members/peers.
+///
+/// Every inter-node operation opens a fresh TCP connection, so a flood of
+/// half-open unauthenticated connections can otherwise consume the whole
+/// [`MAX_PREAUTH_CONN_INFLIGHT`] budget and starve heartbeats/Raft traffic —
+/// fencing live nodes and releasing their ownership. Member sources draw from
+/// this separate counter instead, so only the non-member budget is saturable.
+const MAX_PREAUTH_MEMBER_CONN_INFLIGHT: usize = 64;
 
-fn try_acquire_global_preauth_slot() -> bool {
-    if PREAUTH_CONN_INFLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_PREAUTH_CONN_INFLIGHT {
-        PREAUTH_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        return false;
+/// Pre-authentication connection budget for one control listener.
+struct PreauthBudget {
+    /// Slots held by sources that are not configured members.
+    global: AtomicUsize,
+    /// Slots held by configured member/peer sources.
+    member: AtomicUsize,
+    /// Half-open connections per non-member source address.
+    per_ip: Mutex<BTreeMap<IpAddr, usize>>,
+}
+
+impl PreauthBudget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            global: AtomicUsize::new(0),
+            member: AtomicUsize::new(0),
+            per_ip: Mutex::new(BTreeMap::new()),
+        })
     }
-    true
-}
 
-fn release_global_preauth_slot() {
-    PREAUTH_CONN_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-}
-
-fn try_acquire_preauth_slot(peer: IpAddr) -> bool {
-    let mut guard = PREAUTH_CONN_PER_IP.lock();
-    let count = guard.entry(peer).or_insert(0);
-    if *count >= MAX_PREAUTH_CONN_PER_IP {
-        return false;
+    /// Take a pre-auth slot for `peer`. Member sources are admitted from the
+    /// reserved budget and bypass the shared per-source cap (several members
+    /// can share one NAT/host address and member RPCs must never queue).
+    fn try_acquire(self: &Arc<Self>, peer: IpAddr, member_source: bool) -> Option<PreauthGuard> {
+        let (counter, max) = if member_source {
+            (&self.member, MAX_PREAUTH_MEMBER_CONN_INFLIGHT)
+        } else {
+            (&self.global, MAX_PREAUTH_CONN_INFLIGHT)
+        };
+        if counter.fetch_add(1, Ordering::AcqRel) >= max {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        if !member_source {
+            let mut guard = self.per_ip.lock();
+            let count = guard.entry(peer).or_insert(0);
+            if *count >= MAX_PREAUTH_CONN_PER_IP {
+                drop(guard);
+                counter.fetch_sub(1, Ordering::AcqRel);
+                return None;
+            }
+            *count += 1;
+        }
+        Some(PreauthGuard {
+            budget: Arc::clone(self),
+            peer,
+            member_source,
+        })
     }
-    *count += 1;
-    true
 }
 
-fn release_preauth_slot(peer: IpAddr) {
-    let mut guard = PREAUTH_CONN_PER_IP.lock();
-    if let Some(count) = guard.get_mut(&peer) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            guard.remove(&peer);
+/// Releases the pre-auth slot acquired by [`PreauthBudget::try_acquire`].
+struct PreauthGuard {
+    budget: Arc<PreauthBudget>,
+    peer: IpAddr,
+    member_source: bool,
+}
+
+impl Drop for PreauthGuard {
+    fn drop(&mut self) {
+        if self.member_source {
+            self.budget.member.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        self.budget.global.fetch_sub(1, Ordering::AcqRel);
+        let mut guard = self.budget.per_ip.lock();
+        if let Some(count) = guard.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                guard.remove(&self.peer);
+            }
         }
     }
 }
@@ -639,6 +687,11 @@ pub type JoinAcceptFn = Arc<
 /// Returns true when `node_id` is in the current Raft membership.
 pub type MembershipFn = Arc<dyn Fn(NodeId) -> bool + Send + Sync>;
 
+/// Returns true when `ip` is the source address of a configured cluster
+/// member/peer, i.e. a source that must not compete with unauthenticated
+/// traffic for the shared pre-auth connection budget.
+pub type MemberSourceFn = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
+
 /// Verifies an HTTP-API-signed membership change (`admin_proof`).
 pub type AdminProofFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
@@ -699,6 +752,10 @@ pub async fn serve_control_plane(
 }
 
 /// Serve on an already-bound listener (bind-before-spawn startup).
+///
+/// No source is exempt from the shared pre-auth budget; use
+/// [`serve_control_plane_listener_with_member_sources`] to reserve capacity
+/// for configured cluster members.
 pub async fn serve_control_plane_listener(
     listener: TcpListener,
     secret: String,
@@ -713,8 +770,50 @@ pub async fn serve_control_plane_listener(
     write_forward: Option<ClientWriteForwardCtx>,
     tls_server: Option<Arc<ServerConfig>>,
 ) -> Result<(), std::io::Error> {
+    serve_control_plane_listener_with_member_sources(
+        listener,
+        secret,
+        local_id,
+        raft,
+        on_join,
+        on_heartbeat,
+        on_admin,
+        on_stats,
+        is_member,
+        verify_admin_proof,
+        write_forward,
+        Arc::new(|_ip: IpAddr| false),
+        tls_server,
+    )
+    .await
+}
+
+/// Serve on an already-bound listener, reserving pre-auth capacity for
+/// configured member/peer source addresses.
+///
+/// Inter-node RPCs each open a fresh connection, so a flood of half-open
+/// unauthenticated connections must not be able to consume every accept slot:
+/// `is_member_source` classifies a source address as a member, and those take
+/// a slot from a separate reserved counter. A flood can therefore only
+/// exhaust the non-member budget.
+pub async fn serve_control_plane_listener_with_member_sources(
+    listener: TcpListener,
+    secret: String,
+    local_id: NodeId,
+    raft: Raft,
+    on_join: JoinAcceptFn,
+    on_heartbeat: Arc<dyn Fn(HeartbeatInfo) + Send + Sync>,
+    on_admin: Arc<dyn Fn(ControlMessage) -> ControlMessage + Send + Sync>,
+    on_stats: Arc<dyn Fn(String) -> serde_json::Value + Send + Sync>,
+    is_member: MembershipFn,
+    verify_admin_proof: AdminProofFn,
+    write_forward: Option<ClientWriteForwardCtx>,
+    is_member_source: MemberSourceFn,
+    tls_server: Option<Arc<ServerConfig>>,
+) -> Result<(), std::io::Error> {
     let acceptor = tls_server.map(TlsAcceptor::from);
     let tls_required = acceptor.is_some();
+    let preauth_budget = PreauthBudget::new();
     let bind = listener
         .local_addr()
         .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static bind parse"));
@@ -727,15 +826,15 @@ pub async fn serve_control_plane_listener(
                 continue;
             }
         };
-        if !try_acquire_global_preauth_slot() {
-            tracing::debug!(%peer, "control connection rejected: global preauth limit");
+        let member_source = is_member_source(peer.ip());
+        let Some(preauth) = preauth_budget.try_acquire(peer.ip(), member_source) else {
+            tracing::debug!(
+                %peer,
+                member_source,
+                "control connection rejected: preauth limit"
+            );
             continue;
-        }
-        if !try_acquire_preauth_slot(peer.ip()) {
-            release_global_preauth_slot();
-            tracing::debug!(%peer, "control connection rejected: preauth per-ip limit");
-            continue;
-        }
+        };
         let secret = secret.clone();
         let raft = raft.clone();
         let on_join = Arc::clone(&on_join);
@@ -747,14 +846,7 @@ pub async fn serve_control_plane_listener(
         let write_forward = write_forward.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            struct PreauthGuard(IpAddr);
-            impl Drop for PreauthGuard {
-                fn drop(&mut self) {
-                    release_preauth_slot(self.0);
-                    release_global_preauth_slot();
-                }
-            }
-            let preauth = PreauthGuard(peer.ip());
+            let preauth = preauth;
             struct InflightGuard;
             impl Drop for InflightGuard {
                 fn drop(&mut self) {
@@ -1622,6 +1714,69 @@ mod tests {
     async fn control_accept_backoff_survives_transient_errors() {
         control_accept_backoff(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)).await;
         control_accept_backoff(std::io::Error::from(std::io::ErrorKind::Interrupted)).await;
+    }
+
+    #[test]
+    fn preauth_budget_reserves_capacity_for_member_sources() {
+        let budget = PreauthBudget::new();
+
+        // Saturate the shared budget the way an unauthenticated flood would:
+        // one held socket per distinct source address.
+        let mut held = Vec::new();
+        for i in 0..MAX_PREAUTH_CONN_INFLIGHT {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 18, (i / 256) as u8, (i % 256) as u8));
+            held.push(
+                budget
+                    .try_acquire(ip, false)
+                    .unwrap_or_else(|| panic!("slot {i} must be available")),
+            );
+        }
+        let intruder = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert!(
+            budget.try_acquire(intruder, false).is_none(),
+            "the shared budget must be exhausted"
+        );
+
+        // A configured member source is admitted from the reserved budget.
+        let member = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let member_slot = budget
+            .try_acquire(member, true)
+            .expect("member sources must not compete with the shared budget");
+        assert!(budget.try_acquire(member, true).is_some());
+        drop(member_slot);
+
+        // Releasing one non-member slot restores exactly one non-member slot
+        // without touching the reserved member budget.
+        held.pop();
+        let restored = budget
+            .try_acquire(intruder, false)
+            .expect("a released slot must be reusable");
+        assert!(budget.try_acquire(intruder, false).is_none());
+        let member_slot = budget
+            .try_acquire(member, true)
+            .expect("member capacity is independent of the shared budget");
+        drop(restored);
+        drop(member_slot);
+
+        // Draining the flood restores the shared budget.
+        drop(held);
+        assert!(budget.try_acquire(intruder, false).is_some());
+    }
+
+    #[test]
+    fn preauth_per_source_cap_applies_to_non_members_only() {
+        let budget = PreauthBudget::new();
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let mut held = Vec::new();
+        for _ in 0..MAX_PREAUTH_CONN_PER_IP {
+            held.push(budget.try_acquire(source, false).expect("per-ip slot"));
+        }
+        assert!(budget.try_acquire(source, false).is_none());
+        // Member traffic from the same address is not blocked by an
+        // unauthenticated flood's per-source bucket.
+        assert!(budget.try_acquire(source, true).is_some());
+        drop(held);
+        assert!(budget.try_acquire(source, false).is_some());
     }
 
     #[tokio::test]
@@ -3052,18 +3207,16 @@ mod tests {
 
     #[test]
     fn control_preauth_slots_are_bounded_per_ip() {
+        let budget = PreauthBudget::new();
         let ip = test_ip(70);
+        let mut held = Vec::new();
         for _ in 0..MAX_PREAUTH_CONN_PER_IP {
-            assert!(try_acquire_preauth_slot(ip));
+            held.push(budget.try_acquire(ip, false).expect("per-ip slot"));
         }
-        assert!(!try_acquire_preauth_slot(ip));
-        for _ in 0..MAX_PREAUTH_CONN_PER_IP {
-            release_preauth_slot(ip);
-        }
-        assert!(!PREAUTH_CONN_PER_IP.lock().contains_key(&ip));
-        release_preauth_slot(ip);
-        // Shared with concurrently running tests, so only check it is usable.
-        assert!(try_acquire_global_preauth_slot());
-        release_global_preauth_slot();
+        assert!(budget.try_acquire(ip, false).is_none());
+        drop(held);
+        assert!(budget.try_acquire(ip, false).is_some());
+        // The per-source bucket is released with the last held slot.
+        assert!(budget.per_ip.lock().get(&ip).is_none_or(|n| *n == 0));
     }
 }

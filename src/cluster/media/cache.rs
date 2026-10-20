@@ -23,10 +23,32 @@ impl InitCacheStore {
         Self::default()
     }
 
+    /// Stage `entry`, replacing the stored one only when its epoch is not
+    /// older. Returns whether the entry was stored.
+    ///
+    /// The ownership check that admits an `InitCache` off the wire and this
+    /// insertion are separate critical sections, so a failover can move the
+    /// stream to a newer epoch in between. Without this fence the superseded
+    /// owner's entry then replaces the current owner's staged init fields under
+    /// the old epoch label; subscribers that join after fail-back reject it via
+    /// `accepts_owner` and get no codec headers/keyframe. Same-epoch updates
+    /// still replace the whole entry.
+    pub fn put_if_epoch_ge(&self, app: &str, stream: &str, entry: InitCacheEntry) -> bool {
+        let mut g = self.inner.lock();
+        let key = (app.to_string(), stream.to_string());
+        if g.get(&key)
+            .is_some_and(|existing| entry.epoch < existing.epoch)
+        {
+            return false;
+        }
+        g.insert(key, entry);
+        true
+    }
+
+    /// Stage `entry` unless a newer epoch is already staged (see
+    /// [`Self::put_if_epoch_ge`]).
     pub fn put(&self, app: &str, stream: &str, entry: InitCacheEntry) {
-        self.inner
-            .lock()
-            .insert((app.to_string(), stream.to_string()), entry);
+        self.put_if_epoch_ge(app, stream, entry);
     }
 
     pub fn get(&self, app: &str, stream: &str) -> Option<InitCacheEntry> {
@@ -218,14 +240,76 @@ mod tests {
         assert!(store.get("other", "s1").is_none());
         assert!(store.get("live", "s2").is_none());
 
-        // `put` replaces the whole entry.
-        store.put("live", "s1", InitCacheEntry::default());
+        // `put` replaces the whole entry at the same epoch.
+        store.put(
+            "live",
+            "s1",
+            InitCacheEntry {
+                epoch: 3,
+                ..InitCacheEntry::default()
+            },
+        );
         assert_eq!(store.get("live", "s1").unwrap().metadata, None);
 
         store.remove("live", "s1");
         assert!(store.get("live", "s1").is_none());
         // Removing a missing key is a no-op.
         store.remove("live", "missing");
+    }
+
+    #[test]
+    fn put_fences_older_epochs_and_accepts_newer_or_equal() {
+        let store = InitCacheStore::new();
+        let entry = |epoch: u64, metadata: &[u8]| InitCacheEntry {
+            metadata: Some(metadata.to_vec()),
+            epoch,
+            ..InitCacheEntry::default()
+        };
+        assert!(store.put_if_epoch_ge("live", "s", entry(5, b"e5")));
+        assert_eq!(store.get("live", "s").unwrap().epoch, 5);
+
+        // A superseded owner's InitCache may still arrive after a failover
+        // staged a newer epoch; it must not replace it.
+        assert!(!store.put_if_epoch_ge("live", "s", entry(4, b"stale")));
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 5, "an older epoch must not relabel the entry");
+        assert_eq!(
+            e.metadata.as_deref(),
+            Some(&b"e5"[..]),
+            "an older epoch must not clobber newer staged fields"
+        );
+
+        // Same-epoch updates (e.g. a snapshot refresh) still replace the entry.
+        store.put("live", "s", entry(5, b"e5-refreshed"));
+        assert_eq!(
+            store.get("live", "s").unwrap().metadata.as_deref(),
+            Some(&b"e5-refreshed"[..])
+        );
+
+        // A newer epoch replaces the whole entry.
+        store.put("live", "s", entry(6, b"e6"));
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 6);
+        assert_eq!(e.metadata.as_deref(), Some(&b"e6"[..]));
+
+        // The wire path uses the same fence: a stale InitCache/snapshot must
+        // not overwrite the newer staged entry.
+        store.apply_wire("live", "s", 6, None, Some(vec![1]), None, None);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.metadata, None);
+        assert_eq!(e.avc_header, Some(vec![1]));
+        store.apply_wire("live", "s", 5, Some(b"stale".to_vec()), None, None, None);
+        let e = store.get("live", "s").unwrap();
+        assert_eq!(e.epoch, 6);
+        assert_eq!(e.metadata, None, "stale wire InitCache overwrote epoch 6");
+        assert_eq!(e.avc_header, Some(vec![1]));
+
+        let snap = librtmp2::server::StreamInitSnapshot {
+            metadata: Some(b"snap".to_vec()),
+            ..Default::default()
+        };
+        store.store_snapshot("live", "s", 4, &snap);
+        assert_eq!(store.get("live", "s").unwrap().epoch, 6);
     }
 
     #[test]

@@ -1348,22 +1348,37 @@ const DELETE_DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often to re-query peers for live sessions while draining. Local counts
+/// are cheap and checked every 50 ms, but each remote query is a fresh
+/// authenticated control-plane round trip per peer, so it is paced instead of
+/// being issued on every local iteration.
+const REMOTE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Remote RTMP sessions for `id`, or 0 outside cluster mode.
+#[cfg(feature = "cluster")]
+async fn remote_stream_sessions(state: &AppState, id: &str) -> u64 {
+    match state.coordinator.cluster_manager() {
+        Some(mgr) => mgr.remote_stream_session_count(id).await,
+        None => 0,
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn remote_stream_sessions(_state: &AppState, _id: &str) -> u64 {
+    0
+}
 
 async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
     let started = Instant::now();
     let mut last_warn = started;
+    let mut last_remote_poll = started;
+    let mut remote = remote_stream_sessions(&state, &id).await;
     loop {
         let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
-        #[cfg(feature = "cluster")]
-        let remote = {
-            if let Some(mgr) = state.coordinator.cluster_manager() {
-                mgr.remote_stream_session_count(&id).await
-            } else {
-                0
-            }
-        };
-        #[cfg(not(feature = "cluster"))]
-        let remote = 0u64;
+        if last_remote_poll.elapsed() >= REMOTE_DRAIN_POLL_INTERVAL {
+            remote = remote_stream_sessions(&state, &id).await;
+            last_remote_poll = Instant::now();
+        }
         if local == 0 && remote == 0 {
             break;
         }
@@ -1525,16 +1540,7 @@ async fn handle_stream_delete(
     }
 
     let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
-    #[cfg(feature = "cluster")]
-    let remote = {
-        if let Some(mgr) = state.coordinator.cluster_manager() {
-            mgr.remote_stream_session_count(&id).await
-        } else {
-            0
-        }
-    };
-    #[cfg(not(feature = "cluster"))]
-    let remote = 0u64;
+    let remote = remote_stream_sessions(&state, &id).await;
     if local == 0 && remote == 0 {
         return match finalize_stream_delete(&state, &id).await {
             Ok(()) => {
