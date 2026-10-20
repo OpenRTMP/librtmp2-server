@@ -756,10 +756,7 @@ impl SqliteStateMachine {
     }
 }
 
-fn log_id_ahead_of_boundary(
-    current: Option<LogId<u64>>,
-    boundary: Option<LogId<u64>>,
-) -> bool {
+fn log_id_ahead_of_boundary(current: Option<LogId<u64>>, boundary: Option<LogId<u64>>) -> bool {
     match (current, boundary) {
         (Some(c), Some(b)) => c > b,
         (Some(_), None) => true,
@@ -781,9 +778,9 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 let data = self
                     .build_app_snapshot(applied)
                     .map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::read_state_machine(
-                            &std::io::Error::other(e),
-                        ),
+                        source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(
+                            e,
+                        )),
                     })?;
                 (data, applied, self.last_membership.lock().clone())
             };
