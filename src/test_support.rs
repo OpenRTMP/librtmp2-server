@@ -135,7 +135,7 @@ impl TestServer {
                 max_connections_per_addr: i32::MAX,
             };
 
-            let mut server = match RtmpServer::new(cfg) {
+            let mut server = match RtmpServer::from_config(cfg, None) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = rtmp_ready_tx.send(Err(format!("RTMP init failed: {e}")));

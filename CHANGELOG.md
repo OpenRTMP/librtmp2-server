@@ -121,6 +121,9 @@ begin at `1.0.0`.
   compacted log entries.
 
 ### Changed
+- Requires `librtmp2` 0.15.0, which provides the safe server-construction path
+  (`Server::from_config`), the E-RTMP v2 ModEx parser, and the protocol/client
+  fixes documented in that release.
 - Internal control-plane listener configuration is bundled into a struct
   (`ControlPlaneListenerConfig`), and the cluster test script derives its
   source root instead of duplicating path literals. No behavior change.
