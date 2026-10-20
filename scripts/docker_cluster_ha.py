@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Re-run cluster_ha tests only after leader-forward fix.
 
-The source root defaults to the checkout that contains this script. Set
-``OPENRTMP_SRC_ROOT`` to test another checkout and ``OPENRTMP_DEST`` to use a
-different build directory (defaults to a folder in the system temp dir).
+``DEFAULT_SRC_ROOT`` is the parent directory that contains the repository
+checkouts; the script resolves the ``librtmp2-server`` and ``librtmp2`` source
+trees beneath it. Set ``OPENRTMP_SRC_ROOT`` to point at another parent
+directory and ``OPENRTMP_DEST`` to use a different build directory (defaults to
+a folder in the system temp dir).
 """
 from __future__ import annotations
 
