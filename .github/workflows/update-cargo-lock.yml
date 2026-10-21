@@ -48,7 +48,8 @@ jobs:
         if: steps.commit-lock.outputs.updated == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
-          gh workflow run tests.yml --ref "${{ github.ref_name }}"
-          gh workflow run e2e-tests.yml --ref "${{ github.ref_name }}"
-          gh workflow run benchmarks.yml --ref "${{ github.ref_name }}"
+          gh workflow run tests.yml --ref "$BRANCH_NAME"
+          gh workflow run e2e-tests.yml --ref "$BRANCH_NAME"
+          gh workflow run benchmarks.yml --ref "$BRANCH_NAME"
