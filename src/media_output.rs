@@ -1292,7 +1292,10 @@ fn spawn_hook(command: &str, event: &str, env: &ExecEnv<'_>) -> io::Result<Child
     let mut cmd = {
         use std::os::unix::process::CommandExt;
         let mut c = Command::new("/bin/sh");
-        c.arg("-c").arg(command);
+        // Only the administrator's MEDIA_EXEC_PUBLISH(_DONE) configuration is
+        // interpreted as shell code. Publisher metadata is passed as separate
+        // environment variables below, never interpolated into this string.
+        c.arg("-c").arg(command); // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection
         // Give the hook its own process group so teardown can terminate shell
         // pipelines and descendants, not just the top-level /bin/sh process.
         c.process_group(0);
@@ -1301,7 +1304,9 @@ fn spawn_hook(command: &str, event: &str, env: &ExecEnv<'_>) -> io::Result<Child
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
+        // Same admin-configured hook contract as the Unix implementation;
+        // untrusted stream metadata is passed through the environment only.
+        c.arg("/C").arg(command); // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection
         c
     };
     #[cfg(not(any(unix, windows)))]
@@ -1532,10 +1537,11 @@ fn restrict_media_path_permissions(_path: &Path, _is_dir: bool) -> io::Result<()
 fn create_private_media_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+    // Every recording has a unique session filename. Never overwrite an
+    // existing path, even if another actor has planted a file or symlink.
     let file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
@@ -1545,8 +1551,14 @@ fn create_private_media_file(path: &Path) -> io::Result<File> {
 
 #[cfg(not(unix))]
 fn create_private_media_file(path: &Path) -> io::Result<File> {
-    let file = File::create(path)?;
-    restrict_media_path_permissions(path, false)?;
+    // create_new fails if the path already exists, including a symlink or
+    // Windows reparse-point file, instead of opening an attacker-chosen target.
+    let file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(error) = restrict_media_path_permissions(path, false) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
     Ok(file)
 }
 
@@ -2187,6 +2199,17 @@ mod tests {
             ttl,
             0,
         ));
+    }
+
+    #[test]
+    fn recording_file_creation_never_overwrites_existing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("recording.flv");
+        fs::write(&path, b"original").unwrap();
+
+        let error = create_private_media_file(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(path).unwrap(), b"original");
     }
 
     #[test]
@@ -3202,6 +3225,26 @@ mod tests {
         // Frames still flow through without sinks.
         manager.handle_frame(&frame(9, FrameType::Audio, 0, &[1]), "s2", 1);
         manager.stop_all();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publisher_stream_metadata_cannot_inject_publish_hook_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("injected");
+        let hostile_name = format!("camera'; touch '{}'; echo '", marker.display());
+        let env = ExecEnv {
+            conn_id: 1,
+            stream_id: "s1",
+            stream_name: &hostile_name,
+            app: "live",
+            recording_file: None,
+            hls_playlist: None,
+        };
+
+        let mut child = spawn_hook("printf '%s' \\"$OPENRTMP_STREAM_NAME\\" >/dev/null", "publish", &env).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!marker.exists(), "publisher metadata must not execute shell code");
     }
 
     #[test]
