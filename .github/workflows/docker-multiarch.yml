@@ -17,6 +17,12 @@ on:
         type: string
         required: false
 
+    secrets:
+      QUAY_USERNAME:
+        required: false
+      QUAY_TOKEN:
+        required: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
