@@ -3242,7 +3242,8 @@ mod tests {
             hls_playlist: None,
         };
 
-        let mut child = spawn_hook(r#"printf '%s' "$OPENRTMP_STREAM_NAME" >/dev/null"#, "publish", &env).unwrap();
+        let command = r#"printf '%s' "$OPENRTMP_STREAM_NAME" >/dev/null"#;
+        let mut child = spawn_hook(command, "publish", &env).unwrap();
         assert!(child.wait().unwrap().success());
         assert!(!marker.exists(), "publisher metadata must not execute shell code");
     }
