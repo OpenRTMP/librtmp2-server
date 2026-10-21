@@ -168,7 +168,9 @@ jobs:
     permissions:
       packages: write
       contents: read
-    secrets: inherit
+    secrets:
+      QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+      QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
     with:
       version: ${{ needs.package.outputs.version }}
       ref: ${{ needs.resolve.outputs.sha }}
