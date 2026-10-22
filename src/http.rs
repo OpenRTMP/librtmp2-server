@@ -1441,7 +1441,11 @@ async fn handle_stream_delete(
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
     let path = format!("/api/v1/streams/{id}");
-    if state.deleted_streams.lock().contains(&id) {
+    // Only this node's HTTP-owned marker means "a delete is already in
+    // progress". `deleted_streams` also carries the cluster's transient
+    // force-unpublish/drain markers; those must not short-circuit the delete,
+    // or the stream row would survive an accepted delete.
+    if state.sticky_deleted_streams.lock().contains(&id) {
         log_http_access(
             "DELETE",
             &path,
@@ -3715,11 +3719,17 @@ mod tests {
             created_at: now_ts(),
         };
         state.db.stream_add(&stream).unwrap();
+        // A delete started by this node's API owns both marker sets.
         state.deleted_streams.lock().insert("pending".to_string());
+        state
+            .sticky_deleted_streams
+            .lock()
+            .insert("pending".to_string());
 
-        let app = router(state);
+        let app = router(state.clone());
         let (header, value) = bearer("a-strong-random-secret-value");
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -3731,6 +3741,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // A cluster-owned marker (force-unpublish/drain) is not a delete in
+        // progress: it must not short-circuit the delete.
+        let clustered = Stream {
+            id: "clustered".to_string(),
+            name: "Clustered".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_clus_key_with_sufficient_length_here".to_string(),
+            play_key: "play_clus_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_clus_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&clustered).unwrap();
+        state.deleted_streams.lock().insert("clustered".to_string());
+
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/clustered")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matches!(
+            state.db.stream_get("clustered"),
+            DbLookup::Missing
+        ));
     }
 
     #[tokio::test]
