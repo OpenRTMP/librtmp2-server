@@ -1552,6 +1552,36 @@ pub async fn send_topology(
     }
 }
 
+/// Round-trip budget for a single heartbeat.
+///
+/// A heartbeat opens a fresh TCP (and TLS) connection and then runs a
+/// multi-message auth handshake, so one heartbeat costs several sequential
+/// network round trips. A fixed 500 ms cap therefore dropped every heartbeat
+/// on a link with more than ~70 ms RTT: the peer stopped refreshing
+/// `last_seen`, was marked DOWN, lost its stream ownership and could cost the
+/// cluster its quorum even though the link was healthy. Scale the budget with
+/// the configured heartbeat interval instead, and keep it below the health
+/// tracker's miss limit (`heartbeat * 5`, at least 2s) so a peer that answers
+/// within the budget is never marked DOWN.
+pub fn heartbeat_roundtrip_timeout(heartbeat: Duration) -> Duration {
+    let miss_limit = heartbeat.saturating_mul(5).max(Duration::from_secs(2));
+    miss_limit
+        .saturating_sub(heartbeat)
+        .max(Duration::from_millis(500))
+        .min(ROUNDTRIP_TIMEOUT)
+}
+
+/// Default heartbeat interval assumed by [`send_heartbeat`] when the caller
+/// does not know the cluster's configured interval. It matches the default
+/// `CLUSTER_HEARTBEAT_MS` value.
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Send a heartbeat to a peer with the default round-trip budget.
+///
+/// The budget is derived from the default heartbeat interval; callers that
+/// know the cluster's configured interval should use
+/// [`send_heartbeat_with_timeout`] with
+/// [`heartbeat_roundtrip_timeout`].
 pub async fn send_heartbeat(
     peer_addr: &str,
     secret: &str,
@@ -1566,8 +1596,42 @@ pub async fn send_heartbeat(
     viewer_players: Vec<(String, u64)>,
     tls_client: Option<Arc<ClientConfig>>,
 ) {
-    let _ = tokio::time::timeout(Duration::from_millis(500), async {
-        let _ = authed_roundtrip_inner(
+    send_heartbeat_with_timeout(
+        peer_addr,
+        secret,
+        local_id,
+        health,
+        load,
+        control_addr,
+        media_addr,
+        publishers,
+        players,
+        stream_players,
+        viewer_players,
+        tls_client,
+        heartbeat_roundtrip_timeout(DEFAULT_HEARTBEAT_INTERVAL),
+    )
+    .await
+}
+
+/// Send a heartbeat to a peer with an explicit round-trip budget.
+pub(crate) async fn send_heartbeat_with_timeout(
+    peer_addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    health: &str,
+    load: f64,
+    control_addr: String,
+    media_addr: String,
+    publishers: u64,
+    players: u64,
+    stream_players: Vec<(String, u64)>,
+    viewer_players: Vec<(String, u64)>,
+    tls_client: Option<Arc<ClientConfig>>,
+    timeout: Duration,
+) {
+    match tokio::time::timeout(timeout, async {
+        authed_roundtrip_inner(
             peer_addr,
             secret,
             local_id,
@@ -1584,9 +1648,18 @@ pub async fn send_heartbeat(
                 viewer_players,
             },
         )
-        .await;
+        .await
     })
-    .await;
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(%peer_addr, error = %e, "cluster heartbeat failed");
+        }
+        Err(_) => {
+            tracing::warn!(%peer_addr, ?timeout, "cluster heartbeat timed out");
+        }
+    }
 }
 
 pub async fn send_session_count(
@@ -2368,7 +2441,7 @@ mod tests {
         assert_eq!(err, "unsupported");
 
         // Heartbeats are bound to the authenticated member identity.
-        send_heartbeat(
+        send_heartbeat_with_timeout(
             &ctl.addr,
             SECRET,
             2,
@@ -2381,9 +2454,10 @@ mod tests {
             vec![("s".into(), 2)],
             vec![("v".into(), 1)],
             None,
+            heartbeat_roundtrip_timeout(Duration::from_millis(500)),
         )
         .await;
-        send_heartbeat(
+        send_heartbeat_with_timeout(
             &ctl.addr,
             SECRET,
             9,
@@ -2396,6 +2470,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
+            heartbeat_roundtrip_timeout(Duration::from_millis(500)),
         )
         .await;
         {

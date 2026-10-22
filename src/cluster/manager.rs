@@ -167,7 +167,8 @@ pub struct ClusterManager {
     /// actually drain — see `retry_pending_drain_clears`.
     pending_drain_clears: Mutex<std::collections::HashSet<String>>,
     /// (stream_id, node_id, acquired_at, queued_at) for `AcquireStreamOwner`
-    /// writes whose client-side 2s deadline elapsed before Raft answered.
+    /// writes that failed before Raft answered (the local 2s deadline
+    /// elapsed, or a forwarded write failed with a transport error).
     /// Dropping that future does not cancel an in-flight write, so it can
     /// still commit afterward; reconciled on the next health tick — see
     /// `reconcile_ambiguous_acquires`. A record that has not committed within
@@ -197,6 +198,15 @@ pub struct ClusterManager {
     /// Recently accepted `admin_proof` values — blocks captured ClientWrite /
     /// membership proofs from being replayed while the API token is unchanged.
     used_admin_proofs: Mutex<HashMap<String, Instant>>,
+    /// Join proofs this node accepted whose outcome the joiner may not have
+    /// learned yet: the `JoinResponse` can be lost after the membership
+    /// change already committed. The joiner's proof is a static
+    /// `CLUSTER_JOIN_PROOF` configuration value, so spending it before the
+    /// joiner knows the outcome leaves it unable to retry its join at all.
+    /// The proof is spent only once the new member is observed alive — its
+    /// first heartbeat proves the joiner learned the outcome — see
+    /// `defer_join_proof_burn`.
+    pending_join_proofs: Mutex<HashMap<NodeId, (String, Instant)>>,
     /// Last peer-address value rejected per `(node, kind)`, so a peer that
     /// keeps advertising an invalid address (mTLS heartbeat) only warns when the
     /// rejected value changes instead of on every heartbeat.
@@ -390,6 +400,7 @@ impl ClusterManager {
             standby_subs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
+            pending_join_proofs: Mutex::new(HashMap::new()),
             rejected_peer_addrs: Mutex::new(std::collections::HashMap::new()),
         });
 
@@ -820,15 +831,23 @@ impl ClusterManager {
             acquired_at,
         }) {
             Ok(resp) => resp,
-            Err(CoordError::Cluster(msg)) if msg == RAFT_WRITE_TIMEOUT_MSG => {
+            Err(e) => {
                 // The caller gives up on this acquire, but the write may
                 // still commit later; check on the next health tick and
                 // release it if it does, rather than leaving a ghost owner
                 // no local publisher is actually using.
+                //
+                // Every failed write is ambiguous, not just the local 2s
+                // deadline: a write forwarded to the leader that fails with
+                // a transport error after the leader already committed
+                // leaves the same ghost row, and that row blocks the stream
+                // for every other node until this node restarts. An
+                // explicit state-machine verdict (Conflict/NotFound) is
+                // the only unambiguous rejection — and it is reported
+                // through the successful response, not as an error here.
                 self.queue_ambiguous_acquire(stream_id.to_string(), node_id, acquired_at);
-                return Err(CoordError::Cluster(msg));
+                return Err(e);
             }
-            Err(e) => return Err(e),
         };
         let epoch = resp.into_owner_epoch()?;
         self.ownership.set(stream_id, node_id, epoch);
@@ -1116,6 +1135,9 @@ impl ClusterManager {
         if !self.peer_in_membership(info.node_id) {
             return;
         }
+        // The new member's first heartbeat proves it learned the outcome of
+        // its join, so its one-time join proof can be spent now.
+        self.burn_pending_join_proof(info.node_id);
         let state = NodeHealthState::from_heartbeat(&info.health);
         let known_addrs = self.meta.get(info.node_id);
         let (ctrl, media_a) = heartbeat_routing_addrs(
@@ -1382,9 +1404,10 @@ impl ClusterManager {
             return false;
         }
         // A join proof is a configured one-time capability. Keep it retryable
-        // until add_learner/forwarding has actually succeeded; accept_join()
-        // records it after success. Other admin attempts mint a fresh nonce on
-        // each retry, so they can be consumed immediately here.
+        // until the joining node has learned the outcome; accept_join()
+        // defers the spending to the new member's first heartbeat. Other
+        // admin attempts mint a fresh nonce on each retry, so they can be
+        // consumed immediately here.
         if !payload.starts_with("Join:") {
             used.insert(proof.to_string(), now);
         }
@@ -1396,6 +1419,69 @@ impl ClusterManager {
         let now = Instant::now();
         Self::purge_expired_admin_proofs(&mut used, now);
         used.insert(proof.to_string(), now);
+    }
+
+    /// Record a join proof that must not be spent yet.
+    ///
+    /// The membership change is already committed when the join is accepted,
+    /// but the `JoinResponse` can still be lost on the way back. The joiner's
+    /// proof is a static `CLUSTER_JOIN_PROOF` configuration value: spending it
+    /// here would leave the joiner unable to retry its join until the replay
+    /// TTL expires, so a lost response would strand the node for minutes.
+    /// The proof is spent only once the new member is observed alive — its
+    /// first heartbeat proves it learned the outcome.
+    fn defer_join_proof_burn(&self, node_id: NodeId, proof: String) {
+        let mut pending = self.pending_join_proofs.lock();
+        Self::spend_expired_join_proofs(self, &mut pending, Instant::now());
+        pending.insert(node_id, (proof, Instant::now()));
+    }
+
+    /// Spend the deferred join proof of a node that has just been seen alive.
+    fn burn_pending_join_proof(&self, node_id: NodeId) {
+        let entry = self.pending_join_proofs.lock().remove(&node_id);
+        let Some((proof, _queued_at)) = entry else {
+            return;
+        };
+        crate::log_info!("Cluster: node {node_id} confirmed its join; spending its join proof");
+        self.consume_admin_proof(&proof);
+    }
+
+    /// Spend the join proofs whose node never confirmed the join.
+    fn expire_pending_join_proofs(&self) {
+        let mut pending = self.pending_join_proofs.lock();
+        Self::spend_expired_join_proofs(self, &mut pending, Instant::now());
+    }
+
+    /// Spend the join proofs whose node never confirmed the join.
+    ///
+    /// A proof that stays unconfirmed for longer than the replay TTL is spent
+    /// anyway: the joiner that presented it never came alive, and leaving the
+    /// capability usable for longer than the TTL would weaken the one-time
+    /// protection a spent proof gives against a captured join request.
+    fn spend_expired_join_proofs(
+        &self,
+        pending: &mut HashMap<NodeId, (String, Instant)>,
+        now: Instant,
+    ) {
+        let expired: Vec<(NodeId, String)> = pending
+            .iter()
+            .filter(|(_, (_, queued_at))| {
+                now.checked_duration_since(*queued_at)
+                    .is_none_or(|age| age >= ADMIN_PROOF_REPLAY_TTL)
+            })
+            .map(|(id, (proof, _))| (*id, proof.clone()))
+            .collect();
+        for (id, _) in &expired {
+            pending.remove(id);
+        }
+        for (_, proof) in expired {
+            crate::log_warn!(
+                "Cluster: join proof was never confirmed by the joining node; spending it"
+            );
+            let mut used = self.used_admin_proofs.lock();
+            Self::purge_expired_admin_proofs(&mut used, now);
+            used.insert(proof, now);
+        }
     }
 
     async fn forward_admin(
@@ -1471,7 +1557,9 @@ impl ClusterManager {
         .await;
         if result.is_ok() {
             self.record_joined_peer_addresses(node_id, &control_for_meta, &media_for_meta);
-            self.consume_admin_proof(&proof_for_cache);
+            // The joiner may never learn the outcome (a lost JoinResponse),
+            // so the proof stays spendable until the new member is seen alive.
+            self.defer_join_proof_burn(node_id, proof_for_cache);
         }
         result
     }
@@ -1654,7 +1742,9 @@ impl ClusterManager {
             })
             .collect();
         crate::log_info!("Cluster: node {node_id} joined as learner");
-        self.consume_admin_proof(&proof);
+        // The joiner may never learn the outcome (a lost JoinResponse), so
+        // the proof stays spendable until the new member is seen alive.
+        self.defer_join_proof_burn(node_id, proof);
         Ok((self.cluster_id(), peers))
     }
 
@@ -1843,9 +1933,10 @@ impl ClusterManager {
         }
     }
 
-    /// Queue an acquire whose client-side deadline elapsed for reconciliation
-    /// on the next health tick. The list is bounded: repeated timeouts must
-    /// not grow it (and the per-tick owner lookups it causes) without limit.
+    /// Queue an acquire whose write failed before Raft answered for
+    /// reconciliation on the next health tick. The list is bounded: repeated
+    /// failures must not grow it (and the per-tick owner lookups it causes)
+    /// without limit.
     fn queue_ambiguous_acquire(&self, stream_id: String, node_id: u64, acquired_at: i64) {
         let mut pending = self.pending_ambiguous_acquires.lock();
         pending.push((stream_id, node_id, acquired_at, Instant::now()));
@@ -1859,9 +1950,10 @@ impl ClusterManager {
         }
     }
 
-    /// Check each acquire whose client-side deadline elapsed for whether the
-    /// write actually landed after all; if it did, release it — the caller
-    /// already gave up and no local publisher is using that reservation.
+    /// Check each acquire whose write failed before Raft answered for whether
+    /// the write actually landed after all; if it did, release it — the
+    /// caller already gave up and no local publisher is using that
+    /// reservation.
     fn reconcile_ambiguous_acquires(&self) {
         let pending: Vec<(String, u64, i64, Instant)> =
             self.pending_ambiguous_acquires.lock().drain(..).collect();
@@ -1927,7 +2019,7 @@ impl ClusterManager {
                 continue;
             }
             crate::log_warn!(
-                "Cluster: acquire for stream {stream_id} timed out client-side but later \
+                "Cluster: acquire for stream {stream_id} failed client-side but later \
                  committed at epoch={}; releasing the unclaimed reservation",
                 owner.epoch
             );
@@ -2740,6 +2832,7 @@ impl ClusterManager {
             self.process_state_effects();
             self.retry_pending_drain_clears();
             self.reconcile_ambiguous_acquires();
+            self.expire_pending_join_proofs();
             if !self.config.bandwidth_interface.is_empty() {
                 let iface = self.config.bandwidth_interface.clone();
                 let max = self.config.bandwidth_max_mbps;
@@ -2852,6 +2945,7 @@ impl ClusterManager {
             let health = self.health.local().as_str().to_string();
             let load = self.admission.current_load();
             let tls = self.tls_client.clone();
+            let heartbeat_timeout = network::heartbeat_roundtrip_timeout(self.config.heartbeat);
             let futs = peers.into_iter().map(|(id, ctrl, _)| {
                 let secret = secret.clone();
                 let advertise = advertise.clone();
@@ -2862,7 +2956,7 @@ impl ClusterManager {
                 let tls = tls.clone();
                 async move {
                     let _ = id;
-                    network::send_heartbeat(
+                    network::send_heartbeat_with_timeout(
                         &ctrl,
                         &secret,
                         node_id,
@@ -2875,6 +2969,7 @@ impl ClusterManager {
                         stream_players,
                         viewer_players,
                         tls,
+                        heartbeat_timeout,
                     )
                     .await;
                 }
