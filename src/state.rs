@@ -161,8 +161,12 @@ impl StateCoordinator {
 
     pub fn set_api_token(&self, token: &str) -> Result<(), CoordError> {
         match self {
+            // `token_set` only writes when no non-empty token is stored yet, so
+            // `Ok(false)` means the rotation did not happen: report it instead
+            // of claiming success.
             StateCoordinator::Standalone(db) => match db.token_set(token) {
-                Ok(_) => Ok(()),
+                Ok(true) => Ok(()),
+                Ok(false) => Err(CoordError::Conflict),
                 Err(_) => Err(CoordError::Db),
             },
             #[cfg(feature = "cluster")]
