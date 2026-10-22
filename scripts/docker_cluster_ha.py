@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from openrtmp_docker_paths import (
     CARGO_MANIFEST,
+    require_disjoint_dest,
     require_source_tree,
     resolve_dest,
     resolve_src_root,
@@ -83,6 +84,10 @@ def main() -> int:
     # cannot silently run the suite against a stale destination copy.
     server_src = require_source_tree(SRC_ROOT, "librtmp2-server")
     lib_src = require_source_tree(SRC_ROOT, "librtmp2")
+    # Refuse a destination that overlaps a checkout before anything is
+    # staged: the refresh below deletes the destination tree first, so an
+    # overlapping destination would delete the very sources it copies.
+    require_disjoint_dest(DEST, [server_src, lib_src])
     DEST.mkdir(parents=True, exist_ok=True)
     if not (DEST / "librtmp2-server" / CARGO_MANIFEST).is_file():
         for src, name in ((server_src, "librtmp2-server"), (lib_src, "librtmp2")):
