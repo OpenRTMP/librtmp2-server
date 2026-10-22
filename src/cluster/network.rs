@@ -1579,6 +1579,21 @@ pub fn heartbeat_roundtrip_timeout(heartbeat: Duration) -> Duration {
 /// `CLUSTER_HEARTBEAT_MS` value.
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The payload of a cluster heartbeat.
+///
+/// Bundled into one value so the heartbeat helpers do not grow a parameter
+/// per reported field.
+pub(crate) struct HeartbeatPayload {
+    pub health: String,
+    pub load: f64,
+    pub control_addr: String,
+    pub media_addr: String,
+    pub publishers: u64,
+    pub players: u64,
+    pub stream_players: Vec<(String, u64)>,
+    pub viewer_players: Vec<(String, u64)>,
+}
+
 /// Send a heartbeat to a peer with the default round-trip budget.
 ///
 /// The budget is derived from the default heartbeat interval; callers that
@@ -1603,14 +1618,16 @@ pub async fn send_heartbeat(
         peer_addr,
         secret,
         local_id,
-        health,
-        load,
-        control_addr,
-        media_addr,
-        publishers,
-        players,
-        stream_players,
-        viewer_players,
+        HeartbeatPayload {
+            health: health.to_string(),
+            load,
+            control_addr,
+            media_addr,
+            publishers,
+            players,
+            stream_players,
+            viewer_players,
+        },
         tls_client,
         heartbeat_roundtrip_timeout(DEFAULT_HEARTBEAT_INTERVAL),
     )
@@ -1629,14 +1646,7 @@ pub(crate) async fn send_heartbeat_with_timeout(
     peer_addr: &str,
     secret: &str,
     local_id: NodeId,
-    health: &str,
-    load: f64,
-    control_addr: String,
-    media_addr: String,
-    publishers: u64,
-    players: u64,
-    stream_players: Vec<(String, u64)>,
-    viewer_players: Vec<(String, u64)>,
+    payload: HeartbeatPayload,
     tls_client: Option<Arc<ClientConfig>>,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -1648,14 +1658,14 @@ pub(crate) async fn send_heartbeat_with_timeout(
             tls_client,
             ControlMessage::Heartbeat {
                 node_id: local_id,
-                health: health.to_string(),
-                load,
-                control_addr,
-                media_addr,
-                publishers,
-                players,
-                stream_players,
-                viewer_players,
+                health: payload.health,
+                load: payload.load,
+                control_addr: payload.control_addr,
+                media_addr: payload.media_addr,
+                publishers: payload.publishers,
+                players: payload.players,
+                stream_players: payload.stream_players,
+                viewer_players: payload.viewer_players,
             },
         )
         .await
@@ -2452,14 +2462,16 @@ mod tests {
                 &ctl.addr,
                 SECRET,
                 2,
-                "healthy",
-                0.5,
-                "c".into(),
-                "m".into(),
-                1,
-                2,
-                vec![("s".into(), 2)],
-                vec![("v".into(), 1)],
+                HeartbeatPayload {
+                    health: "healthy".into(),
+                    load: 0.5,
+                    control_addr: "c".into(),
+                    media_addr: "m".into(),
+                    publishers: 1,
+                    players: 2,
+                    stream_players: vec![("s".into(), 2)],
+                    viewer_players: vec![("v".into(), 1)],
+                },
                 None,
                 heartbeat_roundtrip_timeout(Duration::from_millis(500)),
             )
@@ -2471,14 +2483,16 @@ mod tests {
                 &ctl.addr,
                 SECRET,
                 9,
-                "healthy",
-                0.5,
-                String::new(),
-                String::new(),
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
+                HeartbeatPayload {
+                    health: "healthy".into(),
+                    load: 0.5,
+                    control_addr: String::new(),
+                    media_addr: String::new(),
+                    publishers: 0,
+                    players: 0,
+                    stream_players: Vec::new(),
+                    viewer_players: Vec::new(),
+                },
                 None,
                 heartbeat_roundtrip_timeout(Duration::from_millis(500)),
             )
@@ -2506,6 +2520,131 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("connect"), "{err}");
         node.raft.shutdown().await.unwrap();
+    }
+
+    /// The round-trip budget scales with the configured heartbeat interval and
+    /// stays below the health tracker's miss limit, so a peer that answers
+    /// within the budget is never marked DOWN.
+    #[test]
+    fn heartbeat_roundtrip_budget_scales_with_the_interval() {
+        for heartbeat in [
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ] {
+            let budget = heartbeat_roundtrip_timeout(heartbeat);
+            let miss_limit = heartbeat.saturating_mul(5).max(Duration::from_secs(2));
+            assert!(
+                budget < miss_limit,
+                "the budget {budget:?} must stay below the miss limit {miss_limit:?}"
+            );
+            assert!(
+                budget >= Duration::from_millis(500),
+                "the budget {budget:?} must not drop below the 500 ms floor"
+            );
+            assert!(
+                budget <= ROUNDTRIP_TIMEOUT,
+                "the budget {budget:?} must not exceed the hard round-trip cap"
+            );
+        }
+        // A longer interval buys a longer budget.
+        assert!(
+            heartbeat_roundtrip_timeout(Duration::from_secs(2))
+                > heartbeat_roundtrip_timeout(Duration::from_millis(500))
+        );
+    }
+
+    /// A control server that accepts the connection and never answers, so the
+    /// caller's round-trip budget is what ends the exchange.
+    async fn silent_ctl() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _peer)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        addr
+    }
+
+    /// A heartbeat payload with the reported counters left at zero.
+    fn heartbeat_payload() -> HeartbeatPayload {
+        HeartbeatPayload {
+            health: "healthy".into(),
+            load: 0.5,
+            control_addr: "c".into(),
+            media_addr: "m".into(),
+            publishers: 0,
+            players: 0,
+            stream_players: Vec::new(),
+            viewer_players: Vec::new(),
+        }
+    }
+
+    /// The heartbeat outcome is reported to the caller: a peer that answers
+    /// succeeds, an unreachable peer fails, and a peer that never answers hits
+    /// the round-trip budget.
+    #[tokio::test]
+    async fn heartbeat_reports_success_failure_and_timeout() {
+        let addr = fake_ctl(vec![ControlMessage::AdminOk]).await;
+        assert!(
+            send_heartbeat_with_timeout(
+                &addr,
+                SECRET,
+                1,
+                heartbeat_payload(),
+                None,
+                heartbeat_roundtrip_timeout(Duration::from_millis(500)),
+            )
+            .await
+            .is_ok()
+        );
+
+        // Nothing is listening: the failure is reported, not swallowed.
+        let err = send_heartbeat_with_timeout(
+            &dead_addr(),
+            SECRET,
+            1,
+            heartbeat_payload(),
+            None,
+            heartbeat_roundtrip_timeout(Duration::from_millis(500)),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("connect"), "{err}");
+
+        // The peer never answers: the round-trip budget ends the exchange.
+        let silent = silent_ctl().await;
+        let err = send_heartbeat_with_timeout(
+            &silent,
+            SECRET,
+            1,
+            heartbeat_payload(),
+            None,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+
+        // The public wrapper reports the failure instead of propagating it.
+        send_heartbeat(
+            &dead_addr(),
+            SECRET,
+            1,
+            "healthy",
+            0.5,
+            "c".into(),
+            "m".into(),
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .await;
     }
 
     #[tokio::test]
