@@ -1058,18 +1058,34 @@ impl MediaHub {
                             // believing it is subscribed while this node never
                             // fans the stream out to it — the stream would stay
                             // dark until the connection is re-established.
-                            // Answer with the retryable code instead: the peer
-                            // drops its "wired" state and re-offers the
-                            // Subscribe.
+                            // The retryable code cannot repair that either: it
+                            // travels through the very queue that just failed,
+                            // and control messages are never evicted to make
+                            // room, so a queue that holds only control messages
+                            // stays full and the notification is dropped with
+                            // its result discarded. The peer would then keep
+                            // its "wired" state and never re-offer the
+                            // Subscribe — the very symptom this branch
+                            // exists to remove.
+                            // Keep the registration and flag the connections
+                            // for a re-init instead: the fan-out path re-sends
+                            // the InitCache ahead of the next resync point, so
+                            // the peer stays subscribed, the stream is fanned
+                            // out, and the missing codec headers are repaired
+                            // without depending on the saturated queue.
                             tracing::warn!(
                                 peer = peer_id,
                                 %app,
                                 %stream,
-                                "media subscribe init cache enqueue failed; asking peer to retry"
+                                "media subscribe init cache enqueue failed; keeping subscription and re-sending the init cache"
                             );
-                            let _ = sink
-                                .send(subscribe_unavailable_error(&app, &stream, generation))
-                                .await;
+                            self.subs.add(peer_id, &app, &stream);
+                            sink.mark_reinit(&app, &stream);
+                            let peer = self.peers.lock().get(&peer_id).cloned();
+                            if let Some(p) = peer {
+                                p.mark_reinit(&app, &stream);
+                            }
+                            *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
                             continue;
                         }
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
@@ -2121,9 +2137,13 @@ mod tests {
     }
 
     fn subscribe(generation: u64) -> MediaMessage {
+        subscribe_stream(generation, "s")
+    }
+
+    fn subscribe_stream(generation: u64, stream: &str) -> MediaMessage {
         MediaMessage::Subscribe {
             app: "live".into(),
-            stream: "s".into(),
+            stream: stream.into(),
             epoch: 0,
             generation,
         }
@@ -2494,6 +2514,60 @@ mod tests {
         owner.hub.evict_init_cache("live", "s");
         assert!(owner.hub.cache.get("live", "s").is_none());
         owner.hub.shutdown();
+    }
+
+    /// A Subscribe whose InitCache cannot be enqueued must not abandon the
+    /// registration: the peer stays subscribed and the init cache is re-sent
+    /// on the next resync point. The retryable answer cannot carry that
+    /// signal — it travels through the very queue that just failed.
+    #[tokio::test]
+    async fn failed_init_cache_enqueue_keeps_the_subscription_and_arms_a_reinit() {
+        let n = node(1);
+        // One message per peer queue: the init cache of the first Subscribe
+        // is taken by the writer, the second one fills the queue, the third
+        // one cannot be enqueued.
+        n.hub.set_media_max_messages_for_test(1);
+        for s in ["s1", "s2", "s3"] {
+            n.hub.put_init_cache(
+                "live",
+                s,
+                7,
+                InitCacheEntry {
+                    avc_header: Some(AVC_SEQ.to_vec()),
+                    keyframe: Some((1, vec![0u8; 64 * KB])),
+                    ..InitCacheEntry::default()
+                },
+            );
+        }
+        // The peer never reads: the writer blocks on the first init cache,
+        // so the queue really fills up.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let hub = Arc::clone(&n.hub);
+        let _session = tokio::spawn(async move {
+            hub.run_inbound_media_session(2, MEDIA_PROTOCOL_VERSION, Box::new(server))
+                .await
+        });
+        for s in ["s1", "s2", "s3"] {
+            send(&mut client, subscribe_stream(1, s)).await;
+            // Give the writer time to take the previous init cache off the
+            // queue.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            eventually(|| n.hub.subscribed_nodes_for("live", "s3") == vec![2]).await,
+            "a failed init cache enqueue must not abandon the registration"
+        );
+        let sink = n.hub.inbound_sinks.lock().get(&2).cloned().unwrap();
+        // The resync point cannot enqueue the init cache either — the queue
+        // is still full — so the re-send stays armed and is retried.
+        let mut frame = hinted(7, 1, DeliveryHint::ResyncPoint, AVC_KEY);
+        frame.stream = "s3".into();
+        n.hub.fanout_local_frame(frame).await;
+        assert!(
+            sink.take_reinit("live", "s3"),
+            "the init cache re-send must be armed and retried on the next resync point"
+        );
+        n.hub.shutdown();
     }
 
     #[tokio::test]
