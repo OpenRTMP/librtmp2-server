@@ -2915,14 +2915,16 @@ impl ClusterManager {
                         &ctrl,
                         &secret,
                         node_id,
-                        &health,
-                        load,
-                        advertise,
-                        media_advertise,
-                        local_pubs,
-                        local_players,
-                        stream_players,
-                        viewer_players,
+                        network::HeartbeatPayload {
+                            health: health.clone(),
+                            load,
+                            control_addr: advertise,
+                            media_addr: media_advertise,
+                            publishers: local_pubs,
+                            players: local_players,
+                            stream_players,
+                            viewer_players,
+                        },
                         tls,
                         heartbeat_timeout,
                     )
@@ -4057,6 +4059,59 @@ mod tests {
                 .lock()
                 .iter()
                 .any(|(s, _, _, _)| s == "own")
+        );
+    }
+
+    /// An acquire whose write failed before Raft answered is queued for
+    /// reconciliation: the same write is not queued twice, a record whose
+    /// write is still open is kept, and a record whose write landed after all
+    /// is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ambiguous_acquires_are_queued_once_and_released_once_they_land() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("amb")).unwrap();
+
+        // The same write is queued once: a second queue of the identical
+        // record must not grow the list.
+        m.queue_ambiguous_acquire("amb".into(), 1, 5);
+        m.queue_ambiguous_acquire("amb".into(), 1, 5);
+        assert_eq!(m.pending_ambiguous_acquires.lock().len(), 1);
+
+        // The write is still open: the record is kept for the next tick.
+        m.reconcile_ambiguous_acquires();
+        assert_eq!(m.pending_ambiguous_acquires.lock().len(), 1);
+
+        // The write landed after all: the unclaimed reservation is released.
+        m.acquire_stream_owner("amb", 1, 0, 5).unwrap();
+        m.reconcile_ambiguous_acquires();
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("amb")
+                .is_none())
+            .await
+        );
+        assert!(
+            !m.pending_ambiguous_acquires
+                .lock()
+                .iter()
+                .any(|(s, _, _, _)| s == "amb")
+        );
+    }
+
+    /// The pending ambiguous-acquire list is bounded: the overflow is reported
+    /// instead of growing the list without limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ambiguous_acquire_list_reports_its_overflow() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        for i in 0..=MAX_PENDING_AMBIGUOUS_ACQUIRES {
+            m.queue_ambiguous_acquire(format!("s{i}"), 1, i as i64);
+        }
+        assert_eq!(
+            m.pending_ambiguous_acquires.lock().len(),
+            MAX_PENDING_AMBIGUOUS_ACQUIRES + 1
         );
     }
 

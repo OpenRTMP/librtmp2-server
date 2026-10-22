@@ -4331,6 +4331,35 @@ mod tests {
     }
 
     #[test]
+    fn publisher_exists_detects_absent_rows_and_fails_closed_on_error() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream(
+            "stream1",
+            "pub_key_123",
+            "pl_key_456",
+            "st_key_789",
+        ))
+        .unwrap();
+        assert!(db.publisher_try_acquire(&Publisher {
+            id: "pub_exists".to_string(),
+            stream_id: "stream1".to_string(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+
+        assert!(db.publisher_exists("pub_exists"));
+        assert!(!db.publisher_exists("pub_missing"));
+
+        db.with_conn(|c| c.execute("DROP TABLE publishers", []))
+            .unwrap();
+        assert!(
+            db.publisher_exists("pub_exists"),
+            "a failed lookup must fail closed so a release keeps retrying"
+        );
+    }
+
+    #[test]
     fn viewer_add_rejects_pending_delete_and_missing_parent() {
         let db = Db::open(":memory:").unwrap();
         db.stream_add(&sample_stream(

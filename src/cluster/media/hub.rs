@@ -2570,6 +2570,124 @@ mod tests {
         n.hub.shutdown();
     }
 
+    /// An outbound peer to node 2 and an inbound session from node 2: the
+    /// same peer carries the stream on both connections. The returned owner
+    /// socket and client half keep both connections alive.
+    async fn peer_and_sink(
+        n: &Node,
+    ) -> (
+        Arc<MediaPeer>,
+        Arc<InboundMediaSink>,
+        tokio::net::TcpStream,
+        tokio::io::DuplexStream,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        n.hub.connect_peer(2, &addr).await.unwrap();
+        let owner = accept_from_hub(&listener, 2).await;
+        let (client, server) = tokio::io::duplex(1024);
+        let hub = Arc::clone(&n.hub);
+        let _session = tokio::spawn(async move {
+            hub.run_inbound_media_session(2, MEDIA_PROTOCOL_VERSION, Box::new(server))
+                .await
+        });
+        assert!(eventually(|| n.hub.inbound_sinks.lock().contains_key(&2)).await);
+        n.hub.subs.add(2, "live", "s");
+        n.hub.put_init_cache(
+            "live",
+            "s",
+            7,
+            InitCacheEntry {
+                avc_header: Some(AVC_SEQ.to_vec()),
+                ..InitCacheEntry::default()
+            },
+        );
+        let peer = n.hub.peers.lock().get(&2).cloned().unwrap();
+        let sink = n.hub.inbound_sinks.lock().get(&2).cloned().unwrap();
+        (peer, sink, owner, client)
+    }
+
+    /// The re-initialisation marker is per connection: the connection that
+    /// did not receive the init cache keeps it, so that connection still
+    /// restarts with the codec headers.
+    #[tokio::test]
+    async fn fanout_rearms_the_peer_that_missed_the_init_cache() {
+        let n = node(1);
+        n.hub.set_media_max_messages_for_test(2);
+        let (peer, sink, _owner, _client) = peer_and_sink(&n).await;
+        // Both connections wait for the init cache.
+        peer.mark_reinit("live", "s");
+        sink.mark_reinit("live", "s");
+
+        n.hub
+            .fanout_local_frame(hinted(7, 1, DeliveryHint::ResyncPoint, AVC_KEY))
+            .await;
+
+        assert!(
+            peer.take_reinit("live", "s"),
+            "the connection that missed the init cache must stay armed"
+        );
+        assert!(
+            !sink.take_reinit("live", "s"),
+            "the connection that received the init cache must not stay armed"
+        );
+        n.hub.shutdown();
+    }
+
+    /// The other direction: the init cache went out on the peer, so the sink
+    /// that never received it keeps its marker.
+    #[tokio::test]
+    async fn fanout_rearms_the_sink_that_missed_the_init_cache() {
+        let n = node(1);
+        n.hub.set_media_max_messages_for_test(2);
+        let (peer, sink, _owner, _client) = peer_and_sink(&n).await;
+        peer.mark_reinit("live", "s");
+        sink.mark_reinit("live", "s");
+
+        // The sink's queue is full: its writer is blocked on the oversized
+        // message, so the init cache cannot be enqueued there.
+        sink.try_send(MediaMessage::InitCache {
+            app: "live".into(),
+            stream: "s".into(),
+            epoch: 7,
+            metadata: None,
+            avc_header: None,
+            aac_header: None,
+            keyframe: Some((1, vec![0u8; 64 * KB])),
+        })
+        .unwrap();
+        assert!(
+            eventually(|| sink.stats().queue.queue_messages == 0).await,
+            "the sink's writer must take the oversized message off the queue"
+        );
+        for _ in 0..2 {
+            sink.try_send(MediaMessage::InitCache {
+                app: "live".into(),
+                stream: "s".into(),
+                epoch: 7,
+                metadata: None,
+                avc_header: None,
+                aac_header: None,
+                keyframe: None,
+            })
+            .unwrap();
+        }
+
+        n.hub
+            .fanout_local_frame(hinted(7, 1, DeliveryHint::ResyncPoint, AVC_KEY))
+            .await;
+
+        assert!(
+            sink.take_reinit("live", "s"),
+            "the connection that missed the init cache must stay armed"
+        );
+        assert!(
+            !peer.take_reinit("live", "s"),
+            "the connection that received the init cache must not stay armed"
+        );
+        n.hub.shutdown();
+    }
+
     #[tokio::test]
     async fn evict_init_cache_for_stream_drops_entries_of_any_app() {
         let n = node(1);
