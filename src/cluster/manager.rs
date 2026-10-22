@@ -57,6 +57,15 @@ const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 /// Bounded retry budget for re-learning peer media addresses after a restart.
 const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
 const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
+/// How long an `AcquireStreamOwner` write whose client-side deadline elapsed
+/// is kept for reconciliation. A write that has not committed within this
+/// window is dropped from the pending list instead of being retried on every
+/// health tick for the lifetime of the process.
+const AMBIGUOUS_ACQUIRE_TTL: Duration = Duration::from_secs(60);
+/// Upper bound on the pending ambiguous-acquire list: repeated timeouts must
+/// not grow the list — and the per-tick owner lookups it causes — without
+/// limit.
+const MAX_PENDING_AMBIGUOUS_ACQUIRES: usize = 1024;
 /// Bound on the wait for a freshly added learner to reach line-rate. Kept
 /// under `network`'s 8s control round trip so a slow catch-up surfaces as
 /// this error on the joiner instead of a client-side round-trip timeout.
@@ -157,12 +166,13 @@ pub struct ClusterManager {
     /// RTMP poll loop reacted to the marker). Retried until local sessions
     /// actually drain — see `retry_pending_drain_clears`.
     pending_drain_clears: Mutex<std::collections::HashSet<String>>,
-    /// (stream_id, node_id, acquired_at) for `AcquireStreamOwner` writes whose
-    /// client-side 2s deadline elapsed before Raft answered. Dropping that
-    /// future does not cancel an in-flight write, so it can still commit
-    /// afterward; reconciled on the next health tick — see
-    /// `reconcile_ambiguous_acquires`.
-    pending_ambiguous_acquires: Mutex<Vec<(String, u64, i64)>>,
+    /// (stream_id, node_id, acquired_at, queued_at) for `AcquireStreamOwner`
+    /// writes whose client-side 2s deadline elapsed before Raft answered.
+    /// Dropping that future does not cancel an in-flight write, so it can
+    /// still commit afterward; reconciled on the next health tick — see
+    /// `reconcile_ambiguous_acquires`. A record that has not committed within
+    /// `AMBIGUOUS_ACQUIRE_TTL` is dropped instead of being retried forever.
+    pending_ambiguous_acquires: Mutex<Vec<(String, u64, i64, Instant)>>,
     /// Nodes whose membership removal committed but
     /// [`Self::release_owners_for_node`] has not yet succeeded. Retried on
     /// the leader health tick — a removed node has no `down_since`, so the
@@ -815,11 +825,7 @@ impl ClusterManager {
                 // still commit later; check on the next health tick and
                 // release it if it does, rather than leaving a ghost owner
                 // no local publisher is actually using.
-                self.pending_ambiguous_acquires.lock().push((
-                    stream_id.to_string(),
-                    node_id,
-                    acquired_at,
-                ));
+                self.queue_ambiguous_acquire(stream_id.to_string(), node_id, acquired_at);
                 return Err(CoordError::Cluster(msg));
             }
             Err(e) => return Err(e),
@@ -1837,20 +1843,49 @@ impl ClusterManager {
         }
     }
 
+    /// Queue an acquire whose client-side deadline elapsed for reconciliation
+    /// on the next health tick. The list is bounded: repeated timeouts must
+    /// not grow it (and the per-tick owner lookups it causes) without limit.
+    fn queue_ambiguous_acquire(&self, stream_id: String, node_id: u64, acquired_at: i64) {
+        let mut pending = self.pending_ambiguous_acquires.lock();
+        pending.push((stream_id, node_id, acquired_at, Instant::now()));
+        let overflow = pending.len().saturating_sub(MAX_PENDING_AMBIGUOUS_ACQUIRES);
+        if overflow > 0 {
+            pending.drain(..overflow);
+            crate::log_warn!(
+                "Cluster: pending ambiguous acquires exceeded {MAX_PENDING_AMBIGUOUS_ACQUIRES}; \
+                 dropped the {overflow} oldest record(s)"
+            );
+        }
+    }
+
     /// Check each acquire whose client-side deadline elapsed for whether the
     /// write actually landed after all; if it did, release it — the caller
     /// already gave up and no local publisher is using that reservation.
     fn reconcile_ambiguous_acquires(&self) {
-        let pending: Vec<(String, u64, i64)> =
+        let pending: Vec<(String, u64, i64, Instant)> =
             self.pending_ambiguous_acquires.lock().drain(..).collect();
-        for (stream_id, node_id, acquired_at) in pending {
+        for (stream_id, node_id, acquired_at, queued_at) in pending {
+            if queued_at.elapsed() >= AMBIGUOUS_ACQUIRE_TTL {
+                // The write never committed within the reconciliation window:
+                // drop the record instead of retrying it on every tick for
+                // the lifetime of the process.
+                crate::log_warn!(
+                    "Cluster: acquire for stream {stream_id} did not commit within \
+                     {AMBIGUOUS_ACQUIRE_TTL:?}; dropping the ambiguous acquire"
+                );
+                continue;
+            }
             let Some(owner) = self.db.stream_owner_get(&stream_id) else {
                 // Timed-out write may still commit on a later tick — keep the
                 // record until the row appears (and is released) or a different
                 // acquire supersedes it.
-                self.pending_ambiguous_acquires
-                    .lock()
-                    .push((stream_id, node_id, acquired_at));
+                self.pending_ambiguous_acquires.lock().push((
+                    stream_id,
+                    node_id,
+                    acquired_at,
+                    queued_at,
+                ));
                 continue;
             };
             if owner.owner_node_id != node_id || owner.acquired_at != acquired_at {
@@ -1865,9 +1900,12 @@ impl ClusterManager {
                     // Do not read a failed lookup as "no publisher": releasing
                     // now could drop ownership out from under a live
                     // publisher. Keep the record and retry next tick.
-                    self.pending_ambiguous_acquires
-                        .lock()
-                        .push((stream_id, node_id, acquired_at));
+                    self.pending_ambiguous_acquires.lock().push((
+                        stream_id,
+                        node_id,
+                        acquired_at,
+                        queued_at,
+                    ));
                     continue;
                 }
             };
@@ -1880,9 +1918,12 @@ impl ClusterManager {
                 // record so the release is retried once the publisher
                 // disconnects, instead of dropping it (which would leave a
                 // ghost owner no node reconciles).
-                self.pending_ambiguous_acquires
-                    .lock()
-                    .push((stream_id, node_id, acquired_at));
+                self.pending_ambiguous_acquires.lock().push((
+                    stream_id,
+                    node_id,
+                    acquired_at,
+                    queued_at,
+                ));
                 continue;
             }
             crate::log_warn!(
@@ -1895,9 +1936,12 @@ impl ClusterManager {
                     "Cluster: failed to release ambiguously-committed acquire for {stream_id}: {e:?}"
                 );
                 // Still ambiguous — retry on the next tick.
-                self.pending_ambiguous_acquires
-                    .lock()
-                    .push((stream_id, node_id, acquired_at));
+                self.pending_ambiguous_acquires.lock().push((
+                    stream_id,
+                    node_id,
+                    acquired_at,
+                    queued_at,
+                ));
             }
         }
     }
@@ -3852,14 +3896,14 @@ mod tests {
         // A timed-out acquire whose write never landed is kept for retry.
         m.pending_ambiguous_acquires
             .lock()
-            .push(("never-landed".into(), 1, 5));
+            .push(("never-landed".into(), 1, 5, Instant::now()));
         m.reconcile_ambiguous_acquires();
         assert!(
             wait_until(Duration::from_secs(2), || m
                 .pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, _, _)| s == "never-landed"))
+                .any(|(s, _, _, _)| s == "never-landed"))
             .await
         );
         // One superseded by a different acquire is dropped; one that did land
@@ -3867,12 +3911,12 @@ mod tests {
         m.acquire_stream_owner("own", 1, 0, 77).unwrap();
         m.pending_ambiguous_acquires
             .lock()
-            .push(("own".into(), 2, 77));
+            .push(("own".into(), 2, 77, Instant::now()));
         m.reconcile_ambiguous_acquires();
         assert!(m.db().stream_owner_get("own").is_some());
         m.pending_ambiguous_acquires
             .lock()
-            .push(("own".into(), 1, 77));
+            .push(("own".into(), 1, 77, Instant::now()));
         m.reconcile_ambiguous_acquires();
         assert!(
             wait_until(Duration::from_secs(5), || m
@@ -3885,7 +3929,7 @@ mod tests {
             !m.pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, _, _)| s == "own")
+                .any(|(s, _, _, _)| s == "own")
         );
     }
 
@@ -3905,7 +3949,7 @@ mod tests {
 
         m.pending_ambiguous_acquires
             .lock()
-            .push(("fx".into(), 1, 21));
+            .push(("fx".into(), 1, 21, Instant::now()));
         m.reconcile_ambiguous_acquires();
 
         assert!(
@@ -3913,7 +3957,7 @@ mod tests {
                 .pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, nid, at)| s == "fx" && *nid == 1 && *at == 21))
+                .any(|(s, nid, at, _)| s == "fx" && *nid == 1 && *at == 21))
             .await,
             "a failed publisher lookup must keep the ambiguous acquire pending"
         );
@@ -3935,7 +3979,7 @@ mod tests {
 
         m.pending_ambiguous_acquires
             .lock()
-            .push(("act".into(), 1, 33));
+            .push(("act".into(), 1, 33, Instant::now()));
         m.reconcile_ambiguous_acquires();
 
         assert!(
@@ -3943,7 +3987,7 @@ mod tests {
                 .pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, nid, at)| s == "act" && *nid == 1 && *at == 33))
+                .any(|(s, nid, at, _)| s == "act" && *nid == 1 && *at == 33))
             .await,
             "a live local publisher must keep the ambiguous acquire pending"
         );
