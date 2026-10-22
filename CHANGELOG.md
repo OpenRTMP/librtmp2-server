@@ -21,9 +21,9 @@ begin at `1.0.0`.
 - A one-time join proof is now spent only once the joining node has been seen
   alive, so a lost join response no longer strands a statically configured
   join proof for the whole replay window.
-- The pending ambiguous-acquire list is bounded and its records expire, so
-  repeated write failures cannot grow the list or the per-tick owner lookups
-  it causes.
+- The pending ambiguous-acquire list keeps a record while the write's outcome
+  is still unknown, so a write that lands after the client-side give-up is
+  always reconciled and released instead of leaving a ghost owner.
 - The heartbeat round-trip budget now scales with the configured heartbeat
   interval instead of a fixed 500 ms cap, so a healthy peer on a slower link
   is no longer marked DOWN; heartbeat failures and timeouts are logged
