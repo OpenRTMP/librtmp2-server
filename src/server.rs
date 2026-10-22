@@ -2725,6 +2725,10 @@ impl ShardLoop {
             self.shared.idle_timeout,
         );
 
+        // A publisher/player deactivation that failed on connection close has
+        // no later lifecycle event to retry it, so the poll loop does it.
+        self.shared.bridge.retry_pending_deactivations();
+
         #[cfg(feature = "cluster")]
         if self.shared.cluster_enabled
             && let Some(mgr) = self.shared.bridge.cluster_manager()

@@ -27,6 +27,9 @@ const RTMP_AUTH_MAX_FAILURES: usize = 10;
 /// Cap tracked auth-failure buckets so a scan from many distinct IPs cannot
 /// grow `auth_failures` without bound, mirroring `rate_limit::MAX_TRACKED_KEYS`.
 const MAX_TRACKED_AUTH_FAILURE_KEYS: usize = 10_000;
+/// How often a publisher/player deactivation that failed on connection close
+/// is retried.
+const DEACTIVATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Test-only callback used by
 /// [`DbRtmpBridge::release_player_if_id`]'s regression test to replace the
@@ -137,6 +140,33 @@ struct ConnState {
     last_rtt_at: Option<Instant>,
 }
 
+/// A publisher/player row whose `active=1` deactivation write failed.
+///
+/// The connection that owned the row is gone, so nothing else would ever clear
+/// the flag: the row is kept here and retried from the RTMP poll loop.
+enum PendingDeactivation {
+    Publisher(Publisher),
+    Player(Player),
+}
+
+impl PendingDeactivation {
+    /// Write the row back with `active=0`.
+    fn deactivate(&self, db: &Db) -> bool {
+        match self {
+            PendingDeactivation::Publisher(p) => db.publisher_update(&p.id, p),
+            PendingDeactivation::Player(p) => db.player_update(&p.id, p),
+        }
+    }
+
+    /// Role name, stream id and session id — for logs.
+    fn describe(&self) -> (&'static str, &str, &str) {
+        match self {
+            PendingDeactivation::Publisher(p) => ("publisher", &p.stream_id, &p.id),
+            PendingDeactivation::Player(p) => ("player", &p.stream_id, &p.id),
+        }
+    }
+}
+
 /// DB-backed [`RtmpEventHandler`]. Each connection's role(s) and DB row(s)
 /// live in a per-connection map entry, captured at publish/play time — so
 /// closing one connection can never touch another connection's row, unlike
@@ -166,6 +196,13 @@ pub struct DbRtmpBridge {
     /// The RTMP poll loop closes these sockets after `deleted_streams` no
     /// longer matches (finalize already cleared the marker).
     pending_force_close: Mutex<HashSet<ConnId>>,
+    /// Publisher/player rows whose `active=1` deactivation write failed on
+    /// connection close. Retried from the RTMP poll loop — once `on_close`
+    /// finishes there is no later conn lifecycle event that would retry.
+    pending_deactivations: Mutex<Vec<PendingDeactivation>>,
+    /// When the last deactivation retry ran, so a persistently failing DB is
+    /// not written to on every poll tick.
+    last_deactivation_retry: Mutex<Option<Instant>>,
     /// Test hook: number of remote-play unsubscribe calls issued (asserts one
     /// per abandoned local play role).
     #[cfg(all(test, feature = "cluster"))]
@@ -251,6 +288,8 @@ impl DbRtmpBridge {
             #[cfg(feature = "cluster")]
             pending_ownership_releases: Mutex::new(Vec::new()),
             pending_force_close: Mutex::new(HashSet::new()),
+            pending_deactivations: Mutex::new(Vec::new()),
+            last_deactivation_retry: Mutex::new(None),
             #[cfg(all(test, feature = "cluster"))]
             remote_play_unsubscribes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, feature = "cluster"))]
@@ -1964,6 +2003,12 @@ impl RtmpEventHandler for DbRtmpBridge {
                     pub_row.stream_id,
                     pub_row.id
                 );
+                // The connection state is gone, so no later lifecycle event
+                // would retry this write: queue the row instead of leaking an
+                // `active=1` publisher that blocks every later publish.
+                self.pending_deactivations
+                    .lock()
+                    .push(PendingDeactivation::Publisher(pub_row));
             }
         }
 
@@ -1985,6 +2030,11 @@ impl RtmpEventHandler for DbRtmpBridge {
                     player_row.stream_id,
                     player_row.id
                 );
+                // Same as the publisher row above: without a retry the row
+                // would keep `active=1` and hold a viewer slot forever.
+                self.pending_deactivations
+                    .lock()
+                    .push(PendingDeactivation::Player(player_row));
             }
         } else if !had_role {
             // No authorized role — still record the TCP close for auditability
@@ -2053,6 +2103,44 @@ impl DbRtmpBridge {
                         .lock()
                         .push((stream_id, epoch));
                 }
+            }
+        }
+    }
+
+    /// Retry publisher/player deactivations that failed during `on_close`.
+    ///
+    /// `on_close` is the last chance to clear the `active=1` flag of a row
+    /// whose connection is gone. When the write fails there is no later
+    /// lifecycle event that would retry it, so the row is queued and retried
+    /// here — otherwise it would keep `active=1` until the next server start
+    /// and block every later publish to that stream.
+    pub fn retry_pending_deactivations(&self) {
+        if self.pending_deactivations.lock().is_empty() {
+            return;
+        }
+        {
+            let mut last = self.last_deactivation_retry.lock();
+            if let Some(at) = *last
+                && at.elapsed() < DEACTIVATION_RETRY_INTERVAL
+            {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let pending: Vec<PendingDeactivation> =
+            self.pending_deactivations.lock().drain(..).collect();
+        for row in pending {
+            let (kind, stream_id, session_id) = row.describe();
+            if row.deactivate(&self.db) {
+                crate::log_info!(
+                    "RTMP: {kind} deactivated on retry: stream={stream_id} session={session_id}"
+                );
+            } else {
+                crate::log_warn!(
+                    "RTMP: pending {kind} deactivation still failing for stream={stream_id} \
+                     session={session_id}"
+                );
+                self.pending_deactivations.lock().push(row);
             }
         }
     }
