@@ -1,80 +1,31 @@
 #!/usr/bin/env python3
 """Run cargo test suites for librtmp2-server inside rust:latest.
 
-``SRC_ROOT`` is the parent directory that contains the ``librtmp2-server`` and
-``librtmp2`` source trees; the script resolves both beneath it. Set
-``OPENRTMP_SRC_ROOT`` to point at another parent directory and ``OPENRTMP_DEST``
-to use a different build directory (defaults to a folder in the system temp
-dir).
+The cargo test suites run against the staged ``librtmp2-server`` and
+``librtmp2`` checkouts; see ``openrtmp_docker_paths`` for the source and
+build directories.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-DEFAULT_SRC_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = Path(os.environ.get("OPENRTMP_SRC_ROOT") or DEFAULT_SRC_ROOT).resolve()
-DEST = Path(
-    os.environ.get("OPENRTMP_DEST") or Path(tempfile.gettempdir()) / "openrtmp-build"
-).resolve()
+# The shared helpers live next to this script: make them importable whether
+# the script is run as a file (``python scripts/docker_cargo_test.py``) or as
+# a module (``python -m scripts.docker_cargo_test``).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from openrtmp_docker_paths import resolve_dest, resolve_src_root, stage_sources
+
+SRC_ROOT = resolve_src_root()
+DEST = resolve_dest("openrtmp-build")
 LOG_NAME = "cargo-test-full.log"
-CARGO_MANIFEST = "Cargo.toml"
-
-
-def require_source_tree(name: str) -> Path:
-    """Return ``SRC_ROOT/name``, failing loudly when the checkout is missing.
-
-    ``shutil.copytree`` over a missing directory raises deep inside the copy,
-    so without this check a wrong ``SRC_ROOT`` dies with a confusing error
-    before Docker is even started.
-    """
-    path = SRC_ROOT / name
-    if not (path / CARGO_MANIFEST).is_file():
-        raise SystemExit(
-            f"source tree missing or incomplete: {path}\n"
-            "set OPENRTMP_SRC_ROOT to the OpenRTMP checkout "
-            f"(default is {DEFAULT_SRC_ROOT})"
-        )
-    return path
-
-
-def require_disjoint_dest(dest: Path, sources: list[Path]) -> None:
-    """Refuse a destination that overlaps one of the source checkouts.
-
-    The refresh step deletes the destination before staging the sources into
-    it, so a destination that equals or contains a checkout would delete the
-    very sources it is about to copy — and one inside a checkout would stage
-    the tree into itself.
-    """
-    dest = dest.resolve()
-    for src in sources:
-        src = src.resolve()
-        if dest == src or dest in src.parents or src in dest.parents:
-            raise SystemExit(
-                f"destination overlaps the source checkout: DEST={dest} SRC={src}\n"
-                "set OPENRTMP_DEST to a directory outside the OpenRTMP checkout"
-            )
 
 
 def refresh_copy() -> None:
-    require_disjoint_dest(
-        DEST,
-        [SRC_ROOT / "librtmp2", SRC_ROOT / "librtmp2-server"],
-    )
-    for name in ("librtmp2", "librtmp2-server"):
-        src = require_source_tree(name)
-        dst = DEST / name
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(
-            src,
-            dst,
-            ignore=shutil.ignore_patterns("target", ".git", "*.log"),
-        )
+    stage_sources(DEST, SRC_ROOT, ("librtmp2", "librtmp2-server"))
 
 
 def main() -> int:
