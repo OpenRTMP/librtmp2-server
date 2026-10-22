@@ -154,6 +154,46 @@ def _parse_versions(specs: list[str]) -> dict:
     return versions
 
 
+# Legs the sweep is expected to produce for librtmp2-server. The relay (join)
+# tiers are fixed by run_rtmp_benchmarks.sh; the load tiers come from the
+# sweep's own `load viewers` parameter (the workflow passes LOAD_VIEWERS).
+EXPECTED_JOIN_TIERS = ("1", "25", "100")
+
+
+def _expected_load_tiers(sweep: dict) -> list[str]:
+    """Load viewer tiers the sweep was asked to run."""
+    raw = (sweep.get("params") or {}).get("load viewers", "")
+    return [tier for tier in raw.split() if tier.isdigit()]
+
+
+def _missing_sweep_rows(sweep: dict) -> list[str]:
+    """The librtmp2-server rows the sweep is expected to contain.
+
+    Only librtmp2-server's own rows are required: a competitor that failed to
+    start must not throw away the finished legs (see benchmarks.yml).
+    """
+    missing: list[str] = []
+    if "openrtmp" not in sweep["handshake"]:
+        missing.append("publish handshake")
+    if "openrtmp" not in sweep["play_handshake"]:
+        missing.append("play handshake")
+    join = sweep["join"]
+    for tier in EXPECTED_JOIN_TIERS:
+        if "openrtmp" not in join.get(tier, {}):
+            missing.append(f"join {tier} viewers")
+    load = sweep["load"]
+    load_tiers = _expected_load_tiers(sweep)
+    if not load_tiers:
+        # The expected tiers are unknown, so only "at least one" is required.
+        if not any("openrtmp" in rows for rows in load.values()):
+            missing.append("load rows")
+    else:
+        for tier in load_tiers:
+            if "openrtmp" not in load.get(tier, {}):
+                missing.append(f"load {tier} viewers")
+    return missing
+
+
 def cmd_merge(args: argparse.Namespace) -> int:
     from bench_report import RESULTS_FILE, write_file  # same directory
 
@@ -161,13 +201,20 @@ def cmd_merge(args: argparse.Namespace) -> int:
     sweep = parse_log(SWEEP_LOG.read_text(errors="replace"))
     sweep["versions"] = _parse_versions(args.version)
     sweep["params"] = {key: value for key, _, value in (p.partition("=") for p in args.param)}
-    results["sweep"] = sweep
-    write_file(RESULTS_FILE, json.dumps(results, indent=1) + "\n")
     servers = sorted({s for k in ("handshake", "play_handshake") for s in sweep[k]})
     print(f"sweep: servers={servers} join={sorted(sweep['join'])} load={sorted(sweep['load'])}")
-    if "openrtmp" not in sweep["handshake"] or not sweep["load"]:
-        print("error: librtmp2-server produced no handshake/load rows; see the sweep log", file=sys.stderr)
+    missing = _missing_sweep_rows(sweep)
+    if missing:
+        # Write nothing: an incomplete sweep must not replace the published
+        # record with a partial one.
+        print(
+            "error: librtmp2-server produced no/incomplete rows for "
+            f"{', '.join(missing)}; see the sweep log",
+            file=sys.stderr,
+        )
         return 1
+    results["sweep"] = sweep
+    write_file(RESULTS_FILE, json.dumps(results, indent=1) + "\n")
     return 0
 
 
