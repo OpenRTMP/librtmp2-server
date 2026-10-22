@@ -1052,10 +1052,24 @@ impl MediaHub {
                             // authorization denial — the peer retries, then
                             // calls subs.clear_entry, dropping the refcount
                             // shared by every local player on that node, turning
-                            // a stall into permanent loss of a live stream. The
-                            // wire has no Subscribe ACK, so silence is the same
-                            // signal success gives; the peer keeps its ref and a
-                            // later resubscribe re-offers this Subscribe.
+                            // a stall into permanent loss of a live stream.
+                            // The wire has no Subscribe ACK, so abandoning the
+                            // registration silently would leave the peer
+                            // believing it is subscribed while this node never
+                            // fans the stream out to it — the stream would stay
+                            // dark until the connection is re-established.
+                            // Answer with the retryable code instead: the peer
+                            // drops its "wired" state and re-offers the
+                            // Subscribe.
+                            tracing::warn!(
+                                peer = peer_id,
+                                %app,
+                                %stream,
+                                "media subscribe init cache enqueue failed; asking peer to retry"
+                            );
+                            let _ = sink
+                                .send(subscribe_unavailable_error(&app, &stream, generation))
+                                .await;
                             continue;
                         }
                         *conn_subs.entry((app.clone(), stream.clone())).or_insert(0) += 1;
