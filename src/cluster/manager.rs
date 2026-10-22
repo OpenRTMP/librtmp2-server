@@ -58,10 +58,16 @@ const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
 const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
 /// Warning threshold for the pending ambiguous-acquire list. The list holds
-/// the writes whose outcome is still unknown, so it is not capped: a record
-/// whose write is still open must not be dropped, or the write could land
-/// later without ever being reconciled.
+/// the writes whose outcome is still unknown, so it is not capped by count:
+/// a record whose write is still open must not be dropped, or the write could
+/// land later without ever being reconciled. It is bounded by age instead —
+/// see `AMBIGUOUS_ACQUIRE_MAX_AGE`.
 const MAX_PENDING_AMBIGUOUS_ACQUIRES: usize = 1024;
+/// Maximum age of an ambiguous-acquire record whose outcome is still unknown.
+/// A write that is still open after this long does not land any more, so the
+/// record is dropped with a warning instead of being retried for the lifetime
+/// of the process.
+const AMBIGUOUS_ACQUIRE_MAX_AGE: Duration = Duration::from_secs(600);
 /// Bound on the wait for a freshly added learner to reach line-rate. Kept
 /// under `network`'s 8s control round trip so a slow catch-up surfaces as
 /// this error on the joiner instead of a client-side round-trip timeout.
@@ -71,6 +77,25 @@ const JOIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(6);
 /// metrics notification cannot drop the peer, short enough that a reverted
 /// join is pruned.
 const JOIN_MEMBERSHIP_HOLD: Duration = Duration::from_secs(JOIN_CATCHUP_TIMEOUT.as_secs() * 3);
+
+/// How a cluster write failed. A write that never reached the cluster cannot
+/// commit, while a dispatched write may still commit after the caller gave
+/// up — only the latter has to be reconciled.
+enum WriteFailure {
+    /// The write never reached the cluster, so it can never commit.
+    Undispatched(CoordError),
+    /// The write was dispatched; it may still commit.
+    Dispatched(CoordError),
+}
+
+impl WriteFailure {
+    /// The error the caller sees.
+    fn into_coord_error(self) -> CoordError {
+        match self {
+            WriteFailure::Undispatched(e) | WriteFailure::Dispatched(e) => e,
+        }
+    }
+}
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -172,8 +197,9 @@ pub struct ClusterManager {
     /// elapsed, or a forwarded write failed with a transport error).
     /// Dropping that future does not cancel an in-flight write, so it can
     /// still commit afterward; reconciled on the next health tick — see
-    /// `reconcile_ambiguous_acquires`. A record that has not committed within
-    /// `AMBIGUOUS_ACQUIRE_TTL` is dropped instead of being retried forever.
+    /// `reconcile_ambiguous_acquires`. A record whose write is still open
+    /// after `AMBIGUOUS_ACQUIRE_MAX_AGE` is dropped with a warning instead
+    /// of being retried forever.
     pending_ambiguous_acquires: Mutex<Vec<(String, u64, i64, Instant)>>,
     /// Nodes whose membership removal committed but
     /// [`Self::release_owners_for_node`] has not yet succeeded. Retried on
@@ -826,20 +852,25 @@ impl ClusterManager {
         // the tracker while we wait, so a post-write get() may already see the
         // new owner and skip the prior remote unsubscribe.
         let previous = self.ownership.get(stream_id);
-        let resp = match self.block_on_write(ClusterCommand::AcquireStreamOwner {
+        let resp = match self.block_on_write_outcome(ClusterCommand::AcquireStreamOwner {
             stream_id: stream_id.to_string(),
             node_id,
             epoch,
             acquired_at,
         }) {
             Ok(resp) => resp,
-            Err(e) => {
+            Err(WriteFailure::Undispatched(e)) => {
+                // The write never reached the cluster, so it can never
+                // commit: there is no ghost owner to reconcile.
+                return Err(e);
+            }
+            Err(WriteFailure::Dispatched(e)) => {
                 // The caller gives up on this acquire, but the write may
                 // still commit later; check on the next health tick and
                 // release it if it does, rather than leaving a ghost owner
                 // no local publisher is actually using.
                 //
-                // Every failed write is ambiguous, not just the local 2s
+                // Every dispatched write is ambiguous, not just the local 2s
                 // deadline: a write forwarded to the leader that fails with
                 // a transport error after the leader already committed
                 // leaves the same ghost row, and that row blocks the stream
@@ -950,6 +981,14 @@ impl ClusterManager {
     }
 
     fn block_on_write(&self, cmd: ClusterCommand) -> Result<ClusterResponse, CoordError> {
+        self.block_on_write_outcome(cmd)
+            .map_err(WriteFailure::into_coord_error)
+    }
+
+    /// Like [`Self::block_on_write`], but tells apart a write that never
+    /// reached the cluster — and can therefore never commit — from one that
+    /// was dispatched and may still land.
+    fn block_on_write_outcome(&self, cmd: ClusterCommand) -> Result<ClusterResponse, WriteFailure> {
         // Admin proof is only needed when forwarding to a remote leader.
         // Local-leader `raft.client_write` must not depend on session_hooks —
         // health_loop / ownership can run before `register_session_hooks`.
@@ -970,13 +1009,20 @@ impl ClusterManager {
             match raft.client_write(cmd.clone()).await {
                 Ok(resp) => Ok(resp.data),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                    // The leader has not seen this write yet: everything that
+                    // fails before the forward below leaves the write
+                    // undispatched, so it can never commit.
                     let token = api_token.ok_or_else(|| {
-                        CoordError::Cluster("API token unavailable for cluster admin write".into())
+                        WriteFailure::Undispatched(CoordError::Cluster(
+                            "API token unavailable for cluster admin write".into(),
+                        ))
                     })?;
-                    let req = serde_json::to_value(&cmd)
-                        .map_err(|e| CoordError::Cluster(e.to_string()))?;
-                    let req_str = serde_json::to_string(&req)
-                        .map_err(|e| CoordError::Cluster(e.to_string()))?;
+                    let req = serde_json::to_value(&cmd).map_err(|e| {
+                        WriteFailure::Undispatched(CoordError::Cluster(e.to_string()))
+                    })?;
+                    let req_str = serde_json::to_string(&req).map_err(|e| {
+                        WriteFailure::Undispatched(CoordError::Cluster(e.to_string()))
+                    })?;
                     let proof = Self::mint_fresh_admin_proof(&token, &req_str);
                     let addr = ftl
                         .leader_node
@@ -986,20 +1032,28 @@ impl ClusterManager {
                                 .and_then(|id| meta.get(id).map(|(ctrl, _)| ctrl))
                         })
                         .ok_or_else(|| {
-                            CoordError::Cluster("no leader available to forward write".into())
+                            WriteFailure::Undispatched(CoordError::Cluster(
+                                "no leader available to forward write".into(),
+                            ))
                         })?;
+                    // The write is on the wire now: the leader may commit it
+                    // even when the answer never arrives.
                     network::send_client_write(&addr, &secret, local_id, cmd, proof, tls_client)
                         .await
-                        .map_err(CoordError::Cluster)
+                        .map_err(|e| WriteFailure::Dispatched(CoordError::Cluster(e)))
                 }
-                Err(e) => Err(CoordError::Cluster(format!("raft write: {e}"))),
+                Err(e) => Err(WriteFailure::Dispatched(CoordError::Cluster(format!(
+                    "raft write: {e}"
+                )))),
             }
         };
         const RAFT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
         let timed = async move {
             tokio::time::timeout(RAFT_WRITE_TIMEOUT, fut)
                 .await
-                .map_err(|_| CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))?
+                .map_err(|_| {
+                    WriteFailure::Dispatched(CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))
+                })?
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| self.rt_handle.block_on(timed))
@@ -1964,6 +2018,24 @@ impl ClusterManager {
         }
     }
 
+    /// Keep an ambiguous-acquire record for the next tick, unless it has aged
+    /// out. A write whose outcome is still unknown after
+    /// `AMBIGUOUS_ACQUIRE_MAX_AGE` does not land any more, so the record is
+    /// dropped with a warning instead of being retried forever.
+    fn requeue_ambiguous_acquire(&self, record: (String, u64, i64, Instant)) {
+        let (stream_id, node_id, acquired_at, queued_at) = record;
+        if queued_at.elapsed() >= AMBIGUOUS_ACQUIRE_MAX_AGE {
+            crate::log_warn!(
+                "Cluster: dropping the unresolved acquire for stream {stream_id} (node {node_id}); \
+                 it has been open for longer than {AMBIGUOUS_ACQUIRE_MAX_AGE:?}"
+            );
+            return;
+        }
+        self.pending_ambiguous_acquires
+            .lock()
+            .push((stream_id, node_id, acquired_at, queued_at));
+    }
+
     /// Check each acquire whose write failed before Raft answered for whether
     /// the write actually landed after all; if it did, release it — the
     /// caller already gave up and no local publisher is using that
@@ -1978,12 +2050,7 @@ impl ClusterManager {
                 // acquire supersedes it. The client-side give-up does not
                 // cancel the leader's write, so a record whose write is still
                 // open must not be dropped.
-                self.pending_ambiguous_acquires.lock().push((
-                    stream_id,
-                    node_id,
-                    acquired_at,
-                    queued_at,
-                ));
+                self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
                 continue;
             };
             if owner.owner_node_id != node_id || owner.acquired_at != acquired_at {
@@ -1998,12 +2065,7 @@ impl ClusterManager {
                     // Do not read a failed lookup as "no publisher": releasing
                     // now could drop ownership out from under a live
                     // publisher. Keep the record and retry next tick.
-                    self.pending_ambiguous_acquires.lock().push((
-                        stream_id,
-                        node_id,
-                        acquired_at,
-                        queued_at,
-                    ));
+                    self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
                     continue;
                 }
             };
@@ -2016,12 +2078,7 @@ impl ClusterManager {
                 // record so the release is retried once the publisher
                 // disconnects, instead of dropping it (which would leave a
                 // ghost owner no node reconciles).
-                self.pending_ambiguous_acquires.lock().push((
-                    stream_id,
-                    node_id,
-                    acquired_at,
-                    queued_at,
-                ));
+                self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
                 continue;
             }
             crate::log_warn!(
@@ -2034,12 +2091,7 @@ impl ClusterManager {
                     "Cluster: failed to release ambiguously-committed acquire for {stream_id}: {e:?}"
                 );
                 // Still ambiguous — retry on the next tick.
-                self.pending_ambiguous_acquires.lock().push((
-                    stream_id,
-                    node_id,
-                    acquired_at,
-                    queued_at,
-                ));
+                self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
             }
         }
     }
