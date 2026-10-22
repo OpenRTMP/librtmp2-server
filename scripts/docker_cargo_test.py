@@ -1,22 +1,52 @@
 #!/usr/bin/env python3
-"""Run cargo test suites for librtmp2-server inside rust:latest."""
+"""Run cargo test suites for librtmp2-server inside rust:latest.
+
+``SRC_ROOT`` is the parent directory that contains the ``librtmp2-server`` and
+``librtmp2`` source trees; the script resolves both beneath it. Set
+``OPENRTMP_SRC_ROOT`` to point at another parent directory and ``OPENRTMP_DEST``
+to use a different build directory (defaults to a folder in the system temp
+dir).
+"""
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
-SRC_ROOT = r"X:\AWDev\GitHub\OpenRTMP"
-DEST = r"C:\Users\alexg\AppData\Local\Temp\openrtmp-build"
+DEFAULT_SRC_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = Path(os.environ.get("OPENRTMP_SRC_ROOT") or DEFAULT_SRC_ROOT).resolve()
+DEST = Path(
+    os.environ.get("OPENRTMP_DEST") or Path(tempfile.gettempdir()) / "openrtmp-build"
+).resolve()
 LOG_NAME = "cargo-test-full.log"
+CARGO_MANIFEST = "Cargo.toml"
+
+
+def require_source_tree(name: str) -> Path:
+    """Return ``SRC_ROOT/name``, failing loudly when the checkout is missing.
+
+    ``shutil.copytree`` over a missing directory raises deep inside the copy,
+    so without this check a wrong ``SRC_ROOT`` dies with a confusing error
+    before Docker is even started.
+    """
+    path = SRC_ROOT / name
+    if not (path / CARGO_MANIFEST).is_file():
+        raise SystemExit(
+            f"source tree missing or incomplete: {path}\n"
+            "set OPENRTMP_SRC_ROOT to the OpenRTMP checkout "
+            f"(default is {DEFAULT_SRC_ROOT})"
+        )
+    return path
 
 
 def refresh_copy() -> None:
     for name in ("librtmp2", "librtmp2-server"):
-        src = os.path.join(SRC_ROOT, name)
-        dst = os.path.join(DEST, name)
-        if os.path.exists(dst):
+        src = require_source_tree(name)
+        dst = DEST / name
+        if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(
             src,
@@ -26,9 +56,9 @@ def refresh_copy() -> None:
 
 
 def main() -> int:
-    os.makedirs(DEST, exist_ok=True)
+    DEST.mkdir(parents=True, exist_ok=True)
     refresh_copy()
-    mount = DEST.replace("\\", "/")
+    mount = str(DEST).replace("\\", "/")
     bash = r"""
 set -euxo pipefail
 export PATH=/usr/local/cargo/bin:$PATH
@@ -76,16 +106,16 @@ exit 0
         "-c",
         bash,
     ]
-    stale_log = os.path.join(DEST, LOG_NAME)
-    if os.path.exists(stale_log):
-        os.remove(stale_log)
+    stale_log = DEST / LOG_NAME
+    if stale_log.exists():
+        stale_log.unlink()
     print("running docker cargo test...", flush=True)
     r = subprocess.run(cmd)
-    src_log = os.path.join(DEST, LOG_NAME)
-    out_log = os.path.join(SRC_ROOT, "librtmp2-server", LOG_NAME)
-    if os.path.exists(src_log):
+    src_log = DEST / LOG_NAME
+    out_log = SRC_ROOT / "librtmp2-server" / LOG_NAME
+    if src_log.exists():
         shutil.copy(src_log, out_log)
-        print(f"copied log bytes={os.path.getsize(out_log)}", flush=True)
+        print(f"copied log bytes={out_log.stat().st_size}", flush=True)
     return r.returncode
 
 
