@@ -42,7 +42,29 @@ def require_source_tree(name: str) -> Path:
     return path
 
 
+def require_disjoint_dest(dest: Path, sources: list[Path]) -> None:
+    """Refuse a destination that overlaps one of the source checkouts.
+
+    The refresh step deletes the destination before staging the sources into
+    it, so a destination that equals or contains a checkout would delete the
+    very sources it is about to copy — and one inside a checkout would stage
+    the tree into itself.
+    """
+    dest = dest.resolve()
+    for src in sources:
+        src = src.resolve()
+        if dest == src or dest in src.parents or src in dest.parents:
+            raise SystemExit(
+                f"destination overlaps the source checkout: DEST={dest} SRC={src}\n"
+                "set OPENRTMP_DEST to a directory outside the OpenRTMP checkout"
+            )
+
+
 def refresh_copy() -> None:
+    require_disjoint_dest(
+        DEST,
+        [SRC_ROOT / "librtmp2", SRC_ROOT / "librtmp2-server"],
+    )
     for name in ("librtmp2", "librtmp2-server"):
         src = require_source_tree(name)
         dst = DEST / name
