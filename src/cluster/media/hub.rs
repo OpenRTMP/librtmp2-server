@@ -1625,14 +1625,21 @@ impl MediaHub {
                 // codec headers may be missing, so send the init cache
                 // ahead of the resync point that restarts the stream — on
                 // the same connection, since two TCP sessions have no
-                // ordering between them.
-                let reinit = hint == DeliveryHint::ResyncPoint
-                    && (sink
-                        .map(|s| s.take_reinit(&frame.app, &frame.stream))
-                        .unwrap_or(false)
-                        | peer
-                            .map(|p| p.take_reinit(&frame.app, &frame.stream))
-                            .unwrap_or(false));
+                // ordering between them. The marker is per connection: it is
+                // taken from both here, but only the connection that actually
+                // receives the init cache may leave it cleared — the sibling
+                // connection is re-armed below.
+                let (sink_reinit, peer_reinit) = if hint == DeliveryHint::ResyncPoint {
+                    (
+                        sink.map(|s| s.take_reinit(&frame.app, &frame.stream))
+                            .unwrap_or(false),
+                        peer.map(|p| p.take_reinit(&frame.app, &frame.stream))
+                            .unwrap_or(false),
+                    )
+                } else {
+                    (false, false)
+                };
+                let reinit = sink_reinit || peer_reinit;
                 let init = reinit
                     .then(|| self.init_cache_message(&frame.app, &frame.stream))
                     .flatten();
@@ -1642,11 +1649,29 @@ impl MediaHub {
                 if let Some(sink) = sink
                     && send(&|m| sink.try_send(m).is_ok())
                 {
+                    // The init cache went out on the sink only: the peer's
+                    // marker was consumed above but never served, so re-arm
+                    // it instead of dropping it.
+                    if reinit
+                        && peer_reinit
+                        && init.is_some()
+                        && let Some(p) = peer
+                    {
+                        p.mark_reinit(&frame.app, &frame.stream);
+                    }
                     return;
                 }
                 if let Some(peer) = peer
                     && send(&|m| peer.try_send(m).is_ok())
                 {
+                    // Same for the sink: it never received the init cache.
+                    if reinit
+                        && sink_reinit
+                        && init.is_some()
+                        && let Some(s) = sink
+                    {
+                        s.mark_reinit(&frame.app, &frame.stream);
+                    }
                     return;
                 }
                 if reinit {
