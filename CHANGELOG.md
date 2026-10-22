@@ -32,8 +32,9 @@ begin at `1.0.0`.
   creation or play-key creation: only a delete started by this node's own API
   counts as "a delete is in progress".
 - When the init cache cannot be queued for a peer, the subscribe registration
-  is no longer abandoned silently; the peer is asked to retry instead of
-  staying subscribed to a stream it never receives.
+  is no longer abandoned silently; the registration is kept and the init
+  cache is re-sent at the next resync point, so the peer stays subscribed and
+  the missing codec headers are repaired.
 - A failed publisher/player deactivation on connection close is now retried
   from the poll loop, so the row no longer keeps a publisher or viewer slot
   reserved until the next server start.
