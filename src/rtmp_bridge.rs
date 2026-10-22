@@ -30,6 +30,11 @@ const MAX_TRACKED_AUTH_FAILURE_KEYS: usize = 10_000;
 /// How often a publisher/player deactivation that failed on connection close
 /// is retried.
 const DEACTIVATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// How many pending deactivations one poll cycle retries. Every retry is a
+/// blocking database write, so draining the whole queue in one cycle can
+/// stall the RTMP poll loop for seconds; the rows left in the queue are
+/// retried by the next cycle.
+const MAX_PENDING_DEACTIVATION_BATCH: usize = 4;
 
 /// Test-only callback used by
 /// [`DbRtmpBridge::release_player_if_id`]'s regression test to replace the
@@ -149,12 +154,41 @@ enum PendingDeactivation {
     Player(Player),
 }
 
+/// Outcome of a deactivation retry.
+enum DeactivationOutcome {
+    /// The row was written with `active=0`.
+    Done,
+    /// The row no longer exists — the deactivation is complete.
+    Gone,
+    /// The write failed — the row must be retried later.
+    Failed,
+}
+
 impl PendingDeactivation {
     /// Write the row back with `active=0`.
-    fn deactivate(&self, db: &Db) -> bool {
-        match self {
+    ///
+    /// `Db::publisher_update`/`Db::player_update` report "no row updated" and
+    /// a failed write the same way, so a vanished row is told apart from a
+    /// database error by a read-only existence check: a row that is gone
+    /// needs no retry, while an existing row (or an unreadable database)
+    /// must be retried — dropping it would leave `active=1` and block every
+    /// later publish to that stream.
+    fn deactivate(&self, db: &Db) -> DeactivationOutcome {
+        let updated = match self {
             PendingDeactivation::Publisher(p) => db.publisher_update(&p.id, p),
             PendingDeactivation::Player(p) => db.player_update(&p.id, p),
+        };
+        if updated {
+            return DeactivationOutcome::Done;
+        }
+        let exists = match self {
+            PendingDeactivation::Publisher(p) => db.publisher_exists(&p.id),
+            PendingDeactivation::Player(p) => db.player_exists(&p.id),
+        };
+        if exists {
+            DeactivationOutcome::Failed
+        } else {
+            DeactivationOutcome::Gone
         }
     }
 
@@ -2127,20 +2161,31 @@ impl DbRtmpBridge {
             }
             *last = Some(Instant::now());
         }
-        let pending: Vec<PendingDeactivation> =
-            self.pending_deactivations.lock().drain(..).collect();
+        let pending: Vec<PendingDeactivation> = {
+            let mut queue = self.pending_deactivations.lock();
+            let n = queue.len().min(MAX_PENDING_DEACTIVATION_BATCH);
+            queue.drain(..n).collect()
+        };
         for row in pending {
             let (kind, stream_id, session_id) = row.describe();
-            if row.deactivate(&self.db) {
-                crate::log_info!(
-                    "RTMP: {kind} deactivated on retry: stream={stream_id} session={session_id}"
-                );
-            } else {
-                crate::log_warn!(
-                    "RTMP: pending {kind} deactivation still failing for stream={stream_id} \
-                     session={session_id}"
-                );
-                self.pending_deactivations.lock().push(row);
+            match row.deactivate(&self.db) {
+                DeactivationOutcome::Done => {
+                    crate::log_info!(
+                        "RTMP: {kind} deactivated on retry: stream={stream_id} session={session_id}"
+                    );
+                }
+                DeactivationOutcome::Gone => {
+                    crate::log_info!(
+                        "RTMP: {kind} row already gone: stream={stream_id} session={session_id}"
+                    );
+                }
+                DeactivationOutcome::Failed => {
+                    crate::log_warn!(
+                        "RTMP: pending {kind} deactivation still failing for stream={stream_id} \
+                         session={session_id}"
+                    );
+                    self.pending_deactivations.lock().push(row);
+                }
             }
         }
     }

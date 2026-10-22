@@ -2201,6 +2201,27 @@ impl Db {
         rows.inspect_err(|e| crate::log_error!("publisher_update_stats error for {id}: {e}"))
     }
 
+    /// True when any publishers row with this id still exists (active or not).
+    /// Lets callers distinguish a vanished row from a failed update — see
+    /// [`Self::player_exists`] and `DbRtmpBridge::retry_pending_deactivations`.
+    pub fn publisher_exists(&self, id: &str) -> bool {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT 1 FROM publishers WHERE id=? LIMIT 1",
+            params![id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                crate::log_error!("publisher_exists failed: {e}");
+                // Fail closed: treat as present so a failed release keeps
+                // retrying until the DB is readable again.
+                true
+            }
+        }
+    }
+
     /// Queue a stats-only update for publisher `id` (same semantics as
     /// [`Self::publisher_update_stats`]) to be written by the next
     /// [`Self::flush_pending_stats`], without touching SQLite or the
