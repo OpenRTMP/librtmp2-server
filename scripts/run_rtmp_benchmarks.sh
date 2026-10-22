@@ -109,6 +109,11 @@ for _v in LOAD_RUN_SECS LOAD_WARMUP_MS LOAD_MEASURE_DELAY LOAD_MEASURE_SECS STRA
   [[ "${!_v}" =~ ^[0-9]+$ ]] || { echo "error: $_v must be a non-negative integer" >&2; exit 2; }
 done
 ((LOAD_MEASURE_SECS > 0)) || { echo "error: LOAD_MEASURE_SECS must be > 0" >&2; exit 2; }
+# The measurement window starts LOAD_MEASURE_DELAY s after the relay launch and
+# lasts LOAD_MEASURE_SECS s, while the relay itself stops after
+# LOAD_RUN_SECS s: a window that reaches past the relay would average the
+# CPU of idle seconds and understate the published cpu_pct.
+((LOAD_MEASURE_DELAY + LOAD_MEASURE_SECS <= LOAD_RUN_SECS)) || { echo "error: LOAD_MEASURE_DELAY + LOAD_MEASURE_SECS must not exceed LOAD_RUN_SECS" >&2; exit 2; }
 if [[ "$STRACE_SAMPLE" = "1" ]]; then
   ((STRACE_SECS > 0)) || { echo "error: STRACE_SECS must be > 0 (0 disables the timeout)" >&2; exit 2; }
 fi
