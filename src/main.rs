@@ -24,7 +24,7 @@ struct Cli {
     verbose: bool,
 
     /// Show this help
-    #[arg(short = 'h', action = clap::ArgAction::Help)]
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::Help)]
     help: Option<bool>,
 }
 
