@@ -1109,7 +1109,10 @@ async fn handle_stream_create(
             "Name must be 1-128 characters and must not contain control characters",
         );
     }
-    if state.deleted_streams.lock().contains(&id) {
+    // Only this node's HTTP-owned marker means "a delete is in progress".
+    // `deleted_streams` also carries the cluster's transient
+    // force-unpublish/drain markers, which must not block creation.
+    if state.sticky_deleted_streams.lock().contains(&id) {
         log_http_access(
             "POST",
             PATH,
@@ -1441,7 +1444,11 @@ async fn handle_stream_delete(
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
     let path = format!("/api/v1/streams/{id}");
-    if state.deleted_streams.lock().contains(&id) {
+    // Only this node's HTTP-owned marker means "a delete is already in
+    // progress". `deleted_streams` also carries the cluster's transient
+    // force-unpublish/drain markers; those must not short-circuit the delete,
+    // or the stream row would survive an accepted delete.
+    if state.sticky_deleted_streams.lock().contains(&id) {
         log_http_access(
             "DELETE",
             &path,
@@ -1655,7 +1662,10 @@ async fn handle_stream_player_create(
         return err_json(StatusCode::BAD_REQUEST, "BAD_REQUEST", "Invalid stream id");
     }
     let path = format!("/api/v1/streams/{id}/players");
-    if state.deleted_streams.lock().contains(&id) {
+    // Only this node's HTTP-owned marker means "a delete is in progress".
+    // `deleted_streams` also carries the cluster's transient
+    // force-unpublish/drain markers, which must not block play-key creation.
+    if state.sticky_deleted_streams.lock().contains(&id) {
         log_http_access(
             "POST",
             &path,
@@ -3715,11 +3725,17 @@ mod tests {
             created_at: now_ts(),
         };
         state.db.stream_add(&stream).unwrap();
+        // A delete started by this node's API owns both marker sets.
         state.deleted_streams.lock().insert("pending".to_string());
+        state
+            .sticky_deleted_streams
+            .lock()
+            .insert("pending".to_string());
 
-        let app = router(state);
+        let app = router(state.clone());
         let (header, value) = bearer("a-strong-random-secret-value");
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -3731,6 +3747,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // A cluster-owned marker (force-unpublish/drain) is not a delete in
+        // progress: it must not short-circuit the delete.
+        let clustered = Stream {
+            id: "clustered".to_string(),
+            name: "Clustered".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_clus_key_with_sufficient_length_here".to_string(),
+            play_key: "play_clus_key_with_sufficient_length_here".to_string(),
+            stats_key: "st_clus_key_with_sufficient_length_here".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&clustered).unwrap();
+        state.deleted_streams.lock().insert("clustered".to_string());
+
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/clustered")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matches!(
+            state.db.stream_get("clustered"),
+            DbLookup::Missing
+        ));
     }
 
     #[tokio::test]
@@ -3914,11 +3963,22 @@ mod tests {
         assert!(body.contains("stats_key:"));
 
         // An id whose previous incarnation is still draining is refused.
+        // A delete started by this node's API owns both marker sets.
         state.deleted_streams.lock().insert("draining".to_string());
+        state
+            .sticky_deleted_streams
+            .lock()
+            .insert("draining".to_string());
         let (status, body) = post(Some(r#"{"id":"draining"}"#), true).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(body.contains("being deleted"));
         assert!(matches!(state.db.stream_get("draining"), DbLookup::Missing));
+
+        // A cluster-owned marker (force-unpublish/drain) is not a delete in
+        // progress: it must not refuse the creation.
+        state.deleted_streams.lock().insert("clustered".to_string());
+        let (status, body) = post(Some(r#"{"id":"clustered"}"#), true).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
     }
 
     #[tokio::test]
@@ -4259,8 +4319,13 @@ mod tests {
         let state = roomy_state();
         add_stream(&state, "pcmark");
         // The delete drain owns this stream: the marker check must reject the
-        // request before it ever reads or writes the DB.
+        // request before it ever reads or writes the DB. A delete started by
+        // this node's API owns both marker sets.
         state.deleted_streams.lock().insert("pcmark".to_string());
+        state
+            .sticky_deleted_streams
+            .lock()
+            .insert("pcmark".to_string());
         let app = router(state.clone());
 
         let (status, body) = send(
@@ -4279,6 +4344,21 @@ mod tests {
             1,
             "no play key may be added to a stream that is being deleted"
         );
+
+        // A cluster-owned marker (force-unpublish/drain) is not a delete in
+        // progress: it must not refuse the play-key creation.
+        add_stream(&state, "pccluster");
+        state.deleted_streams.lock().insert("pccluster".to_string());
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/pccluster/players",
+            true,
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(state.db.viewer_list("pccluster").len(), 2);
     }
 
     #[tokio::test]

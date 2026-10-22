@@ -27,6 +27,14 @@ const RTMP_AUTH_MAX_FAILURES: usize = 10;
 /// Cap tracked auth-failure buckets so a scan from many distinct IPs cannot
 /// grow `auth_failures` without bound, mirroring `rate_limit::MAX_TRACKED_KEYS`.
 const MAX_TRACKED_AUTH_FAILURE_KEYS: usize = 10_000;
+/// How often a publisher/player deactivation that failed on connection close
+/// is retried.
+const DEACTIVATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// How many pending deactivations one poll cycle retries. Every retry is a
+/// blocking database write, so draining the whole queue in one cycle can
+/// stall the RTMP poll loop for seconds; the rows left in the queue are
+/// retried by the next cycle.
+const MAX_PENDING_DEACTIVATION_BATCH: usize = 4;
 
 /// Test-only callback used by
 /// [`DbRtmpBridge::release_player_if_id`]'s regression test to replace the
@@ -137,6 +145,62 @@ struct ConnState {
     last_rtt_at: Option<Instant>,
 }
 
+/// A publisher/player row whose `active=1` deactivation write failed.
+///
+/// The connection that owned the row is gone, so nothing else would ever clear
+/// the flag: the row is kept here and retried from the RTMP poll loop.
+enum PendingDeactivation {
+    Publisher(Publisher),
+    Player(Player),
+}
+
+/// Outcome of a deactivation retry.
+enum DeactivationOutcome {
+    /// The row was written with `active=0`.
+    Done,
+    /// The row no longer exists — the deactivation is complete.
+    Gone,
+    /// The write failed — the row must be retried later.
+    Failed,
+}
+
+impl PendingDeactivation {
+    /// Write the row back with `active=0`.
+    ///
+    /// `Db::publisher_update`/`Db::player_update` report "no row updated" and
+    /// a failed write the same way, so a vanished row is told apart from a
+    /// database error by a read-only existence check: a row that is gone
+    /// needs no retry, while an existing row (or an unreadable database)
+    /// must be retried — dropping it would leave `active=1` and block every
+    /// later publish to that stream.
+    fn deactivate(&self, db: &Db) -> DeactivationOutcome {
+        let updated = match self {
+            PendingDeactivation::Publisher(p) => db.publisher_update(&p.id, p),
+            PendingDeactivation::Player(p) => db.player_update(&p.id, p),
+        };
+        if updated {
+            return DeactivationOutcome::Done;
+        }
+        let exists = match self {
+            PendingDeactivation::Publisher(p) => db.publisher_exists(&p.id),
+            PendingDeactivation::Player(p) => db.player_exists(&p.id),
+        };
+        if exists {
+            DeactivationOutcome::Failed
+        } else {
+            DeactivationOutcome::Gone
+        }
+    }
+
+    /// Role name, stream id and session id — for logs.
+    fn describe(&self) -> (&'static str, &str, &str) {
+        match self {
+            PendingDeactivation::Publisher(p) => ("publisher", &p.stream_id, &p.id),
+            PendingDeactivation::Player(p) => ("player", &p.stream_id, &p.id),
+        }
+    }
+}
+
 /// DB-backed [`RtmpEventHandler`]. Each connection's role(s) and DB row(s)
 /// live in a per-connection map entry, captured at publish/play time — so
 /// closing one connection can never touch another connection's row, unlike
@@ -166,6 +230,13 @@ pub struct DbRtmpBridge {
     /// The RTMP poll loop closes these sockets after `deleted_streams` no
     /// longer matches (finalize already cleared the marker).
     pending_force_close: Mutex<HashSet<ConnId>>,
+    /// Publisher/player rows whose `active=1` deactivation write failed on
+    /// connection close. Retried from the RTMP poll loop — once `on_close`
+    /// finishes there is no later conn lifecycle event that would retry.
+    pending_deactivations: Mutex<Vec<PendingDeactivation>>,
+    /// When the last deactivation retry ran, so a persistently failing DB is
+    /// not written to on every poll tick.
+    last_deactivation_retry: Mutex<Option<Instant>>,
     /// Test hook: number of remote-play unsubscribe calls issued (asserts one
     /// per abandoned local play role).
     #[cfg(all(test, feature = "cluster"))]
@@ -251,6 +322,8 @@ impl DbRtmpBridge {
             #[cfg(feature = "cluster")]
             pending_ownership_releases: Mutex::new(Vec::new()),
             pending_force_close: Mutex::new(HashSet::new()),
+            pending_deactivations: Mutex::new(Vec::new()),
+            last_deactivation_retry: Mutex::new(None),
             #[cfg(all(test, feature = "cluster"))]
             remote_play_unsubscribes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, feature = "cluster"))]
@@ -1964,6 +2037,12 @@ impl RtmpEventHandler for DbRtmpBridge {
                     pub_row.stream_id,
                     pub_row.id
                 );
+                // The connection state is gone, so no later lifecycle event
+                // would retry this write: queue the row instead of leaking an
+                // `active=1` publisher that blocks every later publish.
+                self.pending_deactivations
+                    .lock()
+                    .push(PendingDeactivation::Publisher(pub_row));
             }
         }
 
@@ -1985,6 +2064,11 @@ impl RtmpEventHandler for DbRtmpBridge {
                     player_row.stream_id,
                     player_row.id
                 );
+                // Same as the publisher row above: without a retry the row
+                // would keep `active=1` and hold a viewer slot forever.
+                self.pending_deactivations
+                    .lock()
+                    .push(PendingDeactivation::Player(player_row));
             }
         } else if !had_role {
             // No authorized role — still record the TCP close for auditability
@@ -2052,6 +2136,55 @@ impl DbRtmpBridge {
                     self.pending_ownership_releases
                         .lock()
                         .push((stream_id, epoch));
+                }
+            }
+        }
+    }
+
+    /// Retry publisher/player deactivations that failed during `on_close`.
+    ///
+    /// `on_close` is the last chance to clear the `active=1` flag of a row
+    /// whose connection is gone. When the write fails there is no later
+    /// lifecycle event that would retry it, so the row is queued and retried
+    /// here — otherwise it would keep `active=1` until the next server start
+    /// and block every later publish to that stream.
+    pub fn retry_pending_deactivations(&self) {
+        if self.pending_deactivations.lock().is_empty() {
+            return;
+        }
+        {
+            let mut last = self.last_deactivation_retry.lock();
+            if let Some(at) = *last
+                && at.elapsed() < DEACTIVATION_RETRY_INTERVAL
+            {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let pending: Vec<PendingDeactivation> = {
+            let mut queue = self.pending_deactivations.lock();
+            let n = queue.len().min(MAX_PENDING_DEACTIVATION_BATCH);
+            queue.drain(..n).collect()
+        };
+        for row in pending {
+            let (kind, stream_id, session_id) = row.describe();
+            match row.deactivate(&self.db) {
+                DeactivationOutcome::Done => {
+                    crate::log_info!(
+                        "RTMP: {kind} deactivated on retry: stream={stream_id} session={session_id}"
+                    );
+                }
+                DeactivationOutcome::Gone => {
+                    crate::log_info!(
+                        "RTMP: {kind} row already gone: stream={stream_id} session={session_id}"
+                    );
+                }
+                DeactivationOutcome::Failed => {
+                    crate::log_warn!(
+                        "RTMP: pending {kind} deactivation still failing for stream={stream_id} \
+                         session={session_id}"
+                    );
+                    self.pending_deactivations.lock().push(row);
                 }
             }
         }
@@ -2530,6 +2663,142 @@ mod tests {
 
         bridge.on_close(1);
         assert_eq!(db.publisher_list(Some("s1")).len(), 0);
+    }
+
+    /// A deactivation whose write failed on connection close is retried from
+    /// the poll loop: a row that can be written is written and not queued
+    /// again, a row that no longer exists is dropped, and a row whose write
+    /// keeps failing is queued again.
+    #[test]
+    fn pending_deactivations_are_written_dropped_and_requeued() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let _s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        // Nothing is pending: the retry does nothing.
+        bridge.retry_pending_deactivations();
+
+        assert!(db.publisher_try_acquire(&Publisher {
+            id: "pub_ok".to_string(),
+            stream_id: "s1".to_string(),
+            connected_at: crate::db::now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+        {
+            let mut pending = bridge.pending_deactivations.lock();
+            // The row of a publisher whose connection is gone.
+            pending.push(PendingDeactivation::Publisher(Publisher {
+                id: "pub_ok".to_string(),
+                stream_id: "s1".to_string(),
+                connected_at: crate::db::now_ts(),
+                active: false,
+                ..Default::default()
+            }));
+            // A row that no longer exists needs no retry.
+            pending.push(PendingDeactivation::Player(Player {
+                id: "pl_gone".to_string(),
+                stream_id: "s1".to_string(),
+                connected_at: crate::db::now_ts(),
+                active: false,
+                ..Default::default()
+            }));
+        }
+
+        bridge.retry_pending_deactivations();
+        assert!(
+            bridge.pending_deactivations.lock().is_empty(),
+            "a written and a vanished row must not be queued again"
+        );
+        assert!(
+            db.publisher_list(Some("s1")).is_empty(),
+            "the retry must write the row with active=0"
+        );
+
+        // The retry interval throttles the next cycle: the queued row waits.
+        bridge
+            .pending_deactivations
+            .lock()
+            .push(PendingDeactivation::Publisher(Publisher {
+                id: "pub_fail".to_string(),
+                stream_id: "s1".to_string(),
+                connected_at: crate::db::now_ts(),
+                active: false,
+                ..Default::default()
+            }));
+        bridge.retry_pending_deactivations();
+        assert_eq!(
+            bridge.pending_deactivations.lock().len(),
+            1,
+            "a throttled cycle must not touch the queue"
+        );
+
+        // The write fails now, and the read-only existence check fails
+        // closed: the row stays queued for a later cycle.
+        db.with_conn(|c| c.execute("DROP TABLE publishers", []))
+            .unwrap();
+        // The retry interval would throttle the next cycle: clear it so the
+        // test drives the next cycle right away.
+        *bridge.last_deactivation_retry.lock() = None;
+        bridge.retry_pending_deactivations();
+        assert_eq!(
+            bridge.pending_deactivations.lock().len(),
+            1,
+            "a row whose write failed must be queued again"
+        );
+    }
+
+    /// One poll cycle retries a bounded number of rows: the rest stay queued
+    /// for the next cycle instead of stalling the poll loop.
+    #[test]
+    fn pending_deactivation_retry_is_bounded_per_cycle() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let _s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        {
+            let mut pending = bridge.pending_deactivations.lock();
+            for i in 0..=MAX_PENDING_DEACTIVATION_BATCH {
+                pending.push(PendingDeactivation::Publisher(Publisher {
+                    id: format!("pub_batch{i}"),
+                    stream_id: "s1".to_string(),
+                    connected_at: crate::db::now_ts(),
+                    active: false,
+                    ..Default::default()
+                }));
+            }
+        }
+
+        bridge.retry_pending_deactivations();
+        assert_eq!(
+            bridge.pending_deactivations.lock().len(),
+            1,
+            "one cycle must retry at most {MAX_PENDING_DEACTIVATION_BATCH} rows"
+        );
+    }
+
+    /// A deactivation that fails on connection close is queued for the poll
+    /// loop: the connection state is gone, so no later lifecycle event would
+    /// retry the write.
+    #[test]
+    fn failed_deactivation_on_close_is_queued_for_the_poll_loop() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
+
+        // The deactivation write fails on close: the row is queued instead of
+        // leaking an `active=1` publisher that blocks every later publish.
+        db.with_conn(|c| c.execute("DROP TABLE publishers", []))
+            .unwrap();
+        bridge.on_close(1);
+        assert_eq!(
+            bridge.pending_deactivations.lock().len(),
+            1,
+            "a failed deactivation must be queued for the poll loop"
+        );
     }
 
     #[test]

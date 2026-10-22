@@ -27,13 +27,15 @@ class SourceTreeValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             module.SRC_ROOT = Path(tmp)
             with self.assertRaises(SystemExit) as ctx:
-                module.require_source_tree("librtmp2-server")
+                module.require_source_tree(module.SRC_ROOT, "librtmp2-server")
             self.assertIn("source tree missing", str(ctx.exception))
 
             tree = Path(tmp) / "librtmp2-server"
             tree.mkdir()
             (tree / "Cargo.toml").write_text("", encoding="utf-8")
-            self.assertEqual(module.require_source_tree("librtmp2-server"), tree)
+            self.assertEqual(
+                module.require_source_tree(module.SRC_ROOT, "librtmp2-server"), tree
+            )
 
     def test_sync_server_fails_loudly_for_missing_source(self) -> None:
         module = _load()

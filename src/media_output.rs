@@ -1553,7 +1553,10 @@ fn create_private_media_file(path: &Path) -> io::Result<File> {
 fn create_private_media_file(path: &Path) -> io::Result<File> {
     // create_new fails if the path already exists, including a symlink or
     // Windows reparse-point file, instead of opening an attacker-chosen target.
-    let file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     if let Err(error) = restrict_media_path_permissions(path, false) {
         drop(file);
         let _ = fs::remove_file(path);
@@ -3245,7 +3248,10 @@ mod tests {
         let command = r#"printf '%s' "$OPENRTMP_STREAM_NAME" >/dev/null"#;
         let mut child = spawn_hook(command, "publish", &env).unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(!marker.exists(), "publisher metadata must not execute shell code");
+        assert!(
+            !marker.exists(),
+            "publisher metadata must not execute shell code"
+        );
     }
 
     #[test]

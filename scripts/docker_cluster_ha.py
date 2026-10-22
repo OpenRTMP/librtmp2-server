@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """Re-run cluster_ha tests only after leader-forward fix.
 
-``DEFAULT_SRC_ROOT`` is the parent directory that contains the repository
-checkouts; the script resolves the ``librtmp2-server`` and ``librtmp2`` source
-trees beneath it. Set ``OPENRTMP_SRC_ROOT`` to point at another parent
-directory and ``OPENRTMP_DEST`` to use a different build directory (defaults to
-a folder in the system temp dir).
+The cluster_ha suite runs against the staged checkouts; see
+``openrtmp_docker_paths`` for the source and build directories.
 """
 from __future__ import annotations
 
@@ -13,38 +10,41 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-DEFAULT_SRC_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = Path(os.environ.get("OPENRTMP_SRC_ROOT") or DEFAULT_SRC_ROOT).resolve()
-DEST = Path(
-    os.environ.get("OPENRTMP_DEST") or Path(tempfile.gettempdir()) / "openrtmp-build2"
-).resolve()
+# The shared helpers live next to this script: make them importable whether
+# the script is run as a file (``python scripts/docker_cluster_ha.py``) or as
+# a module (``python -m scripts.docker_cluster_ha``).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from openrtmp_docker_paths import (
+    CARGO_MANIFEST,
+    require_disjoint_dest,
+    require_source_tree,
+    resolve_dest,
+    resolve_src_root,
+)
+
+SRC_ROOT = resolve_src_root()
+DEST = resolve_dest("openrtmp-build2")
 LOG_NAME = "cargo-cluster-ha.log"
-CARGO_MANIFEST = "Cargo.toml"
 
 
-def require_source_tree(name: str) -> Path:
-    """Return ``SRC_ROOT/name``, failing loudly when the checkout is missing.
-
-    ``os.walk`` over a missing directory silently yields nothing, so without
-    this check a wrong ``SRC_ROOT`` would run the suite against whatever stale
-    copy already lives in ``DEST`` and report that result as the verdict on the
-    current tree.
-    """
-    path = SRC_ROOT / name
-    if not (path / CARGO_MANIFEST).is_file():
-        raise SystemExit(
-            f"source tree missing or incomplete: {path}\n"
-            "set OPENRTMP_SRC_ROOT to the OpenRTMP checkout "
-            f"(default is {DEFAULT_SRC_ROOT})"
-        )
-    return path
+def source_files(src: Path) -> set[Path]:
+    """Relative paths of the files the build copy must contain."""
+    out: set[Path] = set()
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in (".git", "target")]
+        rel = Path(root).relative_to(src)
+        for f in files:
+            if f.endswith(".log"):
+                continue
+            out.add(rel / f)
+    return out
 
 
 def sync_server() -> None:
-    src = require_source_tree("librtmp2-server")
+    src = require_source_tree(SRC_ROOT, "librtmp2-server")
     dst = DEST / "librtmp2-server"
     # Sync only changed source (keep target cache).
     for root, dirs, files in os.walk(src):
@@ -56,22 +56,38 @@ def sync_server() -> None:
             if f.endswith(".log"):
                 continue
             shutil.copy2(Path(root) / f, out / f)
-    # Ensure librtmp2 present
-    lib_src = require_source_tree("librtmp2")
+    # Drop the files that no longer exist in the source, so the build copy
+    # matches the checkout: a deleted or renamed module must not survive here
+    # and be compiled (or reported on) as if it were still part of the tree.
+    keep = source_files(src)
+    for root, dirs, files in os.walk(dst):
+        dirs[:] = [d for d in dirs if d not in (".git", "target")]
+        for f in files:
+            path = Path(root) / f
+            if path.relative_to(dst) not in keep:
+                path.unlink()
+    # Ensure librtmp2 present and current — the sibling checkout may have
+    # changed since the last copy.
+    lib_src = require_source_tree(SRC_ROOT, "librtmp2")
     lib_dst = DEST / "librtmp2"
-    if not (lib_dst / CARGO_MANIFEST).is_file():
-        shutil.copytree(
-            lib_src,
-            lib_dst,
-            ignore=shutil.ignore_patterns("target", ".git", "*.log"),
-        )
+    if lib_dst.exists():
+        shutil.rmtree(lib_dst)
+    shutil.copytree(
+        lib_src,
+        lib_dst,
+        ignore=shutil.ignore_patterns("target", ".git", "*.log"),
+    )
 
 
 def main() -> int:
     # Validate both trees before either branch so a moved/renamed checkout
     # cannot silently run the suite against a stale destination copy.
-    server_src = require_source_tree("librtmp2-server")
-    lib_src = require_source_tree("librtmp2")
+    server_src = require_source_tree(SRC_ROOT, "librtmp2-server")
+    lib_src = require_source_tree(SRC_ROOT, "librtmp2")
+    # Refuse a destination that overlaps a checkout before anything is
+    # staged: the refresh below deletes the destination tree first, so an
+    # overlapping destination would delete the very sources it copies.
+    require_disjoint_dest(DEST, [server_src, lib_src])
     DEST.mkdir(parents=True, exist_ok=True)
     if not (DEST / "librtmp2-server" / CARGO_MANIFEST).is_file():
         for src, name in ((server_src, "librtmp2-server"), (lib_src, "librtmp2")):

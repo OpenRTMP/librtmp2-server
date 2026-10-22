@@ -57,6 +57,17 @@ const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 /// Bounded retry budget for re-learning peer media addresses after a restart.
 const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
 const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
+/// Warning threshold for the pending ambiguous-acquire list. The list holds
+/// the writes whose outcome is still unknown, so it is not capped by count:
+/// a record whose write is still open must not be dropped, or the write could
+/// land later without ever being reconciled. It is bounded by age instead —
+/// see `AMBIGUOUS_ACQUIRE_MAX_AGE`.
+const MAX_PENDING_AMBIGUOUS_ACQUIRES: usize = 1024;
+/// Maximum age of an ambiguous-acquire record whose outcome is still unknown.
+/// A write that is still open after this long does not land any more, so the
+/// record is dropped with a warning instead of being retried for the lifetime
+/// of the process.
+const AMBIGUOUS_ACQUIRE_MAX_AGE: Duration = Duration::from_secs(600);
 /// Bound on the wait for a freshly added learner to reach line-rate. Kept
 /// under `network`'s 8s control round trip so a slow catch-up surfaces as
 /// this error on the joiner instead of a client-side round-trip timeout.
@@ -66,6 +77,25 @@ const JOIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(6);
 /// metrics notification cannot drop the peer, short enough that a reverted
 /// join is pruned.
 const JOIN_MEMBERSHIP_HOLD: Duration = Duration::from_secs(JOIN_CATCHUP_TIMEOUT.as_secs() * 3);
+
+/// How a cluster write failed. A write that never reached the cluster cannot
+/// commit, while a dispatched write may still commit after the caller gave
+/// up — only the latter has to be reconciled.
+enum WriteFailure {
+    /// The write never reached the cluster, so it can never commit.
+    Undispatched(CoordError),
+    /// The write was dispatched; it may still commit.
+    Dispatched(CoordError),
+}
+
+impl WriteFailure {
+    /// The error the caller sees.
+    fn into_coord_error(self) -> CoordError {
+        match self {
+            WriteFailure::Undispatched(e) | WriteFailure::Dispatched(e) => e,
+        }
+    }
+}
 
 /// Resolve control/media addresses from a heartbeat payload.
 ///
@@ -148,6 +178,11 @@ pub struct ClusterManager {
     /// Per-peer per-viewer (play-key) player counts from heartbeats.
     peer_viewer_players:
         Mutex<std::collections::HashMap<NodeId, std::collections::HashMap<String, u64>>>,
+    /// Peers whose last heartbeat attempt failed. The first failure of a peer
+    /// warns, repeated failures only debug-log, and a successful heartbeat
+    /// clears the entry — an unreachable peer must not log once per
+    /// heartbeat interval.
+    heartbeat_failures: Mutex<std::collections::HashSet<NodeId>>,
     /// Raft state-machine side-effect channel (drain/revoke/token).
     effects_rx:
         Mutex<Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>>,
@@ -157,12 +192,15 @@ pub struct ClusterManager {
     /// RTMP poll loop reacted to the marker). Retried until local sessions
     /// actually drain — see `retry_pending_drain_clears`.
     pending_drain_clears: Mutex<std::collections::HashSet<String>>,
-    /// (stream_id, node_id, acquired_at) for `AcquireStreamOwner` writes whose
-    /// client-side 2s deadline elapsed before Raft answered. Dropping that
-    /// future does not cancel an in-flight write, so it can still commit
-    /// afterward; reconciled on the next health tick — see
-    /// `reconcile_ambiguous_acquires`.
-    pending_ambiguous_acquires: Mutex<Vec<(String, u64, i64)>>,
+    /// (stream_id, node_id, acquired_at, queued_at) for `AcquireStreamOwner`
+    /// writes that failed before Raft answered (the local 2s deadline
+    /// elapsed, or a forwarded write failed with a transport error).
+    /// Dropping that future does not cancel an in-flight write, so it can
+    /// still commit afterward; reconciled on the next health tick — see
+    /// `reconcile_ambiguous_acquires`. A record whose write is still open
+    /// after `AMBIGUOUS_ACQUIRE_MAX_AGE` is dropped with a warning instead
+    /// of being retried forever.
+    pending_ambiguous_acquires: Mutex<Vec<(String, u64, i64, Instant)>>,
     /// Nodes whose membership removal committed but
     /// [`Self::release_owners_for_node`] has not yet succeeded. Retried on
     /// the leader health tick — a removed node has no `down_since`, so the
@@ -187,6 +225,15 @@ pub struct ClusterManager {
     /// Recently accepted `admin_proof` values — blocks captured ClientWrite /
     /// membership proofs from being replayed while the API token is unchanged.
     used_admin_proofs: Mutex<HashMap<String, Instant>>,
+    /// Join proofs this node accepted whose outcome the joiner may not have
+    /// learned yet: the `JoinResponse` can be lost after the membership
+    /// change already committed. The joiner's proof is a static
+    /// `CLUSTER_JOIN_PROOF` configuration value, so spending it before the
+    /// joiner knows the outcome leaves it unable to retry its join at all.
+    /// The proof is spent only once the new member is observed alive — its
+    /// first heartbeat proves the joiner learned the outcome — see
+    /// `defer_join_proof_burn`.
+    pending_join_proofs: Mutex<HashMap<NodeId, (String, Instant)>>,
     /// Last peer-address value rejected per `(node, kind)`, so a peer that
     /// keeps advertising an invalid address (mTLS heartbeat) only warns when the
     /// rejected value changes instead of on every heartbeat.
@@ -371,6 +418,7 @@ impl ClusterManager {
             peer_session_counts: Mutex::new(std::collections::HashMap::new()),
             peer_stream_players: Mutex::new(std::collections::HashMap::new()),
             peer_viewer_players: Mutex::new(std::collections::HashMap::new()),
+            heartbeat_failures: Mutex::new(std::collections::HashSet::new()),
             effects_rx: Mutex::new(Some(effects_rx)),
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
@@ -380,6 +428,7 @@ impl ClusterManager {
             standby_subs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
+            pending_join_proofs: Mutex::new(HashMap::new()),
             rejected_peer_addrs: Mutex::new(std::collections::HashMap::new()),
         });
 
@@ -803,26 +852,35 @@ impl ClusterManager {
         // the tracker while we wait, so a post-write get() may already see the
         // new owner and skip the prior remote unsubscribe.
         let previous = self.ownership.get(stream_id);
-        let resp = match self.block_on_write(ClusterCommand::AcquireStreamOwner {
+        let resp = match self.block_on_write_outcome(ClusterCommand::AcquireStreamOwner {
             stream_id: stream_id.to_string(),
             node_id,
             epoch,
             acquired_at,
         }) {
             Ok(resp) => resp,
-            Err(CoordError::Cluster(msg)) if msg == RAFT_WRITE_TIMEOUT_MSG => {
+            Err(WriteFailure::Undispatched(e)) => {
+                // The write never reached the cluster, so it can never
+                // commit: there is no ghost owner to reconcile.
+                return Err(e);
+            }
+            Err(WriteFailure::Dispatched(e)) => {
                 // The caller gives up on this acquire, but the write may
                 // still commit later; check on the next health tick and
                 // release it if it does, rather than leaving a ghost owner
                 // no local publisher is actually using.
-                self.pending_ambiguous_acquires.lock().push((
-                    stream_id.to_string(),
-                    node_id,
-                    acquired_at,
-                ));
-                return Err(CoordError::Cluster(msg));
+                //
+                // Every dispatched write is ambiguous, not just the local 2s
+                // deadline: a write forwarded to the leader that fails with
+                // a transport error after the leader already committed
+                // leaves the same ghost row, and that row blocks the stream
+                // for every other node until this node restarts. An
+                // explicit state-machine verdict (Conflict/NotFound) is
+                // the only unambiguous rejection — and it is reported
+                // through the successful response, not as an error here.
+                self.queue_ambiguous_acquire(stream_id.to_string(), node_id, acquired_at);
+                return Err(e);
             }
-            Err(e) => return Err(e),
         };
         let epoch = resp.into_owner_epoch()?;
         self.ownership.set(stream_id, node_id, epoch);
@@ -923,6 +981,14 @@ impl ClusterManager {
     }
 
     fn block_on_write(&self, cmd: ClusterCommand) -> Result<ClusterResponse, CoordError> {
+        self.block_on_write_outcome(cmd)
+            .map_err(WriteFailure::into_coord_error)
+    }
+
+    /// Like [`Self::block_on_write`], but tells apart a write that never
+    /// reached the cluster — and can therefore never commit — from one that
+    /// was dispatched and may still land.
+    fn block_on_write_outcome(&self, cmd: ClusterCommand) -> Result<ClusterResponse, WriteFailure> {
         // Admin proof is only needed when forwarding to a remote leader.
         // Local-leader `raft.client_write` must not depend on session_hooks —
         // health_loop / ownership can run before `register_session_hooks`.
@@ -943,13 +1009,20 @@ impl ClusterManager {
             match raft.client_write(cmd.clone()).await {
                 Ok(resp) => Ok(resp.data),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                    // The leader has not seen this write yet: everything that
+                    // fails before the forward below leaves the write
+                    // undispatched, so it can never commit.
                     let token = api_token.ok_or_else(|| {
-                        CoordError::Cluster("API token unavailable for cluster admin write".into())
+                        WriteFailure::Undispatched(CoordError::Cluster(
+                            "API token unavailable for cluster admin write".into(),
+                        ))
                     })?;
-                    let req = serde_json::to_value(&cmd)
-                        .map_err(|e| CoordError::Cluster(e.to_string()))?;
-                    let req_str = serde_json::to_string(&req)
-                        .map_err(|e| CoordError::Cluster(e.to_string()))?;
+                    let req = serde_json::to_value(&cmd).map_err(|e| {
+                        WriteFailure::Undispatched(CoordError::Cluster(e.to_string()))
+                    })?;
+                    let req_str = serde_json::to_string(&req).map_err(|e| {
+                        WriteFailure::Undispatched(CoordError::Cluster(e.to_string()))
+                    })?;
                     let proof = Self::mint_fresh_admin_proof(&token, &req_str);
                     let addr = ftl
                         .leader_node
@@ -959,20 +1032,28 @@ impl ClusterManager {
                                 .and_then(|id| meta.get(id).map(|(ctrl, _)| ctrl))
                         })
                         .ok_or_else(|| {
-                            CoordError::Cluster("no leader available to forward write".into())
+                            WriteFailure::Undispatched(CoordError::Cluster(
+                                "no leader available to forward write".into(),
+                            ))
                         })?;
+                    // The write is on the wire now: the leader may commit it
+                    // even when the answer never arrives.
                     network::send_client_write(&addr, &secret, local_id, cmd, proof, tls_client)
                         .await
-                        .map_err(CoordError::Cluster)
+                        .map_err(|e| WriteFailure::Dispatched(CoordError::Cluster(e)))
                 }
-                Err(e) => Err(CoordError::Cluster(format!("raft write: {e}"))),
+                Err(e) => Err(WriteFailure::Dispatched(CoordError::Cluster(format!(
+                    "raft write: {e}"
+                )))),
             }
         };
         const RAFT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
         let timed = async move {
             tokio::time::timeout(RAFT_WRITE_TIMEOUT, fut)
                 .await
-                .map_err(|_| CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))?
+                .map_err(|_| {
+                    WriteFailure::Dispatched(CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))
+                })?
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| self.rt_handle.block_on(timed))
@@ -1089,6 +1170,7 @@ impl ClusterManager {
         self.peer_session_counts.lock().remove(&node_id);
         self.peer_stream_players.lock().remove(&node_id);
         self.peer_viewer_players.lock().remove(&node_id);
+        self.heartbeat_failures.lock().remove(&node_id);
         self.rejected_peer_addrs
             .lock()
             .retain(|(id, _), _| *id != node_id);
@@ -1110,6 +1192,9 @@ impl ClusterManager {
         if !self.peer_in_membership(info.node_id) {
             return;
         }
+        // The new member's first heartbeat proves it learned the outcome of
+        // its join, so its one-time join proof can be spent now.
+        self.burn_pending_join_proof(info.node_id);
         let state = NodeHealthState::from_heartbeat(&info.health);
         let known_addrs = self.meta.get(info.node_id);
         let (ctrl, media_a) = heartbeat_routing_addrs(
@@ -1376,9 +1461,10 @@ impl ClusterManager {
             return false;
         }
         // A join proof is a configured one-time capability. Keep it retryable
-        // until add_learner/forwarding has actually succeeded; accept_join()
-        // records it after success. Other admin attempts mint a fresh nonce on
-        // each retry, so they can be consumed immediately here.
+        // until the joining node has learned the outcome; accept_join()
+        // defers the spending to the new member's first heartbeat. Other
+        // admin attempts mint a fresh nonce on each retry, so they can be
+        // consumed immediately here.
         if !payload.starts_with("Join:") {
             used.insert(proof.to_string(), now);
         }
@@ -1390,6 +1476,69 @@ impl ClusterManager {
         let now = Instant::now();
         Self::purge_expired_admin_proofs(&mut used, now);
         used.insert(proof.to_string(), now);
+    }
+
+    /// Record a join proof that must not be spent yet.
+    ///
+    /// The membership change is already committed when the join is accepted,
+    /// but the `JoinResponse` can still be lost on the way back. The joiner's
+    /// proof is a static `CLUSTER_JOIN_PROOF` configuration value: spending it
+    /// here would leave the joiner unable to retry its join until the replay
+    /// TTL expires, so a lost response would strand the node for minutes.
+    /// The proof is spent only once the new member is observed alive — its
+    /// first heartbeat proves it learned the outcome.
+    fn defer_join_proof_burn(&self, node_id: NodeId, proof: String) {
+        let mut pending = self.pending_join_proofs.lock();
+        Self::spend_expired_join_proofs(self, &mut pending, Instant::now());
+        pending.insert(node_id, (proof, Instant::now()));
+    }
+
+    /// Spend the deferred join proof of a node that has just been seen alive.
+    fn burn_pending_join_proof(&self, node_id: NodeId) {
+        let entry = self.pending_join_proofs.lock().remove(&node_id);
+        let Some((proof, _queued_at)) = entry else {
+            return;
+        };
+        crate::log_info!("Cluster: node {node_id} confirmed its join; spending its join proof");
+        self.consume_admin_proof(&proof);
+    }
+
+    /// Spend the join proofs whose node never confirmed the join.
+    fn expire_pending_join_proofs(&self) {
+        let mut pending = self.pending_join_proofs.lock();
+        Self::spend_expired_join_proofs(self, &mut pending, Instant::now());
+    }
+
+    /// Spend the join proofs whose node never confirmed the join.
+    ///
+    /// A proof that stays unconfirmed for longer than the replay TTL is spent
+    /// anyway: the joiner that presented it never came alive, and leaving the
+    /// capability usable for longer than the TTL would weaken the one-time
+    /// protection a spent proof gives against a captured join request.
+    fn spend_expired_join_proofs(
+        &self,
+        pending: &mut HashMap<NodeId, (String, Instant)>,
+        now: Instant,
+    ) {
+        let expired: Vec<(NodeId, String)> = pending
+            .iter()
+            .filter(|(_, (_, queued_at))| {
+                now.checked_duration_since(*queued_at)
+                    .is_none_or(|age| age >= ADMIN_PROOF_REPLAY_TTL)
+            })
+            .map(|(id, (proof, _))| (*id, proof.clone()))
+            .collect();
+        for (id, _) in &expired {
+            pending.remove(id);
+        }
+        for (_, proof) in expired {
+            crate::log_warn!(
+                "Cluster: join proof was never confirmed by the joining node; spending it"
+            );
+            let mut used = self.used_admin_proofs.lock();
+            Self::purge_expired_admin_proofs(&mut used, now);
+            used.insert(proof, now);
+        }
     }
 
     async fn forward_admin(
@@ -1465,7 +1614,9 @@ impl ClusterManager {
         .await;
         if result.is_ok() {
             self.record_joined_peer_addresses(node_id, &control_for_meta, &media_for_meta);
-            self.consume_admin_proof(&proof_for_cache);
+            // The joiner may never learn the outcome (a lost JoinResponse),
+            // so the proof stays spendable until the new member is seen alive.
+            self.defer_join_proof_burn(node_id, proof_for_cache);
         }
         result
     }
@@ -1648,7 +1799,9 @@ impl ClusterManager {
             })
             .collect();
         crate::log_info!("Cluster: node {node_id} joined as learner");
-        self.consume_admin_proof(&proof);
+        // The joiner may never learn the outcome (a lost JoinResponse), so
+        // the proof stays spendable until the new member is seen alive.
+        self.defer_join_proof_burn(node_id, proof);
         Ok((self.cluster_id(), peers))
     }
 
@@ -1837,20 +1990,67 @@ impl ClusterManager {
         }
     }
 
-    /// Check each acquire whose client-side deadline elapsed for whether the
-    /// write actually landed after all; if it did, release it — the caller
-    /// already gave up and no local publisher is using that reservation.
+    /// Queue an acquire whose write failed before Raft answered for
+    /// reconciliation on the next health tick.
+    ///
+    /// The record is kept until the write's fate is known: giving up on the
+    /// client side does not cancel the leader's write, so a write that lands
+    /// later still has to be reconciled and released. Dropping an unresolved
+    /// record would leave exactly the ghost owner the reconciliation exists to
+    /// prevent, so the list holds the writes whose outcome is still open and
+    /// shrinks again as soon as the cluster makes progress.
+    fn queue_ambiguous_acquire(&self, stream_id: String, node_id: u64, acquired_at: i64) {
+        let mut pending = self.pending_ambiguous_acquires.lock();
+        if pending
+            .iter()
+            .any(|(s, n, a, _)| *s == stream_id && *n == node_id && *a == acquired_at)
+        {
+            // Already queued for this exact write.
+            return;
+        }
+        pending.push((stream_id, node_id, acquired_at, Instant::now()));
+        if pending.len() > MAX_PENDING_AMBIGUOUS_ACQUIRES {
+            crate::log_warn!(
+                "Cluster: {} ambiguous acquires are still unresolved; they are kept \
+                 until their write either lands or is superseded",
+                pending.len()
+            );
+        }
+    }
+
+    /// Keep an ambiguous-acquire record for the next tick, unless it has aged
+    /// out. A write whose outcome is still unknown after
+    /// `AMBIGUOUS_ACQUIRE_MAX_AGE` does not land any more, so the record is
+    /// dropped with a warning instead of being retried forever.
+    fn requeue_ambiguous_acquire(&self, record: (String, u64, i64, Instant)) {
+        let (stream_id, node_id, acquired_at, queued_at) = record;
+        if queued_at.elapsed() >= AMBIGUOUS_ACQUIRE_MAX_AGE {
+            crate::log_warn!(
+                "Cluster: dropping the unresolved acquire for stream {stream_id} (node {node_id}); \
+                 it has been open for longer than {AMBIGUOUS_ACQUIRE_MAX_AGE:?}"
+            );
+            return;
+        }
+        self.pending_ambiguous_acquires
+            .lock()
+            .push((stream_id, node_id, acquired_at, queued_at));
+    }
+
+    /// Check each acquire whose write failed before Raft answered for whether
+    /// the write actually landed after all; if it did, release it — the
+    /// caller already gave up and no local publisher is using that
+    /// reservation.
     fn reconcile_ambiguous_acquires(&self) {
-        let pending: Vec<(String, u64, i64)> =
+        let pending: Vec<(String, u64, i64, Instant)> =
             self.pending_ambiguous_acquires.lock().drain(..).collect();
-        for (stream_id, node_id, acquired_at) in pending {
+        for (stream_id, node_id, acquired_at, queued_at) in pending {
             let Some(owner) = self.db.stream_owner_get(&stream_id) else {
-                // Timed-out write may still commit on a later tick — keep the
+                // The write may still commit on a later tick — keep the
                 // record until the row appears (and is released) or a different
-                // acquire supersedes it.
-                self.pending_ambiguous_acquires
-                    .lock()
-                    .push((stream_id, node_id, acquired_at));
+                // acquire supersedes it. The client-side give-up does not
+                // cancel the leader's write, so a record whose write is still
+                // open must not be dropped.
+                self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
                 continue;
             };
             if owner.owner_node_id != node_id || owner.acquired_at != acquired_at {
@@ -1865,9 +2065,7 @@ impl ClusterManager {
                     // Do not read a failed lookup as "no publisher": releasing
                     // now could drop ownership out from under a live
                     // publisher. Keep the record and retry next tick.
-                    self.pending_ambiguous_acquires
-                        .lock()
-                        .push((stream_id, node_id, acquired_at));
+                    self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
                     continue;
                 }
             };
@@ -1880,13 +2078,11 @@ impl ClusterManager {
                 // record so the release is retried once the publisher
                 // disconnects, instead of dropping it (which would leave a
                 // ghost owner no node reconciles).
-                self.pending_ambiguous_acquires
-                    .lock()
-                    .push((stream_id, node_id, acquired_at));
+                self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
                 continue;
             }
             crate::log_warn!(
-                "Cluster: acquire for stream {stream_id} timed out client-side but later \
+                "Cluster: acquire for stream {stream_id} failed client-side but later \
                  committed at epoch={}; releasing the unclaimed reservation",
                 owner.epoch
             );
@@ -1895,9 +2091,7 @@ impl ClusterManager {
                     "Cluster: failed to release ambiguously-committed acquire for {stream_id}: {e:?}"
                 );
                 // Still ambiguous — retry on the next tick.
-                self.pending_ambiguous_acquires
-                    .lock()
-                    .push((stream_id, node_id, acquired_at));
+                self.requeue_ambiguous_acquire((stream_id, node_id, acquired_at, queued_at));
             }
         }
     }
@@ -2696,6 +2890,7 @@ impl ClusterManager {
             self.process_state_effects();
             self.retry_pending_drain_clears();
             self.reconcile_ambiguous_acquires();
+            self.expire_pending_join_proofs();
             if !self.config.bandwidth_interface.is_empty() {
                 let iface = self.config.bandwidth_interface.clone();
                 let max = self.config.bandwidth_max_mbps;
@@ -2715,6 +2910,107 @@ impl ClusterManager {
             let metrics = self.last_metrics.lock().clone();
             let is_leader =
                 metrics.as_ref().and_then(|m| m.current_leader) == Some(self.config.node_id);
+            // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
+            self.sync_ownership_from_db();
+            self.reconcile_media_replicas();
+            let local_pubs = self
+                .db
+                .publisher_list_all()
+                .iter()
+                .filter(|p| p.active)
+                .count() as u64;
+            let local_players = self
+                .db
+                .player_list_all()
+                .iter()
+                .filter(|p| p.active)
+                .count() as u64;
+            let mut stream_players: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut viewer_players: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            for p in self.db.player_list_all().iter().filter(|p| p.active) {
+                *stream_players.entry(p.stream_id.clone()).or_insert(0) += 1;
+                if !p.viewer_id.is_empty() {
+                    *viewer_players.entry(p.viewer_id.clone()).or_insert(0) += 1;
+                }
+            }
+            let stream_players: Vec<(String, u64)> = stream_players.into_iter().collect();
+            let viewer_players: Vec<(String, u64)> = viewer_players.into_iter().collect();
+            let advertise = self.config.advertise_control();
+            let media_advertise = self.config.advertise_media();
+            self.prune_topology_to_membership();
+            // Emit heartbeats concurrently so a few dead peers cannot exceed
+            // the stale threshold waiting on sequential 500ms timeouts.
+            let peers: Vec<_> = self
+                .meta
+                .all()
+                .into_iter()
+                .filter(|(id, _, _)| *id != self.config.node_id)
+                .collect();
+            let secret = self.config.secret.clone();
+            let node_id = self.config.node_id;
+            let health = self.health.local().as_str().to_string();
+            let load = self.admission.current_load();
+            let tls = self.tls_client.clone();
+            let heartbeat_timeout = network::heartbeat_roundtrip_timeout(self.config.heartbeat);
+            let futs = peers.into_iter().map(|(id, ctrl, _)| {
+                let secret = secret.clone();
+                let advertise = advertise.clone();
+                let media_advertise = media_advertise.clone();
+                let health = health.clone();
+                let stream_players = stream_players.clone();
+                let viewer_players = viewer_players.clone();
+                let tls = tls.clone();
+                async move {
+                    let result = network::send_heartbeat_with_timeout(
+                        &ctrl,
+                        &secret,
+                        node_id,
+                        network::HeartbeatPayload {
+                            health: health.clone(),
+                            load,
+                            control_addr: advertise,
+                            media_addr: media_advertise,
+                            publishers: local_pubs,
+                            players: local_players,
+                            stream_players,
+                            viewer_players,
+                        },
+                        tls,
+                        heartbeat_timeout,
+                    )
+                    .await;
+                    (id, ctrl, result)
+                }
+            });
+            let results = futures::future::join_all(futs).await;
+            // A peer that stays unreachable must not log once per heartbeat
+            // interval: the first failure warns, the repeats only debug-log,
+            // and a successful heartbeat clears the state.
+            for (id, ctrl, result) in results {
+                match result {
+                    Ok(()) => {
+                        self.heartbeat_failures.lock().remove(&id);
+                    }
+                    Err(reason) => {
+                        let first = self.heartbeat_failures.lock().insert(id);
+                        if first {
+                            crate::log_warn!(
+                                "Cluster: heartbeat to node {id} at {ctrl} failed: {reason}"
+                            );
+                        } else {
+                            crate::log_debug!(
+                                "Cluster: heartbeat to node {id} at {ctrl} still failing: {reason}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Ownership cleanup runs after the heartbeats: `release_owners_for_node`
+            // blocks on a Raft write (up to 2s), and blocking before the
+            // heartbeat fan-out delays the next cycle past the health tracker's
+            // miss limit, so a healthy peer would be marked DOWN.
             if is_leader {
                 let grace = self.config.heartbeat.saturating_mul(5);
                 for id in self.health.peers_ready_for_ownership_release(grace) {
@@ -2765,77 +3061,6 @@ impl ClusterManager {
             // Keep session caches through the DOWN fencing grace so delete
             // finalize still sees remote sessions until ownership is released.
             let _ = down;
-            // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
-            self.sync_ownership_from_db();
-            self.reconcile_media_replicas();
-            let local_pubs = self
-                .db
-                .publisher_list_all()
-                .iter()
-                .filter(|p| p.active)
-                .count() as u64;
-            let local_players = self
-                .db
-                .player_list_all()
-                .iter()
-                .filter(|p| p.active)
-                .count() as u64;
-            let mut stream_players: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            let mut viewer_players: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            for p in self.db.player_list_all().iter().filter(|p| p.active) {
-                *stream_players.entry(p.stream_id.clone()).or_insert(0) += 1;
-                if !p.viewer_id.is_empty() {
-                    *viewer_players.entry(p.viewer_id.clone()).or_insert(0) += 1;
-                }
-            }
-            let stream_players: Vec<(String, u64)> = stream_players.into_iter().collect();
-            let viewer_players: Vec<(String, u64)> = viewer_players.into_iter().collect();
-            let advertise = self.config.advertise_control();
-            let media_advertise = self.config.advertise_media();
-            self.prune_topology_to_membership();
-            // Emit heartbeats concurrently so a few dead peers cannot exceed
-            // the stale threshold waiting on sequential 500ms timeouts.
-            let peers: Vec<_> = self
-                .meta
-                .all()
-                .into_iter()
-                .filter(|(id, _, _)| *id != self.config.node_id)
-                .collect();
-            let secret = self.config.secret.clone();
-            let node_id = self.config.node_id;
-            let health = self.health.local().as_str().to_string();
-            let load = self.admission.current_load();
-            let tls = self.tls_client.clone();
-            let futs = peers.into_iter().map(|(id, ctrl, _)| {
-                let secret = secret.clone();
-                let advertise = advertise.clone();
-                let media_advertise = media_advertise.clone();
-                let health = health.clone();
-                let stream_players = stream_players.clone();
-                let viewer_players = viewer_players.clone();
-                let tls = tls.clone();
-                async move {
-                    let _ = id;
-                    network::send_heartbeat(
-                        &ctrl,
-                        &secret,
-                        node_id,
-                        &health,
-                        load,
-                        advertise,
-                        media_advertise,
-                        local_pubs,
-                        local_players,
-                        stream_players,
-                        viewer_players,
-                        tls,
-                    )
-                    .await;
-                }
-            });
-            futures::future::join_all(futs).await;
             if let Some(m) = metrics {
                 let voters: Vec<NodeId> = m.membership_config.membership().voter_ids().collect();
                 let alive = self.health.alive_voters(&voters, self.config.node_id);
@@ -3852,14 +4077,14 @@ mod tests {
         // A timed-out acquire whose write never landed is kept for retry.
         m.pending_ambiguous_acquires
             .lock()
-            .push(("never-landed".into(), 1, 5));
+            .push(("never-landed".into(), 1, 5, Instant::now()));
         m.reconcile_ambiguous_acquires();
         assert!(
             wait_until(Duration::from_secs(2), || m
                 .pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, _, _)| s == "never-landed"))
+                .any(|(s, _, _, _)| s == "never-landed"))
             .await
         );
         // One superseded by a different acquire is dropped; one that did land
@@ -3867,12 +4092,12 @@ mod tests {
         m.acquire_stream_owner("own", 1, 0, 77).unwrap();
         m.pending_ambiguous_acquires
             .lock()
-            .push(("own".into(), 2, 77));
+            .push(("own".into(), 2, 77, Instant::now()));
         m.reconcile_ambiguous_acquires();
         assert!(m.db().stream_owner_get("own").is_some());
         m.pending_ambiguous_acquires
             .lock()
-            .push(("own".into(), 1, 77));
+            .push(("own".into(), 1, 77, Instant::now()));
         m.reconcile_ambiguous_acquires();
         assert!(
             wait_until(Duration::from_secs(5), || m
@@ -3885,7 +4110,60 @@ mod tests {
             !m.pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, _, _)| s == "own")
+                .any(|(s, _, _, _)| s == "own")
+        );
+    }
+
+    /// An acquire whose write failed before Raft answered is queued for
+    /// reconciliation: the same write is not queued twice, a record whose
+    /// write is still open is kept, and a record whose write landed after all
+    /// is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ambiguous_acquires_are_queued_once_and_released_once_they_land() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("amb")).unwrap();
+
+        // The same write is queued once: a second queue of the identical
+        // record must not grow the list.
+        m.queue_ambiguous_acquire("amb".into(), 1, 5);
+        m.queue_ambiguous_acquire("amb".into(), 1, 5);
+        assert_eq!(m.pending_ambiguous_acquires.lock().len(), 1);
+
+        // The write is still open: the record is kept for the next tick.
+        m.reconcile_ambiguous_acquires();
+        assert_eq!(m.pending_ambiguous_acquires.lock().len(), 1);
+
+        // The write landed after all: the unclaimed reservation is released.
+        m.acquire_stream_owner("amb", 1, 0, 5).unwrap();
+        m.reconcile_ambiguous_acquires();
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("amb")
+                .is_none())
+            .await
+        );
+        assert!(
+            !m.pending_ambiguous_acquires
+                .lock()
+                .iter()
+                .any(|(s, _, _, _)| s == "amb")
+        );
+    }
+
+    /// The pending ambiguous-acquire list is bounded: the overflow is reported
+    /// instead of growing the list without limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ambiguous_acquire_list_reports_its_overflow() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        for i in 0..=MAX_PENDING_AMBIGUOUS_ACQUIRES {
+            m.queue_ambiguous_acquire(format!("s{i}"), 1, i as i64);
+        }
+        assert_eq!(
+            m.pending_ambiguous_acquires.lock().len(),
+            MAX_PENDING_AMBIGUOUS_ACQUIRES + 1
         );
     }
 
@@ -3905,7 +4183,7 @@ mod tests {
 
         m.pending_ambiguous_acquires
             .lock()
-            .push(("fx".into(), 1, 21));
+            .push(("fx".into(), 1, 21, Instant::now()));
         m.reconcile_ambiguous_acquires();
 
         assert!(
@@ -3913,7 +4191,7 @@ mod tests {
                 .pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, nid, at)| s == "fx" && *nid == 1 && *at == 21))
+                .any(|(s, nid, at, _)| s == "fx" && *nid == 1 && *at == 21))
             .await,
             "a failed publisher lookup must keep the ambiguous acquire pending"
         );
@@ -3935,7 +4213,7 @@ mod tests {
 
         m.pending_ambiguous_acquires
             .lock()
-            .push(("act".into(), 1, 33));
+            .push(("act".into(), 1, 33, Instant::now()));
         m.reconcile_ambiguous_acquires();
 
         assert!(
@@ -3943,7 +4221,7 @@ mod tests {
                 .pending_ambiguous_acquires
                 .lock()
                 .iter()
-                .any(|(s, nid, at)| s == "act" && *nid == 1 && *at == 33))
+                .any(|(s, nid, at, _)| s == "act" && *nid == 1 && *at == 33))
             .await,
             "a live local publisher must keep the ambiguous acquire pending"
         );

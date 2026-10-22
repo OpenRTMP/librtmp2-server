@@ -109,6 +109,11 @@ for _v in LOAD_RUN_SECS LOAD_WARMUP_MS LOAD_MEASURE_DELAY LOAD_MEASURE_SECS STRA
   [[ "${!_v}" =~ ^[0-9]+$ ]] || { echo "error: $_v must be a non-negative integer" >&2; exit 2; }
 done
 ((LOAD_MEASURE_SECS > 0)) || { echo "error: LOAD_MEASURE_SECS must be > 0" >&2; exit 2; }
+# The measurement window starts LOAD_MEASURE_DELAY s after the relay launch and
+# lasts LOAD_MEASURE_SECS s, while the relay itself stops after
+# LOAD_RUN_SECS s: a window that reaches past the relay would average the
+# CPU of idle seconds and understate the published cpu_pct.
+((LOAD_MEASURE_DELAY + LOAD_MEASURE_SECS <= LOAD_RUN_SECS)) || { echo "error: LOAD_MEASURE_DELAY + LOAD_MEASURE_SECS must not exceed LOAD_RUN_SECS" >&2; exit 2; }
 if [[ "$STRACE_SAMPLE" = "1" ]]; then
   ((STRACE_SECS > 0)) || { echo "error: STRACE_SECS must be > 0 (0 disables the timeout)" >&2; exit 2; }
 fi
@@ -270,6 +275,10 @@ perf_usable() {
   command -v "$PERF" >/dev/null 2>&1 && "$PERF" stat -e task-clock -- true >/dev/null 2>&1
 }
 
+# Set when a load leg fails: the script then exits non-zero at the end, so the
+# CI workflow can tell a complete sweep from one with missing legs.
+SWEEP_FAILED=0
+
 load_test() {
   local label="$1" server_pid_file="$2" pub_url="$3" play_arg_kind="$4" play_arg="$5"
   local hz server_pid n pid bench_pid t0 t1 ticks0 ticks1 rss peak_rss
@@ -325,6 +334,7 @@ load_test() {
     wait "$bench_pid" || rc=$?
     if ((rc != 0)); then
       echo "error: bench_relay exited $rc for $label load, players=$n — leg failed; results skipped" >&2
+      SWEEP_FAILED=1
     else
       cat "$relay_out"
       cpu_pct="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", 100 * d / hz / (t1 - t0) }')"
@@ -585,3 +595,7 @@ else
 fi
 
 echo "Done. Logs in $WORK_DIR/logs"
+if ((SWEEP_FAILED)); then
+  echo "error: one or more sweep legs failed; the sweep is incomplete" >&2
+  exit 1
+fi

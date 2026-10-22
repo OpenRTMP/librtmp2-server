@@ -239,6 +239,17 @@ fn parse_max_connections(val: &str) -> i32 {
     }
 }
 
+/// Parse a boolean config value: `1` / `true` / `yes` / `on` and
+/// `0` / `false` / `no` / `off`, case-insensitive. `None` for anything else,
+/// so the caller can report the invalid value instead of silently defaulting.
+fn parse_bool(val: &str) -> Option<bool> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_per_addr_cap(val: &str, key: &str) -> i32 {
     match val.parse::<i32>() {
         Ok(v) if v > 0 => v,
@@ -355,11 +366,10 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "RTMP_MAX_RELAY_QUEUE_MB" => {
             config.rtmp_max_relay_queue_mb = parse_mb(val, 8, 1, 128, key);
         }
-        "TLS_ENABLED" => match val {
-            "1" | "true" => config.tls_enabled = true,
-            "0" | "false" => config.tls_enabled = false,
-            _ => eprintln!(
-                "Config: ignoring invalid TLS_ENABLED value '{val}' (expected 1/0/true/false)"
+        "TLS_ENABLED" => match parse_bool(val) {
+            Some(v) => config.tls_enabled = v,
+            None => eprintln!(
+                "Config: ignoring invalid TLS_ENABLED value '{val}' (expected 1/0/true/false/yes/no/on/off)"
             ),
         },
         "TLS_CERT_FILE" => config.tls_cert_file = val.to_string(),
@@ -502,11 +512,10 @@ where
     if let Some(v) = get("LRTMP2_TLS_ENABLED")
         && !v.is_empty()
     {
-        match v.as_str() {
-            "1" | "true" => config.tls_enabled = true,
-            "0" | "false" => config.tls_enabled = false,
-            _ => crate::log_warn!(
-                "Ignoring invalid LRTMP2_TLS_ENABLED value '{v}' (expected 1/0/true/false)"
+        match parse_bool(&v) {
+            Some(b) => config.tls_enabled = b,
+            None => crate::log_warn!(
+                "Ignoring invalid LRTMP2_TLS_ENABLED value '{v}' (expected 1/0/true/false/yes/no/on/off)"
             ),
         }
     }

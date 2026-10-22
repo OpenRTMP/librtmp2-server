@@ -11,6 +11,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 While in alpha the project stays on `0.x`; semantic-versioning guarantees only
 begin at `1.0.0`.
 
+## [Unreleased]
+
+### Fixed
+- A stream-ownership write that failed for any reason (not only a client-side
+  deadline) is now reconciled as ambiguous, so a forwarded write that failed
+  after the leader already committed no longer leaves a ghost owner row that
+  blocks the stream on every node until a restart.
+- A one-time join proof is now spent only once the joining node has been seen
+  alive, so a lost join response no longer strands a statically configured
+  join proof for the whole replay window.
+- The pending ambiguous-acquire list keeps a record while the write's outcome
+  is still unknown, so a write that lands after the client-side give-up is
+  always reconciled and released instead of leaving a ghost owner.
+- The heartbeat round-trip budget now scales with the configured heartbeat
+  interval instead of a fixed 500 ms cap, so a healthy peer on a slower link
+  is no longer marked DOWN; heartbeat failures and timeouts are logged
+  instead of being discarded.
+- A cluster drain marker no longer short-circuits the HTTP delete, stream
+  creation or play-key creation: only a delete started by this node's own API
+  counts as "a delete is in progress".
+- When the init cache cannot be queued for a peer, the subscribe registration
+  is no longer abandoned silently; the registration is kept and the init
+  cache is re-sent at the next resync point, so the peer stays subscribed and
+  the missing codec headers are repaired.
+- A failed publisher/player deactivation on connection close is now retried
+  from the poll loop, so the row no longer keeps a publisher or viewer slot
+  reserved until the next server start.
+- The re-initialisation marker is kept on the connection that did not receive
+  the init cache, so that connection still restarts with the codec headers.
+- An explicitly configured cluster capacity of zero is no longer reset by the
+  absolute-capacity alternative, so a drain-only node stays drain-only.
+- The command line accepts the conventional `--help` long flag.
+- A refused API-token rotation is now reported instead of being reported as
+  a success.
+- An empty database-path environment variable now falls through to the
+  documented fallback variable.
+- The TLS switches accept the common boolean spellings (`yes`/`no`/`on`/`off`,
+  case-insensitive).
+- The benchmark sweep exits non-zero when a load leg failed, so an incomplete
+  sweep can no longer replace the published benchmark record; the sweep
+  merge rejects an incomplete result before writing it; the measurement window
+  is validated against the run window; the docker helper scripts resolve the
+  source tree from the environment instead of a hard-coded path; and the
+  cluster HA helper refreshes the copied source tree completely.
+
 ## [0.6.6] — 2026-10-21
 
 ### Security

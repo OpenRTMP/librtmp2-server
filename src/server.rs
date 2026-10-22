@@ -1813,9 +1813,13 @@ impl ServerApp {
     /// be opened or the token cannot be persisted.
     pub fn create(config: ServerConfig) -> Result<ServerApp, String> {
         let db_path = std::env::var("LRTMP2_DB")
-            .or_else(|_| std::env::var("LRTMP2_DB_PATH"))
             .ok()
             .filter(|v| !v.is_empty())
+            .or_else(|| {
+                std::env::var("LRTMP2_DB_PATH")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            })
             .ok_or("LRTMP2_DB or LRTMP2_DB_PATH environment variable must be set to the SQLite database path")?;
 
         Self::bootstrap(config, &db_path)
@@ -2724,6 +2728,10 @@ impl ShardLoop {
             &revoked_now,
             self.shared.idle_timeout,
         );
+
+        // A publisher/player deactivation that failed on connection close has
+        // no later lifecycle event to retry it, so the poll loop does it.
+        self.shared.bridge.retry_pending_deactivations();
 
         #[cfg(feature = "cluster")]
         if self.shared.cluster_enabled
@@ -4251,6 +4259,19 @@ mod tests {
         let app = ServerApp::create(ServerConfig::default());
         set_env("LRTMP2_DB_PATH", None);
         let app = app.expect("create with LRTMP2_DB_PATH");
+        assert_eq!(app.config.api_token.len(), 64);
+        assert!(path.exists());
+
+        // An empty LRTMP2_DB counts as unset, so the LRTMP2_DB_PATH fallback
+        // must still be used.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.db");
+        set_env("LRTMP2_DB", Some(""));
+        set_env("LRTMP2_DB_PATH", Some(path.to_str().unwrap()));
+        let app = ServerApp::create(ServerConfig::default());
+        set_env("LRTMP2_DB", None);
+        set_env("LRTMP2_DB_PATH", None);
+        let app = app.expect("create with the LRTMP2_DB_PATH fallback");
         assert_eq!(app.config.api_token.len(), 64);
         assert!(path.exists());
     }
