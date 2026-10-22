@@ -94,9 +94,19 @@ def _join_row(cur: dict) -> list | None:
     return [cur["avg"], cur["p95"], cur["fps"]]
 
 
-def _load_row(cur: dict) -> list | None:
+def _load_row(cur: dict, requested: int | None) -> list | None:
+    """Only complete samples: every requested viewer must have received frames.
+
+    `bench_relay` exits successfully when *at least one* viewer received
+    frames, so a row in which only some of the requested viewers got frames
+    is a partial run and must not be published as a valid result.
+    """
     row = [cur.get(k) for k in ("avg", "p95", "fps", "cpu", "rss")]
-    complete = None not in row and cur.get("received", 0) > 0
+    complete = (
+        None not in row
+        and requested is not None
+        and cur.get("received", 0) == requested
+    )
     return row if complete else None
 
 
@@ -112,7 +122,7 @@ def _store(sweep: dict, section: tuple, cur: dict) -> None:
         if row:
             sweep["join"].setdefault(str(players), {})[server] = row
     elif kind == "load":
-        row = _load_row(cur)
+        row = _load_row(cur, players)
         if row:
             sweep["load"].setdefault(str(players), {})[server] = row
 
