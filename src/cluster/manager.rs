@@ -57,14 +57,10 @@ const ADMIN_PROOF_REPLAY_TTL: Duration = Duration::from_secs(600);
 /// Bounded retry budget for re-learning peer media addresses after a restart.
 const TOPOLOGY_RECOVERY_TIMEOUT_SECS: u64 = 10;
 const TOPOLOGY_RECOVERY_RETRY_MS: u64 = 500;
-/// How long an `AcquireStreamOwner` write whose client-side deadline elapsed
-/// is kept for reconciliation. A write that has not committed within this
-/// window is dropped from the pending list instead of being retried on every
-/// health tick for the lifetime of the process.
-const AMBIGUOUS_ACQUIRE_TTL: Duration = Duration::from_secs(60);
-/// Upper bound on the pending ambiguous-acquire list: repeated timeouts must
-/// not grow the list — and the per-tick owner lookups it causes — without
-/// limit.
+/// Warning threshold for the pending ambiguous-acquire list. The list holds
+/// the writes whose outcome is still unknown, so it is not capped: a record
+/// whose write is still open must not be dropped, or the write could land
+/// later without ever being reconciled.
 const MAX_PENDING_AMBIGUOUS_ACQUIRES: usize = 1024;
 /// Bound on the wait for a freshly added learner to reach line-rate. Kept
 /// under `network`'s 8s control round trip so a slow catch-up surfaces as
@@ -1934,18 +1930,29 @@ impl ClusterManager {
     }
 
     /// Queue an acquire whose write failed before Raft answered for
-    /// reconciliation on the next health tick. The list is bounded: repeated
-    /// failures must not grow it (and the per-tick owner lookups it causes)
-    /// without limit.
+    /// reconciliation on the next health tick.
+    ///
+    /// The record is kept until the write's fate is known: giving up on the
+    /// client side does not cancel the leader's write, so a write that lands
+    /// later still has to be reconciled and released. Dropping an unresolved
+    /// record would leave exactly the ghost owner the reconciliation exists to
+    /// prevent, so the list holds the writes whose outcome is still open and
+    /// shrinks again as soon as the cluster makes progress.
     fn queue_ambiguous_acquire(&self, stream_id: String, node_id: u64, acquired_at: i64) {
         let mut pending = self.pending_ambiguous_acquires.lock();
+        if pending
+            .iter()
+            .any(|(s, n, a, _)| *s == stream_id && *n == node_id && *a == acquired_at)
+        {
+            // Already queued for this exact write.
+            return;
+        }
         pending.push((stream_id, node_id, acquired_at, Instant::now()));
-        let overflow = pending.len().saturating_sub(MAX_PENDING_AMBIGUOUS_ACQUIRES);
-        if overflow > 0 {
-            pending.drain(..overflow);
+        if pending.len() > MAX_PENDING_AMBIGUOUS_ACQUIRES {
             crate::log_warn!(
-                "Cluster: pending ambiguous acquires exceeded {MAX_PENDING_AMBIGUOUS_ACQUIRES}; \
-                 dropped the {overflow} oldest record(s)"
+                "Cluster: {} ambiguous acquires are still unresolved; they are kept \
+                 until their write either lands or is superseded",
+                pending.len()
             );
         }
     }
@@ -1958,20 +1965,12 @@ impl ClusterManager {
         let pending: Vec<(String, u64, i64, Instant)> =
             self.pending_ambiguous_acquires.lock().drain(..).collect();
         for (stream_id, node_id, acquired_at, queued_at) in pending {
-            if queued_at.elapsed() >= AMBIGUOUS_ACQUIRE_TTL {
-                // The write never committed within the reconciliation window:
-                // drop the record instead of retrying it on every tick for
-                // the lifetime of the process.
-                crate::log_warn!(
-                    "Cluster: acquire for stream {stream_id} did not commit within \
-                     {AMBIGUOUS_ACQUIRE_TTL:?}; dropping the ambiguous acquire"
-                );
-                continue;
-            }
             let Some(owner) = self.db.stream_owner_get(&stream_id) else {
-                // Timed-out write may still commit on a later tick — keep the
+                // The write may still commit on a later tick — keep the
                 // record until the row appears (and is released) or a different
-                // acquire supersedes it.
+                // acquire supersedes it. The client-side give-up does not
+                // cancel the leader's write, so a record whose write is still
+                // open must not be dropped.
                 self.pending_ambiguous_acquires.lock().push((
                     stream_id,
                     node_id,
