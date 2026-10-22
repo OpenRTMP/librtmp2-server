@@ -547,9 +547,10 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(),
         "CLUSTER_CAPACITY_MBPS" => {
             if let Ok(v) = val.parse::<f64>() {
                 cfg.bandwidth_max_mbps = v;
-                if cfg.capacity <= 0.0 {
-                    cfg.capacity = 1.0;
-                }
+                // The admission headroom stays as configured: an explicit
+                // CLUSTER_CAPACITY=0 (drain-only node) must not be reset to
+                // 1.0 by the absolute-capacity alternative. The unset default
+                // is already 1.0.
             }
         }
         "CLUSTER_DRAIN_THRESHOLD" => {
