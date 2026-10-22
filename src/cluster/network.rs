@@ -1560,13 +1560,16 @@ pub async fn send_topology(
 /// on a link with more than ~70 ms RTT: the peer stopped refreshing
 /// `last_seen`, was marked DOWN, lost its stream ownership and could cost the
 /// cluster its quorum even though the link was healthy. Scale the budget with
-/// the configured heartbeat interval instead, and keep it below the health
-/// tracker's miss limit (`heartbeat * 5`, at least 2s) so a peer that answers
-/// within the budget is never marked DOWN.
+/// the configured heartbeat interval instead, and keep it comfortably below
+/// the health tracker's miss limit (`heartbeat * 5`, at least 2s) so a peer
+/// that answers within the budget is never marked DOWN and one slow peer
+/// cannot spend the whole window.
 pub fn heartbeat_roundtrip_timeout(heartbeat: Duration) -> Duration {
     let miss_limit = heartbeat.saturating_mul(5).max(Duration::from_secs(2));
-    miss_limit
-        .saturating_sub(heartbeat)
+    // Half the miss limit: the whole fan-out waits for its slowest peer, so
+    // a single unreachable peer must not be able to consume the entire
+    // budget and delay every other peer's heartbeat past the miss limit.
+    (miss_limit / 2)
         .max(Duration::from_millis(500))
         .min(ROUNDTRIP_TIMEOUT)
 }
@@ -1596,7 +1599,7 @@ pub async fn send_heartbeat(
     viewer_players: Vec<(String, u64)>,
     tls_client: Option<Arc<ClientConfig>>,
 ) {
-    send_heartbeat_with_timeout(
+    if let Err(e) = send_heartbeat_with_timeout(
         peer_addr,
         secret,
         local_id,
@@ -1612,9 +1615,16 @@ pub async fn send_heartbeat(
         heartbeat_roundtrip_timeout(DEFAULT_HEARTBEAT_INTERVAL),
     )
     .await
+    {
+        tracing::warn!(%peer_addr, error = %e, "cluster heartbeat failed");
+    }
 }
 
 /// Send a heartbeat to a peer with an explicit round-trip budget.
+///
+/// Returns the failure reason (`Err`) instead of logging it: a peer that
+/// stays unreachable must not log once per heartbeat interval, so the caller
+/// decides how loudly to report the outcome.
 pub(crate) async fn send_heartbeat_with_timeout(
     peer_addr: &str,
     secret: &str,
@@ -1629,7 +1639,7 @@ pub(crate) async fn send_heartbeat_with_timeout(
     viewer_players: Vec<(String, u64)>,
     tls_client: Option<Arc<ClientConfig>>,
     timeout: Duration,
-) {
+) -> Result<(), String> {
     match tokio::time::timeout(timeout, async {
         authed_roundtrip_inner(
             peer_addr,
@@ -1652,13 +1662,9 @@ pub(crate) async fn send_heartbeat_with_timeout(
     })
     .await
     {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(%peer_addr, error = %e, "cluster heartbeat failed");
-        }
-        Err(_) => {
-            tracing::warn!(%peer_addr, ?timeout, "cluster heartbeat timed out");
-        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!("timed out after {timeout:?}")),
     }
 }
 
@@ -2441,38 +2447,44 @@ mod tests {
         assert_eq!(err, "unsupported");
 
         // Heartbeats are bound to the authenticated member identity.
-        send_heartbeat_with_timeout(
-            &ctl.addr,
-            SECRET,
-            2,
-            "healthy",
-            0.5,
-            "c".into(),
-            "m".into(),
-            1,
-            2,
-            vec![("s".into(), 2)],
-            vec![("v".into(), 1)],
-            None,
-            heartbeat_roundtrip_timeout(Duration::from_millis(500)),
-        )
-        .await;
-        send_heartbeat_with_timeout(
-            &ctl.addr,
-            SECRET,
-            9,
-            "healthy",
-            0.5,
-            String::new(),
-            String::new(),
-            0,
-            0,
-            Vec::new(),
-            Vec::new(),
-            None,
-            heartbeat_roundtrip_timeout(Duration::from_millis(500)),
-        )
-        .await;
+        assert!(
+            send_heartbeat_with_timeout(
+                &ctl.addr,
+                SECRET,
+                2,
+                "healthy",
+                0.5,
+                "c".into(),
+                "m".into(),
+                1,
+                2,
+                vec![("s".into(), 2)],
+                vec![("v".into(), 1)],
+                None,
+                heartbeat_roundtrip_timeout(Duration::from_millis(500)),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            send_heartbeat_with_timeout(
+                &ctl.addr,
+                SECRET,
+                9,
+                "healthy",
+                0.5,
+                String::new(),
+                String::new(),
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                None,
+                heartbeat_roundtrip_timeout(Duration::from_millis(500)),
+            )
+            .await
+            .is_err()
+        );
         {
             let hbs = ctl.rec.heartbeats.lock();
             assert_eq!(hbs.len(), 1);

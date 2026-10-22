@@ -153,6 +153,11 @@ pub struct ClusterManager {
     /// Per-peer per-viewer (play-key) player counts from heartbeats.
     peer_viewer_players:
         Mutex<std::collections::HashMap<NodeId, std::collections::HashMap<String, u64>>>,
+    /// Peers whose last heartbeat attempt failed. The first failure of a peer
+    /// warns, repeated failures only debug-log, and a successful heartbeat
+    /// clears the entry — an unreachable peer must not log once per
+    /// heartbeat interval.
+    heartbeat_failures: Mutex<std::collections::HashSet<NodeId>>,
     /// Raft state-machine side-effect channel (drain/revoke/token).
     effects_rx:
         Mutex<Option<std::sync::mpsc::Receiver<crate::cluster::raft::state_machine::StateEffect>>>,
@@ -387,6 +392,7 @@ impl ClusterManager {
             peer_session_counts: Mutex::new(std::collections::HashMap::new()),
             peer_stream_players: Mutex::new(std::collections::HashMap::new()),
             peer_viewer_players: Mutex::new(std::collections::HashMap::new()),
+            heartbeat_failures: Mutex::new(std::collections::HashSet::new()),
             effects_rx: Mutex::new(Some(effects_rx)),
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
@@ -1110,6 +1116,7 @@ impl ClusterManager {
         self.peer_session_counts.lock().remove(&node_id);
         self.peer_stream_players.lock().remove(&node_id);
         self.peer_viewer_players.lock().remove(&node_id);
+        self.heartbeat_failures.lock().remove(&node_id);
         self.rejected_peer_addrs
             .lock()
             .retain(|(id, _), _| *id != node_id);
@@ -2851,56 +2858,6 @@ impl ClusterManager {
             let metrics = self.last_metrics.lock().clone();
             let is_leader =
                 metrics.as_ref().and_then(|m| m.current_leader) == Some(self.config.node_id);
-            if is_leader {
-                let grace = self.config.heartbeat.saturating_mul(5);
-                for id in self.health.peers_ready_for_ownership_release(grace) {
-                    crate::log_info!("Cluster: node {id} DOWN for {:?} — releasing owners", grace);
-                    match self.release_owners_for_node(id) {
-                        Ok(()) => {
-                            self.health.mark_ownership_released(id);
-                            self.drop_peer_heartbeat_caches(id);
-                        }
-                        Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
-                    }
-                }
-            }
-            // Any node retries pending cleanups, not just the leader: a
-            // follower forwards the write with the admin proof token, which
-            // is exactly what a restarted follower needs to release its own
-            // stale rows after `register_session_hooks` supplied the token.
-            let pending_cleanups: Vec<NodeId> =
-                self.pending_node_cleanups.lock().iter().copied().collect();
-            for id in pending_cleanups {
-                match self.release_owners_for_node(id) {
-                    Ok(()) => {
-                        self.pending_node_cleanups.lock().remove(&id);
-                        crate::log_info!(
-                            "Cluster: finished pending ownership cleanup for removed node {id}"
-                        );
-                    }
-                    Err(e) => crate::log_warn!(
-                        "Cluster: pending ownership cleanup for removed node {id}: {e:?}"
-                    ),
-                }
-            }
-            // Drain queued stale-owner releases off the heartbeat path: each
-            // write can block up to the 2s Raft timeout, so draining many rows
-            // synchronously would delay heartbeats and risk fencing.
-            if !self.pending_stream_cleanups.lock().is_empty()
-                && !self
-                    .pending_cleanup_drain_running
-                    .swap(true, Ordering::AcqRel)
-            {
-                let this = Arc::clone(&self);
-                tokio::spawn(async move {
-                    this.retry_pending_stream_cleanups();
-                    this.pending_cleanup_drain_running
-                        .store(false, Ordering::Release);
-                });
-            }
-            // Keep session caches through the DOWN fencing grace so delete
-            // finalize still sees remote sessions until ownership is released.
-            let _ = down;
             // Followers: keep OwnershipTracker in sync with Raft-applied SQLite.
             self.sync_ownership_from_db();
             self.reconcile_media_replicas();
@@ -2954,8 +2911,7 @@ impl ClusterManager {
                 let viewer_players = viewer_players.clone();
                 let tls = tls.clone();
                 async move {
-                    let _ = id;
-                    network::send_heartbeat_with_timeout(
+                    let result = network::send_heartbeat_with_timeout(
                         &ctrl,
                         &secret,
                         node_id,
@@ -2971,9 +2927,86 @@ impl ClusterManager {
                         heartbeat_timeout,
                     )
                     .await;
+                    (id, ctrl, result)
                 }
             });
-            futures::future::join_all(futs).await;
+            let results = futures::future::join_all(futs).await;
+            // A peer that stays unreachable must not log once per heartbeat
+            // interval: the first failure warns, the repeats only debug-log,
+            // and a successful heartbeat clears the state.
+            for (id, ctrl, result) in results {
+                match result {
+                    Ok(()) => {
+                        self.heartbeat_failures.lock().remove(&id);
+                    }
+                    Err(reason) => {
+                        let first = self.heartbeat_failures.lock().insert(id);
+                        if first {
+                            crate::log_warn!(
+                                "Cluster: heartbeat to node {id} at {ctrl} failed: {reason}"
+                            );
+                        } else {
+                            crate::log_debug!(
+                                "Cluster: heartbeat to node {id} at {ctrl} still failing: {reason}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Ownership cleanup runs after the heartbeats: `release_owners_for_node`
+            // blocks on a Raft write (up to 2s), and blocking before the
+            // heartbeat fan-out delays the next cycle past the health tracker's
+            // miss limit, so a healthy peer would be marked DOWN.
+            if is_leader {
+                let grace = self.config.heartbeat.saturating_mul(5);
+                for id in self.health.peers_ready_for_ownership_release(grace) {
+                    crate::log_info!("Cluster: node {id} DOWN for {:?} — releasing owners", grace);
+                    match self.release_owners_for_node(id) {
+                        Ok(()) => {
+                            self.health.mark_ownership_released(id);
+                            self.drop_peer_heartbeat_caches(id);
+                        }
+                        Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
+                    }
+                }
+            }
+            // Any node retries pending cleanups, not just the leader: a
+            // follower forwards the write with the admin proof token, which
+            // is exactly what a restarted follower needs to release its own
+            // stale rows after `register_session_hooks` supplied the token.
+            let pending_cleanups: Vec<NodeId> =
+                self.pending_node_cleanups.lock().iter().copied().collect();
+            for id in pending_cleanups {
+                match self.release_owners_for_node(id) {
+                    Ok(()) => {
+                        self.pending_node_cleanups.lock().remove(&id);
+                        crate::log_info!(
+                            "Cluster: finished pending ownership cleanup for removed node {id}"
+                        );
+                    }
+                    Err(e) => crate::log_warn!(
+                        "Cluster: pending ownership cleanup for removed node {id}: {e:?}"
+                    ),
+                }
+            }
+            // Drain queued stale-owner releases off the heartbeat path: each
+            // write can block up to the 2s Raft timeout, so draining many rows
+            // synchronously would delay heartbeats and risk fencing.
+            if !self.pending_stream_cleanups.lock().is_empty()
+                && !self
+                    .pending_cleanup_drain_running
+                    .swap(true, Ordering::AcqRel)
+            {
+                let this = Arc::clone(&self);
+                tokio::spawn(async move {
+                    this.retry_pending_stream_cleanups();
+                    this.pending_cleanup_drain_running
+                        .store(false, Ordering::Release);
+                });
+            }
+            // Keep session caches through the DOWN fencing grace so delete
+            // finalize still sees remote sessions until ownership is released.
+            let _ = down;
             if let Some(m) = metrics {
                 let voters: Vec<NodeId> = m.membership_config.membership().voter_ids().collect();
                 let alive = self.health.alive_voters(&voters, self.config.node_id);
