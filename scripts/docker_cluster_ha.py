@@ -43,6 +43,19 @@ def require_source_tree(name: str) -> Path:
     return path
 
 
+def source_files(src: Path) -> set[Path]:
+    """Relative paths of the files the build copy must contain."""
+    out: set[Path] = set()
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in (".git", "target")]
+        rel = Path(root).relative_to(src)
+        for f in files:
+            if f.endswith(".log"):
+                continue
+            out.add(rel / f)
+    return out
+
+
 def sync_server() -> None:
     src = require_source_tree("librtmp2-server")
     dst = DEST / "librtmp2-server"
@@ -56,15 +69,27 @@ def sync_server() -> None:
             if f.endswith(".log"):
                 continue
             shutil.copy2(Path(root) / f, out / f)
-    # Ensure librtmp2 present
+    # Drop the files that no longer exist in the source, so the build copy
+    # matches the checkout: a deleted or renamed module must not survive here
+    # and be compiled (or reported on) as if it were still part of the tree.
+    keep = source_files(src)
+    for root, dirs, files in os.walk(dst):
+        dirs[:] = [d for d in dirs if d not in (".git", "target")]
+        for f in files:
+            path = Path(root) / f
+            if path.relative_to(dst) not in keep:
+                path.unlink()
+    # Ensure librtmp2 present and current — the sibling checkout may have
+    # changed since the last copy.
     lib_src = require_source_tree("librtmp2")
     lib_dst = DEST / "librtmp2"
-    if not (lib_dst / CARGO_MANIFEST).is_file():
-        shutil.copytree(
-            lib_src,
-            lib_dst,
-            ignore=shutil.ignore_patterns("target", ".git", "*.log"),
-        )
+    if lib_dst.exists():
+        shutil.rmtree(lib_dst)
+    shutil.copytree(
+        lib_src,
+        lib_dst,
+        ignore=shutil.ignore_patterns("target", ".git", "*.log"),
+    )
 
 
 def main() -> int:
