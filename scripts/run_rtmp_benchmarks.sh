@@ -270,6 +270,10 @@ perf_usable() {
   command -v "$PERF" >/dev/null 2>&1 && "$PERF" stat -e task-clock -- true >/dev/null 2>&1
 }
 
+# Set when a load leg fails: the script then exits non-zero at the end, so the
+# CI workflow can tell a complete sweep from one with missing legs.
+SWEEP_FAILED=0
+
 load_test() {
   local label="$1" server_pid_file="$2" pub_url="$3" play_arg_kind="$4" play_arg="$5"
   local hz server_pid n pid bench_pid t0 t1 ticks0 ticks1 rss peak_rss
@@ -325,6 +329,7 @@ load_test() {
     wait "$bench_pid" || rc=$?
     if ((rc != 0)); then
       echo "error: bench_relay exited $rc for $label load, players=$n — leg failed; results skipped" >&2
+      SWEEP_FAILED=1
     else
       cat "$relay_out"
       cpu_pct="$(awk -v d="$((ticks1 - ticks0))" -v hz="$hz" -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.1f", 100 * d / hz / (t1 - t0) }')"
@@ -585,3 +590,7 @@ else
 fi
 
 echo "Done. Logs in $WORK_DIR/logs"
+if ((SWEEP_FAILED)); then
+  echo "error: one or more sweep legs failed; the sweep is incomplete" >&2
+  exit 1
+fi
