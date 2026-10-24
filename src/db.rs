@@ -489,7 +489,7 @@ fn restrict_db_file_permissions(resolved: Option<&str>) {
 
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Db> {
-        let conn = if path.is_empty() || path == ":memory:" {
+        let mut conn = if path.is_empty() || path == ":memory:" {
             Connection::open(path)?
         } else {
             Connection::open_with_flags(path, on_disk_db_open_flags())?
