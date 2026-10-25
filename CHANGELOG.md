@@ -56,6 +56,11 @@ begin at `1.0.0`.
   source tree from the environment instead of a hard-coded path; and the
   cluster HA helper refreshes the copied source tree completely.
 
+### Changed
+- `BENCHMARKS.md` and the CI sweep compare against MediaMTX v1.21.3, nginx
+  1.31.8 with nginx-rtmp-module master, SRS 8.0 (`v8.0-d2`) and LiveForge
+  main @ a93fa22.
+
 ## [0.6.6] — 2026-10-21
 
 ### Security
