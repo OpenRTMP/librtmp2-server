@@ -57,10 +57,10 @@ permissions:
 
 env:
   # Competitor versions are pinned so a run only changes when we change them.
-  MEDIAMTX_VERSION: v1.21.2
-  SRS_REF: v8.0-d0
-  LIVEFORGE_REF: 4e70fb3a7b6b3d92bf2e099965f2c81c4f3f98c5
-  NGINX_REF: release-1.31.6
+  MEDIAMTX_VERSION: v1.21.3
+  SRS_REF: v8.0-d2
+  LIVEFORGE_REF: a93fa220d452c983346e133a3ffe565398dc4f89
+  NGINX_REF: release-1.31.8
   NGINX_RTMP_REF: 6c7719d0ba32e00b563ec70bd43dad11960fa9c4
 
 jobs:
