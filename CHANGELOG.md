@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-11-01
+
 ### Added
 - librtmp2's own log lines (handshake, `connect`, per-connection close
   reasons, error replies) go to the server log, prefixed `librtmp2:`, and
@@ -1169,7 +1171,9 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.5...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...HEAD
+[0.6.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.6...v0.6.7
+[0.6.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.5...v0.6.6
 [0.6.5]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.4...v0.6.5
 [0.6.4]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.2...v0.6.3
