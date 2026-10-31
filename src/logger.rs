@@ -102,6 +102,12 @@ pub fn bridge_librtmp2() {
 }
 
 fn forward_librtmp2_line(level: librtmp2::log::LogLevel, msg: &str, _userdata: *mut u8) {
+    let (level, line) = librtmp2_line(level, msg);
+    log(level, &line);
+}
+
+/// Map a librtmp2 log line to this logger's level and message text.
+fn librtmp2_line(level: librtmp2::log::LogLevel, msg: &str) -> (Level, String) {
     use librtmp2::log::LogLevel;
     let level = match level {
         LogLevel::Error => Level::Error,
@@ -109,7 +115,7 @@ fn forward_librtmp2_line(level: librtmp2::log::LogLevel, msg: &str, _userdata: *
         LogLevel::Info => Level::Info,
         LogLevel::Debug => Level::Debug,
     };
-    log(level, &format!("librtmp2: {}", strip_librtmp2_level(msg)));
+    (level, format!("librtmp2: {}", strip_librtmp2_level(msg)))
 }
 
 /// librtmp2 formats lines as `[LEVEL] file:line: message`; this logger
@@ -239,19 +245,31 @@ mod tests {
     }
 
     #[test]
-    fn librtmp2_lines_are_forwarded_at_every_level() {
+    fn librtmp2_lines_keep_their_level_and_lose_the_library_prefix() {
+        use librtmp2::log::LogLevel;
+        for (lib, ours) in [
+            (LogLevel::Error, Level::Error),
+            (LogLevel::Warn, Level::Warn),
+            (LogLevel::Info, Level::Info),
+            (LogLevel::Debug, Level::Debug),
+        ] {
+            assert_eq!(
+                librtmp2_line(lib, "[INFO] conn.rs:1: forwarded"),
+                (ours, "librtmp2: conn.rs:1: forwarded".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_routes_library_lines_through_the_callback() {
         use librtmp2::log::LogLevel;
         bridge_librtmp2();
-        for level in [
-            LogLevel::Error,
-            LogLevel::Warn,
-            LogLevel::Info,
+        // Exercise both entry points; the mapping itself is asserted above.
+        forward_librtmp2_line(
             LogLevel::Debug,
-        ] {
-            forward_librtmp2_line(level, "[INFO] conn.rs:1: forwarded", std::ptr::null_mut());
-        }
-        // Through the library's own entry point, which must now reach the
-        // installed callback instead of printing on its own.
+            "[DEBUG] conn.rs:1: forwarded",
+            std::ptr::null_mut(),
+        );
         librtmp2::log::log(LogLevel::Warn, file!(), line!(), format_args!("bridged"));
     }
 
