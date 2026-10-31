@@ -15,6 +15,14 @@ begin at `1.0.0`.
 
 ## [0.6.7] — 2026-11-01
 
+### Security
+- Recording files are created with `create_new`, so a recording never
+  opens or overwrites an existing path, including a planted file or
+  symlink. A file whose permissions cannot be restricted is removed again.
+  Publisher metadata reaches the `MEDIA_EXEC_PUBLISH`/`MEDIA_EXEC_PUBLISH_DONE`
+  hooks only as environment variables, never as part of the shell command;
+  a regression test covers this.
+
 ### Added
 - librtmp2's own log lines (handshake, `connect`, per-connection close
   reasons, error replies) go to the server log, prefixed `librtmp2:`, and
@@ -73,6 +81,12 @@ begin at `1.0.0`.
 - `BENCHMARKS.md` and the CI sweep compare against MediaMTX v1.21.3, nginx
   1.31.8 with nginx-rtmp-module master, SRS 8.0 (`v8.0-d2`) and LiveForge
   main @ a93fa22.
+- Dependency updates: rusqlite 0.41 (bundled SQLite via libsqlite3-sys
+  0.39), parking_lot 0.13, tokio 1.54.1, aws-lc-rs 1.19, uuid 1.29.
+- CI: GitHub Actions are pinned to full commit SHAs, the Cargo.lock update
+  workflow passes the branch name through an environment variable instead
+  of interpolating it into the shell, and the Docker release jobs get only
+  the Quay credentials they need.
 
 ## [0.6.6] — 2026-10-21
 
