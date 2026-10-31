@@ -230,6 +230,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn level_from_u8_matches_the_config_scale() {
+        assert_eq!(Level::from_u8(0), Level::Error);
+        assert_eq!(Level::from_u8(1), Level::Warn);
+        assert_eq!(Level::from_u8(2), Level::Info);
+        assert_eq!(Level::from_u8(3), Level::Debug);
+        assert_eq!(Level::from_u8(9), Level::Debug);
+    }
+
+    #[test]
+    fn librtmp2_lines_are_forwarded_at_every_level() {
+        use librtmp2::log::LogLevel;
+        bridge_librtmp2();
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+        ] {
+            forward_librtmp2_line(level, "[INFO] conn.rs:1: forwarded", std::ptr::null_mut());
+        }
+        // Through the library's own entry point, which must now reach the
+        // installed callback instead of printing on its own.
+        librtmp2::log::log(LogLevel::Warn, file!(), line!(), format_args!("bridged"));
+    }
+
+    #[test]
     fn librtmp2_level_prefix_is_stripped() {
         assert_eq!(
             strip_librtmp2_level("[WARN] conn.rs:12: RTMP conn 1 [1.2.3.4:5]: closed"),
