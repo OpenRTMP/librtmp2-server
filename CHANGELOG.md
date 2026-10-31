@@ -13,6 +13,17 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+- librtmp2's own log lines (handshake, `connect`, per-connection close
+  reasons, error replies) go to the server log, prefixed `librtmp2:`, and
+  follow `LOG_LEVEL`/`LOG_FILE`. Before, the library wrote straight to stderr
+  and its debug lines could never be turned on. The close reasons need a
+  librtmp2 release that emits them.
+- The startup line names the server and librtmp2 versions and the log level.
+- A connection that closes without publishing or playing logs how long it
+  lived, so a client that reconnects and drops within a second is easy to
+  spot.
+
 ### Fixed
 - A stream-ownership write that failed for any reason (not only a client-side
   deadline) is now reconciled as ambiguous, so a forwarded write that failed

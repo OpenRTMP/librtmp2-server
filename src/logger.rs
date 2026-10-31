@@ -85,6 +85,52 @@ pub fn init(level: i32, file_path: &str) {
     }
 }
 
+/// Route librtmp2's protocol-layer log lines (handshake, connect, close
+/// reasons) into this logger at the same level filter. Without this the
+/// library writes to stderr on its own, bypassing `LOG_FILE`, and its debug
+/// lines are never enabled.
+pub fn bridge_librtmp2() {
+    use librtmp2::log::LogLevel;
+    let lib_level = match Level::from_u8(LEVEL.load(Ordering::Relaxed)) {
+        Level::Error => LogLevel::Error,
+        Level::Warn => LogLevel::Warn,
+        Level::Info => LogLevel::Info,
+        Level::Debug => LogLevel::Debug,
+    };
+    librtmp2::log::set_level(lib_level);
+    librtmp2::log::set_callback(forward_librtmp2_line, std::ptr::null_mut());
+}
+
+fn forward_librtmp2_line(level: librtmp2::log::LogLevel, msg: &str, _userdata: *mut u8) {
+    use librtmp2::log::LogLevel;
+    let level = match level {
+        LogLevel::Error => Level::Error,
+        LogLevel::Warn => Level::Warn,
+        LogLevel::Info => Level::Info,
+        LogLevel::Debug => Level::Debug,
+    };
+    log(level, &format!("librtmp2: {}", strip_librtmp2_level(msg)));
+}
+
+/// librtmp2 formats lines as `[LEVEL] file:line: message`; this logger
+/// prints its own level, so drop the library's.
+fn strip_librtmp2_level(msg: &str) -> &str {
+    msg.strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(msg, |(_, body)| body)
+}
+
+impl Level {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Level::Error,
+            1 => Level::Warn,
+            2 => Level::Info,
+            _ => Level::Debug,
+        }
+    }
+}
+
 pub fn close() {
     let mut guard = FILE.lock();
     if let Some(lf) = guard.as_mut() {
@@ -182,6 +228,15 @@ macro_rules! log_debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn librtmp2_level_prefix_is_stripped() {
+        assert_eq!(
+            strip_librtmp2_level("[WARN] conn.rs:12: RTMP conn 1 [1.2.3.4:5]: closed"),
+            "conn.rs:12: RTMP conn 1 [1.2.3.4:5]: closed"
+        );
+        assert_eq!(strip_librtmp2_level("no prefix"), "no prefix");
+    }
 
     #[test]
     fn sanitize_escapes_newlines_and_carriage_returns() {

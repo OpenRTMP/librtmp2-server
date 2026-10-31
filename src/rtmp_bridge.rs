@@ -143,6 +143,8 @@ struct ConnState {
     player_stats_reset_pending: bool,
     /// Timestamp of the last RTT flush to the DB.
     last_rtt_at: Option<Instant>,
+    /// When the connection was first seen (for the close log line).
+    connected_at: Option<Instant>,
 }
 
 /// A publisher/player row whose `active=1` deactivation write failed.
@@ -1940,6 +1942,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         let cs = conns.entry(conn).or_default();
         cs.remote_addr = remote_addr.to_string();
         cs.remote_ip = remote_ip_of(remote_addr);
+        cs.connected_at.get_or_insert_with(Instant::now);
         drop(conns);
         crate::log_info!("RTMP: new connection {conn} from {remote_addr}");
     }
@@ -2073,7 +2076,16 @@ impl RtmpEventHandler for DbRtmpBridge {
         } else if !had_role {
             // No authorized role — still record the TCP close for auditability
             // (matches srt-live-server logging accepted peers that never stream).
-            crate::log_info!("RTMP: connection closed {conn} from {peer}");
+            // Say how long it lived: a client that keeps reconnecting and
+            // dropping within a second is failing the RTMP setup, and the
+            // librtmp2 close line just before this one says why.
+            let lifetime = cs
+                .connected_at
+                .map(|t| format!(" after {} ms", t.elapsed().as_millis()))
+                .unwrap_or_default();
+            crate::log_info!(
+                "RTMP: connection closed {conn} from {peer}{lifetime} without publish/play"
+            );
         }
     }
 }

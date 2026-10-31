@@ -1873,7 +1873,12 @@ impl ServerApp {
         &self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), String> {
-        crate::log_info!("OpenRTMP librtmp2-server alpha starting...");
+        crate::log_info!(
+            "OpenRTMP librtmp2-server {} (librtmp2 {}) starting; log level {}",
+            env!("CARGO_PKG_VERSION"),
+            librtmp2::version_string(),
+            self.config.log_level
+        );
 
         let coordinator = self.start_coordinator().await?;
         let api_token = self.live_api_token();

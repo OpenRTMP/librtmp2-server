@@ -195,6 +195,9 @@ RTMPS_BIND=0.0.0.0:1936
 HTTP_BIND=0.0.0.0:8080
 
 # Log level: 0=error 1=warn 2=info 3=debug
+# Applies to librtmp2's protocol lines too (prefixed "librtmp2:"): at 2 every
+# closed RTMP connection logs its close reason; 3 adds the handshake flavour
+# and each RTMP command, which helps when an encoder fails to connect.
 LOG_LEVEL=2
 
 # Log file path (empty = stderr only)
