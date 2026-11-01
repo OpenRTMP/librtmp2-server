@@ -113,10 +113,10 @@ OBS / FFmpeg / App
 
 ### Compile
 
-`librtmp2-server` uses the published `librtmp2` 0.14.0 release from crates.io:
+`librtmp2-server` uses the published `librtmp2` 0.16.0 release from crates.io:
 
 ```toml
-librtmp2 = { version = "0.15.0", features = ["tls"] }
+librtmp2 = { version = "0.16.0", features = ["tls"] }
 ```
 
 ```bash
@@ -195,8 +195,8 @@ RTMPS_BIND=0.0.0.0:1936
 HTTP_BIND=0.0.0.0:8080
 
 # Log level: 0=error 1=warn 2=info 3=debug
-# Applies to librtmp2's protocol lines too (prefixed "librtmp2:"). From
-# librtmp2 0.16.0 on, every closed RTMP connection logs its close reason at 2,
+# Applies to librtmp2's protocol lines too (prefixed "librtmp2:"). Every
+# closed RTMP connection logs its close reason at 2,
 # and 3 adds the handshake flavour and each RTMP command, which helps when an
 # encoder fails to connect.
 LOG_LEVEL=2

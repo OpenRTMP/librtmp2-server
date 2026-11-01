@@ -27,8 +27,7 @@ begin at `1.0.0`.
 - librtmp2's own log lines (handshake, `connect`, per-connection close
   reasons, error replies) go to the server log, prefixed `librtmp2:`, and
   follow `LOG_LEVEL`/`LOG_FILE`. Before, the library wrote straight to stderr
-  and its debug lines could never be turned on. The close reasons need a
-  librtmp2 release that emits them.
+  and its debug lines could never be turned on.
 - The startup line names the server and librtmp2 versions and the log level.
 - A connection that closes without publishing or playing logs how long it
   lived, so a client that reconnects and drops within a second is easy to
@@ -78,6 +77,11 @@ begin at `1.0.0`.
   cluster HA helper refreshes the copied source tree completely.
 
 ### Changed
+- Built on librtmp2 0.16.0: every closed RTMP connection logs its close
+  reason, and the library answers the digest handshake that DJI cameras and
+  other Flash-style encoders send, completes the connect `_result`, accepts a
+  SetChunkSize above 65536 and a fmt=1 header on a new chunk stream, and
+  logs peer-supplied connect fields escaped.
 - `BENCHMARKS.md` and the CI sweep compare against MediaMTX v1.21.3, nginx
   1.31.8 with nginx-rtmp-module master, SRS 8.0 (`v8.0-d2`) and LiveForge
   main @ a93fa22.
