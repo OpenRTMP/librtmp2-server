@@ -250,6 +250,10 @@ pub struct SessionHooks {
     pub api_token: Arc<parking_lot::RwLock<String>>,
     /// Force local RTMP publishers off a stream (stale epoch after partition).
     pub force_unpublish_stream: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Re-stamp local publisher sessions for a stream after ownership was
+    /// reacquired at a fresh epoch, so exported frames carry the epoch the
+    /// cluster now stores instead of the pre-partition one.
+    pub retag_stream_epoch: Arc<dyn Fn(&str, u64) + Send + Sync>,
     /// Optional local live-session counter for drain wait aggregation.
     pub local_stream_sessions: Arc<dyn Fn(&str) -> u64 + Send + Sync>,
 }
@@ -1490,7 +1494,17 @@ impl ClusterManager {
     fn defer_join_proof_burn(&self, node_id: NodeId, proof: String) {
         let mut pending = self.pending_join_proofs.lock();
         Self::spend_expired_join_proofs(self, &mut pending, Instant::now());
-        pending.insert(node_id, (proof, Instant::now()));
+        if let Some((superseded, _)) = pending.insert(node_id, (proof.clone(), Instant::now())) {
+            // A superseded, different proof must not stay replayable until the
+            // TTL: spend it now. (An identical value is the same capability,
+            // already represented by the new pending entry.)
+            if superseded != proof {
+                let now = Instant::now();
+                let mut used = self.used_admin_proofs.lock();
+                Self::purge_expired_admin_proofs(&mut used, now);
+                used.insert(superseded, now);
+            }
+        }
     }
 
     /// Spend the deferred join proof of a node that has just been seen alive.
@@ -2111,20 +2125,37 @@ impl ClusterManager {
             if owner.as_ref().map(|o| o.owner_node_id) == Some(node_id) {
                 continue;
             }
-            match self.acquire_stream_owner(&p.stream_id, node_id, 0, crate::db::now_ts()) {
+            // A fresh epoch is essential: reusing 0 (or the old one) makes the
+            // stored row disagree with the epoch the live publisher stamps on
+            // exported frames, so every receiver fences its media.
+            let epoch = self.ownership.next_epoch();
+            match self.acquire_stream_owner(&p.stream_id, node_id, epoch, crate::db::now_ts()) {
                 Ok(epoch) => {
+                    if let Some(hooks) = self.session_hooks.lock().as_ref() {
+                        (hooks.retag_stream_epoch)(&p.stream_id, epoch);
+                    }
                     crate::log_info!(
                         "Cluster: reacquired ownership of stream {} at epoch {epoch} after isolation cleared",
                         p.stream_id
                     );
                 }
-                Err(e) => {
+                Err(crate::state::CoordError::Conflict) => {
                     crate::log_warn!(
-                        "Cluster: could not reacquire ownership of stream {} after isolation cleared ({e:?}); \
+                        "Cluster: stream {} was claimed by another owner after isolation cleared; \
                          forcing local publisher off",
                         p.stream_id
                     );
                     self.force_unpublish_and_drain(&p.stream_id);
+                }
+                Err(e) => {
+                    // A local admission refusal or an in-flight write failure is
+                    // not proof that another node owns the stream. Leave the
+                    // local publisher running and retry on the next health tick.
+                    crate::log_warn!(
+                        "Cluster: could not reacquire ownership of stream {} after isolation cleared \
+                         ({e:?}); deferring to the next tick",
+                        p.stream_id
+                    );
                 }
             }
         }
@@ -2751,7 +2782,16 @@ impl ClusterManager {
 
     /// Sync in-memory ownership from SQLite (followers apply Raft → DB).
     fn sync_ownership_from_db(&self) {
-        let owners = self.db.stream_owner_list();
+        // A failed read is not "no owners": feeding an empty list into
+        // sync_from() would fence every tracked stream and trigger a
+        // destructive release/unsubscribe pass. Skip the tick instead.
+        let owners = match self.db.stream_owner_list_result() {
+            Ok(owners) => owners,
+            Err(e) => {
+                crate::log_error!("Cluster: ownership sync skipped, owner read failed: {e}");
+                return;
+            }
+        };
         let changed = self.ownership.sync_from(&owners);
         // Reclaim timeline state for deleted streams even when the ownership
         // sync reports no change: a locally released stream has no tracker
@@ -2791,17 +2831,21 @@ impl ClusterManager {
         for (stream_id, old_owner) in &changed {
             let still_ours =
                 self.ownership.get(stream_id).map(|(n, _)| n) == Some(self.config.node_id);
-            if !still_ours
-                && self
-                    .db
-                    .publisher_list(Some(stream_id.as_str()))
-                    .iter()
-                    .any(|p| p.active)
-            {
-                // Applied owner moved away (or cleared) while we still have a
-                // local publisher — kick it so we don't serve under a stale
-                // epoch after isolation catch-up.
-                self.force_unpublish_and_drain(stream_id);
+            if !still_ours {
+                match self.db.publisher_list_checked(Some(stream_id.as_str())) {
+                    crate::db::DbLookup::Ok(publishers) => {
+                        if publishers.iter().any(|p| p.active) {
+                            // Applied owner moved away (or cleared) while we still have a
+                            // local publisher — kick it so we don't serve under a stale
+                            // epoch after isolation catch-up.
+                            self.force_unpublish_and_drain(stream_id);
+                        }
+                    }
+                    // A failed read cannot prove there is no local publisher.
+                    // Leave it running and let the next sync tick decide.
+                    crate::db::DbLookup::Failed => {}
+                    crate::db::DbLookup::Missing => {}
+                }
             }
             let Some((old_node, _)) = old_owner else {
                 continue;
@@ -3764,6 +3808,7 @@ mod tests {
                 revoked_viewers: Arc::clone(&self.revoked),
                 api_token: Arc::clone(&self.token),
                 force_unpublish_stream: Arc::new(move |s: &str| forced.lock().push(s.to_string())),
+                retag_stream_epoch: Arc::new(|_: &str, _: u64| {}),
                 local_stream_sessions: Arc::new(move |_: &str| sessions.load(Ordering::SeqCst)),
             }
         }

@@ -250,18 +250,20 @@ fn parse_bool(val: &str) -> Option<bool> {
     }
 }
 
-fn parse_per_addr_cap(val: &str, key: &str) -> i32 {
+fn parse_per_addr_cap(val: &str, key: &str) -> Option<i32> {
     match val.parse::<i32>() {
-        Ok(v) if v > 0 => v,
+        Ok(v) if v > 0 => Some(v),
         Ok(_) => {
             eprintln!(
-                "Config: ignoring non-positive {key} value '{val}' (would fall back to librtmp2's built-in per-IP default); keeping no per-IP cap"
+                "Config: ignoring non-positive {key} value '{val}'; keeping the configured per-IP cap"
             );
-            i32::MAX
+            None
         }
         Err(_) => {
-            eprintln!("Config: ignoring invalid {key} value '{val}'");
-            i32::MAX
+            eprintln!(
+                "Config: ignoring invalid {key} value '{val}'; keeping the configured per-IP cap"
+            );
+            None
         }
     }
 }
@@ -292,7 +294,8 @@ fn parse_rate_limit_window_secs(val: &str) -> u64 {
 
 fn parse_rate_limit_count(val: &str, default: usize, max: usize, key: &str) -> usize {
     match val.parse::<usize>() {
-        Ok(v) => v.clamp(1, max),
+        // 0 is a documented deny-all, not the same as "unset".
+        Ok(v) => v.min(max),
         Err(_) => {
             eprintln!("Config: ignoring invalid {key} value '{val}'");
             default
@@ -347,12 +350,14 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "RTMP_BIND" => config.rtmp_bind = val.to_string(),
         "RTMP_MAX_CONNECTIONS" => config.rtmp_max_conn = parse_max_connections(val),
         "RTMP_MAX_CONNECTIONS_PER_ADDR" => {
-            config.rtmp_max_connections_per_addr =
-                parse_per_addr_cap(val, "RTMP_MAX_CONNECTIONS_PER_ADDR");
+            if let Some(v) = parse_per_addr_cap(val, "RTMP_MAX_CONNECTIONS_PER_ADDR") {
+                config.rtmp_max_connections_per_addr = v;
+            }
         }
         "RTMP_MAX_PENDING_TLS_PER_ADDR" => {
-            config.rtmp_max_pending_tls_per_addr =
-                parse_per_addr_cap(val, "RTMP_MAX_PENDING_TLS_PER_ADDR");
+            if let Some(v) = parse_per_addr_cap(val, "RTMP_MAX_PENDING_TLS_PER_ADDR") {
+                config.rtmp_max_pending_tls_per_addr = v;
+            }
         }
         "RTMP_IDLE_TIMEOUT_SECS" => {
             config.rtmp_idle_timeout_secs = parse_idle_timeout_secs(val);
@@ -473,16 +478,16 @@ where
 
     if let Some(v) = get("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR")
         && !v.is_empty()
+        && let Some(cap) = parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR")
     {
-        config.rtmp_max_connections_per_addr =
-            parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR");
+        config.rtmp_max_connections_per_addr = cap;
     }
 
     if let Some(v) = get("LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR")
         && !v.is_empty()
+        && let Some(cap) = parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR")
     {
-        config.rtmp_max_pending_tls_per_addr =
-            parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR");
+        config.rtmp_max_pending_tls_per_addr = cap;
     }
 
     if let Some(v) = get("LRTMP2_RTMP_IDLE_TIMEOUT_SECS")
@@ -775,14 +780,14 @@ mod tests {
     }
 
     #[test]
-    fn per_addr_cap_defaults_to_unlimited_and_rejects_non_positive() {
-        assert_eq!(parse_per_addr_cap("5", "TEST_KEY"), 5);
+    fn per_addr_cap_rejects_non_positive() {
+        assert_eq!(parse_per_addr_cap("5", "TEST_KEY"), Some(5));
         // 0/negative would make librtmp2 fall back to its own built-in
         // per-IP default (4), which is exactly the surprise this config
         // guards against, so it must not pass through unchanged.
-        assert_eq!(parse_per_addr_cap("0", "TEST_KEY"), i32::MAX);
-        assert_eq!(parse_per_addr_cap("-1", "TEST_KEY"), i32::MAX);
-        assert_eq!(parse_per_addr_cap("not-a-number", "TEST_KEY"), i32::MAX);
+        assert_eq!(parse_per_addr_cap("0", "TEST_KEY"), None);
+        assert_eq!(parse_per_addr_cap("-1", "TEST_KEY"), None);
+        assert_eq!(parse_per_addr_cap("not-a-number", "TEST_KEY"), None);
     }
 
     #[test]

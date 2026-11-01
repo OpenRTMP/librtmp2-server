@@ -608,11 +608,13 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(),
 }
 
 fn parse_bool_strict(val: &str, key: &str) -> Result<bool, String> {
-    match val.trim() {
-        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
-        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+    // Accept the common spellings the main server config accepts; previously
+    // mixed-case (True/On) and on/off were hard startup errors.
+    match val.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
         other => Err(format!(
-            "invalid boolean for {key}: '{other}' (expected true/false/1/0/yes/no)"
+            "invalid boolean for {key}: '{other}' (expected true/false/1/0/yes/no/on/off)"
         )),
     }
 }

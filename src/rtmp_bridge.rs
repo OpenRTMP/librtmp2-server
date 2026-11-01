@@ -360,6 +360,18 @@ impl DbRtmpBridge {
             .map(|(_, ep)| *ep)
     }
 
+    /// Re-stamp every local publisher connection for `stream_id` with the
+    /// epoch just reacquired after an isolation/partition recovery, so
+    /// exported frames are fenced under the epoch the cluster stores.
+    pub fn retag_stream_epoch(&self, stream_id: &str, epoch: u64) {
+        let mut epochs = self.ownership_epochs.lock();
+        for (sid, ep) in epochs.values_mut() {
+            if sid == stream_id {
+                *ep = epoch;
+            }
+        }
+    }
+
     /// Per-connection ownership epoch claimed for this publisher socket.
     /// Used when stamping exported relay frames — never fall back to a
     /// durable/current stream epoch (that can label frames with a peer's
@@ -384,10 +396,16 @@ impl DbRtmpBridge {
     /// sinks via publish_key lookup. Falls back to the conn mapping, then
     /// publish_key resolution.
     pub fn resolve_media_output_stream_id(&self, conn: ConnId, frame_route: &str) -> String {
+        // Fast path for the normal pinned configuration: `relay_key` already
+        // carries the durable stream id, so the per-frame DB lookup would only
+        // confirm what the connection map already holds.
+        let sid = self.stream_id_for_conn(conn);
+        if !sid.is_empty() && sid == frame_route {
+            return sid;
+        }
         if let DbLookup::Ok(s) = self.db.stream_get(frame_route) {
             return s.id;
         }
-        let sid = self.stream_id_for_conn(conn);
         if !sid.is_empty() {
             return sid;
         }

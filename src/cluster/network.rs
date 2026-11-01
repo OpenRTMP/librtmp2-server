@@ -35,8 +35,11 @@ const MAX_FRAME: u32 = 64 * 1024 * 1024;
 /// authenticated peer that advertises a snapshot from reserving a large slice
 /// of the snapshot read budget for the whole snapshot timeout.
 const MAX_SNAPSHOT_FRAME: u32 = 8 * 1024 * 1024;
-/// Post-auth control-plane frames (Raft RPC, admin) — smaller than snapshot path.
-const MAX_CONTROL_FRAME: u32 = 8 * 1024 * 1024;
+/// Post-auth control-plane frames (Raft RPC, admin). This must match the
+/// writer's MAX_FRAME: a single Raft log entry (e.g. `SeedFromStandalone`)
+/// has no chunking, so a smaller read cap would accept it on the leader and
+/// make it unreplicable to every learner.
+const MAX_CONTROL_FRAME: u32 = MAX_FRAME;
 /// Small control frames are bounded by the authenticated connection cap, so
 /// keep them outside the shared byte budgets to preserve capacity for
 /// heartbeats and other liveness traffic even while large reads are stalled.
@@ -97,6 +100,20 @@ impl PreauthBudget {
         })
     }
 
+    /// Bucket key for the per-source cap. An IPv6 host normally controls at
+    /// least a /64, so keying on the exact address lets one host spend the
+    /// whole shared budget with 32 addresses. Members are exempt.
+    fn per_ip_key(peer: IpAddr) -> IpAddr {
+        match peer {
+            IpAddr::V6(v6) => {
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(std::net::Ipv6Addr::from(octets))
+            }
+            IpAddr::V4(_) => peer,
+        }
+    }
+
     /// Take a pre-auth slot for `peer`. Member sources are admitted from the
     /// reserved budget and bypass the shared per-source cap (several members
     /// can share one NAT/host address and member RPCs must never queue).
@@ -111,8 +128,9 @@ impl PreauthBudget {
             return None;
         }
         if !member_source {
+            let key = Self::per_ip_key(peer);
             let mut guard = self.per_ip.lock();
-            let count = guard.entry(peer).or_insert(0);
+            let count = guard.entry(key).or_insert(0);
             if *count >= MAX_PREAUTH_CONN_PER_IP {
                 drop(guard);
                 counter.fetch_sub(1, Ordering::AcqRel);
@@ -143,10 +161,11 @@ impl Drop for PreauthGuard {
         }
         self.budget.global.fetch_sub(1, Ordering::AcqRel);
         let mut guard = self.budget.per_ip.lock();
-        if let Some(count) = guard.get_mut(&self.peer) {
+        let key = PreauthBudget::per_ip_key(self.peer);
+        if let Some(count) = guard.get_mut(&key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                guard.remove(&self.peer);
+                guard.remove(&key);
             }
         }
     }
@@ -2238,20 +2257,31 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_non_snapshot_control_frame_rejected_unless_allowed() {
-        let big = ControlMessage::StatsProxyResp {
-            body: serde_json::Value::String("z".repeat(MAX_CONTROL_FRAME as usize + 16)),
-        };
-        let bytes = frame_bytes(&big);
+        // A frame just above the shared writer cap is rejected from its
+        // declared length, before any body is read or budget is reserved.
+        let declared = (MAX_FRAME as usize + 16) as u32;
+        let bytes = declared.to_be_bytes().to_vec();
         let mut r: &[u8] = &bytes;
         let err = match read_control_frame(&mut r).await {
-            Ok(_) => panic!("server-side reads must cap non-snapshot frames"),
+            Ok(_) => panic!("server-side reads must cap control frames at MAX_FRAME"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("frame too large"), "{err}");
-
-        // Client-side response reads allow large responses.
         let mut r: &[u8] = &bytes;
-        assert!(read_frame(&mut r).await.is_ok());
+        assert!(read_frame(&mut r).await.is_err());
+
+        // The server-side control cap must match the writer cap: Raft log
+        // entries are not chunked, so a smaller read cap made a >8 MiB entry
+        // committed on the leader unreplicable to every learner. (Reading a
+        // real multi-MiB frame here would contend with the shared read budget
+        // other tests hold in parallel.)
+        assert_eq!(MAX_CONTROL_FRAME, MAX_FRAME);
+        let small = ControlMessage::StatsProxyResp {
+            body: serde_json::Value::String("z".repeat(4096)),
+        };
+        let bytes = frame_bytes(&small);
+        let mut r: &[u8] = &bytes;
+        assert!(read_control_frame(&mut r).await.is_ok());
     }
 
     #[tokio::test]

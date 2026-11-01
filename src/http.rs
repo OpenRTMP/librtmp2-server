@@ -321,6 +321,9 @@ fn xml_escape(s: &str) -> String {
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
             '\t' | '\n' | '\r' => out.push(c),
+            // XML 1.0 also forbids the non-characters U+FFFE/U+FFFF and the
+            // surrogate range (not representable in Rust char).
+            '\u{FFFE}' | '\u{FFFF}' => {}
             c if (c as u32) < 0x20 => {}
             c => out.push(c),
         }
@@ -1011,9 +1014,18 @@ async fn handle_streams_list(State(state): State<Arc<AppState>>, headers: Header
         );
     }
     // Bearer-authenticated admin view — includes keys for panels like librtmp2-server-panel.
-    let list: Vec<Value> = state
-        .db
-        .stream_list()
+    let streams = match state.db.stream_list_checked() {
+        Ok(streams) => streams,
+        Err(e) => {
+            crate::log_error!("GET /api/v1/streams: {e}");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB_ERROR",
+                "stream list unavailable",
+            );
+        }
+    };
+    let list: Vec<Value> = streams
         .iter()
         .map(|s| stream_to_json(&state.db, s))
         .collect();
@@ -1034,7 +1046,7 @@ async fn handle_stream_create(
     State(state): State<Arc<AppState>>,
     addr: ClientAddr,
     headers: HeaderMap,
-    body: Option<Json<CreateStreamRequest>>,
+    body: Result<Json<CreateStreamRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     const PATH: &str = "/api/v1/streams";
     let peer = http_peer(&state, addr, &headers);
@@ -1053,7 +1065,21 @@ async fn handle_stream_create(
         );
     }
 
-    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let req = match body {
+        Ok(Json(req)) => req,
+        // A request without a JSON Content-Type has always been treated as an
+        // empty body ("missing id"); keep that contract while still reporting
+        // 413/422 rejections instead of collapsing them into 400.
+        Err(rejection) if rejection.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            CreateStreamRequest::default()
+        }
+        Err(rejection) => {
+            let status = rejection.status();
+            let message = rejection.body_text();
+            log_http_access("POST", PATH, &peer, status, &message);
+            return err_json(status, "BAD_REQUEST", &message);
+        }
+    };
     let Some(id) = req
         .id
         .map(|s| s.trim().to_string())
@@ -1265,6 +1291,23 @@ async fn handle_stream_create(
                 StatusCode::CONFLICT,
                 "CONFLICT",
                 "Stream ID or access key already exists",
+            );
+        }
+        Err(e) if e.to_string().contains("timed out") => {
+            // The Raft write was dispatched but not confirmed: the stream can
+            // exist with keys the client never received. Report a retryable
+            // service condition rather than a generic 500.
+            log_http_access(
+                "POST",
+                PATH,
+                &peer,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cluster write timed out",
+            );
+            return err_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CLUSTER_TIMEOUT",
+                "Stream creation timed out and may still complete; check the stream list before retrying",
             );
         }
         Err(_) => {

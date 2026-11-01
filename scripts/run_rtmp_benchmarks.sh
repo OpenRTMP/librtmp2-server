@@ -109,6 +109,9 @@ for _v in LOAD_RUN_SECS LOAD_WARMUP_MS LOAD_MEASURE_DELAY LOAD_MEASURE_SECS STRA
   [[ "${!_v}" =~ ^[0-9]+$ ]] || { echo "error: $_v must be a non-negative integer" >&2; exit 2; }
 done
 ((LOAD_MEASURE_SECS > 0)) || { echo "error: LOAD_MEASURE_SECS must be > 0" >&2; exit 2; }
+# A warmup that reaches the end of the relay leaves no steady-state window and
+# would still be published with frames_per_viewer=0 / gbps=0.
+((LOAD_WARMUP_MS < LOAD_RUN_SECS * 1000)) || { echo "error: LOAD_WARMUP_MS must be shorter than LOAD_RUN_SECS" >&2; exit 2; }
 # The measurement window starts LOAD_MEASURE_DELAY s after the relay launch and
 # lasts LOAD_MEASURE_SECS s, while the relay itself stops after
 # LOAD_RUN_SECS s: a window that reaches past the relay would average the
