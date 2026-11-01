@@ -2837,6 +2837,57 @@ impl ClusterManager {
         }
     }
 
+    /// Reset the timeline state of streams that no longer exist. Streams that
+    /// still have local sessions are deferred until those drain.
+    fn prune_deleted_timelines(&self) {
+        let timeline_ids = self.media.timeline_stream_ids();
+        if timeline_ids.is_empty() {
+            return;
+        }
+        // One query for every timeline id instead of a `stream_get` per
+        // id per tick. A DB error skips pruning this tick (fail-safe)
+        // rather than treating every stream as gone.
+        let crate::db::DbLookup::Ok(existing) = self.db.stream_ids() else {
+            return;
+        };
+        let mut gone: Vec<String> = Vec::new();
+        for sid in timeline_ids {
+            if existing.contains(&sid) {
+                continue;
+            }
+            if self.local_live_sessions(&sid) == 0 {
+                gone.push(sid);
+            } else {
+                // Local sessions can still emit frames for this
+                // deleted stream; defer the reset (and the repeated
+                // prune) until they drain.
+                self.pending_drain_clears.lock().insert(sid);
+            }
+        }
+        self.media.reset_timelines_for(&gone);
+    }
+
+    /// The applied owner of `stream_id` moved away (or was cleared): kick a
+    /// local publisher so it does not keep serving under a stale epoch after
+    /// isolation catch-up.
+    fn kick_local_publisher_of_lost_stream(&self, stream_id: &str) {
+        match self.db.publisher_list_checked(Some(stream_id)) {
+            crate::db::DbLookup::Ok(publishers) => {
+                if publishers.iter().any(|p| p.active) {
+                    self.force_unpublish_and_drain(stream_id);
+                }
+            }
+            // A failed read cannot prove there is no local publisher.
+            // Remember the stream and re-check it on later ticks.
+            crate::db::DbLookup::Failed => {
+                self.pending_publisher_checks
+                    .lock()
+                    .insert(stream_id.to_string());
+            }
+            crate::db::DbLookup::Missing => {}
+        }
+    }
+
     /// Sync in-memory ownership from SQLite (followers apply Raft → DB).
     fn sync_ownership_from_db(&self) {
         self.retry_pending_publisher_checks();
@@ -2854,29 +2905,7 @@ impl ClusterManager {
         // Reclaim timeline state for deleted streams even when the ownership
         // sync reports no change: a locally released stream has no tracker
         // entry to report, so its remapper would otherwise leak.
-        let timeline_ids = self.media.timeline_stream_ids();
-        if !timeline_ids.is_empty() {
-            // One query for every timeline id instead of a `stream_get` per
-            // id per tick. A DB error skips pruning this tick (fail-safe)
-            // rather than treating every stream as gone.
-            if let crate::db::DbLookup::Ok(existing) = self.db.stream_ids() {
-                let mut gone: Vec<String> = Vec::new();
-                for sid in timeline_ids {
-                    if existing.contains(&sid) {
-                        continue;
-                    }
-                    if self.local_live_sessions(&sid) == 0 {
-                        gone.push(sid);
-                    } else {
-                        // Local sessions can still emit frames for this
-                        // deleted stream; defer the reset (and the repeated
-                        // prune) until they drain.
-                        self.pending_drain_clears.lock().insert(sid);
-                    }
-                }
-                self.media.reset_timelines_for(&gone);
-            }
-        }
+        self.prune_deleted_timelines();
         if changed.is_empty() {
             return;
         }
@@ -2890,24 +2919,7 @@ impl ClusterManager {
             let still_ours =
                 self.ownership.get(stream_id).map(|(n, _)| n) == Some(self.config.node_id);
             if !still_ours {
-                match self.db.publisher_list_checked(Some(stream_id.as_str())) {
-                    crate::db::DbLookup::Ok(publishers) => {
-                        if publishers.iter().any(|p| p.active) {
-                            // Applied owner moved away (or cleared) while we still have a
-                            // local publisher — kick it so we don't serve under a stale
-                            // epoch after isolation catch-up.
-                            self.force_unpublish_and_drain(stream_id);
-                        }
-                    }
-                    // A failed read cannot prove there is no local publisher.
-                    // Remember the stream and re-check it on later ticks.
-                    crate::db::DbLookup::Failed => {
-                        self.pending_publisher_checks
-                            .lock()
-                            .insert(stream_id.clone());
-                    }
-                    crate::db::DbLookup::Missing => {}
-                }
+                self.kick_local_publisher_of_lost_stream(stream_id);
             }
             let Some((old_node, _)) = old_owner else {
                 continue;
