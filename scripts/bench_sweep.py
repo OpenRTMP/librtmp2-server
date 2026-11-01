@@ -109,8 +109,8 @@ def _load_row(cur: dict, requested: int | None) -> list | None:
         None not in row
         and requested is not None
         and cur.get("received", 0) == requested
-        // A complete viewer count with zero steady-state frames is not a
-        // measurement (e.g. the warmup covered the run); never publish it.
+        # A complete viewer count with zero steady-state frames is not a
+        # measurement (e.g. the warmup covered the run); never publish it.
         and cur.get("fps", 0) > 0
     )
     return row if complete else None
