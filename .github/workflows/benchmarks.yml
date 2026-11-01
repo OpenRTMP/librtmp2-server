@@ -239,8 +239,14 @@ jobs:
         run: |
           set -o pipefail
           # Root: nginx wants to write its default log paths and the load test
-          # needs more than the runner user's file-descriptor limit.
+          # needs more than the runner user's file-descriptor limit. The
+          # competitor paths are passed on the command line: on the Ubuntu 26.04
+          # runners sudo no longer keeps them with -E, and the script then
+          # skipped every competitor.
           sudo -E env "PATH=$PATH" \
+            MEDIAMTX_BIN="${MEDIAMTX_BIN:-}" SRS_BIN="${SRS_BIN:-}" LIVEFORGE_BIN="${LIVEFORGE_BIN:-}" \
+            NGINX_BIN="${NGINX_BIN:-nginx}" \
+            NGINX_RTMP_MODULE="${NGINX_RTMP_MODULE:-/usr/lib/nginx/modules/ngx_rtmp_module.so}" \
             LIBRTMP2_DIR="$PWD/librtmp2-lib" \
             BENCH_SERVERS="$SWEEP_SERVERS" LOAD_VIEWERS="$LOAD_VIEWERS" PERF_STAT=0 \
             scripts/run_rtmp_benchmarks.sh "$RUNNER_TEMP/sweep-work" 2>&1 | tee sweep.log
