@@ -13,6 +13,46 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-11-01
+
+### Fixed
+- A publisher that keeps sending media is no longer dropped for not
+  answering RTMP pings (librtmp2 0.16.1). The DJI Osmo Pocket 3 never sends
+  a ping response and was disconnected after about 15 seconds of streaming.
+- The release benchmark run measures the compared servers again. On the
+  Ubuntu 26.04 runners their binary paths no longer reached the sweep, so
+  the v0.6.7 release record only contains librtmp2-server.
+- The GitHub release body keeps the generated pull request list and compare
+  link below the CHANGELOG section.
+- After a cluster node recovers from isolation, it reacquires ownership of
+  its streams at a fresh epoch and re-stamps its local publishers, so their
+  exported frames are no longer fenced by receivers. A claim whose
+  publisher closed in the meantime is released again.
+- A local admission refusal no longer forces a local publisher off; only a
+  real ownership conflict does.
+- A superseded join proof is spent right away, and a failed ownership or
+  publisher read no longer triggers destructive cleanup.
+- The streams API reports a storage failure instead of returning an empty
+  list, keeps the status of rejected requests, and answers a cluster write
+  timeout with a retryable error.
+- Stats output drops code points that are not valid in XML, and older
+  databases get the `rtt_ms` columns migrated.
+- Failed session inserts are logged, rapid stream switches are debounced,
+  and the media-output path no longer looks up the database for every
+  frame.
+- IPv6 pre-auth slots are keyed by /64, the cluster control read limit
+  matches what the writer sends, and an invalid per-IP cap override keeps
+  the configured cap.
+- The benchmark sweep does not publish incomplete join legs or legs with
+  zero frames per viewer, retries its final rebase, and rejects a warmup
+  that covers the whole run.
+
+### Changed
+- Built on librtmp2 0.16.1. Besides the ping fix above, a peer that keeps
+  sending but stops reading what the server sends is now closed after
+  10 seconds without any of its queued output going out.
+- Dependency update: openssl 0.10.82 (openssl-sys 0.9.118).
+
 ## [0.6.7] — 2026-11-01
 
 ### Security
@@ -1189,7 +1229,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.8...HEAD
+[0.6.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.5...v0.6.6
 [0.6.5]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.4...v0.6.5
