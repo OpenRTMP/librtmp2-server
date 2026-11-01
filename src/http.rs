@@ -449,9 +449,12 @@ fn stream_to_json_with_players(s: &Stream, players: Vec<Value>) -> Value {
     })
 }
 
-fn stream_to_json(db: &Db, s: &Stream) -> Value {
-    let players: Vec<Value> = db.viewer_list(&s.id).iter().map(viewer_to_json).collect();
-    stream_to_json_with_players(s, players)
+fn stream_to_json(db: &Db, s: &Stream) -> Result<Value, String> {
+    let viewers = db
+        .viewer_list_checked(&s.id)
+        .map_err(|e| format!("viewer_list({}): {e}", s.id))?;
+    let players: Vec<Value> = viewers.iter().map(viewer_to_json).collect();
+    Ok(stream_to_json_with_players(s, players))
 }
 
 fn create_viewer_row(
@@ -1025,10 +1028,20 @@ async fn handle_streams_list(State(state): State<Arc<AppState>>, headers: Header
             );
         }
     };
-    let list: Vec<Value> = streams
-        .iter()
-        .map(|s| stream_to_json(&state.db, s))
-        .collect();
+    let mut list = Vec::with_capacity(streams.len());
+    for s in &streams {
+        match stream_to_json(&state.db, s) {
+            Ok(value) => list.push(value),
+            Err(e) => {
+                crate::log_error!("GET /api/v1/streams: {e}");
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DB_ERROR",
+                    "stream list unavailable",
+                );
+            }
+        }
+    }
     Json(list).into_response()
 }
 

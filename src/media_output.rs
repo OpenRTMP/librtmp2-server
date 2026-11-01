@@ -523,6 +523,7 @@ impl MediaOutputManager {
             return;
         }
 
+        let had_session = self.sessions.contains_key(&frame.publisher_conn_id);
         let needs_switch = self
             .sessions
             .get(&frame.publisher_conn_id)
@@ -536,7 +537,7 @@ impl MediaOutputManager {
                 self.retire(old);
             }
             self.start_session(frame.publisher_conn_id, stream_id, generation);
-            if let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) {
+            if had_session && let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) {
                 session.last_switch_at = Some(Instant::now());
             }
         }
@@ -572,12 +573,19 @@ impl MediaOutputManager {
                 backward > 1000 && backward < u32::MAX / 2
             });
         if timestamp_reset {
+            let last_switch_at = self
+                .sessions
+                .get(&frame.publisher_conn_id)
+                .and_then(|session| session.last_switch_at);
             if let Some(old) = self.sessions.remove(&frame.publisher_conn_id) {
                 self.retire(old);
             }
             self.start_session(frame.publisher_conn_id, stream_id, generation);
             if let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) {
                 session.restarted_at = Some(Instant::now());
+                // Carry the switch interval across the timestamp-reset restart,
+                // otherwise a later stream change bypasses it.
+                session.last_switch_at = last_switch_at;
             }
         }
 

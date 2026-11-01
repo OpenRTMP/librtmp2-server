@@ -206,6 +206,10 @@ pub struct ClusterManager {
     /// the leader health tick — a removed node has no `down_since`, so the
     /// normal DOWN sweep will not pick this up.
     pending_node_cleanups: Mutex<std::collections::HashSet<NodeId>>,
+    /// Streams whose local-publisher check failed while ownership moved away;
+    /// retried on later sync ticks so a transient read error cannot leave a
+    /// stale publisher exporting under the old epoch.
+    pending_publisher_checks: Mutex<std::collections::HashSet<String>>,
     /// `(stream_id, epoch)` ownership rows left by a previous run of this
     /// node whose startup release could not be forwarded yet (a follower
     /// without the admin proof token). Retried with epoch fencing, so a
@@ -431,6 +435,7 @@ impl ClusterManager {
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
+            pending_publisher_checks: Mutex::new(std::collections::HashSet::new()),
             pending_stream_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_cleanup_drain_running: AtomicBool::new(false),
             recovery_retry_pending: AtomicBool::new(false),
@@ -2126,7 +2131,20 @@ impl ClusterManager {
     fn reconcile_publishers_after_isolation(&self) {
         let node_id = self.config.node_id;
         let mut retry = false;
+        // Streams with an unresolved acquire are settled by
+        // `reconcile_ambiguous_acquires`; issuing another acquire for them
+        // could race the write that is already in flight.
+        let ambiguous: std::collections::HashSet<String> = self
+            .pending_ambiguous_acquires
+            .lock()
+            .iter()
+            .map(|(stream_id, _, _, _)| stream_id.clone())
+            .collect();
         for p in self.db.publisher_list_all() {
+            if ambiguous.contains(&p.stream_id) {
+                retry = true;
+                continue;
+            }
             let owner = self.db.stream_owner_get(&p.stream_id);
             if owner.as_ref().map(|o| o.owner_node_id) == Some(node_id) {
                 continue;
@@ -2788,8 +2806,40 @@ impl ClusterManager {
         }
     }
 
+    /// Re-check streams whose publisher lookup failed while ownership moved
+    /// away. A successful read either kicks a still-active local publisher or
+    /// clears the pending entry.
+    fn retry_pending_publisher_checks(&self) {
+        let pending: Vec<String> = self
+            .pending_publisher_checks
+            .lock()
+            .iter()
+            .cloned()
+            .collect();
+        for stream_id in pending {
+            if self.ownership.get(&stream_id).map(|(n, _)| n) == Some(self.config.node_id) {
+                self.pending_publisher_checks.lock().remove(&stream_id);
+                continue;
+            }
+            match self.db.publisher_list_checked(Some(&stream_id)) {
+                crate::db::DbLookup::Ok(publishers) => {
+                    if publishers.iter().any(|p| p.active) {
+                        self.force_unpublish_and_drain(&stream_id);
+                    }
+                    self.pending_publisher_checks.lock().remove(&stream_id);
+                }
+                crate::db::DbLookup::Missing => {
+                    self.pending_publisher_checks.lock().remove(&stream_id);
+                }
+                // Keep retrying: the read failure still proves nothing.
+                crate::db::DbLookup::Failed => {}
+            }
+        }
+    }
+
     /// Sync in-memory ownership from SQLite (followers apply Raft → DB).
     fn sync_ownership_from_db(&self) {
+        self.retry_pending_publisher_checks();
         // A failed read is not "no owners": feeding an empty list into
         // sync_from() would fence every tracked stream and trigger a
         // destructive release/unsubscribe pass. Skip the tick instead.
@@ -2850,8 +2900,12 @@ impl ClusterManager {
                         }
                     }
                     // A failed read cannot prove there is no local publisher.
-                    // Leave it running and let the next sync tick decide.
-                    crate::db::DbLookup::Failed => {}
+                    // Remember the stream and re-check it on later ticks.
+                    crate::db::DbLookup::Failed => {
+                        self.pending_publisher_checks
+                            .lock()
+                            .insert(stream_id.clone());
+                    }
                     crate::db::DbLookup::Missing => {}
                 }
             }
