@@ -250,18 +250,16 @@ fn parse_bool(val: &str) -> Option<bool> {
     }
 }
 
-fn parse_per_addr_cap(val: &str, key: &str) -> i32 {
+fn parse_per_addr_cap(val: &str, key: &str) -> Option<i32> {
     match val.parse::<i32>() {
-        Ok(v) if v > 0 => v,
-        Ok(_) => {
-            eprintln!(
-                "Config: ignoring non-positive {key} value '{val}' (would fall back to librtmp2's built-in per-IP default); keeping no per-IP cap"
-            );
-            i32::MAX
-        }
+        Ok(v) if v > 0 => Some(v),
+        // A non-positive value is the documented "no per-IP cap" spelling.
+        Ok(_) => Some(i32::MAX),
         Err(_) => {
-            eprintln!("Config: ignoring invalid {key} value '{val}'");
-            i32::MAX
+            eprintln!(
+                "Config: ignoring invalid {key} value '{val}'; keeping the configured per-IP cap"
+            );
+            None
         }
     }
 }
@@ -290,12 +288,13 @@ fn parse_rate_limit_window_secs(val: &str) -> u64 {
     }
 }
 
-fn parse_rate_limit_count(val: &str, default: usize, max: usize, key: &str) -> usize {
+fn parse_rate_limit_count(val: &str, max: usize, key: &str) -> Option<usize> {
     match val.parse::<usize>() {
-        Ok(v) => v.clamp(1, max),
+        // 0 is a documented deny-all, not the same as "unset".
+        Ok(v) => Some(v.min(max)),
         Err(_) => {
             eprintln!("Config: ignoring invalid {key} value '{val}'");
-            default
+            None
         }
     }
 }
@@ -347,12 +346,14 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
         "RTMP_BIND" => config.rtmp_bind = val.to_string(),
         "RTMP_MAX_CONNECTIONS" => config.rtmp_max_conn = parse_max_connections(val),
         "RTMP_MAX_CONNECTIONS_PER_ADDR" => {
-            config.rtmp_max_connections_per_addr =
-                parse_per_addr_cap(val, "RTMP_MAX_CONNECTIONS_PER_ADDR");
+            if let Some(v) = parse_per_addr_cap(val, "RTMP_MAX_CONNECTIONS_PER_ADDR") {
+                config.rtmp_max_connections_per_addr = v;
+            }
         }
         "RTMP_MAX_PENDING_TLS_PER_ADDR" => {
-            config.rtmp_max_pending_tls_per_addr =
-                parse_per_addr_cap(val, "RTMP_MAX_PENDING_TLS_PER_ADDR");
+            if let Some(v) = parse_per_addr_cap(val, "RTMP_MAX_PENDING_TLS_PER_ADDR") {
+                config.rtmp_max_pending_tls_per_addr = v;
+            }
         }
         "RTMP_IDLE_TIMEOUT_SECS" => {
             config.rtmp_idle_timeout_secs = parse_idle_timeout_secs(val);
@@ -381,16 +382,19 @@ fn apply_kv(config: &mut ServerConfig, key: &str, val: &str) {
             config.http_rate_limit_window_secs = parse_rate_limit_window_secs(val);
         }
         "HTTP_RATE_LIMIT_API" => {
-            config.http_rate_limit_api =
-                parse_rate_limit_count(val, 120, 10_000, "HTTP_RATE_LIMIT_API");
+            if let Some(v) = parse_rate_limit_count(val, 10_000, "HTTP_RATE_LIMIT_API") {
+                config.http_rate_limit_api = v;
+            }
         }
         "HTTP_RATE_LIMIT_STATS" => {
-            config.http_rate_limit_stats =
-                parse_rate_limit_count(val, 30, 10_000, "HTTP_RATE_LIMIT_STATS");
+            if let Some(v) = parse_rate_limit_count(val, 10_000, "HTTP_RATE_LIMIT_STATS") {
+                config.http_rate_limit_stats = v;
+            }
         }
         "HTTP_RATE_LIMIT_DEFAULT" => {
-            config.http_rate_limit_default =
-                parse_rate_limit_count(val, 60, 10_000, "HTTP_RATE_LIMIT_DEFAULT");
+            if let Some(v) = parse_rate_limit_count(val, 10_000, "HTTP_RATE_LIMIT_DEFAULT") {
+                config.http_rate_limit_default = v;
+            }
         }
         "HTTP_MAX_BODY_BYTES" => config.http_max_body_bytes = parse_max_body_bytes(val),
         "LOG_LEVEL" => match val.parse::<i32>() {
@@ -473,16 +477,16 @@ where
 
     if let Some(v) = get("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR")
         && !v.is_empty()
+        && let Some(cap) = parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR")
     {
-        config.rtmp_max_connections_per_addr =
-            parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR");
+        config.rtmp_max_connections_per_addr = cap;
     }
 
     if let Some(v) = get("LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR")
         && !v.is_empty()
+        && let Some(cap) = parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR")
     {
-        config.rtmp_max_pending_tls_per_addr =
-            parse_per_addr_cap(&v, "LRTMP2_RTMP_MAX_PENDING_TLS_PER_ADDR");
+        config.rtmp_max_pending_tls_per_addr = cap;
     }
 
     if let Some(v) = get("LRTMP2_RTMP_IDLE_TIMEOUT_SECS")
@@ -552,23 +556,23 @@ where
 
     if let Some(v) = get("LRTMP2_HTTP_RATE_LIMIT_API")
         && !v.is_empty()
+        && let Some(count) = parse_rate_limit_count(&v, 10_000, "LRTMP2_HTTP_RATE_LIMIT_API")
     {
-        config.http_rate_limit_api =
-            parse_rate_limit_count(&v, 120, 10_000, "LRTMP2_HTTP_RATE_LIMIT_API");
+        config.http_rate_limit_api = count;
     }
 
     if let Some(v) = get("LRTMP2_HTTP_RATE_LIMIT_STATS")
         && !v.is_empty()
+        && let Some(count) = parse_rate_limit_count(&v, 10_000, "LRTMP2_HTTP_RATE_LIMIT_STATS")
     {
-        config.http_rate_limit_stats =
-            parse_rate_limit_count(&v, 30, 10_000, "LRTMP2_HTTP_RATE_LIMIT_STATS");
+        config.http_rate_limit_stats = count;
     }
 
     if let Some(v) = get("LRTMP2_HTTP_RATE_LIMIT_DEFAULT")
         && !v.is_empty()
+        && let Some(count) = parse_rate_limit_count(&v, 10_000, "LRTMP2_HTTP_RATE_LIMIT_DEFAULT")
     {
-        config.http_rate_limit_default =
-            parse_rate_limit_count(&v, 60, 10_000, "LRTMP2_HTTP_RATE_LIMIT_DEFAULT");
+        config.http_rate_limit_default = count;
     }
 
     if let Some(v) = get("LRTMP2_HTTP_MAX_BODY_BYTES")
@@ -775,14 +779,29 @@ mod tests {
     }
 
     #[test]
-    fn per_addr_cap_defaults_to_unlimited_and_rejects_non_positive() {
-        assert_eq!(parse_per_addr_cap("5", "TEST_KEY"), 5);
-        // 0/negative would make librtmp2 fall back to its own built-in
-        // per-IP default (4), which is exactly the surprise this config
-        // guards against, so it must not pass through unchanged.
-        assert_eq!(parse_per_addr_cap("0", "TEST_KEY"), i32::MAX);
-        assert_eq!(parse_per_addr_cap("-1", "TEST_KEY"), i32::MAX);
-        assert_eq!(parse_per_addr_cap("not-a-number", "TEST_KEY"), i32::MAX);
+    fn per_addr_cap_rejects_non_positive() {
+        assert_eq!(parse_per_addr_cap("5", "TEST_KEY"), Some(5));
+        // A non-positive value is the documented "no per-IP cap" spelling.
+        assert_eq!(parse_per_addr_cap("0", "TEST_KEY"), Some(i32::MAX));
+        assert_eq!(parse_per_addr_cap("-1", "TEST_KEY"), Some(i32::MAX));
+        // A malformed value must not widen (or narrow) the configured cap.
+        assert_eq!(parse_per_addr_cap("not-a-number", "TEST_KEY"), None);
+    }
+
+    #[test]
+    fn invalid_env_overrides_keep_the_configured_limits() {
+        let env = HashMap::from([
+            ("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR", "not-a-number"),
+            ("LRTMP2_HTTP_RATE_LIMIT_DEFAULT", "not-a-number"),
+        ]);
+        let mut config = ServerConfig {
+            rtmp_max_connections_per_addr: 5,
+            http_rate_limit_default: 0,
+            ..ServerConfig::default()
+        };
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
+        assert_eq!(config.rtmp_max_connections_per_addr, 5);
+        assert_eq!(config.http_rate_limit_default, 0);
     }
 
     #[test]

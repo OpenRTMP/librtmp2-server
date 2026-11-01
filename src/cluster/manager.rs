@@ -206,6 +206,10 @@ pub struct ClusterManager {
     /// the leader health tick — a removed node has no `down_since`, so the
     /// normal DOWN sweep will not pick this up.
     pending_node_cleanups: Mutex<std::collections::HashSet<NodeId>>,
+    /// Streams whose local-publisher check failed while ownership moved away;
+    /// retried on later sync ticks so a transient read error cannot leave a
+    /// stale publisher exporting under the old epoch.
+    pending_publisher_checks: Mutex<std::collections::HashSet<String>>,
     /// `(stream_id, epoch)` ownership rows left by a previous run of this
     /// node whose startup release could not be forwarded yet (a follower
     /// without the admin proof token). Retried with epoch fencing, so a
@@ -215,6 +219,10 @@ pub struct ClusterManager {
     /// Guards against stacking drain tasks: the health loop spawns at most one
     /// bounded [`Self::retry_pending_stream_cleanups`] run at a time.
     pending_cleanup_drain_running: AtomicBool,
+    /// A publisher ownership reacquire after isolation failed transiently;
+    /// retry it on subsequent healthy ticks instead of waiting for another
+    /// isolation transition that may never come.
+    recovery_retry_pending: AtomicBool,
     /// (app, stream_id) -> owner node this node currently holds a
     /// standby-replica media subscription against. Reconciled every health
     /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
@@ -250,6 +258,11 @@ pub struct SessionHooks {
     pub api_token: Arc<parking_lot::RwLock<String>>,
     /// Force local RTMP publishers off a stream (stale epoch after partition).
     pub force_unpublish_stream: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Re-stamp local publisher sessions for a stream after ownership was
+    /// reacquired at a fresh epoch, so exported frames carry the epoch the
+    /// cluster now stores instead of the pre-partition one. Returns whether
+    /// a live publisher connection was re-stamped.
+    pub retag_stream_epoch: Arc<dyn Fn(&str, u64) -> bool + Send + Sync>,
     /// Optional local live-session counter for drain wait aggregation.
     pub local_stream_sessions: Arc<dyn Fn(&str) -> u64 + Send + Sync>,
 }
@@ -423,8 +436,10 @@ impl ClusterManager {
             pending_drain_clears: Mutex::new(std::collections::HashSet::new()),
             pending_ambiguous_acquires: Mutex::new(Vec::new()),
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
+            pending_publisher_checks: Mutex::new(std::collections::HashSet::new()),
             pending_stream_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_cleanup_drain_running: AtomicBool::new(false),
+            recovery_retry_pending: AtomicBool::new(false),
             standby_subs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
@@ -1490,7 +1505,17 @@ impl ClusterManager {
     fn defer_join_proof_burn(&self, node_id: NodeId, proof: String) {
         let mut pending = self.pending_join_proofs.lock();
         Self::spend_expired_join_proofs(self, &mut pending, Instant::now());
-        pending.insert(node_id, (proof, Instant::now()));
+        if let Some((superseded, _)) = pending.insert(node_id, (proof.clone(), Instant::now())) {
+            // A superseded, different proof must not stay replayable until the
+            // TTL: spend it now. (An identical value is the same capability,
+            // already represented by the new pending entry.)
+            if superseded != proof {
+                let now = Instant::now();
+                let mut used = self.used_admin_proofs.lock();
+                Self::purge_expired_admin_proofs(&mut used, now);
+                used.insert(superseded, now);
+            }
+        }
     }
 
     /// Spend the deferred join proof of a node that has just been seen alive.
@@ -2106,28 +2131,78 @@ impl ClusterManager {
     /// registered (normal RTMP runtime); otherwise the conflict is only logged.
     fn reconcile_publishers_after_isolation(&self) {
         let node_id = self.config.node_id;
+        let mut retry = false;
+        // Streams with an unresolved acquire are settled by
+        // `reconcile_ambiguous_acquires`; issuing another acquire for them
+        // could race the write that is already in flight.
+        let ambiguous: std::collections::HashSet<String> = self
+            .pending_ambiguous_acquires
+            .lock()
+            .iter()
+            .map(|(stream_id, _, _, _)| stream_id.clone())
+            .collect();
         for p in self.db.publisher_list_all() {
+            if ambiguous.contains(&p.stream_id) {
+                retry = true;
+                continue;
+            }
             let owner = self.db.stream_owner_get(&p.stream_id);
             if owner.as_ref().map(|o| o.owner_node_id) == Some(node_id) {
                 continue;
             }
-            match self.acquire_stream_owner(&p.stream_id, node_id, 0, crate::db::now_ts()) {
+            // A fresh epoch is essential: reusing 0 (or the old one) makes the
+            // stored row disagree with the epoch the live publisher stamps on
+            // exported frames, so every receiver fences its media.
+            let epoch = self.ownership.next_epoch();
+            match self.acquire_stream_owner(&p.stream_id, node_id, epoch, crate::db::now_ts()) {
                 Ok(epoch) => {
+                    let retag = self
+                        .session_hooks
+                        .lock()
+                        .as_ref()
+                        .map(|hooks| Arc::clone(&hooks.retag_stream_epoch));
+                    if retag.is_some_and(|retag| !retag(&p.stream_id, epoch)) {
+                        // The publisher closed between the listing and the
+                        // acquire: its close released the old epoch, so
+                        // nothing would release this one and the stream
+                        // would stay blocked for publishers on other nodes.
+                        if let Err(e) = self.release_stream_owner(&p.stream_id, epoch) {
+                            retry = true;
+                            crate::log_warn!(
+                                "Cluster: could not release stream {} after its publisher closed \
+                                 during recovery ({e:?}); retrying on the next tick",
+                                p.stream_id
+                            );
+                        }
+                        continue;
+                    }
                     crate::log_info!(
                         "Cluster: reacquired ownership of stream {} at epoch {epoch} after isolation cleared",
                         p.stream_id
                     );
                 }
-                Err(e) => {
+                Err(crate::state::CoordError::Conflict) => {
                     crate::log_warn!(
-                        "Cluster: could not reacquire ownership of stream {} after isolation cleared ({e:?}); \
+                        "Cluster: stream {} was claimed by another owner after isolation cleared; \
                          forcing local publisher off",
                         p.stream_id
                     );
                     self.force_unpublish_and_drain(&p.stream_id);
                 }
+                Err(e) => {
+                    // A local admission refusal or an in-flight write failure is
+                    // not proof that another node owns the stream. Leave the
+                    // local publisher running and retry on the next tick.
+                    retry = true;
+                    crate::log_warn!(
+                        "Cluster: could not reacquire ownership of stream {} after isolation cleared \
+                         ({e:?}); deferring to the next tick",
+                        p.stream_id
+                    );
+                }
             }
         }
+        self.recovery_retry_pending.store(retry, Ordering::Release);
     }
 
     fn mark_viewer_revoked(&self, viewer_id: &str) {
@@ -2749,36 +2824,106 @@ impl ClusterManager {
         }
     }
 
+    /// Re-check streams whose publisher lookup failed while ownership moved
+    /// away. A successful read either kicks a still-active local publisher or
+    /// clears the pending entry.
+    fn retry_pending_publisher_checks(&self) {
+        let pending: Vec<String> = self
+            .pending_publisher_checks
+            .lock()
+            .iter()
+            .cloned()
+            .collect();
+        for stream_id in pending {
+            if self.ownership.get(&stream_id).map(|(n, _)| n) == Some(self.config.node_id) {
+                self.pending_publisher_checks.lock().remove(&stream_id);
+                continue;
+            }
+            match self.db.publisher_list_checked(Some(&stream_id)) {
+                crate::db::DbLookup::Ok(publishers) => {
+                    if publishers.iter().any(|p| p.active) {
+                        self.force_unpublish_and_drain(&stream_id);
+                    }
+                    self.pending_publisher_checks.lock().remove(&stream_id);
+                }
+                crate::db::DbLookup::Missing => {
+                    self.pending_publisher_checks.lock().remove(&stream_id);
+                }
+                // Keep retrying: the read failure still proves nothing.
+                crate::db::DbLookup::Failed => {}
+            }
+        }
+    }
+
+    /// Reset the timeline state of streams that no longer exist. Streams that
+    /// still have local sessions are deferred until those drain.
+    fn prune_deleted_timelines(&self) {
+        let timeline_ids = self.media.timeline_stream_ids();
+        if timeline_ids.is_empty() {
+            return;
+        }
+        // One query for every timeline id instead of a `stream_get` per
+        // id per tick. A DB error skips pruning this tick (fail-safe)
+        // rather than treating every stream as gone.
+        let crate::db::DbLookup::Ok(existing) = self.db.stream_ids() else {
+            return;
+        };
+        let mut gone: Vec<String> = Vec::new();
+        for sid in timeline_ids {
+            if existing.contains(&sid) {
+                continue;
+            }
+            if self.local_live_sessions(&sid) == 0 {
+                gone.push(sid);
+            } else {
+                // Local sessions can still emit frames for this
+                // deleted stream; defer the reset (and the repeated
+                // prune) until they drain.
+                self.pending_drain_clears.lock().insert(sid);
+            }
+        }
+        self.media.reset_timelines_for(&gone);
+    }
+
+    /// The applied owner of `stream_id` moved away (or was cleared): kick a
+    /// local publisher so it does not keep serving under a stale epoch after
+    /// isolation catch-up.
+    fn kick_local_publisher_of_lost_stream(&self, stream_id: &str) {
+        match self.db.publisher_list_checked(Some(stream_id)) {
+            crate::db::DbLookup::Ok(publishers) => {
+                if publishers.iter().any(|p| p.active) {
+                    self.force_unpublish_and_drain(stream_id);
+                }
+            }
+            // A failed read cannot prove there is no local publisher.
+            // Remember the stream and re-check it on later ticks.
+            crate::db::DbLookup::Failed => {
+                self.pending_publisher_checks
+                    .lock()
+                    .insert(stream_id.to_string());
+            }
+            crate::db::DbLookup::Missing => {}
+        }
+    }
+
     /// Sync in-memory ownership from SQLite (followers apply Raft → DB).
     fn sync_ownership_from_db(&self) {
-        let owners = self.db.stream_owner_list();
+        self.retry_pending_publisher_checks();
+        // A failed read is not "no owners": feeding an empty list into
+        // sync_from() would fence every tracked stream and trigger a
+        // destructive release/unsubscribe pass. Skip the tick instead.
+        let owners = match self.db.stream_owner_list_result() {
+            Ok(owners) => owners,
+            Err(e) => {
+                crate::log_error!("Cluster: ownership sync skipped, owner read failed: {e}");
+                return;
+            }
+        };
         let changed = self.ownership.sync_from(&owners);
         // Reclaim timeline state for deleted streams even when the ownership
         // sync reports no change: a locally released stream has no tracker
         // entry to report, so its remapper would otherwise leak.
-        let timeline_ids = self.media.timeline_stream_ids();
-        if !timeline_ids.is_empty() {
-            // One query for every timeline id instead of a `stream_get` per
-            // id per tick. A DB error skips pruning this tick (fail-safe)
-            // rather than treating every stream as gone.
-            if let crate::db::DbLookup::Ok(existing) = self.db.stream_ids() {
-                let mut gone: Vec<String> = Vec::new();
-                for sid in timeline_ids {
-                    if existing.contains(&sid) {
-                        continue;
-                    }
-                    if self.local_live_sessions(&sid) == 0 {
-                        gone.push(sid);
-                    } else {
-                        // Local sessions can still emit frames for this
-                        // deleted stream; defer the reset (and the repeated
-                        // prune) until they drain.
-                        self.pending_drain_clears.lock().insert(sid);
-                    }
-                }
-                self.media.reset_timelines_for(&gone);
-            }
-        }
+        self.prune_deleted_timelines();
         if changed.is_empty() {
             return;
         }
@@ -2791,17 +2936,8 @@ impl ClusterManager {
         for (stream_id, old_owner) in &changed {
             let still_ours =
                 self.ownership.get(stream_id).map(|(n, _)| n) == Some(self.config.node_id);
-            if !still_ours
-                && self
-                    .db
-                    .publisher_list(Some(stream_id.as_str()))
-                    .iter()
-                    .any(|p| p.active)
-            {
-                // Applied owner moved away (or cleared) while we still have a
-                // local publisher — kick it so we don't serve under a stale
-                // epoch after isolation catch-up.
-                self.force_unpublish_and_drain(stream_id);
+            if !still_ours {
+                self.kick_local_publisher_of_lost_stream(stream_id);
             }
             let Some((old_node, _)) = old_owner else {
                 continue;
@@ -3042,6 +3178,13 @@ impl ClusterManager {
                         "Cluster: pending ownership cleanup for removed node {id}: {e:?}"
                     ),
                 }
+            }
+            // Retry a publisher reacquire that failed transiently when the
+            // node became ready: the Isolated→Ready transition fires only once.
+            if self.recovery_retry_pending.load(Ordering::Acquire)
+                && self.health.local() == NodeHealthState::Ready
+            {
+                self.reconcile_publishers_after_isolation();
             }
             // Drain queued stale-owner releases off the heartbeat path: each
             // write can block up to the 2s Raft timeout, so draining many rows
@@ -3764,6 +3907,7 @@ mod tests {
                 revoked_viewers: Arc::clone(&self.revoked),
                 api_token: Arc::clone(&self.token),
                 force_unpublish_stream: Arc::new(move |s: &str| forced.lock().push(s.to_string())),
+                retag_stream_epoch: Arc::new(|_: &str, _: u64| true),
                 local_stream_sessions: Arc::new(move |_: &str| sessions.load(Ordering::SeqCst)),
             }
         }
@@ -4201,6 +4345,99 @@ mod tests {
                 .is_some_and(|o| o.epoch == epoch),
             "the owner row must not be released on a failed lookup"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_reacquires_publishers_at_a_fresh_epoch() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("iso")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-iso", "iso")));
+
+        m.reconcile_publishers_after_isolation();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("iso")
+                .is_some_and(|o| o.owner_node_id == 1 && o.epoch > 0))
+            .await,
+            "the local publisher must be reacquired under a fresh epoch"
+        );
+        assert!(!m.recovery_retry_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_releases_the_fresh_epoch_when_the_publisher_already_closed() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        let mut hooks = n.hooks.session_hooks();
+        // The publisher closed between the listing and the acquire, so no
+        // connection is left to re-stamp.
+        hooks.retag_stream_epoch = Arc::new(|_: &str, _: u64| false);
+        m.register_session_hooks(hooks);
+        m.create_stream(&stream("gone")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-gone", "gone")));
+
+        m.reconcile_publishers_after_isolation();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("gone")
+                .is_none())
+            .await,
+            "a recovery claim without a live publisher must be released"
+        );
+        assert!(!m.recovery_retry_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_skips_streams_with_in_flight_ambiguous_acquire() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("amb2")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-amb2", "amb2")));
+        m.pending_ambiguous_acquires
+            .lock()
+            .push(("amb2".into(), 1, 0, Instant::now()));
+
+        m.reconcile_publishers_after_isolation();
+        assert!(m.recovery_retry_pending.load(Ordering::Acquire));
+        assert!(
+            m.db().stream_owner_get("amb2").is_none(),
+            "an in-flight ambiguous acquire must not be raced by a second acquire"
+        );
+
+        m.pending_ambiguous_acquires.lock().clear();
+        m.reconcile_publishers_after_isolation();
+        assert!(!m.recovery_retry_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_publisher_checks_retry_and_clear() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("chk")).unwrap();
+        m.acquire_stream_owner("chk", 1, 0, 1).unwrap();
+        m.pending_publisher_checks.lock().insert("chk".into());
+        m.retry_pending_publisher_checks();
+        assert!(!m.pending_publisher_checks.lock().contains("chk"));
+
+        m.pending_publisher_checks.lock().insert("missing".into());
+        m.retry_pending_publisher_checks();
+        assert!(!m.pending_publisher_checks.lock().contains("missing"));
+
+        // Ownership moved to another node while a local publisher is active:
+        // the retry must fence it.
+        m.create_stream(&stream("chk2")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-chk2", "chk2")));
+        m.ownership.set("chk2", 2, 5);
+        m.pending_publisher_checks.lock().insert("chk2".into());
+        m.retry_pending_publisher_checks();
+        // The retry reaches force_unpublish_and_drain (which needs a live RTMP
+        // session to fence) and settles the pending entry.
+        assert!(!m.pending_publisher_checks.lock().contains("chk2"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -543,7 +543,9 @@ impl Db {
         for sql in [
             "ALTER TABLE publishers ADD COLUMN audio_sample_rate INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE publishers ADD COLUMN audio_channels INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE publishers ADD COLUMN rtt_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE players ADD COLUMN viewer_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE players ADD COLUMN rtt_ms INTEGER NOT NULL DEFAULT 0",
         ] {
             match conn.execute(sql, []) {
                 Ok(_) => {}
@@ -1156,20 +1158,34 @@ impl Db {
     }
 
     pub fn stream_list(&self) -> Vec<Stream> {
-        let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(&format!(
-            "SELECT {} FROM streams ORDER BY created_at",
-            Self::STREAM_COLS
-        )) {
-            Ok(s) => s,
+        match self.stream_list_checked() {
+            Ok(list) => list,
             Err(e) => {
-                crate::log_error!("stream_list: prepare failed: {e}");
-                return Vec::new();
+                crate::log_error!("stream_list: {e}");
+                Vec::new()
             }
-        };
-        stmt.query_map([], Self::load_stream_row)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+        }
+    }
+
+    /// Read every stream, failing on a prepare/query/row-decode error instead
+    /// of returning a partial list. Admin/API callers that must not present a
+    /// storage fault as an empty result use this variant.
+    pub fn stream_list_checked(&self) -> Result<Vec<Stream>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM streams ORDER BY created_at",
+                Self::STREAM_COLS
+            ))
+            .map_err(|e| format!("prepare failed: {e}"))?;
+        let rows = stmt
+            .query_map([], Self::load_stream_row)
+            .map_err(|e| format!("query failed: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("row decode failed: {e}"))?);
+        }
+        Ok(out)
     }
 
     /// Returns the ids of every stream. Callers testing many ids for
@@ -2032,7 +2048,7 @@ impl Db {
         if active > 0 {
             return false;
         }
-        if tx
+        let inserted = tx
             .prepare_cached(
                 "INSERT INTO publishers \
                  (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
@@ -2054,12 +2070,20 @@ impl Db {
                     p.bitrate_kbps,
                     p.rtt_ms,
                     p.connected_at
-                ]))
-            .is_err()
-        {
+                ]));
+        if let Err(e) = inserted {
+            // Do not let a storage fault masquerade as "stream already has an
+            // active publisher": callers map false to that user-facing error.
+            crate::log_error!("publisher_try_acquire: insert failed: {e}");
             return false;
         }
-        tx.commit().is_ok()
+        match tx.commit() {
+            Ok(()) => true,
+            Err(e) => {
+                crate::log_error!("publisher_try_acquire: commit failed: {e}");
+                false
+            }
+        }
     }
 
     pub fn publisher_update(&self, id: &str, p: &Publisher) -> bool {
@@ -2524,7 +2548,7 @@ impl Db {
                 return false;
             }
         };
-        if tx
+        let inserted = tx
             .prepare_cached(
                 "INSERT INTO players \
                  (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
@@ -2542,12 +2566,20 @@ impl Db {
                     p.rtt_ms,
                     p.connected_at
                 ])
-            })
-            .is_err()
-        {
+            });
+        if let Err(e) = inserted {
+            // A failed INSERT is a storage fault, not "connection limit
+            // reached"; log it so the caller's message is not the only signal.
+            crate::log_error!("player insert: insert failed: {e}");
             return false;
         }
-        tx.commit().is_ok()
+        match tx.commit() {
+            Ok(()) => true,
+            Err(e) => {
+                crate::log_error!("player insert: commit failed: {e}");
+                false
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -2957,6 +2989,16 @@ mod tests {
             enabled: true,
             created_at: now_ts(),
         }
+    }
+
+    #[test]
+    fn stream_list_checked_reports_read_failures() {
+        let db = Db::open(":memory:").unwrap();
+        db.conn.lock().execute_batch("DROP TABLE streams").unwrap();
+        assert!(db.stream_list_checked().is_err());
+        // The infallible reader still degrades to an empty list for callers
+        // that cannot propagate the error.
+        assert!(db.stream_list().is_empty());
     }
 
     #[test]

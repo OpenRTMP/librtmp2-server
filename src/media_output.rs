@@ -480,15 +480,10 @@ impl MediaOutputManager {
             if session.stream_id == stream_id {
                 // Every accepted `publish` command bumps the connection's
                 // generation, including a duplicate publish on a connection
-                // that already has this publisher (librtmp2 admits a repeat
-                // publish and the bridge re-claims the same route). Restarting
-                // on every bump is unbounded work driven by a ~30-byte command
-                // (new recording file, HLS session directory plus FFmpeg child,
-                // one FFmpeg per push target and a `MEDIA_EXEC_PUBLISH` child,
-                // all on the RTMP poll thread). Coalesce rapid bumps, but still
-                // start a new session for a genuine republish once the debounce
-                // window has elapsed so two logical publish sessions are never
-                // merged into one recording/HLS session.
+                // that already has this publisher. Coalesce rapid bumps, but
+                // still start a new session for a genuine republish once the
+                // debounce window has elapsed so two logical publish sessions
+                // are never merged into one recording/HLS session.
                 if session
                     .restarted_at
                     .is_some_and(|at| at.elapsed() < REPUBLISH_RESTART_MIN_INTERVAL)
@@ -496,14 +491,30 @@ impl MediaOutputManager {
                     session.generation = generation;
                     return;
                 }
+            } else if session
+                .last_switch_at
+                .is_some_and(|at| at.elapsed() < REPUBLISH_RESTART_MIN_INTERVAL)
+            {
+                // A publisher alternating stream ids must not rebuild every
+                // sink on each poll tick. Drop this switch; the next frame
+                // after the window performs it.
+                return;
             }
         }
+        let switched = self
+            .sessions
+            .get(&conn_id)
+            .is_some_and(|session| session.stream_id != stream_id);
         if let Some(old) = self.sessions.remove(&conn_id) {
             self.retire(old);
         }
         self.start_session(conn_id, stream_id, generation);
         if let Some(session) = self.sessions.get_mut(&conn_id) {
-            session.restarted_at = Some(Instant::now());
+            let now = Instant::now();
+            session.restarted_at = Some(now);
+            if switched {
+                session.last_switch_at = Some(now);
+            }
         }
     }
 
@@ -512,15 +523,23 @@ impl MediaOutputManager {
             return;
         }
 
+        let had_session = self.sessions.contains_key(&frame.publisher_conn_id);
         let needs_switch = self
             .sessions
             .get(&frame.publisher_conn_id)
             .is_none_or(|session| session.stream_id != stream_id);
         if needs_switch {
+            // Always follow the frame's stream here: dropping frames while a
+            // debounce window is open would lose the new stream's codec
+            // headers, and nothing replays them. Repeated publish-command
+            // churn is throttled in `ensure_publisher` instead.
             if let Some(old) = self.sessions.remove(&frame.publisher_conn_id) {
                 self.retire(old);
             }
             self.start_session(frame.publisher_conn_id, stream_id, generation);
+            if had_session && let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) {
+                session.last_switch_at = Some(Instant::now());
+            }
         }
 
         // RTMP timestamps normally move forward. A significant backwards jump
@@ -554,12 +573,19 @@ impl MediaOutputManager {
                 backward > 1000 && backward < u32::MAX / 2
             });
         if timestamp_reset {
+            let last_switch_at = self
+                .sessions
+                .get(&frame.publisher_conn_id)
+                .and_then(|session| session.last_switch_at);
             if let Some(old) = self.sessions.remove(&frame.publisher_conn_id) {
                 self.retire(old);
             }
             self.start_session(frame.publisher_conn_id, stream_id, generation);
             if let Some(session) = self.sessions.get_mut(&frame.publisher_conn_id) {
                 session.restarted_at = Some(Instant::now());
+                // Carry the switch interval across the timestamp-reset restart,
+                // otherwise a later stream change bypasses it.
+                session.last_switch_at = last_switch_at;
             }
         }
 
@@ -629,6 +655,8 @@ struct MediaSession {
     /// When this session was created by a republish restart, so the next one
     /// can be rate-limited per publisher connection.
     restarted_at: Option<Instant>,
+    /// Last time this connection switched to a different stream id.
+    last_switch_at: Option<Instant>,
 }
 
 fn setup_recording_sink(
@@ -788,6 +816,7 @@ impl MediaSession {
             hls_playlist,
             last_timestamp: None,
             restarted_at: None,
+            last_switch_at: None,
         }
     }
 
@@ -3000,6 +3029,32 @@ mod tests {
     }
 
     #[test]
+    fn manager_debounces_rapid_stream_switches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: tmp.path().join("rec"),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+
+        manager.ensure_publisher(1, "s1", 1);
+        manager.ensure_publisher(1, "s2", 2);
+        assert_eq!(manager.sessions[&1].stream_id, "s2");
+
+        // A second switch inside the debounce window is deferred.
+        manager.ensure_publisher(1, "s1", 3);
+        assert_eq!(manager.sessions[&1].stream_id, "s2");
+
+        // Once the window has elapsed the deferred switch is performed.
+        manager.sessions.get_mut(&1).unwrap().last_switch_at =
+            Some(Instant::now() - REPUBLISH_RESTART_MIN_INTERVAL * 2);
+        manager.ensure_publisher(1, "s1", 3);
+        assert_eq!(manager.sessions[&1].stream_id, "s1");
+        manager.stop_all();
+    }
+
+    #[test]
     fn manager_aborts_sessions_when_reaper_unavailable() {
         let tmp = tempfile::tempdir().unwrap();
         let config = MediaOutputConfig {
@@ -3018,6 +3073,8 @@ mod tests {
         // Retirement queue full (rendezvous channel nobody receives on).
         let (full_tx, _full_rx) = mpsc::sync_channel(0);
         manager.retire_tx = Some(full_tx);
+        // Bypass the rapid-switch debounce: this test exercises retirement.
+        manager.sessions.get_mut(&1).unwrap().last_switch_at = None;
         manager.ensure_publisher(1, "s1", 3);
         assert_eq!(manager.sessions[&1].stream_id, "s1");
 
@@ -3025,6 +3082,7 @@ mod tests {
         let (gone_tx, gone_rx) = mpsc::sync_channel(1);
         drop(gone_rx);
         manager.retire_tx = Some(gone_tx);
+        manager.sessions.get_mut(&1).unwrap().last_switch_at = None;
         manager.ensure_publisher(1, "s2", 4);
         assert_eq!(manager.sessions[&1].stream_id, "s2");
 

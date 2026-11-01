@@ -2066,12 +2066,16 @@ impl ServerApp {
         };
         let bridge_fp = Arc::clone(&self.rtmp_bridge);
         let bridge_sessions = Arc::clone(&self.rtmp_bridge);
+        let bridge_epochs = Arc::clone(&self.rtmp_bridge);
         mgr.register_session_hooks(crate::cluster::SessionHooks {
             deleted_streams: Arc::clone(&self.deleted_streams),
             revoked_viewers: Arc::clone(&self.revoked_viewers),
             api_token: Arc::clone(api_token),
             force_unpublish_stream: Arc::new(move |stream_id: &str| {
                 bridge_fp.force_unpublish_stream(stream_id);
+            }),
+            retag_stream_epoch: Arc::new(move |stream_id: &str, epoch: u64| {
+                bridge_epochs.retag_stream_epoch(stream_id, epoch)
             }),
             local_stream_sessions: Arc::new(move |sid: &str| {
                 bridge_sessions.live_conn_count_for_stream(sid) as u64
