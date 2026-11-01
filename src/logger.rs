@@ -85,6 +85,58 @@ pub fn init(level: i32, file_path: &str) {
     }
 }
 
+/// Route librtmp2's protocol-layer log lines (handshake, connect, close
+/// reasons) into this logger at the same level filter. Without this the
+/// library writes to stderr on its own, bypassing `LOG_FILE`, and its debug
+/// lines are never enabled.
+pub fn bridge_librtmp2() {
+    use librtmp2::log::LogLevel;
+    let lib_level = match Level::from_u8(LEVEL.load(Ordering::Relaxed)) {
+        Level::Error => LogLevel::Error,
+        Level::Warn => LogLevel::Warn,
+        Level::Info => LogLevel::Info,
+        Level::Debug => LogLevel::Debug,
+    };
+    librtmp2::log::set_level(lib_level);
+    librtmp2::log::set_callback(forward_librtmp2_line, std::ptr::null_mut());
+}
+
+fn forward_librtmp2_line(level: librtmp2::log::LogLevel, msg: &str, _userdata: *mut u8) {
+    let (level, line) = librtmp2_line(level, msg);
+    log(level, &line);
+}
+
+/// Map a librtmp2 log line to this logger's level and message text.
+fn librtmp2_line(level: librtmp2::log::LogLevel, msg: &str) -> (Level, String) {
+    use librtmp2::log::LogLevel;
+    let level = match level {
+        LogLevel::Error => Level::Error,
+        LogLevel::Warn => Level::Warn,
+        LogLevel::Info => Level::Info,
+        LogLevel::Debug => Level::Debug,
+    };
+    (level, format!("librtmp2: {}", strip_librtmp2_level(msg)))
+}
+
+/// librtmp2 formats lines as `[LEVEL] file:line: message`; this logger
+/// prints its own level, so drop the library's.
+fn strip_librtmp2_level(msg: &str) -> &str {
+    msg.strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(msg, |(_, body)| body)
+}
+
+impl Level {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Level::Error,
+            1 => Level::Warn,
+            2 => Level::Info,
+            _ => Level::Debug,
+        }
+    }
+}
+
 pub fn close() {
     let mut guard = FILE.lock();
     if let Some(lf) = guard.as_mut() {
@@ -182,6 +234,53 @@ macro_rules! log_debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_from_u8_matches_the_config_scale() {
+        assert_eq!(Level::from_u8(0), Level::Error);
+        assert_eq!(Level::from_u8(1), Level::Warn);
+        assert_eq!(Level::from_u8(2), Level::Info);
+        assert_eq!(Level::from_u8(3), Level::Debug);
+        assert_eq!(Level::from_u8(9), Level::Debug);
+    }
+
+    #[test]
+    fn librtmp2_lines_keep_their_level_and_lose_the_library_prefix() {
+        use librtmp2::log::LogLevel;
+        for (lib, ours) in [
+            (LogLevel::Error, Level::Error),
+            (LogLevel::Warn, Level::Warn),
+            (LogLevel::Info, Level::Info),
+            (LogLevel::Debug, Level::Debug),
+        ] {
+            assert_eq!(
+                librtmp2_line(lib, "[INFO] conn.rs:1: forwarded"),
+                (ours, "librtmp2: conn.rs:1: forwarded".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_routes_library_lines_through_the_callback() {
+        use librtmp2::log::LogLevel;
+        bridge_librtmp2();
+        // Exercise both entry points; the mapping itself is asserted above.
+        forward_librtmp2_line(
+            LogLevel::Debug,
+            "[DEBUG] conn.rs:1: forwarded",
+            std::ptr::null_mut(),
+        );
+        librtmp2::log::log(LogLevel::Warn, file!(), line!(), format_args!("bridged"));
+    }
+
+    #[test]
+    fn librtmp2_level_prefix_is_stripped() {
+        assert_eq!(
+            strip_librtmp2_level("[WARN] conn.rs:12: RTMP conn 1 [1.2.3.4:5]: closed"),
+            "conn.rs:12: RTMP conn 1 [1.2.3.4:5]: closed"
+        );
+        assert_eq!(strip_librtmp2_level("no prefix"), "no prefix");
+    }
 
     #[test]
     fn sanitize_escapes_newlines_and_carriage_returns() {

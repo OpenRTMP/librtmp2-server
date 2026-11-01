@@ -143,6 +143,11 @@ struct ConnState {
     player_stats_reset_pending: bool,
     /// Timestamp of the last RTT flush to the DB.
     last_rtt_at: Option<Instant>,
+    /// When the connection was first seen (for the close log line).
+    connected_at: Option<Instant>,
+    /// When the poll loop saw the connection close. `on_close` may run later
+    /// on the auth worker, so the logged lifetime is measured up to here.
+    closed_at: Option<Instant>,
 }
 
 /// A publisher/player row whose `active=1` deactivation write failed.
@@ -1940,6 +1945,7 @@ impl RtmpEventHandler for DbRtmpBridge {
         let cs = conns.entry(conn).or_default();
         cs.remote_addr = remote_addr.to_string();
         cs.remote_ip = remote_ip_of(remote_addr);
+        cs.connected_at.get_or_insert_with(Instant::now);
         drop(conns);
         crate::log_info!("RTMP: new connection {conn} from {remote_addr}");
     }
@@ -2073,12 +2079,35 @@ impl RtmpEventHandler for DbRtmpBridge {
         } else if !had_role {
             // No authorized role — still record the TCP close for auditability
             // (matches srt-live-server logging accepted peers that never stream).
-            crate::log_info!("RTMP: connection closed {conn} from {peer}");
+            // Say how long it lived: a client that keeps reconnecting and
+            // dropping within a second is failing the RTMP setup, and the
+            // librtmp2 close line just before this one says why.
+            let closed_at = cs.closed_at.unwrap_or_else(Instant::now);
+            let lifetime = cs
+                .connected_at
+                .map(|t| {
+                    format!(
+                        " after {} ms",
+                        closed_at.saturating_duration_since(t).as_millis()
+                    )
+                })
+                .unwrap_or_default();
+            crate::log_info!(
+                "RTMP: connection closed {conn} from {peer}{lifetime} without publish/play"
+            );
         }
     }
 }
 
 impl DbRtmpBridge {
+    /// Record when the poll loop saw `conn` close, before `on_close` is
+    /// queued behind pending authorizations.
+    pub(crate) fn mark_closed(&self, conn: ConnId) {
+        if let Some(cs) = self.conns.lock().get_mut(&conn) {
+            cs.closed_at.get_or_insert_with(Instant::now);
+        }
+    }
+
     // Compiled for both standalone and cluster builds: a standalone node still
     // records a per-connection ownership epoch on publish, so the entry must be
     // removed on close/release to keep `ownership_epochs` bounded.
@@ -2550,6 +2579,21 @@ mod tests {
             bridge.authorize_play(1_001, "live", "bogus").is_err(),
             "play from a throttled IP must stay rejected despite a successful publish"
         );
+    }
+
+    #[test]
+    fn mark_closed_records_the_close_once_and_ignores_unknown_conns() {
+        let bridge = test_bridge(Arc::new(Db::open(":memory:").unwrap()));
+        bridge.mark_closed(99);
+        assert!(!bridge.conns.lock().contains_key(&99));
+
+        bridge.on_connect(1, "127.0.0.1:1000");
+        bridge.mark_closed(1);
+        let first = bridge.conns.lock()[&1].closed_at.expect("close recorded");
+        bridge.mark_closed(1);
+        assert_eq!(bridge.conns.lock()[&1].closed_at, Some(first));
+        bridge.on_close(1);
+        assert!(!bridge.conns.lock().contains_key(&1));
     }
 
     #[test]

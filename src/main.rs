@@ -55,6 +55,7 @@ fn run() -> Result<(), String> {
     }
 
     logger::init(config.log_level, &config.log_file);
+    logger::bridge_librtmp2();
 
     let result = (|| -> Result<(), String> {
         let app = ServerApp::create(config)?;

@@ -888,6 +888,7 @@ fn submit_auth(kind: AuthKind, conn_id: u64, app: &str, stream_key: &str) -> Aut
 /// queued closes are drained before the cluster manager stops (see
 /// [`drain_auth_worker_for_shutdown`]).
 fn close_conn_off_poll_thread(rtmp_bridge: &DbRtmpBridge, conn_id: u64) {
+    rtmp_bridge.mark_closed(conn_id);
     let submitted = AUTH_WORKER
         .lock()
         .ok()
@@ -1873,7 +1874,12 @@ impl ServerApp {
         &self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), String> {
-        crate::log_info!("OpenRTMP librtmp2-server alpha starting...");
+        crate::log_info!(
+            "OpenRTMP librtmp2-server {} (librtmp2 {}) starting; log level {}",
+            env!("CARGO_PKG_VERSION"),
+            librtmp2::version_string(),
+            self.config.log_level
+        );
 
         let coordinator = self.start_coordinator().await?;
         let api_token = self.live_api_token();
