@@ -3987,6 +3987,26 @@ mod tests {
     // ---------- POST /api/v1/streams ----------
 
     #[tokio::test]
+    async fn create_stream_reports_malformed_json_instead_of_missing_id() {
+        let state = roomy_state();
+        let app = router(state);
+        let (status, body) = send(&app, "POST", "/api/v1/streams", true, Some(r#"{"id":"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !body.contains("Missing 'id' field"),
+            "an extractor rejection must not be reported as a missing id: {body}"
+        );
+        assert!(body.contains("error"), "{body}");
+    }
+
+    #[test]
+    fn xml_escape_drops_xml_forbidden_noncharacters() {
+        assert_eq!(xml_escape("a\u{FFFE}b\u{FFFF}c"), "abc");
+        assert_eq!(xml_escape("a\u{1}b"), "ab");
+        assert_eq!(xml_escape("<&>\""), "&lt;&amp;&gt;&quot;");
+    }
+
+    #[tokio::test]
     async fn create_stream_validation_errors() {
         let state = roomy_state();
         let app = router(state.clone());

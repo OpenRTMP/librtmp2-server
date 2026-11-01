@@ -2279,6 +2279,27 @@ mod tests {
     }
 
     #[test]
+    fn retag_stream_epoch_updates_only_matching_connections() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        bridge.ownership_epochs.lock().insert(1, ("s1".into(), 1));
+        bridge.ownership_epochs.lock().insert(2, ("s1".into(), 2));
+        bridge
+            .ownership_epochs
+            .lock()
+            .insert(3, ("other".into(), 7));
+
+        bridge.retag_stream_epoch("s1", 9);
+
+        let epochs = bridge.ownership_epochs.lock();
+        assert_eq!(epochs.get(&1).unwrap().1, 9);
+        assert_eq!(epochs.get(&2).unwrap().1, 9);
+        assert_eq!(epochs.get(&3).unwrap().1, 7);
+        drop(epochs);
+        assert_eq!(bridge.ownership_epoch_for_stream("s1"), Some(9));
+    }
+
+    #[test]
     fn legacy_short_keys_cannot_use_fast_auth_path() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let short_pub = "a".to_string();

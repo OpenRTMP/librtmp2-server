@@ -2992,6 +2992,16 @@ mod tests {
     }
 
     #[test]
+    fn stream_list_checked_reports_read_failures() {
+        let db = Db::open(":memory:").unwrap();
+        db.conn.lock().execute_batch("DROP TABLE streams").unwrap();
+        assert!(db.stream_list_checked().is_err());
+        // The infallible reader still degrades to an empty list for callers
+        // that cannot propagate the error.
+        assert!(db.stream_list().is_empty());
+    }
+
+    #[test]
     fn publisher_try_acquire_rejects_second_slot() {
         let db = Db::open(":memory:").unwrap();
         db.stream_add(&sample_stream(

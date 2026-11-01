@@ -1928,6 +1928,21 @@ mod tests {
         assert!(budget.try_acquire(source, false).is_some());
     }
 
+    #[test]
+    fn preauth_per_source_key_buckets_ipv6_by_64_and_maps_ipv4() {
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(PreauthBudget::per_ip_key(v4), v4);
+        // IPv4-mapped IPv6 must keep its IPv4 identity instead of collapsing
+        // into the ::/64 bucket.
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        assert_eq!(PreauthBudget::per_ip_key(mapped), v4);
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let bucket: IpAddr = "2001:db8::".parse().unwrap();
+        assert_eq!(PreauthBudget::per_ip_key(v6), bucket);
+        let same_bucket: IpAddr = "2001:db8::dead:beef".parse().unwrap();
+        assert_eq!(PreauthBudget::per_ip_key(same_bucket), bucket);
+    }
+
     #[tokio::test]
     async fn declared_length_above_max_frame_is_rejected() {
         let mut bytes = Vec::new();

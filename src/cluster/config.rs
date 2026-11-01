@@ -718,6 +718,17 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn boolean_spellings_are_case_insensitive() {
+        for value in ["true", "TRUE", "True", "on", "ON", "yes", "1"] {
+            assert!(parse_bool_strict(value, "TEST").unwrap(), "{value}");
+        }
+        for value in ["false", "FALSE", "False", "off", "OFF", "no", "0"] {
+            assert!(!parse_bool_strict(value, "TEST").unwrap(), "{value}");
+        }
+        assert!(parse_bool_strict("maybe", "TEST").is_err());
+    }
+
+    #[test]
     fn cluster_secret_rejects_short_values() {
         assert!(!is_valid_cluster_secret("short"));
         assert!(!is_valid_cluster_secret("0123456789abcdef"));

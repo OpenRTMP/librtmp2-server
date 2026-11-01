@@ -3029,6 +3029,32 @@ mod tests {
     }
 
     #[test]
+    fn manager_debounces_rapid_stream_switches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MediaOutputConfig {
+            recording_enabled: true,
+            recording_path: tmp.path().join("rec"),
+            ..Default::default()
+        };
+        let mut manager = MediaOutputManager::new(config, test_db());
+
+        manager.ensure_publisher(1, "s1", 1);
+        manager.ensure_publisher(1, "s2", 2);
+        assert_eq!(manager.sessions[&1].stream_id, "s2");
+
+        // A second switch inside the debounce window is deferred.
+        manager.ensure_publisher(1, "s1", 3);
+        assert_eq!(manager.sessions[&1].stream_id, "s2");
+
+        // Once the window has elapsed the deferred switch is performed.
+        manager.sessions.get_mut(&1).unwrap().last_switch_at =
+            Some(Instant::now() - REPUBLISH_RESTART_MIN_INTERVAL * 2);
+        manager.ensure_publisher(1, "s1", 3);
+        assert_eq!(manager.sessions[&1].stream_id, "s1");
+        manager.stop_all();
+    }
+
+    #[test]
     fn manager_aborts_sessions_when_reaper_unavailable() {
         let tmp = tempfile::tempdir().unwrap();
         let config = MediaOutputConfig {

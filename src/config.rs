@@ -789,6 +789,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_env_overrides_keep_the_configured_limits() {
+        let env = HashMap::from([
+            ("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR", "not-a-number"),
+            ("LRTMP2_HTTP_RATE_LIMIT_DEFAULT", "not-a-number"),
+        ]);
+        let mut config = ServerConfig {
+            rtmp_max_connections_per_addr: 5,
+            http_rate_limit_default: 0,
+            ..ServerConfig::default()
+        };
+        config_apply_env_from(&mut config, |key| env.get(key).map(|v| v.to_string())).unwrap();
+        assert_eq!(config.rtmp_max_connections_per_addr, 5);
+        assert_eq!(config.http_rate_limit_default, 0);
+    }
+
+    #[test]
     fn env_overrides_rtmp_max_connections_per_addr() {
         let env = HashMap::from([
             ("LRTMP2_RTMP_MAX_CONNECTIONS_PER_ADDR", "8"),

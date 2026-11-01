@@ -4318,6 +4318,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_reacquires_publishers_at_a_fresh_epoch() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("iso")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-iso", "iso")));
+
+        m.reconcile_publishers_after_isolation();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("iso")
+                .is_some_and(|o| o.owner_node_id == 1 && o.epoch > 0))
+            .await,
+            "the local publisher must be reacquired under a fresh epoch"
+        );
+        assert!(!m.recovery_retry_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_skips_streams_with_in_flight_ambiguous_acquire() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("amb2")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-amb2", "amb2")));
+        m.pending_ambiguous_acquires
+            .lock()
+            .push(("amb2".into(), 1, 0, Instant::now()));
+
+        m.reconcile_publishers_after_isolation();
+        assert!(m.recovery_retry_pending.load(Ordering::Acquire));
+        assert!(
+            m.db().stream_owner_get("amb2").is_none(),
+            "an in-flight ambiguous acquire must not be raced by a second acquire"
+        );
+
+        m.pending_ambiguous_acquires.lock().clear();
+        m.reconcile_publishers_after_isolation();
+        assert!(!m.recovery_retry_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_publisher_checks_retry_and_clear() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        m.create_stream(&stream("chk")).unwrap();
+        m.acquire_stream_owner("chk", 1, 0, 1).unwrap();
+        m.pending_publisher_checks.lock().insert("chk".into());
+        m.retry_pending_publisher_checks();
+        assert!(!m.pending_publisher_checks.lock().contains("chk"));
+
+        m.pending_publisher_checks.lock().insert("missing".into());
+        m.retry_pending_publisher_checks();
+        assert!(!m.pending_publisher_checks.lock().contains("missing"));
+
+        // Ownership moved to another node while a local publisher is active:
+        // the retry must fence it.
+        m.create_stream(&stream("chk2")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-chk2", "chk2")));
+        m.ownership.set("chk2", 2, 5);
+        m.pending_publisher_checks.lock().insert("chk2".into());
+        m.retry_pending_publisher_checks();
+        // The retry reaches force_unpublish_and_drain (which needs a live RTMP
+        // session to fence) and settles the pending entry.
+        assert!(!m.pending_publisher_checks.lock().contains("chk2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconcile_keeps_pending_acquire_while_local_publisher_is_active() {
         let n = bootstrap(1, |_| {}).await;
         let m = &n.mgr;
