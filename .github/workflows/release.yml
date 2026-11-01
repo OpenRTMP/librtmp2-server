@@ -110,6 +110,25 @@ jobs:
           echo "version=${{ needs.resolve.outputs.version }}" >> "$GITHUB_OUTPUT"
           echo "tag=${{ needs.resolve.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
+      - name: Extract changelog section for this version
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if ($0 ~ ("^## \\[" ver "\\]")) { found=1; next }
+              next
+            }
+            /^\[.*\]:/ { if (found) exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No CHANGELOG.md section found for version $VERSION"
+            exit 1
+          fi
+          cat release-notes.md
+
       - name: Build release binary
         run: cargo build --locked --release
 
@@ -156,7 +175,7 @@ jobs:
           # default branch's head (which can move while the release builds).
           target_commitish: ${{ needs.resolve.outputs.sha }}
           name: librtmp2-server ${{ steps.ver.outputs.version }}
-          generate_release_notes: true
+          body_path: release-notes.md
           files: |
             dist/*.tar.gz
             dist/*.sha256
