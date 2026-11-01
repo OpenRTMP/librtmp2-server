@@ -24,6 +24,31 @@ begin at `1.0.0`.
   the v0.6.7 release record only contains librtmp2-server.
 - The GitHub release body keeps the generated pull request list and compare
   link below the CHANGELOG section.
+- After a cluster node recovers from isolation, it reacquires ownership of
+  its streams at a fresh epoch and re-stamps its local publishers, so their
+  exported frames are no longer fenced by receivers. A claim whose
+  publisher closed in the meantime is released again.
+- A local admission refusal no longer forces a local publisher off; only a
+  real ownership conflict does.
+- A superseded join proof is spent right away, and a failed ownership or
+  publisher read no longer triggers destructive cleanup.
+- The streams API reports a storage failure instead of returning an empty
+  list, keeps the status of rejected requests, and answers a cluster write
+  timeout with a retryable error.
+- Stats output drops code points that are not valid in XML, and older
+  databases get the `rtt_ms` columns migrated.
+- Failed session inserts are logged, rapid stream switches are debounced,
+  and the media-output path no longer looks up the database for every
+  frame.
+- IPv6 pre-auth slots are keyed by /64, the cluster control read limit
+  matches what the writer sends, and an invalid per-IP cap override keeps
+  the configured cap.
+- The benchmark sweep does not publish incomplete join legs or legs with
+  zero frames per viewer, retries its final rebase, and rejects a warmup
+  that covers the whole run.
+
+### Changed
+- Dependency update: openssl 0.10.82 (openssl-sys 0.9.118).
 
 ## [0.6.7] — 2026-11-01
 
