@@ -260,8 +260,9 @@ pub struct SessionHooks {
     pub force_unpublish_stream: Arc<dyn Fn(&str) + Send + Sync>,
     /// Re-stamp local publisher sessions for a stream after ownership was
     /// reacquired at a fresh epoch, so exported frames carry the epoch the
-    /// cluster now stores instead of the pre-partition one.
-    pub retag_stream_epoch: Arc<dyn Fn(&str, u64) + Send + Sync>,
+    /// cluster now stores instead of the pre-partition one. Returns whether
+    /// a live publisher connection was re-stamped.
+    pub retag_stream_epoch: Arc<dyn Fn(&str, u64) -> bool + Send + Sync>,
     /// Optional local live-session counter for drain wait aggregation.
     pub local_stream_sessions: Arc<dyn Fn(&str) -> u64 + Send + Sync>,
 }
@@ -2155,8 +2156,25 @@ impl ClusterManager {
             let epoch = self.ownership.next_epoch();
             match self.acquire_stream_owner(&p.stream_id, node_id, epoch, crate::db::now_ts()) {
                 Ok(epoch) => {
-                    if let Some(hooks) = self.session_hooks.lock().as_ref() {
-                        (hooks.retag_stream_epoch)(&p.stream_id, epoch);
+                    let retag = self
+                        .session_hooks
+                        .lock()
+                        .as_ref()
+                        .map(|hooks| Arc::clone(&hooks.retag_stream_epoch));
+                    if retag.is_some_and(|retag| !retag(&p.stream_id, epoch)) {
+                        // The publisher closed between the listing and the
+                        // acquire: its close released the old epoch, so
+                        // nothing would release this one and the stream
+                        // would stay blocked for publishers on other nodes.
+                        if let Err(e) = self.release_stream_owner(&p.stream_id, epoch) {
+                            retry = true;
+                            crate::log_warn!(
+                                "Cluster: could not release stream {} after its publisher closed \
+                                 during recovery ({e:?}); retrying on the next tick",
+                                p.stream_id
+                            );
+                        }
+                        continue;
                     }
                     crate::log_info!(
                         "Cluster: reacquired ownership of stream {} at epoch {epoch} after isolation cleared",
@@ -3889,7 +3907,7 @@ mod tests {
                 revoked_viewers: Arc::clone(&self.revoked),
                 api_token: Arc::clone(&self.token),
                 force_unpublish_stream: Arc::new(move |s: &str| forced.lock().push(s.to_string())),
-                retag_stream_epoch: Arc::new(|_: &str, _: u64| {}),
+                retag_stream_epoch: Arc::new(|_: &str, _: u64| true),
                 local_stream_sessions: Arc::new(move |_: &str| sessions.load(Ordering::SeqCst)),
             }
         }
@@ -4345,6 +4363,31 @@ mod tests {
                 .is_some_and(|o| o.owner_node_id == 1 && o.epoch > 0))
             .await,
             "the local publisher must be reacquired under a fresh epoch"
+        );
+        assert!(!m.recovery_retry_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_releases_the_fresh_epoch_when_the_publisher_already_closed() {
+        let n = bootstrap(1, |_| {}).await;
+        let m = &n.mgr;
+        let mut hooks = n.hooks.session_hooks();
+        // The publisher closed between the listing and the acquire, so no
+        // connection is left to re-stamp.
+        hooks.retag_stream_epoch = Arc::new(|_: &str, _: u64| false);
+        m.register_session_hooks(hooks);
+        m.create_stream(&stream("gone")).unwrap();
+        assert!(m.db().publisher_try_acquire(&publisher("pub-gone", "gone")));
+
+        m.reconcile_publishers_after_isolation();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || m
+                .db()
+                .stream_owner_get("gone")
+                .is_none())
+            .await,
+            "a recovery claim without a live publisher must be released"
         );
         assert!(!m.recovery_retry_pending.load(Ordering::Acquire));
     }

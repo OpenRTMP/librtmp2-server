@@ -363,13 +363,17 @@ impl DbRtmpBridge {
     /// Re-stamp every local publisher connection for `stream_id` with the
     /// epoch just reacquired after an isolation/partition recovery, so
     /// exported frames are fenced under the epoch the cluster stores.
-    pub fn retag_stream_epoch(&self, stream_id: &str, epoch: u64) {
+    /// Returns whether any live publisher connection was re-stamped.
+    pub fn retag_stream_epoch(&self, stream_id: &str, epoch: u64) -> bool {
         let mut epochs = self.ownership_epochs.lock();
+        let mut retagged = false;
         for (sid, ep) in epochs.values_mut() {
             if sid == stream_id {
                 *ep = epoch;
+                retagged = true;
             }
         }
+        retagged
     }
 
     /// Per-connection ownership epoch claimed for this publisher socket.
@@ -2289,7 +2293,8 @@ mod tests {
             .lock()
             .insert(3, ("other".into(), 7));
 
-        bridge.retag_stream_epoch("s1", 9);
+        assert!(bridge.retag_stream_epoch("s1", 9));
+        assert!(!bridge.retag_stream_epoch("closed", 9));
 
         let epochs = bridge.ownership_epochs.lock();
         assert_eq!(epochs.get(&1).unwrap().1, 9);

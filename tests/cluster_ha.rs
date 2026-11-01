@@ -32,7 +32,7 @@ fn register_test_session_hooks(mgr: &ClusterManager) {
         revoked_viewers: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         api_token: Arc::new(parking_lot::RwLock::new(TEST_API_TOKEN.to_string())),
         force_unpublish_stream: Arc::new(|_: &str| {}),
-        retag_stream_epoch: Arc::new(|_: &str, _: u64| {}),
+        retag_stream_epoch: Arc::new(|_: &str, _: u64| true),
         local_stream_sessions: Arc::new(|_: &str| 0u64),
     });
 }

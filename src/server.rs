@@ -2075,7 +2075,7 @@ impl ServerApp {
                 bridge_fp.force_unpublish_stream(stream_id);
             }),
             retag_stream_epoch: Arc::new(move |stream_id: &str, epoch: u64| {
-                bridge_epochs.retag_stream_epoch(stream_id, epoch);
+                bridge_epochs.retag_stream_epoch(stream_id, epoch)
             }),
             local_stream_sessions: Arc::new(move |sid: &str| {
                 bridge_sessions.live_conn_count_for_stream(sid) as u64

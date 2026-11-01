@@ -92,6 +92,8 @@ def _join_row(cur: dict, requested: int | None) -> list | None:
         or cur.get("fps") is None
         or requested is None
         or cur.get("received", 0) != requested
+        # As for load rows: zero steady-state frames is not a measurement.
+        or cur["fps"] <= 0
     ):
         return None
     return [cur["avg"], cur["p95"], cur["fps"]]
