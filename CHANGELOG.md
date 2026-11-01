@@ -48,6 +48,9 @@ begin at `1.0.0`.
   that covers the whole run.
 
 ### Changed
+- Built on librtmp2 0.16.1. Besides the ping fix above, a peer that keeps
+  sending but stops reading what the server sends is now closed after
+  10 seconds without any of its queued output going out.
 - Dependency update: openssl 0.10.82 (openssl-sys 0.9.118).
 
 ## [0.6.7] — 2026-11-01
