@@ -1,0 +1,147 @@
+{
+ "schema": 1,
+ "repo": "OpenRTMP/librtmp2-server",
+ "kind": "release",
+ "version": "0.6.7",
+ "tag": "v0.6.7",
+ "commit": "83a7c7d033e861f758ff4fd6d6eb656f8701a616",
+ "date": "2026-11-01T00:55:18Z",
+ "run_url": "https://github.com/OpenRTMP/librtmp2-server/actions/runs/41257140701",
+ "deps": {
+  "librtmp2": "0.16.0"
+ },
+ "environment": {
+  "cpu": "AMD EPYC 7763 64-Core Processor",
+  "vcpus": 4,
+  "ram_gib": 15.6,
+  "kernel": "Linux 7.0.0-1017-azure x86_64",
+  "rustc": "1.99.1",
+  "runner": "GitHub-hosted ubuntu26 (image 20261026.180.1)",
+  "shared_vm": true
+ },
+ "suites": {
+  "http_api": {
+   "http_api/create_stream": {
+    "ns": 279084.81516658183,
+    "ci_rel": 0.012238027384466457,
+    "bytes": null,
+    "elements": null
+   },
+   "http_api/health": {
+    "ns": 166794.82015668057,
+    "ci_rel": 0.04052002205142191,
+    "bytes": null,
+    "elements": null
+   },
+   "http_api/list_streams": {
+    "ns": 11891723.484320557,
+    "ci_rel": 0.01592073932421453,
+    "bytes": null,
+    "elements": null
+   }
+  }
+ },
+ "sweep": {
+  "handshake": {
+   "openrtmp": [
+    6302.6,
+    3.64,
+    3.63,
+    7.3,
+    8.1
+   ]
+  },
+  "play_handshake": {
+   "openrtmp": [
+    6200.1,
+    3.69,
+    3.49,
+    6.61,
+    7.15
+   ]
+  },
+  "join": {
+   "1": {
+    "openrtmp": [
+     0.55,
+     0.55,
+     74.66
+    ]
+   },
+   "25": {
+    "openrtmp": [
+     2.5,
+     3.35,
+     74.48
+    ]
+   },
+   "100": {
+    "openrtmp": [
+     4.35,
+     9.28,
+     74.36
+    ]
+   }
+  },
+  "load": {
+   "500": {
+    "openrtmp": [
+     25.93,
+     59.01,
+     73.68,
+     37.1,
+     23.3
+    ]
+   },
+   "1000": {
+    "openrtmp": [
+     33.85,
+     93.42,
+     73.64,
+     72.8,
+     32.8
+    ]
+   },
+   "2000": {
+    "openrtmp": [
+     109.21,
+     254.87,
+     73.8,
+     129.8,
+     52.3
+    ]
+   }
+  },
+  "versions": {
+   "openrtmp": {
+    "version": "0.6.7",
+    "detail": "librtmp2 0.16.0",
+    "language": "Rust"
+   },
+   "mediamtx": {
+    "version": "v1.21.3",
+    "detail": "",
+    "language": "Go"
+   },
+   "liveforge": {
+    "version": "main @ a93fa22",
+    "detail": "",
+    "language": "Go"
+   },
+   "srs": {
+    "version": "v8.0-d2",
+    "detail": "",
+    "language": "C++"
+   },
+   "nginx": {
+    "version": "nginx 1.31.8",
+    "detail": "nginx-rtmp-module @ 6c7719d",
+    "language": "C"
+   }
+  },
+  "params": {
+   "load viewers": "500 1000 2000",
+   "publisher": "ffmpeg 1280x720@30 H.264 2.5 Mbps + AAC 128 kbps"
+  }
+ }
+}
