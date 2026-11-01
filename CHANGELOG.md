@@ -13,6 +13,18 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-11-01
+
+### Fixed
+- A publisher that keeps sending media is no longer dropped for not
+  answering RTMP pings (librtmp2 0.16.1). The DJI Osmo Pocket 3 never sends
+  a ping response and was disconnected after about 15 seconds of streaming.
+- The release benchmark run measures the compared servers again. On the
+  Ubuntu 26.04 runners their binary paths no longer reached the sweep, so
+  the v0.6.7 release record only contains librtmp2-server.
+- The GitHub release body keeps the generated pull request list and compare
+  link below the CHANGELOG section.
+
 ## [0.6.7] — 2026-11-01
 
 ### Security
@@ -1189,7 +1201,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.8...HEAD
+[0.6.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.5...v0.6.6
 [0.6.5]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.4...v0.6.5
