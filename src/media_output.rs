@@ -528,17 +528,10 @@ impl MediaOutputManager {
             .get(&frame.publisher_conn_id)
             .is_none_or(|session| session.stream_id != stream_id);
         if needs_switch {
-            // Do not rebuild every sink on each tick when a publisher keeps
-            // alternating stream ids: a switch inside the debounce window is
-            // dropped (its frames are not written into the old stream either).
-            if self
-                .sessions
-                .get(&frame.publisher_conn_id)
-                .and_then(|session| session.last_switch_at)
-                .is_some_and(|at| at.elapsed() < REPUBLISH_RESTART_MIN_INTERVAL)
-            {
-                return;
-            }
+            // Always follow the frame's stream here: dropping frames while a
+            // debounce window is open would lose the new stream's codec
+            // headers, and nothing replays them. Repeated publish-command
+            // churn is throttled in `ensure_publisher` instead.
             if let Some(old) = self.sessions.remove(&frame.publisher_conn_id) {
                 self.retire(old);
             }

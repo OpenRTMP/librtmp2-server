@@ -215,6 +215,10 @@ pub struct ClusterManager {
     /// Guards against stacking drain tasks: the health loop spawns at most one
     /// bounded [`Self::retry_pending_stream_cleanups`] run at a time.
     pending_cleanup_drain_running: AtomicBool,
+    /// A publisher ownership reacquire after isolation failed transiently;
+    /// retry it on subsequent healthy ticks instead of waiting for another
+    /// isolation transition that may never come.
+    recovery_retry_pending: AtomicBool,
     /// (app, stream_id) -> owner node this node currently holds a
     /// standby-replica media subscription against. Reconciled every health
     /// tick against the deterministic replica placement so CLUSTER_MEDIA_REPLICAS
@@ -429,6 +433,7 @@ impl ClusterManager {
             pending_node_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_stream_cleanups: Mutex::new(std::collections::HashSet::new()),
             pending_cleanup_drain_running: AtomicBool::new(false),
+            recovery_retry_pending: AtomicBool::new(false),
             standby_subs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             state_machine: sm_handle.clone(),
             used_admin_proofs: Mutex::new(HashMap::new()),
@@ -2120,6 +2125,7 @@ impl ClusterManager {
     /// registered (normal RTMP runtime); otherwise the conflict is only logged.
     fn reconcile_publishers_after_isolation(&self) {
         let node_id = self.config.node_id;
+        let mut retry = false;
         for p in self.db.publisher_list_all() {
             let owner = self.db.stream_owner_get(&p.stream_id);
             if owner.as_ref().map(|o| o.owner_node_id) == Some(node_id) {
@@ -2150,7 +2156,8 @@ impl ClusterManager {
                 Err(e) => {
                     // A local admission refusal or an in-flight write failure is
                     // not proof that another node owns the stream. Leave the
-                    // local publisher running and retry on the next health tick.
+                    // local publisher running and retry on the next tick.
+                    retry = true;
                     crate::log_warn!(
                         "Cluster: could not reacquire ownership of stream {} after isolation cleared \
                          ({e:?}); deferring to the next tick",
@@ -2159,6 +2166,7 @@ impl ClusterManager {
                 }
             }
         }
+        self.recovery_retry_pending.store(retry, Ordering::Release);
     }
 
     fn mark_viewer_revoked(&self, viewer_id: &str) {
@@ -3086,6 +3094,13 @@ impl ClusterManager {
                         "Cluster: pending ownership cleanup for removed node {id}: {e:?}"
                     ),
                 }
+            }
+            // Retry a publisher reacquire that failed transiently when the
+            // node became ready: the Isolated→Ready transition fires only once.
+            if self.recovery_retry_pending.load(Ordering::Acquire)
+                && self.health.local() == NodeHealthState::Ready
+            {
+                self.reconcile_publishers_after_isolation();
             }
             // Drain queued stale-owner releases off the heartbeat path: each
             // write can block up to the 2s Raft timeout, so draining many rows

@@ -105,7 +105,13 @@ impl PreauthBudget {
     /// whole shared budget with 32 addresses. Members are exempt.
     fn per_ip_key(peer: IpAddr) -> IpAddr {
         match peer {
+            // A dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d.
+            // Clearing the low 64 bits would collapse every IPv4 source into
+            // one bucket, so canonicalize the mapping first.
             IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return IpAddr::V4(v4);
+                }
                 let mut octets = v6.octets();
                 octets[8..].fill(0);
                 IpAddr::V6(std::net::Ipv6Addr::from(octets))
