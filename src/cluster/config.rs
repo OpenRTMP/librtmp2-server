@@ -608,11 +608,13 @@ fn apply_cluster_kv(cfg: &mut ClusterConfig, key: &str, val: &str) -> Result<(),
 }
 
 fn parse_bool_strict(val: &str, key: &str) -> Result<bool, String> {
-    match val.trim() {
-        "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
-        "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
+    // Accept the common spellings the main server config accepts; previously
+    // mixed-case (True/On) and on/off were hard startup errors.
+    match val.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
         other => Err(format!(
-            "invalid boolean for {key}: '{other}' (expected true/false/1/0/yes/no)"
+            "invalid boolean for {key}: '{other}' (expected true/false/1/0/yes/no/on/off)"
         )),
     }
 }
@@ -714,6 +716,17 @@ fn rewrite_wildcard_to_loopback(bind: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn boolean_spellings_are_case_insensitive() {
+        for value in ["true", "TRUE", "True", "on", "ON", "yes", "1"] {
+            assert!(parse_bool_strict(value, "TEST").unwrap(), "{value}");
+        }
+        for value in ["false", "FALSE", "False", "off", "OFF", "no", "0"] {
+            assert!(!parse_bool_strict(value, "TEST").unwrap(), "{value}");
+        }
+        assert!(parse_bool_strict("maybe", "TEST").is_err());
+    }
 
     #[test]
     fn cluster_secret_rejects_short_values() {

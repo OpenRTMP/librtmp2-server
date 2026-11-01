@@ -85,11 +85,16 @@ def _handshake_row(cur: dict) -> list | None:
     return row if complete else None
 
 
-def _join_row(cur: dict) -> list | None:
-    """Only legs that actually delivered frames: the client prints zeroed
-    latency/throughput for a leg in which no viewer received a frame, and that
-    must not be published as a valid result."""
-    if cur.get("avg") is None or cur.get("fps") is None or cur.get("received", 0) <= 0:
+def _join_row(cur: dict, requested: int | None) -> list | None:
+    """Only legs where every requested viewer received frames."""
+    if (
+        cur.get("avg") is None
+        or cur.get("fps") is None
+        or requested is None
+        or cur.get("received", 0) != requested
+        # As for load rows: zero steady-state frames is not a measurement.
+        or cur["fps"] <= 0
+    ):
         return None
     return [cur["avg"], cur["p95"], cur["fps"]]
 
@@ -106,6 +111,9 @@ def _load_row(cur: dict, requested: int | None) -> list | None:
         None not in row
         and requested is not None
         and cur.get("received", 0) == requested
+        # A complete viewer count with zero steady-state frames is not a
+        # measurement (e.g. the warmup covered the run); never publish it.
+        and cur.get("fps", 0) > 0
     )
     return row if complete else None
 
@@ -118,7 +126,7 @@ def _store(sweep: dict, section: tuple, cur: dict) -> None:
         if row:
             sweep["handshake" if kind == "handshake" else "play_handshake"][server] = row
     elif kind == "relay":
-        row = _join_row(cur)
+        row = _join_row(cur, players)
         if row:
             sweep["join"].setdefault(str(players), {})[server] = row
     elif kind == "load":

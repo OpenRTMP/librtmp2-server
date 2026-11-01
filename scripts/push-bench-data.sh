@@ -37,4 +37,11 @@ for attempt in 1 2 3 4; do
   fi
   sleep $((attempt * 3))
 done
+# The loop exits right after its last rebase without retrying the push;
+# try once more before giving up so a run that only needed the final replay
+# is still published.
+if git -c http.extraheader="$auth" push --quiet origin HEAD:main; then
+  echo "bench data pushed to main"
+  exit 0
+fi
 echo "::warning::could not push the benchmark data to main (branch protection?). The results are still in the job summary."

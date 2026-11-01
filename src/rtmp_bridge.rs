@@ -360,6 +360,22 @@ impl DbRtmpBridge {
             .map(|(_, ep)| *ep)
     }
 
+    /// Re-stamp every local publisher connection for `stream_id` with the
+    /// epoch just reacquired after an isolation/partition recovery, so
+    /// exported frames are fenced under the epoch the cluster stores.
+    /// Returns whether any live publisher connection was re-stamped.
+    pub fn retag_stream_epoch(&self, stream_id: &str, epoch: u64) -> bool {
+        let mut epochs = self.ownership_epochs.lock();
+        let mut retagged = false;
+        for (sid, ep) in epochs.values_mut() {
+            if sid == stream_id {
+                *ep = epoch;
+                retagged = true;
+            }
+        }
+        retagged
+    }
+
     /// Per-connection ownership epoch claimed for this publisher socket.
     /// Used when stamping exported relay frames — never fall back to a
     /// durable/current stream epoch (that can label frames with a peer's
@@ -384,10 +400,16 @@ impl DbRtmpBridge {
     /// sinks via publish_key lookup. Falls back to the conn mapping, then
     /// publish_key resolution.
     pub fn resolve_media_output_stream_id(&self, conn: ConnId, frame_route: &str) -> String {
+        // Fast path for the normal pinned configuration: `relay_key` already
+        // carries the durable stream id, so the per-frame DB lookup would only
+        // confirm what the connection map already holds.
+        let sid = self.stream_id_for_conn(conn);
+        if !sid.is_empty() && sid == frame_route {
+            return sid;
+        }
         if let DbLookup::Ok(s) = self.db.stream_get(frame_route) {
             return s.id;
         }
-        let sid = self.stream_id_for_conn(conn);
         if !sid.is_empty() {
             return sid;
         }
@@ -2258,6 +2280,28 @@ mod tests {
         assert_eq!(remote_ip_of("203.0.113.7:5000"), "203.0.113.7");
         assert_eq!(remote_ip_of("[2001:db8::7]:5000"), "2001:db8::7");
         assert_eq!(remote_ip_of("[::ffff:203.0.113.7]:5000"), "203.0.113.7");
+    }
+
+    #[test]
+    fn retag_stream_epoch_updates_only_matching_connections() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(db);
+        bridge.ownership_epochs.lock().insert(1, ("s1".into(), 1));
+        bridge.ownership_epochs.lock().insert(2, ("s1".into(), 2));
+        bridge
+            .ownership_epochs
+            .lock()
+            .insert(3, ("other".into(), 7));
+
+        assert!(bridge.retag_stream_epoch("s1", 9));
+        assert!(!bridge.retag_stream_epoch("closed", 9));
+
+        let epochs = bridge.ownership_epochs.lock();
+        assert_eq!(epochs.get(&1).unwrap().1, 9);
+        assert_eq!(epochs.get(&2).unwrap().1, 9);
+        assert_eq!(epochs.get(&3).unwrap().1, 7);
+        drop(epochs);
+        assert_eq!(bridge.ownership_epoch_for_stream("s1"), Some(9));
     }
 
     #[test]
