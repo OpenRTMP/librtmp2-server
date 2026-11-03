@@ -1645,21 +1645,13 @@ impl DbRtmpBridge {
 
         #[cfg(feature = "cluster")]
         {
-            // A replay of the same stream keeps the subscription this
-            // connection already holds — subscribing again would inflate the
-            // refcount without a matching unsubscribe (only one is ever
-            // issued per connection on close/stream-switch), leaving the
-            // owner forwarding media for a viewer that has since gone away.
-            let same_stream_replay = old_player
-                .as_ref()
-                .is_some_and(|prior| prior.stream_id == stream.id);
-            if let Some(ref prior) = old_player
-                && !same_stream_replay
-            {
+            // Remote refs are owned by the player session id. A replacement
+            // session (also on the same stream) must release the prior id's
+            // ref and add its own; `add`/`remove` are idempotent per id.
+            if let Some(ref prior) = old_player {
                 self.maybe_unsubscribe_remote_play(&prior.id, &prior.stream_id);
             }
-            if !same_stream_replay
-                && let Some(coord) = self.coordinator.lock().clone()
+            if let Some(coord) = self.coordinator.lock().clone()
                 && let Some(mgr) = coord.cluster_manager()
             {
                 mgr.notify_play_subscription(&player_id, app, &stream.id);

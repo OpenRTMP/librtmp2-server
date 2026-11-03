@@ -161,6 +161,9 @@ pub struct ClusterManager {
     network: Arc<NetworkFactory>,
     health: Arc<HealthTracker>,
     admission: Arc<AdmissionController>,
+    /// True while a bandwidth probe task is running; the health loop never
+    /// awaits the probe, so a stalled subprocess cannot delay heartbeats.
+    bandwidth_probe_inflight: Arc<std::sync::atomic::AtomicBool>,
     media: Arc<MediaHub>,
     meta: Arc<ClusterMeta>,
     ownership: Arc<OwnershipTracker>,
@@ -430,6 +433,7 @@ impl ClusterManager {
             network: Arc::clone(&network),
             health: Arc::clone(&health),
             admission: Arc::clone(&admission),
+            bandwidth_probe_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             media: Arc::clone(&media),
             meta: Arc::clone(&meta),
             ownership,
@@ -2870,6 +2874,12 @@ impl ClusterManager {
             if *old_node == self.config.node_id {
                 continue;
             }
+            // An epoch-only change keeps the same owner: the refs are still
+            // valid because the owner keeps serving the stream, and dropping
+            // them would lose the standby/viewer refs without a re-subscribe.
+            if self.ownership.get(stream_id).map(|(node, _)| node) == Some(*old_node) {
+                continue;
+            }
             let app = match self.db.stream_get(stream_id) {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
@@ -2894,8 +2904,10 @@ impl ClusterManager {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
             };
-            // One ref per active player session: drop that session's ref (a
-            // no-op when it never subscribed to this owner) and re-add it.
+            // One ref per active player session; re-adding an existing session
+            // is idempotent, so no unsubscribe is needed here. The old owner's
+            // refs were dropped by `unsubscribe_captured_remote_owners` when the
+            // owner node actually changed.
             let sessions: Vec<String> = self
                 .db
                 .player_list(Some(sid))
@@ -2903,9 +2915,6 @@ impl ClusterManager {
                 .filter(|p| p.active)
                 .map(|p| p.id.clone())
                 .collect();
-            for session in &sessions {
-                self.notify_play_unsubscribe(session, &app, sid);
-            }
             for session in &sessions {
                 self.notify_play_subscription(session, &app, sid);
             }
@@ -3033,6 +3042,10 @@ impl ClusterManager {
             if *old_node == self.config.node_id {
                 continue;
             }
+            // Same owner, new epoch: refs stay valid and must not be dropped.
+            if self.ownership.get(stream_id).map(|(n, _)| n) == Some(*old_node) {
+                continue;
+            }
             let app = match self.db.stream_get(stream_id) {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
@@ -3112,20 +3125,25 @@ impl ClusterManager {
             self.retry_pending_drain_clears();
             self.reconcile_ambiguous_acquires();
             self.expire_pending_join_proofs();
-            if !self.config.bandwidth_interface.is_empty() {
+            if !self.config.bandwidth_interface.is_empty()
+                && !self.bandwidth_probe_inflight.swap(true, Ordering::AcqRel)
+            {
+                // Never await the probe here: on Windows it spawns PowerShell
+                // processes and sleeps between samples, which could delay the
+                // heartbeats past the peers' miss limit. The task updates the
+                // admission load when it finishes and clears the guard.
                 let iface = self.config.bandwidth_interface.clone();
                 let max = self.config.bandwidth_max_mbps;
                 let mode = self.config.bandwidth_mode;
-                // Probe sleeps ~200ms — keep it off the Tokio worker.
-                match tokio::task::spawn_blocking(move || {
-                    measure_interface_utilization(&iface, max, mode)
-                })
-                .await
-                {
-                    Ok(Ok(load)) => self.admission.update_load(load),
-                    Ok(Err(e)) => crate::log_warn!("Cluster bandwidth: {e}"),
-                    Err(e) => crate::log_warn!("Cluster bandwidth probe join: {e}"),
-                }
+                let admission = Arc::clone(&self.admission);
+                let in_flight = Arc::clone(&self.bandwidth_probe_inflight);
+                tokio::task::spawn_blocking(move || {
+                    match measure_interface_utilization(&iface, max, mode) {
+                        Ok(load) => admission.update_load(load),
+                        Err(e) => crate::log_warn!("Cluster bandwidth: {e}"),
+                    }
+                    in_flight.store(false, Ordering::Release);
+                });
             }
             let down = self.health.sweep_stale();
             let metrics = self.last_metrics.lock().clone();

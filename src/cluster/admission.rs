@@ -169,14 +169,58 @@ pub fn measure_interface_utilization(
     }
     #[cfg(target_os = "windows")]
     {
+        fn run_with_deadline(
+            mut command: std::process::Command,
+            timeout: std::time::Duration,
+        ) -> Result<std::process::Output, String> {
+            use std::io::Read;
+            let mut child = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("bandwidth probe failed: {e}"))?;
+            let mut stdout = child.stdout.take();
+            let mut stderr = child.stderr.take();
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let mut out = Vec::new();
+                        let mut err = Vec::new();
+                        if let Some(handle) = stdout.as_mut() {
+                            let _ = handle.read_to_end(&mut out);
+                        }
+                        if let Some(handle) = stderr.as_mut() {
+                            let _ = handle.read_to_end(&mut err);
+                        }
+                        return Ok(std::process::Output {
+                            status,
+                            stdout: out,
+                            stderr: err,
+                        });
+                    }
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err("bandwidth probe timed out".to_string());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => return Err(format!("bandwidth probe failed: {e}")),
+                }
+            }
+        }
+
         fn sample(iface: &str) -> Result<(u64, u64), String> {
             // PowerShell single-quoted strings escape an apostrophe by
             // doubling it; an adapter named "John's Ethernet" would otherwise
             // break the command on every heartbeat.
             let iface = iface.replace('\'', "''");
-            let output = std::process::Command::new("powershell")
-                .args([
+            let output = run_with_deadline(
+                std::process::Command::new("powershell").args([
                     "-NoProfile",
+                    "-NonInteractive",
                     "-Command",
                     &format!(
                         "(Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
@@ -184,9 +228,9 @@ pub fn measure_interface_utilization(
                          (Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
                          Select-Object -ExpandProperty SentBytes)"
                     ),
-                ])
-                .output()
-                .map_err(|e| format!("bandwidth probe failed: {e}"))?;
+                ]),
+                std::time::Duration::from_secs(5),
+            )?;
             if !output.status.success() {
                 return Err(format!(
                     "interface '{iface}' missing or unreadable: {}",
