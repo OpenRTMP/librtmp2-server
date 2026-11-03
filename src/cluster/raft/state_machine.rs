@@ -319,8 +319,8 @@ impl SqliteStateMachine {
                     Err(OwnerError::NotFound) => ClusterResponse::Error("db".into()),
                 }
             }
-            ClusterCommand::ReleaseOwnersForNode { node_id } => {
-                match self.db.stream_owners_release_for_node(*node_id) {
+            ClusterCommand::ReleaseOwnersForNode { node_id, max_epoch } => {
+                match self.db.stream_owners_release_for_node(*node_id, *max_epoch) {
                     Ok(_) => {
                         self.emit_effect(StateEffect::OwnershipChanged);
                         ClusterResponse::Ok
@@ -1644,7 +1644,10 @@ mod tests {
             apply_one(
                 &mut sm,
                 13,
-                ClusterCommand::ReleaseOwnersForNode { node_id: 1 }
+                ClusterCommand::ReleaseOwnersForNode {
+                    node_id: 1,
+                    max_epoch: u64::MAX
+                }
             )
             .await
             .unwrap(),
@@ -1658,6 +1661,54 @@ mod tests {
             effects
                 .iter()
                 .all(|e| matches!(e, StateEffect::OwnershipChanged))
+        );
+    }
+
+    #[test]
+    fn release_owners_for_node_is_epoch_fenced() {
+        let (sm, _rx) = sm_with_effects();
+        let s = stream("fenced");
+        assert_eq!(sm.apply_command(&create(&s)), ClusterResponse::Ok);
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::AcquireStreamOwner {
+                stream_id: "fenced".into(),
+                node_id: 5,
+                epoch: 4,
+                acquired_at: 1,
+            }),
+            ClusterResponse::OwnerEpoch(4)
+        );
+        // A retried cleanup fenced at epoch 4 releases the captured row.
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::ReleaseOwnersForNode {
+                node_id: 5,
+                max_epoch: 4,
+            }),
+            ClusterResponse::Ok
+        );
+        assert!(sm.db().stream_owner_get("fenced").is_none());
+
+        // The same node re-acquires the stream with a newer epoch; an earlier
+        // fenced retry must not delete the fresh row.
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::AcquireStreamOwner {
+                stream_id: "fenced".into(),
+                node_id: 5,
+                epoch: 9,
+                acquired_at: 2,
+            }),
+            ClusterResponse::OwnerEpoch(9)
+        );
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::ReleaseOwnersForNode {
+                node_id: 5,
+                max_epoch: 4,
+            }),
+            ClusterResponse::Ok
+        );
+        assert!(
+            sm.db().stream_owner_get("fenced").is_some(),
+            "a fenced retry must leave a newer acquisition alone"
         );
     }
 
@@ -1890,7 +1941,10 @@ mod tests {
                 stream_id: "e1".into(),
                 epoch: 1,
             },
-            ClusterCommand::ReleaseOwnersForNode { node_id: 1 },
+            ClusterCommand::ReleaseOwnersForNode {
+                node_id: 1,
+                max_epoch: u64::MAX,
+            },
         ] {
             assert!(
                 apply_one(&mut sm, 3, cmd.clone()).await.is_err(),

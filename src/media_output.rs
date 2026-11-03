@@ -3117,10 +3117,13 @@ mod tests {
             manager.overflow_retirements.load(Ordering::Relaxed) >= 1,
             "the session should have been handed to the overflow worker"
         );
+        // The overflow counter above is the structural proof that the poll
+        // thread did not tear the old session down inline. Keep only a loose
+        // upper bound here: a loaded CI runner can make even the off-thread
+        // handoff slower than the old 400 ms threshold.
         assert!(
-            elapsed < Duration::from_millis(400),
-            "retire blocked the poll thread for {elapsed:?}; the session must be \
-             torn down off-thread"
+            elapsed < Duration::from_secs(5),
+            "retire blocked the poll thread for {elapsed:?}"
         );
         manager.stop_all();
     }

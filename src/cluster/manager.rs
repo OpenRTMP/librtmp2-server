@@ -21,7 +21,7 @@ use crate::cluster::config::ClusterConfig;
 use crate::cluster::health::{HealthTracker, NodeHealthState};
 use crate::cluster::media::InboundSubscribeVerdict;
 use crate::cluster::media::hub::{
-    ExportQueue, ExportedFrame, InjectQueue, InjectedFrame, MediaHub,
+    ExportQueue, ExportedFrame, InjectQueue, InjectedFrame, MediaHub, STANDBY_SUB_OWNER,
 };
 use crate::cluster::media::ownership::OwnershipTracker;
 use crate::cluster::membership::{
@@ -98,6 +98,16 @@ impl WriteFailure {
             WriteFailure::Undispatched(e) | WriteFailure::Dispatched(e) => e,
         }
     }
+}
+
+/// Failure of a node-wide ownership release.
+#[derive(Debug)]
+pub enum NodeReleaseError {
+    /// The ownership rows could not be read, so there is no fence to retry
+    /// with; retrying blindly could delete a rejoined node's new rows.
+    Read(CoordError),
+    /// The write failed. Retrying with this epoch fence is safe.
+    Write(u64, CoordError),
 }
 
 /// Resolve control/media addresses from a heartbeat payload.
@@ -208,7 +218,7 @@ pub struct ClusterManager {
     /// [`Self::release_owners_for_node`] has not yet succeeded. Retried on
     /// the leader health tick — a removed node has no `down_since`, so the
     /// normal DOWN sweep will not pick this up.
-    pending_node_cleanups: Mutex<std::collections::HashSet<NodeId>>,
+    pending_node_cleanups: Mutex<std::collections::HashSet<(NodeId, u64)>>,
     /// Streams whose local-publisher check failed while ownership moved away;
     /// retried on later sync ticks so a transient read error cannot leave a
     /// stale publisher exporting under the old epoch.
@@ -926,16 +936,48 @@ impl ClusterManager {
         Ok(())
     }
 
-    pub fn release_owners_for_node(&self, node_id: u64) -> Result<(), CoordError> {
+    /// Release every ownership row of `node_id`, returning the epoch fence used.
+    pub fn release_owners_for_node_with_fence(
+        &self,
+        node_id: u64,
+    ) -> Result<u64, NodeReleaseError> {
         // An empty fallback here would erase every tracker entry on one failed
         // read, so surface the failure instead of hydrating from `Vec::new()`.
+        let owners = self
+            .db
+            .stream_owner_list_result()
+            .map_err(|e| NodeReleaseError::Read(CoordError::Cluster(e)))?;
+        // Fence the release by the highest epoch this node owned *now*: a row
+        // the rejoining node acquires afterwards carries a higher Raft epoch
+        // and survives the (possibly delayed) retry.
+        let fence = owners
+            .iter()
+            .filter(|o| o.owner_node_id == node_id)
+            .map(|o| o.epoch)
+            .max()
+            .unwrap_or(0);
+        self.release_owners_for_node_fenced(node_id, fence)
+            .map_err(|e| NodeReleaseError::Write(fence, e))?;
+        Ok(fence)
+    }
+
+    /// Release every ownership row of `node_id` (coordinator API).
+    pub fn release_owners_for_node(&self, node_id: u64) -> Result<(), CoordError> {
+        match self.release_owners_for_node_with_fence(node_id) {
+            Ok(_) => Ok(()),
+            Err(NodeReleaseError::Read(e)) | Err(NodeReleaseError::Write(_, e)) => Err(e),
+        }
+    }
+
+    /// Release every ownership row of `node_id` whose epoch is at most `fence`.
+    fn release_owners_for_node_fenced(&self, node_id: u64, fence: u64) -> Result<(), CoordError> {
         let owners = self
             .db
             .stream_owner_list_result()
             .map_err(CoordError::Cluster)?;
         let affected: Vec<String> = owners
             .into_iter()
-            .filter(|o| o.owner_node_id == node_id)
+            .filter(|o| o.owner_node_id == node_id && o.epoch <= fence)
             .map(|o| o.stream_id)
             .collect();
         // Snapshot prior owners before clear/hydrate so we can unsubscribe from
@@ -945,8 +987,11 @@ impl ClusterManager {
             .iter()
             .map(|sid| (sid.clone(), self.ownership.get(sid)))
             .collect();
-        self.block_on_write(ClusterCommand::ReleaseOwnersForNode { node_id })?
-            .into_coord_result()?;
+        self.block_on_write(ClusterCommand::ReleaseOwnersForNode {
+            node_id,
+            max_epoch: fence,
+        })?
+        .into_coord_result()?;
         self.ownership.clear_for_node(node_id);
         // The release itself must not be retried: a later retry would run
         // unfenced after the node re-joined and could delete its new rows, so
@@ -1184,14 +1229,23 @@ impl ClusterManager {
                  membership node map failed ({e}); it may keep receiving log replication"
             );
         }
-        if let Err(e) = self.release_owners_for_node(node_id) {
-            crate::log_warn!(
-                "Cluster: node {node_id} removed from membership but releasing its stream \
-                 ownership failed ({e:?}); queuing pending cleanup until release succeeds"
-            );
-            self.pending_node_cleanups.lock().insert(node_id);
-        } else {
-            self.pending_node_cleanups.lock().remove(&node_id);
+        match self.release_owners_for_node_with_fence(node_id) {
+            Ok(_) => {
+                self.pending_node_cleanups
+                    .lock()
+                    .retain(|(queued, _)| *queued != node_id);
+            }
+            Err(NodeReleaseError::Write(fence, e)) => {
+                crate::log_warn!(
+                    "Cluster: node {node_id} removed from membership but releasing its stream \
+                     ownership failed ({e:?}); queuing fenced cleanup (epoch <= {fence})"
+                );
+                self.pending_node_cleanups.lock().insert((node_id, fence));
+            }
+            Err(NodeReleaseError::Read(e)) => crate::log_warn!(
+                "Cluster: node {node_id} removed from membership but its stream ownership \
+                 could not be read ({e:?}); not queuing an unfenced cleanup"
+            ),
         }
         self.media.disconnect_peer(node_id);
         self.meta.remove(node_id);
@@ -1819,18 +1873,25 @@ impl ClusterManager {
             // Release synchronously *before* `note_peer(Learner)` clears
             // `down_since`: a queued release could otherwise run after the new
             // incarnation re-acquired a stream and delete its live row.
-            let released = tokio::task::block_in_place(|| self.release_owners_for_node(node_id));
+            let released =
+                tokio::task::block_in_place(|| self.release_owners_for_node_with_fence(node_id));
             match released {
-                Ok(()) => {
-                    self.pending_node_cleanups.lock().remove(&node_id);
+                Ok(_) => {
+                    self.pending_node_cleanups
+                        .lock()
+                        .retain(|(queued, _)| *queued != node_id);
                 }
-                Err(e) => {
+                Err(NodeReleaseError::Write(fence, e)) => {
                     crate::log_warn!(
                         "Cluster: releasing owners for rejoining node {node_id} failed ({e:?}); \
-                         queuing cleanup for the next health tick"
+                         queuing fenced cleanup (epoch <= {fence}) for the next health tick"
                     );
-                    self.pending_node_cleanups.lock().insert(node_id);
+                    self.pending_node_cleanups.lock().insert((node_id, fence));
                 }
+                Err(NodeReleaseError::Read(e)) => crate::log_warn!(
+                    "Cluster: owners for rejoining node {node_id} could not be read ({e:?}); \
+                     not queuing an unfenced cleanup"
+                ),
             }
         }
 
@@ -2746,8 +2807,10 @@ impl ClusterManager {
         .ok()
     }
 
-    /// Notify media hub that a local player needs frames from a remote owner.
-    pub fn notify_play_subscription(&self, app: &str, stream_id: &str) {
+    /// Notify media hub that a local player session needs frames from a remote
+    /// owner. `session` is the player row id, so re-notifying the same session
+    /// cannot leak a ref.
+    pub fn notify_play_subscription(&self, session: &str, app: &str, stream_id: &str) {
         let Some(owner) = self.db.stream_owner_get(stream_id) else {
             return;
         };
@@ -2760,17 +2823,18 @@ impl ClusterManager {
         let media = Arc::clone(&self.media);
         let app = app.to_string();
         let stream = stream_id.to_string();
+        let session = session.to_string();
         let peer = owner.owner_node_id;
         let epoch = owner.epoch;
         self.rt_handle.spawn(async move {
             media
-                .subscribe_remote(&media_addr, peer, &app, &stream, epoch)
+                .subscribe_remote(&media_addr, peer, &app, &stream, epoch, &session)
                 .await;
         });
     }
 
-    /// Drop remote media subscription when the last local player for a stream leaves.
-    pub fn notify_play_unsubscribe(&self, app: &str, stream_id: &str) {
+    /// Drop the remote media ref held by one local player session.
+    pub fn notify_play_unsubscribe(&self, session: &str, app: &str, stream_id: &str) {
         let Some(owner) = self.ownership.get(stream_id).or_else(|| {
             self.db
                 .stream_owner_get(stream_id)
@@ -2785,8 +2849,11 @@ impl ClusterManager {
         let media = Arc::clone(&self.media);
         let app = app.to_string();
         let stream = stream_id.to_string();
+        let session = session.to_string();
         self.rt_handle.spawn(async move {
-            media.unsubscribe_remote(owner_node, &app, &stream).await;
+            media
+                .unsubscribe_remote(&session, owner_node, &app, &stream)
+                .await;
         });
     }
 
@@ -2807,22 +2874,13 @@ impl ClusterManager {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
             };
-            let n = self
-                .db
-                .player_list(Some(stream_id.as_str()))
-                .iter()
-                .filter(|p| p.active)
-                .count();
-            if n == 0 {
-                continue;
-            }
             let media = Arc::clone(&self.media);
             let owner_node = *old_node;
             let stream = stream_id.clone();
             self.rt_handle.spawn(async move {
-                for _ in 0..n {
-                    media.unsubscribe_remote(owner_node, &app, &stream).await;
-                }
+                media
+                    .unsubscribe_remote_all(owner_node, &app, &stream)
+                    .await;
             });
         }
     }
@@ -2836,20 +2894,20 @@ impl ClusterManager {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
             };
-            let n = self
+            // One ref per active player session: drop that session's ref (a
+            // no-op when it never subscribed to this owner) and re-add it.
+            let sessions: Vec<String> = self
                 .db
                 .player_list(Some(sid))
                 .iter()
                 .filter(|p| p.active)
-                .count();
-            // One SubscriptionTable ref per active player — drop and re-add
-            // the same count so the first disconnect doesn't Unsubscribe for
-            // everyone else still watching.
-            for _ in 0..n {
-                self.notify_play_unsubscribe(&app, sid);
+                .map(|p| p.id.clone())
+                .collect();
+            for session in &sessions {
+                self.notify_play_unsubscribe(session, &app, sid);
             }
-            for _ in 0..n {
-                self.notify_play_subscription(&app, sid);
+            for session in &sessions {
+                self.notify_play_subscription(session, &app, sid);
             }
         }
     }
@@ -2979,19 +3037,13 @@ impl ClusterManager {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
             };
-            let n = self
-                .db
-                .player_list(Some(stream_id))
-                .iter()
-                .filter(|p| p.active)
-                .count();
             let media = Arc::clone(&self.media);
             let owner_node = *old_node;
             let stream = stream_id.clone();
             self.rt_handle.spawn(async move {
-                for _ in 0..n {
-                    media.unsubscribe_remote(owner_node, &app, &stream).await;
-                }
+                media
+                    .unsubscribe_remote_all(owner_node, &app, &stream)
+                    .await;
             });
         }
         let ids: Vec<String> = changed.into_iter().map(|(id, _)| id).collect();
@@ -3006,21 +3058,24 @@ impl ClusterManager {
     /// unsubscribe from it explicitly first (see `sync_ownership_from_db`).
     fn resubscribe_active_players(&self, stream_ids: &[String]) {
         for sid in stream_ids {
-            let n = self
+            let sessions: Vec<String> = self
                 .db
                 .player_list(Some(sid))
                 .iter()
                 .filter(|p| p.active)
-                .count();
-            if n == 0 {
+                .map(|p| p.id.clone())
+                .collect();
+            if sessions.is_empty() {
                 continue;
             }
             let app = match self.db.stream_get(sid) {
                 crate::db::DbLookup::Ok(s) => s.app,
                 _ => "live".to_string(),
             };
-            for _ in 0..n {
-                self.notify_play_subscription(&app, sid);
+            // Re-adding the same session is idempotent, so a sync tick that
+            // races a fresh play can no longer leave a leaked ref behind.
+            for session in &sessions {
+                self.notify_play_subscription(session, &app, sid);
             }
         }
     }
@@ -3181,12 +3236,17 @@ impl ClusterManager {
                 let grace = self.config.heartbeat.saturating_mul(5);
                 for id in self.health.peers_ready_for_ownership_release(grace) {
                     crate::log_info!("Cluster: node {id} DOWN for {:?} — releasing owners", grace);
-                    match self.release_owners_for_node(id) {
-                        Ok(()) => {
+                    match self.release_owners_for_node_with_fence(id) {
+                        Ok(_) => {
                             self.health.mark_ownership_released(id);
                             self.drop_peer_heartbeat_caches(id);
                         }
-                        Err(e) => crate::log_warn!("Cluster: release owners for {id}: {e:?}"),
+                        Err(NodeReleaseError::Read(e)) => {
+                            crate::log_warn!("Cluster: release owners for {id}: {e:?}")
+                        }
+                        Err(NodeReleaseError::Write(_, e)) => {
+                            crate::log_warn!("Cluster: release owners for {id}: {e:?}")
+                        }
                     }
                 }
             }
@@ -3194,14 +3254,15 @@ impl ClusterManager {
             // follower forwards the write with the admin proof token, which
             // is exactly what a restarted follower needs to release its own
             // stale rows after `register_session_hooks` supplied the token.
-            let pending_cleanups: Vec<NodeId> =
+            let pending_cleanups: Vec<(NodeId, u64)> =
                 self.pending_node_cleanups.lock().iter().copied().collect();
-            for id in pending_cleanups {
-                match self.release_owners_for_node(id) {
+            for (id, fence) in pending_cleanups {
+                match self.release_owners_for_node_fenced(id, fence) {
                     Ok(()) => {
-                        self.pending_node_cleanups.lock().remove(&id);
+                        self.pending_node_cleanups.lock().remove(&(id, fence));
                         crate::log_info!(
-                            "Cluster: finished pending ownership cleanup for removed node {id}"
+                            "Cluster: finished pending ownership cleanup for removed node {id} \
+                             (epoch <= {fence})"
                         );
                     }
                     Err(e) => crate::log_warn!(
@@ -3615,7 +3676,9 @@ impl ClusterManager {
                 let app_u = app.clone();
                 let stream_u = stream_id.clone();
                 self.rt_handle.spawn(async move {
-                    media.unsubscribe_remote(old, &app_u, &stream_u).await;
+                    media
+                        .unsubscribe_remote(STANDBY_SUB_OWNER, old, &app_u, &stream_u)
+                        .await;
                 });
             }
             if let Some(new_owner) = new_owner {
@@ -3648,7 +3711,14 @@ impl ClusterManager {
                 let stream_key = stream_id.clone();
                 self.rt_handle.spawn(async move {
                     let ok = media
-                        .subscribe_remote(&media_addr, new_owner, &app, &stream_id, epoch)
+                        .subscribe_remote(
+                            &media_addr,
+                            new_owner,
+                            &app,
+                            &stream_id,
+                            epoch,
+                            STANDBY_SUB_OWNER,
+                        )
                         .await;
                     if !ok {
                         // Sole Subscribe send failed and hub rolled back —
@@ -3818,7 +3888,7 @@ mod heartbeat_routing_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     use tempfile::TempDir;
 
@@ -3833,8 +3903,17 @@ mod tests {
     }
 
     fn free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+        // Ephemeral `bind(0)` ports can be handed out again as soon as the
+        // probe listener drops, so two parallel tests can end up with the same
+        // port. Hand out a monotonically increasing range instead.
+        static NEXT_PORT: AtomicU32 = AtomicU32::new(32000);
+        loop {
+            let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+            let port = u16::try_from(port % 30000 + 20000).unwrap_or(20000);
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
     }
 
     /// An address nothing listens on (connection refused immediately).
@@ -4964,7 +5043,10 @@ mod tests {
         );
         assert!(
             wait_until(Duration::from_secs(5), || {
-                !m.pending_node_cleanups.lock().contains(&2)
+                !m.pending_node_cleanups
+                    .lock()
+                    .iter()
+                    .any(|(node, _)| *node == 2)
             })
             .await
         );
@@ -5013,8 +5095,8 @@ mod tests {
         );
 
         // Remote-owner helpers against unreachable peers degrade gracefully.
-        m.notify_play_subscription("live", "rep");
-        m.notify_play_unsubscribe("live", "rep");
+        m.notify_play_subscription("player-1", "live", "rep");
+        m.notify_play_unsubscribe("player-1", "live", "rep");
         assert!(m.proxy_stream_stats("rep").await.is_none());
         m.peer_stream_players
             .lock()
@@ -5039,7 +5121,14 @@ mod tests {
 
         // Owner changes 5 -> 6 through replicated applies: the tracker sync
         // unsubscribes from the old owner; the standby sub moves too.
-        raw_write(m, ClusterCommand::ReleaseOwnersForNode { node_id: 5 }).await;
+        raw_write(
+            m,
+            ClusterCommand::ReleaseOwnersForNode {
+                node_id: 5,
+                max_epoch: u64::MAX,
+            },
+        )
+        .await;
         raw_write(m, raw_acquire("rep", 6)).await;
         m.poll_side_effects();
         assert!(
@@ -5063,14 +5152,14 @@ mod tests {
         m.release_owners_for_node(6).unwrap();
         m.acquire_stream_owner("rep", 7, 0, 3).unwrap();
         m.reconcile_media_replicas();
-        m.notify_play_subscription("live", "rep");
+        m.notify_play_subscription("player-1", "live", "rep");
         assert!(m.proxy_stream_stats("rep").await.is_none());
         // No owner at all: the standby subscription is dropped.
         m.release_owners_for_node(7).unwrap();
         m.reconcile_media_replicas();
         assert!(m.standby_subs.lock().is_empty());
-        m.notify_play_subscription("live", "rep");
-        m.notify_play_unsubscribe("live", "rep");
+        m.notify_play_subscription("player-1", "live", "rep");
+        m.notify_play_unsubscribe("player-1", "live", "rep");
         assert!(m.proxy_stream_stats("rep").await.is_none());
 
         // Owned locally: stats are served in-process.
@@ -5078,8 +5167,8 @@ mod tests {
         let (body, guard) = m.proxy_stream_stats("rep").await.unwrap();
         assert!(guard.is_none());
         assert_eq!(body["owner_node_id"], 1);
-        m.notify_play_subscription("live", "rep");
-        m.notify_play_unsubscribe("live", "rep");
+        m.notify_play_subscription("player-1", "live", "rep");
+        m.notify_play_unsubscribe("player-1", "live", "rep");
 
         // Inbound subscribe authorization.
         assert!(!m.authorize_inbound_media_subscribe(1, "live", "rep").await);
@@ -5355,7 +5444,7 @@ mod tests {
         );
 
         // Pending cleanup for a removed node is retried by the leader loop.
-        m.pending_node_cleanups.lock().insert(77);
+        m.pending_node_cleanups.lock().insert((77, u64::MAX));
         assert!(
             wait_until(Duration::from_secs(5), || m
                 .pending_node_cleanups
@@ -5497,8 +5586,8 @@ mod tests {
         );
         let (body, _guard) = n2.mgr.proxy_stream_stats("fw").await.unwrap();
         assert_eq!(body["owner_node_id"], 1);
-        n2.mgr.notify_play_subscription("live", "fw");
-        n2.mgr.notify_play_unsubscribe("live", "fw");
+        n2.mgr.notify_play_subscription("player-1", "live", "fw");
+        n2.mgr.notify_play_unsubscribe("player-1", "live", "fw");
 
         // Best-effort drain / revoke broadcasts reach peers whose DB agrees.
         n1.mgr.begin_delete_stream("fw").unwrap();
