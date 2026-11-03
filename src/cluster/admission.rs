@@ -170,6 +170,10 @@ pub fn measure_interface_utilization(
     #[cfg(target_os = "windows")]
     {
         fn sample(iface: &str) -> Result<(u64, u64), String> {
+            // PowerShell single-quoted strings escape an apostrophe by
+            // doubling it; an adapter named "John's Ethernet" would otherwise
+            // break the command on every heartbeat.
+            let iface = iface.replace('\'', "''");
             let output = std::process::Command::new("powershell")
                 .args([
                     "-NoProfile",
@@ -203,8 +207,10 @@ pub fn measure_interface_utilization(
         // PowerShell startups, so divide by the measured elapsed time instead
         // of the nominal sleep: assuming 0.2 s would overstate utilization and
         // can drain a node whose real traffic is below the threshold.
-        let started = std::time::Instant::now();
         let (rx1, tx1) = sample(iface)?;
+        // The counter delta starts at the first reading, so measure from here
+        // rather than including that subprocess call in the interval.
+        let started = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let (rx2, tx2) = sample(iface)?;
         let elapsed = started.elapsed().as_secs_f64().max(0.001);

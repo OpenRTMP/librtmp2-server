@@ -615,7 +615,7 @@ mod tests {
         );
         assert!(
             bridge.session_rows(2).0.is_some(),
-            "the role granted by the earlier transaction must survive the rollback"
+            "bridge state must stay until the poll loop closes the peer"
         );
     }
 
