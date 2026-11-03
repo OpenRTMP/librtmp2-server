@@ -703,25 +703,24 @@ fn parse_bind(bind: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("invalid bind '{bind}': {e}"))
 }
 
-fn rewrite_wildcard_to_loopback(bind: &str) -> String {
-    if let Ok(addr) = bind.parse::<SocketAddr>()
-        && addr.ip().is_unspecified()
-    {
-        return format!("127.0.0.1:{}", addr.port());
-    }
-    bind.to_string()
-}
-
 /// Normalize a bind value into an address peers can actually dial.
 ///
 /// `parse_bind` accepts the port-only spelling (`CLUSTER_BIND=1940`), so the
 /// advertise path must apply the same normalization instead of handing peers
 /// the raw `"1940"` string.
 fn advertise_bind(bind: &str) -> String {
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        if addr.ip().is_unspecified() {
+            return format!("127.0.0.1:{}", addr.port());
+        }
+        // Preserve the operator's exact spelling for a valid address: join
+        // proofs are minted over the advertised string, so normalizing an
+        // equivalent IPv6 form would invalidate them.
+        return bind.to_string();
+    }
     match parse_bind(bind) {
-        Ok(addr) if addr.ip().is_unspecified() => format!("127.0.0.1:{}", addr.port()),
         Ok(addr) => addr.to_string(),
-        Err(_) => rewrite_wildcard_to_loopback(bind),
+        Err(_) => bind.to_string(),
     }
 }
 
@@ -814,6 +813,18 @@ mod tests {
         };
         assert_eq!(cfg.advertise_control(), "127.0.0.1:1940");
         assert_eq!(cfg.advertise_media(), "127.0.0.1:1941");
+    }
+
+    #[test]
+    fn valid_bind_spelling_is_preserved_for_advertising() {
+        let cfg = ClusterConfig {
+            bind: "[fd00:0000:0000:0000:0000:0000:0000:0002]:1940".to_string(),
+            ..ClusterConfig::default()
+        };
+        assert_eq!(
+            cfg.advertise_control(),
+            "[fd00:0000:0000:0000:0000:0000:0000:0002]:1940"
+        );
     }
 
     #[test]

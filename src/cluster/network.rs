@@ -1288,22 +1288,31 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             use openraft::ChangeMembers;
             let change: ChangeMembers<NodeId, BasicNode> =
                 serde_json::from_value(req).map_err(std::io::Error::other)?;
+            let raft_for_change = raft.clone();
+            let membership_write =
+                tokio::spawn(async move { raft_for_change.change_membership(change, false).await });
             match tokio::time::timeout(
                 crate::cluster::manager::RAFT_WRITE_TIMEOUT,
-                raft.change_membership(change, false),
+                membership_write,
             )
             .await
             {
-                Ok(Ok(_)) => ControlMessage::ChangeMembershipResp {
+                Ok(Ok(Ok(_))) => ControlMessage::ChangeMembershipResp {
                     ok: true,
                     message: "ok".into(),
                 },
-                Ok(Err(e)) => ControlMessage::ChangeMembershipResp {
+                Ok(Ok(Err(e))) => ControlMessage::ChangeMembershipResp {
                     ok: false,
                     message: e.to_string(),
                 },
+                Ok(Err(e)) => ControlMessage::ChangeMembershipResp {
+                    ok: false,
+                    message: format!("membership task failed: {e}"),
+                },
                 Err(_) => ControlMessage::ChangeMembershipResp {
                     ok: false,
+                    // The transition keeps running in its own task; only the
+                    // caller's wait is bounded.
                     message: crate::cluster::manager::RAFT_WRITE_TIMEOUT_MSG.into(),
                 },
             }

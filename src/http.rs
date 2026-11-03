@@ -1427,7 +1427,11 @@ async fn remote_stream_sessions(_state: &AppState, _id: &str) -> u64 {
     0
 }
 
-async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
+async fn wait_and_finalize_stream_delete(
+    state: Arc<AppState>,
+    id: String,
+    expected_created_at: i64,
+) {
     let started = Instant::now();
     let mut last_warn = started;
     let mut last_remote_poll = started;
@@ -1468,10 +1472,38 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
     const FINALIZE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
     let mut attempt = 1usize;
     loop {
-        match state.coordinator.begin_delete_stream(&id) {
-            Ok(()) | Err(CoordError::NotFound) | Err(CoordError::Conflict) => {}
-            Err(e) => {
-                crate::log_warn!("HTTP: re-issuing begin_delete for stream '{id}' failed: {e:?}")
+        // Never touch a replacement created with the same id after the
+        // original row was deleted: the re-issued begin-delete would mark it
+        // for deletion, so compare the row identity first.
+        let mut skip_begin = false;
+        match &state.db.stream_get(&id) {
+            crate::db::DbLookup::Missing => {
+                clear_http_delete_marker(&state, &id);
+                return;
+            }
+            crate::db::DbLookup::Ok(current) if current.created_at != expected_created_at => {
+                crate::log_warn!(
+                    "HTTP: stream '{id}' was replaced while its delete was reconciling; \
+                     leaving the replacement untouched"
+                );
+                clear_http_delete_marker(&state, &id);
+                return;
+            }
+            crate::db::DbLookup::Failed => {
+                // Without a verified identity, only finalize: that operation
+                // deletes a pending row only, so a replacement stays intact.
+                skip_begin = true;
+            }
+            crate::db::DbLookup::Ok(_) => {}
+        }
+        if !skip_begin {
+            match state.coordinator.begin_delete_stream(&id) {
+                Ok(()) | Err(CoordError::NotFound) | Err(CoordError::Conflict) => {}
+                Err(e) => {
+                    crate::log_warn!(
+                        "HTTP: re-issuing begin_delete for stream '{id}' failed: {e:?}"
+                    )
+                }
             }
         }
         match finalize_stream_delete(&state, &id).await {
@@ -1549,7 +1581,7 @@ async fn handle_stream_delete(
         );
         return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
     }
-    match state.db.stream_get(&id) {
+    let expected_created_at = match state.db.stream_get(&id) {
         DbLookup::Missing => {
             log_http_access(
                 "DELETE",
@@ -1574,8 +1606,8 @@ async fn handle_stream_delete(
                 "Failed to load stream",
             );
         }
-        DbLookup::Ok(_) => {}
-    }
+        DbLookup::Ok(stream) => stream.created_at,
+    };
 
     mark_http_delete_sticky(&state, &id);
     if let Err(e) = state.coordinator.begin_delete_stream(&id) {
@@ -1614,7 +1646,7 @@ async fn handle_stream_delete(
             let state_bg = Arc::clone(&state);
             let id_bg = id.clone();
             tokio::spawn(async move {
-                wait_and_finalize_stream_delete(state_bg, id_bg).await;
+                wait_and_finalize_stream_delete(state_bg, id_bg, expected_created_at).await;
             });
             return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
         }
@@ -1670,7 +1702,7 @@ async fn handle_stream_delete(
     let state_bg = Arc::clone(&state);
     let id_bg = id.clone();
     tokio::spawn(async move {
-        wait_and_finalize_stream_delete(state_bg, id_bg).await;
+        wait_and_finalize_stream_delete(state_bg, id_bg, expected_created_at).await;
     });
     (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response()
 }

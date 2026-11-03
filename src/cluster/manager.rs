@@ -948,7 +948,14 @@ impl ClusterManager {
         self.block_on_write(ClusterCommand::ReleaseOwnersForNode { node_id })?
             .into_coord_result()?;
         self.ownership.clear_for_node(node_id);
-        self.refresh_ownership_from_db()?;
+        // The release itself must not be retried: a later retry would run
+        // unfenced after the node re-joined and could delete its new rows, so
+        // a failed hydration only logs and keeps the cleared tracker.
+        if let Err(e) = self.refresh_ownership_from_db() {
+            crate::log_error!(
+                "Cluster: ownership refresh after releasing node {node_id} failed: {e:?}"
+            );
+        }
         self.unsubscribe_captured_remote_owners(&previous);
         self.resubscribe_active_players(&affected);
         Ok(())
