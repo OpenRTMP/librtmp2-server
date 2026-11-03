@@ -101,13 +101,13 @@ impl WriteFailure {
 }
 
 /// Failure of a node-wide ownership release.
+///
+/// Carries the epoch fence that was used, so the caller can queue a retry that
+/// only deletes rows captured before the failure.
 #[derive(Debug)]
-pub enum NodeReleaseError {
-    /// The ownership rows could not be read, so there is no fence to retry
-    /// with; retrying blindly could delete a rejoined node's new rows.
-    Read(CoordError),
-    /// The write failed. Retrying with this epoch fence is safe.
-    Write(u64, CoordError),
+pub struct NodeReleaseError {
+    pub fence: u64,
+    pub error: CoordError,
 }
 
 /// Resolve control/media addresses from a heartbeat payload.
@@ -821,8 +821,21 @@ impl ClusterManager {
     }
 
     pub fn begin_delete_stream(&self, id: &str) -> Result<(), CoordError> {
-        self.block_on_write(ClusterCommand::BeginDeleteStream { id: id.to_string() })?
-            .into_coord_result()
+        self.begin_delete_stream_expecting(id, None)
+    }
+
+    /// Begin a delete that only applies while `expected_created_at` still
+    /// matches the row it was accepted for.
+    pub fn begin_delete_stream_expecting(
+        &self,
+        id: &str,
+        expected_created_at: Option<i64>,
+    ) -> Result<(), CoordError> {
+        self.block_on_write(ClusterCommand::BeginDeleteStream {
+            id: id.to_string(),
+            expected_created_at,
+        })?
+        .into_coord_result()
     }
 
     pub fn finalize_delete_stream(&self, id: &str) -> Result<(), CoordError> {
@@ -945,45 +958,69 @@ impl ClusterManager {
         &self,
         node_id: u64,
     ) -> Result<u64, NodeReleaseError> {
-        // An empty fallback here would erase every tracker entry on one failed
-        // read, so surface the failure instead of hydrating from `Vec::new()`.
-        let owners = self
-            .db
-            .stream_owner_list_result()
-            .map_err(|e| NodeReleaseError::Read(CoordError::Cluster(e)))?;
         // Fence the release by the highest epoch this node owned *now*: a row
         // the rejoining node acquires afterwards carries a higher Raft epoch
         // and survives the (possibly delayed) retry.
-        let fence = owners
-            .iter()
-            .filter(|o| o.owner_node_id == node_id)
-            .map(|o| o.epoch)
-            .max()
-            .unwrap_or(0);
+        let fence = match self.db.stream_owner_list_result() {
+            Ok(owners) => owners
+                .iter()
+                .filter(|o| o.owner_node_id == node_id)
+                .map(|o| o.epoch)
+                .max()
+                .unwrap_or(0),
+            Err(e) => {
+                // Ownership epochs are Raft log indexes, so the current log
+                // index is at least as high as every row that exists now and
+                // lower than any later acquisition. Abandoning the cleanup
+                // here would strand the rows forever (the caller also drops
+                // the peer's DOWN state), so fall back to that safe fence.
+                let fence = self.ownership_fence_upper_bound();
+                crate::log_warn!(
+                    "Cluster: ownership rows for node {node_id} unreadable ({e}); \
+                     fencing the release at the log index {fence}"
+                );
+                fence
+            }
+        };
         self.release_owners_for_node_fenced(node_id, fence)
-            .map_err(|e| NodeReleaseError::Write(fence, e))?;
+            .map_err(|error| NodeReleaseError { fence, error })?;
         Ok(fence)
     }
 
     /// Release every ownership row of `node_id` (coordinator API).
     pub fn release_owners_for_node(&self, node_id: u64) -> Result<(), CoordError> {
-        match self.release_owners_for_node_with_fence(node_id) {
-            Ok(_) => Ok(()),
-            Err(NodeReleaseError::Read(e)) | Err(NodeReleaseError::Write(_, e)) => Err(e),
-        }
+        self.release_owners_for_node_with_fence(node_id)
+            .map(|_| ())
+            .map_err(|e| e.error)
+    }
+
+    /// Upper bound on every ownership epoch that can be stored right now.
+    ///
+    /// Epochs are Raft log indexes, so the last log index covers every applied
+    /// acquisition while a later one is guaranteed a strictly higher index.
+    fn ownership_fence_upper_bound(&self) -> u64 {
+        self.raft.metrics().borrow().last_log_index.unwrap_or(0)
     }
 
     /// Release every ownership row of `node_id` whose epoch is at most `fence`.
     fn release_owners_for_node_fenced(&self, node_id: u64, fence: u64) -> Result<(), CoordError> {
-        let owners = self
-            .db
-            .stream_owner_list_result()
-            .map_err(CoordError::Cluster)?;
-        let affected: Vec<String> = owners
-            .into_iter()
-            .filter(|o| o.owner_node_id == node_id && o.epoch <= fence)
-            .map(|o| o.stream_id)
-            .collect();
+        let affected: Vec<String> = match self.db.stream_owner_list_result() {
+            Ok(owners) => owners
+                .into_iter()
+                .filter(|o| o.owner_node_id == node_id && o.epoch <= fence)
+                .map(|o| o.stream_id)
+                .collect(),
+            Err(e) => {
+                // The fenced write below is authoritative; only the local
+                // side effects need a stream list, and the tracker snapshot
+                // names the streams this node believed the peer owned.
+                crate::log_warn!(
+                    "Cluster: cannot list owners before releasing node {node_id} ({e}); \
+                     using the local tracker snapshot"
+                );
+                self.ownership.streams_for_node(node_id)
+            }
+        };
         // Snapshot prior owners before clear/hydrate so we can unsubscribe from
         // the remote peers that actually held fan-out refs.
         // Snapshot before the Raft write (same race as acquire_stream_owner).
@@ -1239,17 +1276,13 @@ impl ClusterManager {
                     .lock()
                     .retain(|(queued, _)| *queued != node_id);
             }
-            Err(NodeReleaseError::Write(fence, e)) => {
+            Err(NodeReleaseError { fence, error }) => {
                 crate::log_warn!(
                     "Cluster: node {node_id} removed from membership but releasing its stream \
-                     ownership failed ({e:?}); queuing fenced cleanup (epoch <= {fence})"
+                     ownership failed ({error:?}); queuing fenced cleanup (epoch <= {fence})"
                 );
                 self.pending_node_cleanups.lock().insert((node_id, fence));
             }
-            Err(NodeReleaseError::Read(e)) => crate::log_warn!(
-                "Cluster: node {node_id} removed from membership but its stream ownership \
-                 could not be read ({e:?}); not queuing an unfenced cleanup"
-            ),
         }
         self.media.disconnect_peer(node_id);
         self.meta.remove(node_id);
@@ -1885,17 +1918,14 @@ impl ClusterManager {
                         .lock()
                         .retain(|(queued, _)| *queued != node_id);
                 }
-                Err(NodeReleaseError::Write(fence, e)) => {
+                Err(NodeReleaseError { fence, error }) => {
                     crate::log_warn!(
-                        "Cluster: releasing owners for rejoining node {node_id} failed ({e:?}); \
-                         queuing fenced cleanup (epoch <= {fence}) for the next health tick"
+                        "Cluster: releasing owners for rejoining node {node_id} failed \
+                         ({error:?}); queuing fenced cleanup (epoch <= {fence}) for the next \
+                         health tick"
                     );
                     self.pending_node_cleanups.lock().insert((node_id, fence));
                 }
-                Err(NodeReleaseError::Read(e)) => crate::log_warn!(
-                    "Cluster: owners for rejoining node {node_id} could not be read ({e:?}); \
-                     not queuing an unfenced cleanup"
-                ),
             }
         }
 
@@ -3259,11 +3289,8 @@ impl ClusterManager {
                             self.health.mark_ownership_released(id);
                             self.drop_peer_heartbeat_caches(id);
                         }
-                        Err(NodeReleaseError::Read(e)) => {
-                            crate::log_warn!("Cluster: release owners for {id}: {e:?}")
-                        }
-                        Err(NodeReleaseError::Write(_, e)) => {
-                            crate::log_warn!("Cluster: release owners for {id}: {e:?}")
+                        Err(NodeReleaseError { error, .. }) => {
+                            crate::log_warn!("Cluster: release owners for {id}: {error:?}")
                         }
                     }
                 }

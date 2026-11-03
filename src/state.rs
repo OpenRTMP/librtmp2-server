@@ -84,14 +84,29 @@ impl StateCoordinator {
     }
 
     pub fn begin_delete_stream(&self, id: &str) -> Result<(), CoordError> {
+        self.begin_delete_stream_expecting(id, None)
+    }
+
+    /// Begin a delete that only applies while the row still has the identity
+    /// the caller captured when the delete was accepted.
+    pub fn begin_delete_stream_expecting(
+        &self,
+        id: &str,
+        expected_created_at: Option<i64>,
+    ) -> Result<(), CoordError> {
         match self {
-            StateCoordinator::Standalone(db) => match db.stream_disable(id) {
-                Some(true) => Ok(()),
-                Some(false) => Err(CoordError::NotFound),
-                None => Err(CoordError::Db),
-            },
+            StateCoordinator::Standalone(db) => {
+                match db.stream_disable_expecting(id, expected_created_at) {
+                    Some(crate::db::StreamDisableOutcome::Disabled) => Ok(()),
+                    Some(crate::db::StreamDisableOutcome::Missing) => Err(CoordError::NotFound),
+                    Some(crate::db::StreamDisableOutcome::Stale) => Err(CoordError::Conflict),
+                    None => Err(CoordError::Db),
+                }
+            }
             #[cfg(feature = "cluster")]
-            StateCoordinator::Cluster(mgr) => mgr.begin_delete_stream(id),
+            StateCoordinator::Cluster(mgr) => {
+                mgr.begin_delete_stream_expecting(id, expected_created_at)
+            }
         }
     }
 
