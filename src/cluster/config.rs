@@ -249,8 +249,17 @@ impl ClusterConfig {
                     .into(),
             );
         }
-        parse_bind(&self.bind).map_err(|e| format!("CLUSTER_BIND: {e}"))?;
-        parse_bind(&self.media_bind).map_err(|e| format!("CLUSTER_MEDIA_BIND: {e}"))?;
+        let control_addr = parse_bind(&self.bind).map_err(|e| format!("CLUSTER_BIND: {e}"))?;
+        let media_addr =
+            parse_bind(&self.media_bind).map_err(|e| format!("CLUSTER_MEDIA_BIND: {e}"))?;
+        // Peers dial the advertised address, so a bind on port 0 would
+        // advertise "…:0" while the listener picks an ephemeral port.
+        if control_addr.port() == 0 {
+            return Err("CLUSTER_BIND must not use port 0".into());
+        }
+        if media_addr.port() == 0 {
+            return Err("CLUSTER_MEDIA_BIND must not use port 0".into());
+        }
         // Peers dial the advertised addresses through
         // `validate_cluster_peer_addr`, which parses a `SocketAddr` and rejects
         // hostnames, loopback (unless allowed), link-local/metadata and other
