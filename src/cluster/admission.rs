@@ -170,7 +170,7 @@ pub fn measure_interface_utilization(
     #[cfg(target_os = "windows")]
     {
         fn run_with_deadline(
-            mut command: std::process::Command,
+            command: &mut std::process::Command,
             timeout: std::time::Duration,
         ) -> Result<std::process::Output, String> {
             use std::io::Read;
@@ -217,20 +217,15 @@ pub fn measure_interface_utilization(
             // doubling it; an adapter named "John's Ethernet" would otherwise
             // break the command on every heartbeat.
             let iface = iface.replace('\'', "''");
-            let output = run_with_deadline(
-                std::process::Command::new("powershell").args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &format!(
-                        "(Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
-                         Select-Object -ExpandProperty ReceivedBytes); \
-                         (Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
-                         Select-Object -ExpandProperty SentBytes)"
-                    ),
-                ]),
-                std::time::Duration::from_secs(5),
-            )?;
+            let script = format!(
+                "(Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
+                 Select-Object -ExpandProperty ReceivedBytes); \
+                 (Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
+                 Select-Object -ExpandProperty SentBytes)"
+            );
+            let mut command = std::process::Command::new("powershell");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            let output = run_with_deadline(&mut command, std::time::Duration::from_secs(5))?;
             if !output.status.success() {
                 return Err(format!(
                     "interface '{iface}' missing or unreadable: {}",
