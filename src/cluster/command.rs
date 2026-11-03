@@ -14,6 +14,12 @@ fn unbounded_owners_epoch() -> u64 {
 ///
 /// All IDs, keys, and timestamps must be generated **before** `client_write`
 /// so every node applies identical values.
+///
+/// Version note: entries are JSON. Fields added later (`expected_created_at`,
+/// `max_epoch`) are `#[serde(default)]`, so an older entry still applies on a
+/// newer node. An *older* node applying a *newer* entry ignores those fields
+/// and falls back to the pre-fence behaviour, so all voters must run the same
+/// build before those fences are relied on (see `docs/clustering.md`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ClusterCommand {
     /// Create stream + default viewer with IDs generated **before** propose
