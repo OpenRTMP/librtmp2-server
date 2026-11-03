@@ -362,13 +362,13 @@ impl ClusterConfig {
     pub fn advertise_control(&self) -> String {
         self.advertise_addr
             .clone()
-            .unwrap_or_else(|| rewrite_wildcard_to_loopback(&self.bind))
+            .unwrap_or_else(|| advertise_bind(&self.bind))
     }
 
     pub fn advertise_media(&self) -> String {
         self.media_advertise_addr
             .clone()
-            .unwrap_or_else(|| rewrite_wildcard_to_loopback(&self.media_bind))
+            .unwrap_or_else(|| advertise_bind(&self.media_bind))
     }
 }
 
@@ -712,6 +712,19 @@ fn rewrite_wildcard_to_loopback(bind: &str) -> String {
     bind.to_string()
 }
 
+/// Normalize a bind value into an address peers can actually dial.
+///
+/// `parse_bind` accepts the port-only spelling (`CLUSTER_BIND=1940`), so the
+/// advertise path must apply the same normalization instead of handing peers
+/// the raw `"1940"` string.
+fn advertise_bind(bind: &str) -> String {
+    match parse_bind(bind) {
+        Ok(addr) if addr.ip().is_unspecified() => format!("127.0.0.1:{}", addr.port()),
+        Ok(addr) => addr.to_string(),
+        Err(_) => rewrite_wildcard_to_loopback(bind),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +803,28 @@ mod tests {
         let err =
             ClusterConfig::load_from_kv(|k| metadata.get(k).map(|s| (*s).to_string())).unwrap_err();
         assert!(err.contains("CLUSTER_JOIN"), "{err}");
+    }
+
+    #[test]
+    fn port_only_bind_is_normalized_for_advertising() {
+        let cfg = ClusterConfig {
+            bind: "1940".to_string(),
+            media_bind: "1941".to_string(),
+            ..ClusterConfig::default()
+        };
+        assert_eq!(cfg.advertise_control(), "127.0.0.1:1940");
+        assert_eq!(cfg.advertise_media(), "127.0.0.1:1941");
+    }
+
+    #[test]
+    fn wildcard_bind_is_rewritten_for_advertising() {
+        let cfg = ClusterConfig {
+            bind: "0.0.0.0:1940".to_string(),
+            media_bind: "[::]:1941".to_string(),
+            ..ClusterConfig::default()
+        };
+        assert_eq!(cfg.advertise_control(), "127.0.0.1:1940");
+        assert_eq!(cfg.advertise_media(), "127.0.0.1:1941");
     }
 
     #[test]

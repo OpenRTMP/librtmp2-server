@@ -169,30 +169,48 @@ pub fn measure_interface_utilization(
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = mode;
-        // Best-effort via Get-NetAdapterStatistics; clear error if missing.
-        let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "(Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
-                     Select-Object -ExpandProperty ReceivedBytes), \
-                     (Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
-                     Select-Object -ExpandProperty SentBytes)"
-                ),
-            ])
-            .output()
-            .map_err(|e| format!("bandwidth probe failed: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "interface '{iface}' missing or unreadable: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+        fn sample(iface: &str) -> Result<(u64, u64), String> {
+            let output = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "(Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
+                         Select-Object -ExpandProperty ReceivedBytes); \
+                         (Get-NetAdapterStatistics -Name '{iface}' -ErrorAction Stop | \
+                         Select-Object -ExpandProperty SentBytes)"
+                    ),
+                ])
+                .output()
+                .map_err(|e| format!("bandwidth probe failed: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "interface '{iface}' missing or unreadable: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut counters = text
+                .split_whitespace()
+                .filter_map(|token| token.parse::<u64>().ok());
+            match (counters.next(), counters.next()) {
+                (Some(rx), Some(tx)) => Ok((rx, tx)),
+                _ => Err(format!("interface '{iface}' returned unparsable counters")),
+            }
         }
-        // Without a second sample, report 0 (caller can blend with capacity).
-        let _ = output;
-        return Ok(0.0);
+
+        // Take two samples 200 ms apart, exactly like the Linux arm: a single
+        // reading cannot yield a rate, and silently returning 0.0 made the
+        // configured bandwidth admission inert while still spawning a
+        // PowerShell process on every heartbeat.
+        let (rx1, tx1) = sample(iface)?;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (rx2, tx2) = sample(iface)?;
+        let rx_bps = rx2.saturating_sub(rx1) as f64 / 0.2;
+        let tx_bps = tx2.saturating_sub(tx1) as f64 / 0.2;
+        let bytes_per_sec = mode.combine(rx_bps, tx_bps);
+        let mbps = bytes_per_sec * 8.0 / 1_000_000.0;
+        Ok((mbps / max_mbps).clamp(0.0, 1.0))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
