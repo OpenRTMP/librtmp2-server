@@ -758,7 +758,7 @@ impl DbRtmpBridge {
     /// `deleted_streams`).
     pub fn abandon_roles_for_stream(&self, stream_id: &str) {
         let mut abandoned_pubs: Vec<ConnId> = Vec::new();
-        let mut abandoned_plays: usize = 0;
+        let mut abandoned_plays: Vec<String> = Vec::new();
         let mut force_close: Vec<ConnId> = Vec::new();
         {
             let mut guard = self.conns.lock();
@@ -780,7 +780,9 @@ impl DbRtmpBridge {
                     abandoned_pubs.push(*conn_id);
                 }
                 if drop_play {
-                    cs.player = None;
+                    if let Some(pl) = cs.player.take() {
+                        abandoned_plays.push(pl.id);
+                    }
                     cs.viewer_id.clear();
                     cs.player_last_stats_at = None;
                     cs.player_bytes_base = 0;
@@ -788,7 +790,6 @@ impl DbRtmpBridge {
                     cs.player_stats_reset_pending = true;
                     self.player_stats_generation
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    abandoned_plays += 1;
                 }
                 if drop_pub || drop_play {
                     if let Some(ref pub_row) = cs.publisher {
@@ -807,8 +808,8 @@ impl DbRtmpBridge {
             self.try_release_ownership_for_conn(conn_id);
         }
         #[cfg(feature = "cluster")]
-        for _ in 0..abandoned_plays {
-            self.maybe_unsubscribe_remote_play(stream_id);
+        for session in &abandoned_plays {
+            self.maybe_unsubscribe_remote_play(session, stream_id);
         }
         #[cfg(not(feature = "cluster"))]
         let _ = abandoned_plays;
@@ -1001,7 +1002,7 @@ impl DbRtmpBridge {
         #[cfg(feature = "cluster")]
         {
             let stream_id_for_unsub = row.stream_id.clone();
-            self.maybe_unsubscribe_remote_play(&stream_id_for_unsub);
+            self.maybe_unsubscribe_remote_play(&row.id, &stream_id_for_unsub);
         }
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -1061,7 +1062,7 @@ impl DbRtmpBridge {
         #[cfg(feature = "cluster")]
         {
             let stream_id_for_unsub = player_row.stream_id.clone();
-            self.maybe_unsubscribe_remote_play(&stream_id_for_unsub);
+            self.maybe_unsubscribe_remote_play(&player_row.id, &stream_id_for_unsub);
         }
 
         let mut guard = self.conns.lock();
@@ -1655,13 +1656,13 @@ impl DbRtmpBridge {
             if let Some(ref prior) = old_player
                 && !same_stream_replay
             {
-                self.maybe_unsubscribe_remote_play(&prior.stream_id);
+                self.maybe_unsubscribe_remote_play(&prior.id, &prior.stream_id);
             }
             if !same_stream_replay
                 && let Some(coord) = self.coordinator.lock().clone()
                 && let Some(mgr) = coord.cluster_manager()
             {
-                mgr.notify_play_subscription(app, &stream.id);
+                mgr.notify_play_subscription(&player_id, app, &stream.id);
             }
         }
 
@@ -1953,7 +1954,7 @@ impl DbRtmpBridge {
     }
 
     #[cfg(feature = "cluster")]
-    fn maybe_unsubscribe_remote_play(&self, stream_id: &str) {
+    fn maybe_unsubscribe_remote_play(&self, session: &str, stream_id: &str) {
         let app = match self.db.stream_get(stream_id) {
             DbLookup::Ok(s) => s.app,
             _ => "live".to_string(),
@@ -1964,7 +1965,7 @@ impl DbRtmpBridge {
             #[cfg(test)]
             self.remote_play_unsubscribes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            mgr.notify_play_unsubscribe(&app, stream_id);
+            mgr.notify_play_unsubscribe(session, &app, stream_id);
         }
     }
 }
@@ -2089,7 +2090,7 @@ impl RtmpEventHandler for DbRtmpBridge {
 
         if let Some(mut player_row) = cs.player {
             #[cfg(feature = "cluster")]
-            self.maybe_unsubscribe_remote_play(&player_row.stream_id);
+            self.maybe_unsubscribe_remote_play(&player_row.id, &player_row.stream_id);
             player_row.active = false;
             if self.db.player_update(&player_row.id, &player_row) {
                 crate::log_info!(
@@ -3348,10 +3349,15 @@ mod tests {
         let mgr = start_test_cluster(Arc::clone(&db)).await;
         bridge.set_coordinator(Arc::new(StateCoordinator::cluster(Arc::clone(&mgr))));
 
-        // One remote subscription ref per local play role, as the peer's media
-        // hub tracks them (an unlearned address keeps the ref without dialing).
-        mgr.media().subscribe_remote("", 2, "live", "s1", 1).await;
-        mgr.media().subscribe_remote("", 2, "live", "s1", 1).await;
+        // One remote subscription ref per local play role, keyed by the player
+        // session id the bridge releases on teardown (an unlearned address
+        // keeps the ref without dialing).
+        for conn in [1, 2] {
+            let player = bridge.session_rows(conn).1.expect("admitted play role");
+            mgr.media()
+                .subscribe_remote("", 2, "live", "s1", 1, &player.id)
+                .await;
+        }
         assert_eq!(mgr.media().subscribed_nodes_for("live", "s1"), vec![2]);
 
         bridge.abandon_roles_for_stream("s1");
@@ -3813,7 +3819,9 @@ mod tests {
 
         let mgr = start_test_cluster(Arc::clone(&db)).await;
         bridge.set_coordinator(Arc::new(StateCoordinator::cluster(Arc::clone(&mgr))));
-        mgr.media().subscribe_remote("", 2, "live", "s1", 1).await;
+        mgr.media()
+            .subscribe_remote("", 2, "live", "s1", 1, "viewer")
+            .await;
 
         // A same-stream replay replaces the session while the release of the
         // old one sits between its DB write and its still-current check.

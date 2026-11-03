@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{Stream, StreamViewer};
 
+/// Default epoch fence for [`ClusterCommand::ReleaseOwnersForNode`] commands
+/// written before the field existed: unbounded, i.e. the old behaviour.
+fn unbounded_owners_epoch() -> u64 {
+    u64::MAX
+}
+
 /// Durable mutations replicated through OpenRaft.
 ///
 /// All IDs, keys, and timestamps must be generated **before** `client_write`
@@ -48,6 +54,12 @@ pub enum ClusterCommand {
     },
     ReleaseOwnersForNode {
         node_id: u64,
+        /// Release only rows with `epoch <= max_epoch`. A row the same node
+        /// acquired after this fence (a rejoin) has a higher Raft epoch and
+        /// survives. Commands written before the fence existed default to
+        /// unbounded, preserving their original behaviour.
+        #[serde(default = "unbounded_owners_epoch")]
+        max_epoch: u64,
     },
     /// Seed bootstrap node from an existing standalone DB snapshot.
     SeedFromStandalone {
@@ -134,7 +146,13 @@ mod tests {
             }
             .requires_admin_proof()
         );
-        assert!(ClusterCommand::ReleaseOwnersForNode { node_id: 1 }.requires_admin_proof());
+        assert!(
+            ClusterCommand::ReleaseOwnersForNode {
+                node_id: 1,
+                max_epoch: u64::MAX
+            }
+            .requires_admin_proof()
+        );
         assert!(ClusterCommand::SetApiToken { token: "t".into() }.requires_admin_proof());
         assert!(
             ClusterCommand::CreateStream {

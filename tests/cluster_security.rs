@@ -31,7 +31,13 @@ fn client_write_admin_commands_require_proof() {
         }
         .requires_admin_proof()
     );
-    assert!(ClusterCommand::ReleaseOwnersForNode { node_id: 2 }.requires_admin_proof());
+    assert!(
+        ClusterCommand::ReleaseOwnersForNode {
+            node_id: 2,
+            max_epoch: u64::MAX
+        }
+        .requires_admin_proof()
+    );
 }
 
 #[test]

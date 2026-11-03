@@ -65,6 +65,10 @@ const SUBSCRIBE_ENQUEUE_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// in-flight NACK retries, so entries whose subscription is gone are dead
 /// weight; the map is otherwise insert-only and grows for the process life.
 const MAX_SUB_GENS: usize = 4096;
+
+/// Ref owner used for standby-replica subscriptions, which are not tied to a
+/// local player session.
+pub const STANDBY_SUB_OWNER: &str = "standby";
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Handles a failed media-plane `accept`: logs it and backs off, returning
@@ -1524,6 +1528,7 @@ impl MediaHub {
         app: &str,
         stream: &str,
         epoch: u64,
+        owner: &str,
     ) -> bool {
         // Hold `subscribe_lock` across add + peer creation + the fresh-peer
         // resubscribe snapshot so a concurrent subscribe for another stream
@@ -1533,7 +1538,7 @@ impl MediaHub {
         // Only an outbound ref decides the wire fast path; the peer's own
         // inbound Subscribe for the same key lives in `subs` and says nothing
         // about a `Subscribe` written on this connection.
-        let first_ref = self.outbound.add(peer_id, app, stream);
+        let first_ref = self.outbound.add(owner, peer_id, app, stream);
         // A new local viewer (first outbound ref) re-arms the bounded transient
         // retry budget for this key; an existing ref does not.
         if first_ref {
@@ -1570,7 +1575,7 @@ impl MediaHub {
             // Concurrent holders already saw their ref and expect a wire
             // Subscribe — keep the ref and retry the send instead of leaving
             // them with refs and no owner fan-out.
-            if !self.outbound.remove_if_sole(peer_id, app, stream) {
+            if !self.outbound.remove_if_sole(owner, peer_id, app, stream) {
                 if peer
                     .try_send(self.subscribe_message(peer_id, app, stream, epoch))
                     .is_ok()
@@ -1587,17 +1592,30 @@ impl MediaHub {
         true
     }
 
-    pub async fn unsubscribe_remote(&self, peer_id: NodeId, app: &str, stream: &str) {
+    pub async fn unsubscribe_remote(&self, owner: &str, peer_id: NodeId, app: &str, stream: &str) {
         // Hold the same lock as subscribe_remote/ensure_peer/resubscribe_peer so
         // a fresh-peer resubscribe snapshot cannot enqueue Subscribe after this
         // Unsubscribe (the owner would keep a phantom subscription). No `.await`
         // is held across the guard.
         let _guard = self.subscribe_lock.lock();
-        // Release only this node's outbound ref; the peer's own inbound ref
+        // Release only this session's outbound ref; the peer's own inbound ref
         // for the same key is owner-side fan-out state and must stay.
-        if !self.outbound.remove(peer_id, app, stream) {
+        if !self.outbound.remove(owner, peer_id, app, stream) {
             return;
         }
+        self.finish_unsubscribe(peer_id, app, stream);
+    }
+
+    /// Drop every local ref for this key (owner moved to another node).
+    pub async fn unsubscribe_remote_all(&self, peer_id: NodeId, app: &str, stream: &str) {
+        let _guard = self.subscribe_lock.lock();
+        if !self.outbound.remove_all(peer_id, app, stream) {
+            return;
+        }
+        self.finish_unsubscribe(peer_id, app, stream);
+    }
+
+    fn finish_unsubscribe(&self, peer_id: NodeId, app: &str, stream: &str) {
         self.bump_sub_gen(peer_id, app, stream);
         self.subscribe_nacks
             .lock()
@@ -1913,7 +1931,8 @@ mod tests {
 
         // The subscription is registered while the owner's address is unknown:
         // the refcount is kept and no dialing peer is spawned.
-        hub1.subscribe_remote("", 2, "live", "s1", 0).await;
+        hub1.subscribe_remote("", 2, "live", "s1", 0, "viewer")
+            .await;
         assert_eq!(
             hub1.subscribed_nodes_for("live", "s1"),
             vec![2],
@@ -3088,7 +3107,9 @@ mod tests {
         );
         assert!(n.hub.subscribe_nacks.lock().is_empty());
 
-        n.hub.subscribe_remote(&owner_addr, 2, "live", "s", 0).await;
+        n.hub
+            .subscribe_remote(&owner_addr, 2, "live", "s", 0, "viewer")
+            .await;
         let mut s = accept_from_hub(&listener, 2).await;
         assert!(matches!(next(&mut s).await, MediaMessage::Subscribe { .. }));
 
@@ -3126,7 +3147,9 @@ mod tests {
         assert!(n.hub.subscribe_nacks.lock().is_empty());
 
         // A later player subscribe (the ref is not wired) repairs the wire.
-        n.hub.subscribe_remote(&owner_addr, 2, "live", "s", 0).await;
+        n.hub
+            .subscribe_remote(&owner_addr, 2, "live", "s", 0, "viewer")
+            .await;
         match next(&mut s).await {
             MediaMessage::Subscribe { stream, .. } => assert_eq!(stream, "s"),
             other => panic!("unexpected {other:?}"),
@@ -3139,7 +3162,9 @@ mod tests {
         let n = node(1);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let owner_addr = listener.local_addr().unwrap().to_string();
-        n.hub.subscribe_remote(&owner_addr, 2, "live", "s", 0).await;
+        n.hub
+            .subscribe_remote(&owner_addr, 2, "live", "s", 0, "viewer")
+            .await;
         let mut s = accept_from_hub(&listener, 2).await;
         assert!(matches!(next(&mut s).await, MediaMessage::Subscribe { .. }));
 
@@ -3183,7 +3208,9 @@ mod tests {
             .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0, SUBSCRIBE_NACK_RETRY)
             .await;
         // Subscribed but no peer connection known.
-        n.hub.subscribe_remote("", 2, "live", "s", 0).await;
+        n.hub
+            .subscribe_remote("", 2, "live", "s", 0, "viewer")
+            .await;
         Arc::clone(&n.hub)
             .run_subscribe_retry(2, "live".into(), "s".into(), 0, 0, SUBSCRIBE_NACK_RETRY)
             .await;
@@ -3231,15 +3258,21 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
 
         // First subscribe creates the peer; the fresh-peer resubscribe sends it.
-        n.hub.subscribe_remote(&addr, 2, "live", "s", 0).await;
+        n.hub
+            .subscribe_remote(&addr, 2, "live", "s", 0, "viewer-a")
+            .await;
         let mut s = accept_from_hub(&listener, 2).await;
         assert!(
             matches!(next(&mut s).await, MediaMessage::Subscribe { ref stream, .. } if stream == "s")
         );
-        // Same stream again only bumps the refcount (no wire message).
-        n.hub.subscribe_remote(&addr, 2, "live", "s", 0).await;
+        // A second session on the same stream only adds a ref (no wire message).
+        n.hub
+            .subscribe_remote(&addr, 2, "live", "s", 0, "viewer-b")
+            .await;
         // A second stream on the existing peer is sent directly.
-        n.hub.subscribe_remote(&addr, 2, "live", "t", 3).await;
+        n.hub
+            .subscribe_remote(&addr, 2, "live", "t", 3, "viewer")
+            .await;
         match next(&mut s).await {
             MediaMessage::Subscribe { stream, epoch, .. } => {
                 assert_eq!(stream, "t");
@@ -3249,14 +3282,15 @@ mod tests {
         }
         assert_eq!(n.hub.peer_count(), 1);
 
-        // Unsubscribe: first release keeps the ref, second sends Unsubscribe.
-        n.hub.unsubscribe_remote(2, "live", "s").await;
-        n.hub.unsubscribe_remote(2, "live", "s").await;
+        // Unsubscribe: the first session's release keeps the ref, the last one
+        // sends Unsubscribe.
+        n.hub.unsubscribe_remote("viewer-a", 2, "live", "s").await;
+        n.hub.unsubscribe_remote("viewer-b", 2, "live", "s").await;
         assert!(
             matches!(next(&mut s).await, MediaMessage::Unsubscribe { ref stream, .. } if stream == "s")
         );
         // Unknown stream: nothing to do.
-        n.hub.unsubscribe_remote(2, "live", "zzz").await;
+        n.hub.unsubscribe_remote("viewer", 2, "live", "zzz").await;
 
         // Owner drops the connection: the peer reconnects and the hub
         // resubscribes the still-held stream on the new connection.
@@ -3301,7 +3335,9 @@ mod tests {
         while p.try_send(MediaMessage::AuthOk).is_ok() {}
         let gen_before = n.hub.sub_gen(2, "live", "s");
         assert!(
-            !n.hub.subscribe_remote(&dead, 2, "live", "s", 0).await,
+            !n.hub
+                .subscribe_remote(&dead, 2, "live", "s", 0, "viewer")
+                .await,
             "sole Subscribe send failure must report false so standby reconcile can retry"
         );
         assert!(
@@ -3323,8 +3359,8 @@ mod tests {
         // this node owns locally and one for a remotely owned stream that
         // genuinely needs an outbound Subscribe.
         n.hub.subs.add(2, "live", "inbound");
-        n.hub.outbound.add(2, "live", "owned");
-        n.hub.outbound.add(2, "live", "remote");
+        n.hub.outbound.add("viewer", 2, "live", "owned");
+        n.hub.outbound.add("viewer", 2, "live", "remote");
         n.ownership.set("inbound", 1, 0); // local_id == 1
         n.ownership.set("owned", 1, 0);
         n.ownership.set("remote", 2, 0);
@@ -3367,7 +3403,11 @@ mod tests {
         assert!(n.hub.subs.add(2, "live", "s"));
         // Ownership of "s" moved to peer 2: this node's viewers re-subscribe.
         n.ownership.set("s", 2, 7);
-        assert!(n.hub.subscribe_remote(&addr, 2, "live", "s", 7).await);
+        assert!(
+            n.hub
+                .subscribe_remote(&addr, 2, "live", "s", 7, "viewer")
+                .await
+        );
 
         let mut s = accept_from_hub(&listener, 2).await;
         match next(&mut s).await {
@@ -3378,8 +3418,12 @@ mod tests {
             other => panic!("handoff must write a wire Subscribe, got {other:?}"),
         }
 
-        // A second local viewer only bumps the outbound ref.
-        assert!(n.hub.subscribe_remote(&addr, 2, "live", "s", 7).await);
+        // A second local viewer adds its own ref.
+        assert!(
+            n.hub
+                .subscribe_remote(&addr, 2, "live", "s", 7, "viewer-b")
+                .await
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(300), next(&mut s))
                 .await
@@ -3394,13 +3438,49 @@ mod tests {
 
         // First release keeps the wire subscription, the last sends
         // Unsubscribe.
-        n.hub.unsubscribe_remote(2, "live", "s").await;
+        n.hub.unsubscribe_remote("viewer", 2, "live", "s").await;
         assert!(
             tokio::time::timeout(Duration::from_millis(300), next(&mut s))
                 .await
                 .is_err()
         );
-        n.hub.unsubscribe_remote(2, "live", "s").await;
+        n.hub.unsubscribe_remote("viewer-b", 2, "live", "s").await;
+        assert!(
+            matches!(next(&mut s).await, MediaMessage::Unsubscribe { ref stream, .. } if stream == "s")
+        );
+        n.hub.shutdown();
+    }
+
+    /// Re-notifying the same local session must not leak an outbound ref.
+    #[tokio::test]
+    async fn resubscribe_for_the_same_session_is_idempotent() {
+        let n = node(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        assert!(
+            n.hub
+                .subscribe_remote(&addr, 2, "live", "s", 0, "player-1")
+                .await
+        );
+        let mut s = accept_from_hub(&listener, 2).await;
+        assert!(matches!(next(&mut s).await, MediaMessage::Subscribe { .. }));
+        // A resubscribe tick for the same player session (the ownership sync
+        // racing the play) must be a no-op, not a second ref.
+        assert!(
+            n.hub
+                .subscribe_remote(&addr, 2, "live", "s", 0, "player-1")
+                .await
+        );
+        assert_eq!(n.hub.outbound.ref_count(2, "live", "s"), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next(&mut s))
+                .await
+                .is_err(),
+            "an idempotent resubscribe must not write a second Subscribe"
+        );
+        // One teardown releases the only ref and unsubscribes.
+        n.hub.unsubscribe_remote("player-1", 2, "live", "s").await;
         assert!(
             matches!(next(&mut s).await, MediaMessage::Unsubscribe { ref stream, .. } if stream == "s")
         );
@@ -3417,7 +3497,7 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
 
         for i in 0..16 {
-            n.hub.outbound.add(2, "live", &format!("s{i}"));
+            n.hub.outbound.add("viewer", 2, "live", &format!("s{i}"));
         }
         n.hub.connect_peer(2, &addr).await.unwrap();
         let mut s = accept_from_hub(&listener, 2).await;
@@ -3448,7 +3528,7 @@ mod tests {
         let hub_addr = listen(&n.hub).await;
 
         n.hub
-            .subscribe_remote(&owner_addr.to_string(), 2, "live", "s", 0)
+            .subscribe_remote(&owner_addr.to_string(), 2, "live", "s", 0, "viewer")
             .await;
         let _inbound = dial_hub(hub_addr, 2).await;
         assert!(eventually(|| n.hub.inbound_sinks.lock().contains_key(&2)).await);
@@ -3589,7 +3669,9 @@ mod tests {
         let n = node(1);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        n.hub.subscribe_remote(&addr, 2, "live", "s", 0).await;
+        n.hub
+            .subscribe_remote(&addr, 2, "live", "s", 0, "viewer")
+            .await;
 
         // A legacy acceptor: same auth, but only knows protocol 1.
         async fn legacy_accept(listener: &TcpListener) -> (tokio::net::TcpStream, u16) {
@@ -3715,7 +3797,7 @@ mod tests {
         sub.ownership.set("s", 2, 4);
 
         sub.hub
-            .subscribe_remote(&owner_addr.to_string(), 2, "live", "s", 4)
+            .subscribe_remote(&owner_addr.to_string(), 2, "live", "s", 4, "viewer")
             .await;
         assert!(eventually(|| owner.hub.subscribed_nodes_for("live", "s") == vec![1]).await);
 

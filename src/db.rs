@@ -1893,11 +1893,18 @@ impl Db {
         }
     }
 
-    pub fn stream_owners_release_for_node(&self, node_id: u64) -> Result<usize, OwnerError> {
+    pub fn stream_owners_release_for_node(
+        &self,
+        node_id: u64,
+        max_epoch: u64,
+    ) -> Result<usize, OwnerError> {
         let conn = self.conn.lock();
+        // Epochs are Raft log indexes (i64); clamp the "unbounded" sentinel so
+        // it cannot wrap to -1 and match nothing.
+        let max_epoch = i64::try_from(max_epoch).unwrap_or(i64::MAX);
         match conn.execute(
-            "DELETE FROM stream_owners WHERE owner_node_id=?",
-            params![node_id as i64],
+            "DELETE FROM stream_owners WHERE owner_node_id=? AND epoch<=?",
+            params![node_id as i64, max_epoch],
         ) {
             Ok(n) => Ok(n),
             Err(e) => {
