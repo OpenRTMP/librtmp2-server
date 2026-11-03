@@ -289,6 +289,18 @@ pub enum DbLookup<T> {
     Failed,
 }
 
+/// Outcome of an identity-checked begin-delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDisableOutcome {
+    /// The row was disabled and marked pending.
+    Disabled,
+    /// No row with that id exists.
+    Missing,
+    /// A different row (new `created_at`) now holds the id: the delete was
+    /// accepted for the older row, so the replacement must stay untouched.
+    Stale,
+}
+
 fn map_optional<T>(result: rusqlite::Result<T>) -> DbLookup<T> {
     match result.optional() {
         Ok(Some(v)) => DbLookup::Ok(v),
@@ -1012,12 +1024,50 @@ impl Db {
     /// `stream_ids_pending_delete`). Returns `Some(true)` if updated,
     /// `Some(false)` if not found, `None` on DB error.
     pub fn stream_disable(&self, id: &str) -> Option<bool> {
+        match self.stream_disable_expecting(id, None)? {
+            StreamDisableOutcome::Disabled => Some(true),
+            StreamDisableOutcome::Missing | StreamDisableOutcome::Stale => Some(false),
+        }
+    }
+
+    /// Disable + mark pending only while the row still matches the identity a
+    /// caller captured when the delete was accepted.
+    ///
+    /// A retried begin-delete is replicated, so the check has to happen in the
+    /// same statement as the mutation: a local pre-read on a follower can lag
+    /// behind the leader and would mark a *replacement* (same id, new row)
+    /// pending, which the following finalize then deletes.
+    pub fn stream_disable_expecting(
+        &self,
+        id: &str,
+        expected_created_at: Option<i64>,
+    ) -> Option<StreamDisableOutcome> {
         let conn = self.conn.lock();
-        match conn.execute(
-            "UPDATE streams SET enabled=0, pending_delete=1 WHERE id=?",
-            params![id],
-        ) {
-            Ok(rows) => Some(rows > 0),
+        let updated = match expected_created_at {
+            Some(expected) => conn.execute(
+                "UPDATE streams SET enabled=0, pending_delete=1 \
+                 WHERE id=? AND created_at=?",
+                params![id, expected],
+            ),
+            None => conn.execute(
+                "UPDATE streams SET enabled=0, pending_delete=1 WHERE id=?",
+                params![id],
+            ),
+        };
+        match updated {
+            Ok(rows) if rows > 0 => Some(StreamDisableOutcome::Disabled),
+            Ok(_) => match conn.query_row(
+                "SELECT COUNT(*) FROM streams WHERE id=?",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            ) {
+                Ok(0) => Some(StreamDisableOutcome::Missing),
+                Ok(_) => Some(StreamDisableOutcome::Stale),
+                Err(e) => {
+                    crate::log_error!("stream_disable identity check failed for {id}: {e}");
+                    None
+                }
+            },
             Err(e) => {
                 crate::log_error!("stream_disable error for {id}: {e}");
                 None
@@ -3248,6 +3298,36 @@ mod tests {
         };
         assert!(!stream.enabled);
         assert_eq!(db.stream_ids_pending_delete(), vec!["pending".to_string()]);
+    }
+
+    #[test]
+    fn stream_disable_expecting_fences_a_replacement_row() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream("fenced", "pub_f", "pl_f", "st_f"))
+            .unwrap();
+        let DbLookup::Ok(original) = db.stream_get("fenced") else {
+            panic!("stream missing");
+        };
+        // Wrong identity: the row stays enabled and not pending.
+        assert_eq!(
+            db.stream_disable_expecting("fenced", Some(original.created_at + 1)),
+            Some(StreamDisableOutcome::Stale)
+        );
+        assert!(matches!(
+            db.stream_get("fenced"),
+            DbLookup::Ok(stream) if stream.enabled
+        ));
+        // Right identity disables it.
+        assert_eq!(
+            db.stream_disable_expecting("fenced", Some(original.created_at)),
+            Some(StreamDisableOutcome::Disabled)
+        );
+        assert_eq!(db.stream_ids_pending_delete(), vec!["fenced".to_string()]);
+        // An absent row is reported separately from a replaced one.
+        assert_eq!(
+            db.stream_disable_expecting("gone", Some(1)),
+            Some(StreamDisableOutcome::Missing)
+        );
     }
 
     #[test]

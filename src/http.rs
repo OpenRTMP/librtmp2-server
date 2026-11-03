@@ -1473,9 +1473,9 @@ async fn wait_and_finalize_stream_delete(
     let mut attempt = 1usize;
     loop {
         // Never touch a replacement created with the same id after the
-        // original row was deleted: the re-issued begin-delete would mark it
-        // for deletion, so compare the row identity first.
-        let mut skip_begin = false;
+        // original row was deleted: the identity is carried in the replicated
+        // command so the check happens atomically with the mutation, and this
+        // local read only short-circuits with a clear log message.
         match &state.db.stream_get(&id) {
             crate::db::DbLookup::Missing => {
                 clear_http_delete_marker(&state, &id);
@@ -1489,21 +1489,26 @@ async fn wait_and_finalize_stream_delete(
                 clear_http_delete_marker(&state, &id);
                 return;
             }
-            crate::db::DbLookup::Failed => {
-                // Without a verified identity, only finalize: that operation
-                // deletes a pending row only, so a replacement stays intact.
-                skip_begin = true;
-            }
-            crate::db::DbLookup::Ok(_) => {}
+            // The local read failed, but the replicated command still carries
+            // the expected identity, so the authoritative apply refuses to
+            // disable a replacement on its own.
+            crate::db::DbLookup::Failed | crate::db::DbLookup::Ok(_) => {}
         }
-        if !skip_begin {
-            match state.coordinator.begin_delete_stream(&id) {
-                Ok(()) | Err(CoordError::NotFound) | Err(CoordError::Conflict) => {}
-                Err(e) => {
-                    crate::log_warn!(
-                        "HTTP: re-issuing begin_delete for stream '{id}' failed: {e:?}"
-                    )
-                }
+        match state
+            .coordinator
+            .begin_delete_stream_expecting(&id, Some(expected_created_at))
+        {
+            Ok(()) | Err(CoordError::NotFound) => {}
+            Err(CoordError::Conflict) => {
+                crate::log_warn!(
+                    "HTTP: stream '{id}' was recreated before its delete applied; \
+                     leaving the replacement untouched"
+                );
+                clear_http_delete_marker(&state, &id);
+                return;
+            }
+            Err(e) => {
+                crate::log_warn!("HTTP: re-issuing begin_delete for stream '{id}' failed: {e:?}")
             }
         }
         match finalize_stream_delete(&state, &id).await {
@@ -1610,13 +1615,34 @@ async fn handle_stream_delete(
     };
 
     mark_http_delete_sticky(&state, &id);
-    if let Err(e) = state.coordinator.begin_delete_stream(&id) {
+    if let Err(e) = state
+        .coordinator
+        .begin_delete_stream_expecting(&id, Some(expected_created_at))
+    {
         // The row is gone as far as the coordinator is concerned (a cluster
         // follower's local read at the check above can lag behind the leader):
         // the resource simply does not exist, so answer 404 like the
         // `DbLookup::Missing` arm does instead of a retryable server error.
         if matches!(&e, CoordError::NotFound) {
             clear_http_delete_marker(&state, &id);
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::NOT_FOUND,
+                "stream not found",
+            );
+            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+        }
+        if matches!(&e, CoordError::Conflict) {
+            // The id now belongs to a replacement created after this delete
+            // was accepted: the original row is already gone, and the
+            // authoritative apply refused to disable the new one.
+            clear_http_delete_marker(&state, &id);
+            crate::log_warn!(
+                "HTTP: stream '{id}' was recreated before its delete applied; \
+                 leaving the replacement untouched"
+            );
             log_http_access(
                 "DELETE",
                 &path,

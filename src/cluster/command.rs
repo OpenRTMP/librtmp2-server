@@ -24,6 +24,13 @@ pub enum ClusterCommand {
     },
     BeginDeleteStream {
         id: String,
+        /// Row identity captured when the delete was accepted. When present,
+        /// the row is only marked pending while `created_at` still matches, so
+        /// a retried begin-delete can never disable a replacement that reused
+        /// the same stream id. Commands written before this field existed
+        /// carry `None` (no identity check).
+        #[serde(default)]
+        expected_created_at: Option<i64>,
     },
     FinalizeDeleteStream {
         id: String,

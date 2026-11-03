@@ -57,6 +57,16 @@ impl OwnershipTracker {
         self.owners.lock().retain(|_, (nid, _)| *nid != node_id);
     }
 
+    /// Stream ids the tracker currently attributes to `node_id`.
+    pub fn streams_for_node(&self, node_id: u64) -> Vec<String> {
+        self.owners
+            .lock()
+            .iter()
+            .filter(|(_, (nid, _))| *nid == node_id)
+            .map(|(sid, _)| sid.clone())
+            .collect()
+    }
+
     /// Replace tracker contents from durable `stream_owners` rows (followers / restart).
     pub fn hydrate_from(&self, owners: &[StreamOwner]) {
         let mut g = self.owners.lock();

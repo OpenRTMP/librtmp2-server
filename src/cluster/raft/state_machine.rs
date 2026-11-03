@@ -176,12 +176,18 @@ impl SqliteStateMachine {
                 Err(StreamAddError::Duplicate) => ClusterResponse::Duplicate,
                 Err(StreamAddError::Db) => ClusterResponse::Error("db".into()),
             },
-            ClusterCommand::BeginDeleteStream { id } => match self.db.stream_disable(id) {
-                Some(true) => {
+            ClusterCommand::BeginDeleteStream {
+                id,
+                expected_created_at,
+            } => match self.db.stream_disable_expecting(id, *expected_created_at) {
+                Some(crate::db::StreamDisableOutcome::Disabled) => {
                     self.emit_effect(StateEffect::DrainStream(id.clone()));
                     ClusterResponse::Ok
                 }
-                Some(false) => ClusterResponse::NotFound,
+                Some(crate::db::StreamDisableOutcome::Missing) => ClusterResponse::NotFound,
+                // The id now belongs to a replacement the delete was not
+                // accepted for: report the conflict without mutating anything.
+                Some(crate::db::StreamDisableOutcome::Stale) => ClusterResponse::Conflict,
                 None => ClusterResponse::Error("db".into()),
             },
             ClusterCommand::FinalizeDeleteStream { id } => {
@@ -1378,7 +1384,10 @@ mod tests {
             apply_one(
                 &mut sm,
                 7,
-                ClusterCommand::BeginDeleteStream { id: "nope".into() }
+                ClusterCommand::BeginDeleteStream {
+                    id: "nope".into(),
+                    expected_created_at: None
+                }
             )
             .await
             .unwrap(),
@@ -1390,7 +1399,10 @@ mod tests {
             apply_one(
                 &mut sm,
                 8,
-                ClusterCommand::BeginDeleteStream { id: "s1".into() }
+                ClusterCommand::BeginDeleteStream {
+                    id: "s1".into(),
+                    expected_created_at: None
+                }
             )
             .await
             .unwrap(),
@@ -1574,6 +1586,49 @@ mod tests {
             ClusterResponse::Ok
         );
         assert_eq!(sm.db().setting_get("cluster_id").as_deref(), Some("cid"));
+    }
+
+    #[tokio::test]
+    async fn begin_delete_with_a_stale_identity_keeps_the_replacement() {
+        let (mut sm, rx) = sm_with_effects();
+        apply_one(&mut sm, 1, create(&stream("rep"))).await.unwrap();
+        drain(&rx);
+        let original = match sm.db().stream_get("rep") {
+            crate::db::DbLookup::Ok(stream) => stream.created_at,
+            _ => panic!("stream missing"),
+        };
+        // A retried begin-delete still carrying the old row identity must not
+        // disable a replacement that reused the id.
+        assert_eq!(
+            apply_one(
+                &mut sm,
+                2,
+                ClusterCommand::BeginDeleteStream {
+                    id: "rep".into(),
+                    expected_created_at: Some(original + 1),
+                }
+            )
+            .await
+            .unwrap(),
+            ClusterResponse::Conflict
+        );
+        assert_eq!(sm.db().stream_pending_delete("rep"), Some(false));
+        assert!(drain(&rx).is_empty());
+        // The identity the delete was accepted for still applies.
+        assert_eq!(
+            apply_one(
+                &mut sm,
+                3,
+                ClusterCommand::BeginDeleteStream {
+                    id: "rep".into(),
+                    expected_created_at: Some(original),
+                }
+            )
+            .await
+            .unwrap(),
+            ClusterResponse::Ok
+        );
+        assert_eq!(sm.db().stream_pending_delete("rep"), Some(true));
     }
 
     #[tokio::test]
@@ -1899,7 +1954,10 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
         );
         for cmd in [
-            ClusterCommand::BeginDeleteStream { id: "e1".into() },
+            ClusterCommand::BeginDeleteStream {
+                id: "e1".into(),
+                expected_created_at: None,
+            },
             ClusterCommand::FinalizeDeleteStream { id: "e1".into() },
             ClusterCommand::SetStreamEnabled {
                 id: "e1".into(),
