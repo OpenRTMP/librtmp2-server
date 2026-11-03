@@ -287,12 +287,14 @@ fn run_authorization_group(bridge: &DbRtmpBridge, group: Vec<Job>) -> Vec<AuthCo
     if committed {
         return completions;
     }
-    // Nothing the group allowed is backed by a row: deny it and drop the
-    // per-connection state it created.
+    // Nothing the group allowed is backed by a row: deny it and close the
+    // connection through the normal poll-loop path. Tearing the session down
+    // inline (`on_close`) would also revoke roles the connection held from
+    // earlier, committed transactions while the RTMP peer keeps streaming.
     for completion in &mut completions {
         if completion.allow {
             completion.allow = false;
-            bridge.on_close(completion.conn_id);
+            bridge.force_close(completion.conn_id);
         }
     }
     for (conn_id, publisher, player) in before {
@@ -598,6 +600,23 @@ mod tests {
                 "{stream} must have no active publisher"
             );
         }
+
+        // The still-connected peers are queued for the normal close path
+        // instead of having their bridge state torn down inline: a connection
+        // that also held an earlier, committed role must keep it until the
+        // poll loop actually closes the socket.
+        assert!(
+            bridge.take_pending_force_close(2),
+            "conn 2 must be force-closed after the rollback"
+        );
+        assert!(
+            bridge.take_pending_force_close(3),
+            "conn 3 must be force-closed after the rollback"
+        );
+        assert!(
+            bridge.session_rows(2).0.is_some(),
+            "the role granted by the earlier transaction must survive the rollback"
+        );
     }
 
     #[test]

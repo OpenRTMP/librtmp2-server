@@ -47,7 +47,10 @@ const CLUSTER_ID_SETTING: &str = "cluster_id";
 /// left durable Raft state, so `raft_has_state()` alone can't tell) and the
 /// seed actually landing.
 const BOOTSTRAP_SEEDED_SETTING: &str = "bootstrap_seeded";
-const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
+pub(crate) const RAFT_WRITE_TIMEOUT_MSG: &str = "raft write timed out";
+/// Upper bound for a Raft write issued on behalf of a client (local or
+/// forwarded). Without it, a quorum-less leader parks the caller forever.
+pub(crate) const RAFT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Stale ownership rows are released with one epoch-fenced Raft write each;
 /// cap how many a single drain attempt submits so a slow leader or quorum
 /// cannot block startup or a health tick for `count * 2s`.
@@ -924,9 +927,13 @@ impl ClusterManager {
     }
 
     pub fn release_owners_for_node(&self, node_id: u64) -> Result<(), CoordError> {
-        let affected: Vec<String> = self
+        // An empty fallback here would erase every tracker entry on one failed
+        // read, so surface the failure instead of hydrating from `Vec::new()`.
+        let owners = self
             .db
-            .stream_owner_list()
+            .stream_owner_list_result()
+            .map_err(CoordError::Cluster)?;
+        let affected: Vec<String> = owners
             .into_iter()
             .filter(|o| o.owner_node_id == node_id)
             .map(|o| o.stream_id)
@@ -941,9 +948,23 @@ impl ClusterManager {
         self.block_on_write(ClusterCommand::ReleaseOwnersForNode { node_id })?
             .into_coord_result()?;
         self.ownership.clear_for_node(node_id);
-        self.ownership.hydrate_from(&self.db.stream_owner_list());
+        self.refresh_ownership_from_db()?;
         self.unsubscribe_captured_remote_owners(&previous);
         self.resubscribe_active_players(&affected);
+        Ok(())
+    }
+
+    /// Re-hydrate the local ownership tracker from SQLite.
+    ///
+    /// A failed read must not be treated as "no owners": hydrating from an
+    /// empty list would stamp exports with epoch 0 and make receivers fence
+    /// them until the next successful sync.
+    fn refresh_ownership_from_db(&self) -> Result<(), CoordError> {
+        let owners = self
+            .db
+            .stream_owner_list_result()
+            .map_err(CoordError::Cluster)?;
+        self.ownership.hydrate_from(&owners);
         Ok(())
     }
 
@@ -990,8 +1011,11 @@ impl ClusterManager {
             }
         }
         if !released.is_empty() {
-            self.ownership.hydrate_from(&self.db.stream_owner_list());
-            self.refresh_subscriptions_for(&released);
+            if let Err(e) = self.refresh_ownership_from_db() {
+                crate::log_error!("Cluster: ownership refresh after stale cleanup failed: {e:?}");
+            } else {
+                self.refresh_subscriptions_for(&released);
+            }
         }
     }
 
@@ -1062,7 +1086,6 @@ impl ClusterManager {
                 )))),
             }
         };
-        const RAFT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
         let timed = async move {
             tokio::time::timeout(RAFT_WRITE_TIMEOUT, fut)
                 .await
@@ -5686,6 +5709,33 @@ mod tests {
                 .lock()
                 .is_empty())
             .await
+        );
+    }
+
+    /// A failed ownership read must leave the tracker untouched instead of
+    /// hydrating from an empty list (which stamps every export with epoch 0).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ownership_refresh_failure_keeps_existing_entries() {
+        let dir = Arc::new(TempDir::new().unwrap());
+        let node = start_in(node_cfg(1, true, None), Arc::clone(&dir)).await;
+        let m = &node.mgr;
+        m.health().set_local(NodeHealthState::Ready);
+
+        let s = stream("keep");
+        m.create_stream(&s).unwrap();
+        let epoch = m.acquire_stream_owner("keep", 1, 0, 1).unwrap();
+        assert_eq!(m.ownership().get("keep"), Some((1, epoch)));
+
+        m.db()
+            .with_conn(|c| c.execute("DROP TABLE stream_owners", []))
+            .unwrap();
+
+        let err = m.release_owners_for_node(1).unwrap_err();
+        assert!(matches!(err, CoordError::Cluster(_)), "{err:?}");
+        assert_eq!(
+            m.ownership().get("keep"),
+            Some((1, epoch)),
+            "a failed read must not wipe the tracker"
         );
     }
 

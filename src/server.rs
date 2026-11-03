@@ -1461,7 +1461,18 @@ pub(crate) fn process_server_connections(
 
         // Tear down bridge roles when the RTMP session drops publish/play
         // without closing TCP (FCUnpublish / closeStream / role switch).
-        if entry.publishing && !is_publishing {
+        //
+        // The tracked flag alone is not authoritative: a `publish` followed by
+        // `play` in the same poll pass is granted and revoked by the protocol
+        // layer before this code runs, so the flag never flips while the
+        // bridge still holds the publisher row. Ask the bridge whenever the
+        // protocol layer no longer publishes, but keep a pending authorization
+        // out of it: the worker installs the row just before the completion is
+        // drained.
+        let holds_publisher = rtmp_bridge.has_publisher(conn_id);
+        if !is_publishing
+            && (entry.publishing || (holds_publisher && !conn.has_pending_publish_authorization()))
+        {
             rtmp_bridge.release_publisher(conn_id);
             // If the DB deactivation failed, release_publisher keeps the
             // row in ConnState for a retry on close -- keep tracking this
@@ -1492,7 +1503,10 @@ pub(crate) fn process_server_connections(
                 }
             }
         }
-        if entry.playing && !is_playing {
+        let holds_player = rtmp_bridge.has_player(conn_id);
+        if !is_playing
+            && (entry.playing || (holds_player && !conn.has_pending_play_authorization()))
+        {
             rtmp_bridge.release_player(conn_id);
             if !rtmp_bridge.has_player(conn_id) {
                 entry.playing = false;

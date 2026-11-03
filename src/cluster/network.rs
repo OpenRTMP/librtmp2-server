@@ -1215,12 +1215,21 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             use openraft::error::{ClientWriteError, RaftError};
-            let body = match raft.client_write(cmd.clone()).await {
-                Ok(resp) => serde_json::json!({
+            let write_result = tokio::time::timeout(
+                crate::cluster::manager::RAFT_WRITE_TIMEOUT,
+                raft.client_write(cmd.clone()),
+            )
+            .await;
+            let body = match write_result {
+                Err(_) => serde_json::json!({
+                    "ok": false,
+                    "error": crate::cluster::manager::RAFT_WRITE_TIMEOUT_MSG,
+                }),
+                Ok(Ok(resp)) => serde_json::json!({
                     "ok": true,
                     "data": resp.data,
                 }),
-                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+                Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl)))) => {
                     let Some(ctx) = write_forward.as_ref() else {
                         return Err(std::io::Error::other(
                             "client write forward unavailable on this node",
@@ -1260,7 +1269,7 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
                         }),
                     }
                 }
-                Err(e) => serde_json::json!({
+                Ok(Err(e)) => serde_json::json!({
                     "ok": false,
                     "error": e.to_string(),
                 }),
@@ -1279,14 +1288,23 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             use openraft::ChangeMembers;
             let change: ChangeMembers<NodeId, BasicNode> =
                 serde_json::from_value(req).map_err(std::io::Error::other)?;
-            match raft.change_membership(change, false).await {
-                Ok(_) => ControlMessage::ChangeMembershipResp {
+            match tokio::time::timeout(
+                crate::cluster::manager::RAFT_WRITE_TIMEOUT,
+                raft.change_membership(change, false),
+            )
+            .await
+            {
+                Ok(Ok(_)) => ControlMessage::ChangeMembershipResp {
                     ok: true,
                     message: "ok".into(),
                 },
-                Err(e) => ControlMessage::ChangeMembershipResp {
+                Ok(Err(e)) => ControlMessage::ChangeMembershipResp {
                     ok: false,
                     message: e.to_string(),
+                },
+                Err(_) => ControlMessage::ChangeMembershipResp {
+                    ok: false,
+                    message: crate::cluster::manager::RAFT_WRITE_TIMEOUT_MSG.into(),
                 },
             }
         }

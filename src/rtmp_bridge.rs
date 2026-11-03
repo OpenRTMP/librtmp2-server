@@ -676,6 +676,17 @@ impl DbRtmpBridge {
             .unwrap_or(false)
     }
 
+    /// Queue `conn` for the normal close path instead of tearing its bridge
+    /// state down inline.
+    ///
+    /// Used when a rolled-back authorization group leaves the in-memory state
+    /// ahead of the transaction: the poll loop notices the flag, closes the
+    /// socket and then runs [`on_close`](Self::on_close), which deactivates
+    /// whatever rows the connection still holds and releases ownership.
+    pub(crate) fn force_close(&self, conn: ConnId) {
+        self.pending_force_close.lock().insert(conn);
+    }
+
     /// `has_publisher(conn) || has_player(conn)` in one lock instead of two —
     /// used on the per-tick poll path, where every tracked connection is
     /// checked once per poll.

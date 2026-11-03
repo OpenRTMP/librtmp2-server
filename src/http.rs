@@ -1460,9 +1460,41 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    match finalize_stream_delete(&state, &id).await {
-        Ok(()) => crate::log_info!("HTTP: stream '{id}' deleted after RTMP drain"),
-        Err(()) => crate::log_error!("HTTP: failed to finalize delete for stream '{id}'"),
+    // Re-issue the (idempotent) begin-delete before each finalize attempt:
+    // the original write can be dropped by the leader after the caller-side
+    // timeout, and a single failed finalize used to abandon the accepted
+    // delete while the stream stayed enabled.
+    const FINALIZE_ATTEMPTS: usize = 6;
+    const FINALIZE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
+    let mut attempt = 1usize;
+    loop {
+        match state.coordinator.begin_delete_stream(&id) {
+            Ok(()) | Err(CoordError::NotFound) | Err(CoordError::Conflict) => {}
+            Err(e) => {
+                crate::log_warn!("HTTP: re-issuing begin_delete for stream '{id}' failed: {e:?}")
+            }
+        }
+        match finalize_stream_delete(&state, &id).await {
+            Ok(()) => {
+                crate::log_info!("HTTP: stream '{id}' deleted after RTMP drain");
+                break;
+            }
+            Err(()) if attempt < FINALIZE_ATTEMPTS => {
+                attempt += 1;
+                // `finalize_stream_delete` clears the marker on a conflict;
+                // keep the stream disabled while the retry loop runs.
+                mark_http_delete_sticky(&state, &id);
+                tokio::time::sleep(FINALIZE_RETRY_DELAY).await;
+            }
+            Err(()) => {
+                mark_http_delete_sticky(&state, &id);
+                crate::log_error!(
+                    "HTTP: failed to finalize delete for stream '{id}' after {FINALIZE_ATTEMPTS} attempts; \
+                     the stream stays disabled and marked for retry"
+                );
+                break;
+            }
+        }
     }
 }
 
@@ -1688,7 +1720,7 @@ async fn handle_stream_player_create(
     addr: ClientAddr,
     headers: HeaderMap,
     Path(id): Path<String>,
-    body: Option<Json<CreatePlayerRequest>>,
+    body: Result<Json<CreatePlayerRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let peer = http_peer(&state, addr, &headers);
     if !bearer_ok(&state, &headers) {
@@ -1763,7 +1795,21 @@ async fn handle_stream_player_create(
         }
     };
 
-    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let req = match body {
+        Ok(Json(req)) => req,
+        // A request without a JSON Content-Type has always been treated as an
+        // empty body; keep that contract while reporting malformed JSON with
+        // the API's error envelope instead of axum's plain-text rejection.
+        Err(rejection) if rejection.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            CreatePlayerRequest::default()
+        }
+        Err(rejection) => {
+            let status = rejection.status();
+            let message = rejection.body_text();
+            log_http_access("POST", &path, &peer, status, &message);
+            return err_json(status, "BAD_REQUEST", &message);
+        }
+    };
     let slot = state.db.viewer_list(&id).len() + 1;
     let name = req
         .name
@@ -2407,7 +2453,7 @@ struct JoinProofRequest {
 async fn handle_cluster_join_proof(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Option<Json<JoinProofRequest>>,
+    body: Result<Json<JoinProofRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if !bearer_ok(&state, &headers) {
         return err_json(
@@ -2416,12 +2462,22 @@ async fn handle_cluster_join_proof(
             "Missing or invalid token",
         );
     }
-    let Some(Json(req)) = body else {
-        return err_json(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "Missing request body",
-        );
+    let req = match body {
+        Ok(Json(req)) => req,
+        // An absent or non-JSON body keeps the documented 400 "missing body"
+        // answer; malformed JSON reports the API error envelope.
+        Err(rejection) if rejection.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "Missing request body",
+            );
+        }
+        Err(rejection) => {
+            let status = rejection.status();
+            let message = rejection.body_text();
+            return err_json(status, "BAD_REQUEST", &message);
+        }
     };
     if req.node_id == 0 {
         return err_json(
@@ -3999,6 +4055,27 @@ mod tests {
         assert!(body.contains("error"), "{body}");
     }
 
+    #[tokio::test]
+    async fn create_player_reports_malformed_json_with_the_api_envelope() {
+        let state = roomy_state();
+        add_stream(&state, "playermalformed");
+        let app = router(state);
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/streams/playermalformed/players",
+            true,
+            Some(r#"{"name":"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(&body), "BAD_REQUEST");
+        assert!(
+            !body.contains("Missing request body"),
+            "malformed JSON must not be reported as a missing body: {body}"
+        );
+    }
+
     #[test]
     fn xml_escape_drops_xml_forbidden_noncharacters() {
         assert_eq!(xml_escape("a\u{FFFE}b\u{FFFF}c"), "abc");
@@ -4201,7 +4278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_finalize_keeps_stream_when_delete_was_rolled_back() {
+    async fn background_finalize_reissues_a_rolled_back_begin() {
         let state = roomy_state();
         add_stream(&state, "revived");
         go_live(&state, "revived");
@@ -4209,18 +4286,20 @@ mod tests {
         let (status, _) = send(&app, "DELETE", "/api/v1/streams/revived", true, None).await;
         assert_eq!(status, StatusCode::ACCEPTED);
 
-        // The pending-delete flag is cleared before the drain finishes, so
-        // finalize sees a Conflict and must not delete the row.
+        // Simulate a BeginDeleteStream write the leader dropped after the
+        // caller-side timeout: the row is enabled again before the drain
+        // finishes. The waiter must re-issue the idempotent begin and complete
+        // the accepted delete instead of leaving a publishable stream behind.
         assert!(state.db.stream_set_enabled("revived", true));
         state.rtmp_bridge.on_close(1);
+        wait_for("delete to finalize", Duration::from_secs(10), || {
+            matches!(state.db.stream_get("revived"), DbLookup::Missing)
+        })
+        .await;
         wait_for("delete marker to clear", Duration::from_secs(5), || {
             !state.deleted_streams.lock().contains("revived")
         })
         .await;
-        let DbLookup::Ok(s) = state.db.stream_get("revived") else {
-            panic!("a rolled-back delete must keep the stream");
-        };
-        assert!(s.enabled);
     }
 
     #[tokio::test]
