@@ -249,17 +249,7 @@ impl ClusterConfig {
                     .into(),
             );
         }
-        let control_addr = parse_bind(&self.bind).map_err(|e| format!("CLUSTER_BIND: {e}"))?;
-        let media_addr =
-            parse_bind(&self.media_bind).map_err(|e| format!("CLUSTER_MEDIA_BIND: {e}"))?;
-        // Peers dial the advertised address, so a bind on port 0 would
-        // advertise "…:0" while the listener picks an ephemeral port.
-        if control_addr.port() == 0 {
-            return Err("CLUSTER_BIND must not use port 0".into());
-        }
-        if media_addr.port() == 0 {
-            return Err("CLUSTER_MEDIA_BIND must not use port 0".into());
-        }
+        validate_bind_addrs(&self.bind, &self.media_bind)?;
         // Peers dial the advertised addresses through
         // `validate_cluster_peer_addr`, which parses a `SocketAddr` and rejects
         // hostnames, loopback (unless allowed), link-local/metadata and other
@@ -706,6 +696,20 @@ fn normalize_absolute_bandwidth_thresholds(
     }
 }
 
+/// Validate the control/media bind strings and reject port 0, which cannot be
+/// derived into a dialable advertised address.
+fn validate_bind_addrs(bind: &str, media_bind: &str) -> Result<(), String> {
+    let control = parse_bind(bind).map_err(|e| format!("CLUSTER_BIND: {e}"))?;
+    let media = parse_bind(media_bind).map_err(|e| format!("CLUSTER_MEDIA_BIND: {e}"))?;
+    if control.port() == 0 {
+        return Err("CLUSTER_BIND must not use port 0".into());
+    }
+    if media.port() == 0 {
+        return Err("CLUSTER_MEDIA_BIND must not use port 0".into());
+    }
+    Ok(())
+}
+
 fn parse_bind(bind: &str) -> Result<SocketAddr, String> {
     bind.parse::<SocketAddr>()
         .or_else(|_| format!("127.0.0.1:{bind}").parse())
@@ -822,6 +826,13 @@ mod tests {
         };
         assert_eq!(cfg.advertise_control(), "127.0.0.1:1940");
         assert_eq!(cfg.advertise_media(), "127.0.0.1:1941");
+    }
+
+    #[test]
+    fn zero_bind_port_is_rejected() {
+        assert!(validate_bind_addrs("127.0.0.1:0", "127.0.0.1:1941").is_err());
+        assert!(validate_bind_addrs("127.0.0.1:1940", "127.0.0.1:0").is_err());
+        assert!(validate_bind_addrs("1940", "127.0.0.1:1941").is_ok());
     }
 
     #[test]
