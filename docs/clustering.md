@@ -319,6 +319,23 @@ upgrades therefore work in any order**; the two encodings are never mixed on
 one connection. A v1 node cannot read the `hint` of a v2 peer's frames
 (irrelevant: it never forwards them).
 
+That guarantee covers the **media protocol only**. Raft log entries are JSON
+and are applied by whichever build owns the log, so Raft-level compatibility is
+separate:
+
+- New fields on replicated commands (`BeginDeleteStream::expected_created_at`,
+  `ReleaseOwnersForNode::max_epoch`) are `#[serde(default)]`, so a **new** node
+  applies entries written by an **old** leader correctly.
+- An **old** node that applies a **new** entry silently ignores those fields,
+  i.e. it behaves exactly like the pre-fence build: a retried begin-delete may
+  mark a replacement pending and a node-wide release may delete rows a rejoined
+  node acquired afterwards. This reintroduces the old data-loss window only
+  while the cluster is mixed.
+- Therefore: **run every Raft voter on the same build before relying on the
+  delete/ownership fences.** Upgrade voters one at a time while the cluster is
+  quiesced (no deletes in flight, no membership changes), or accept the
+  pre-fence behaviour during the window.
+
 ## Limitations
 
 - Media inject/export requires librtmp2 ≥ 0.7 APIs (`enable_relay_export`,
