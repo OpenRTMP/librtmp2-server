@@ -13,6 +13,10 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- The CI benchmark sweep compares against the current stable SRS release,
+  SRS 6.0 (`v6.0-r3`), instead of the SRS 8.0 development tag.
+
 ## [0.6.8] — 2026-11-01
 
 ### Fixed

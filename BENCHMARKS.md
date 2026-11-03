@@ -770,7 +770,8 @@ separate, sizeable C++ project) — build or download each separately and
 point `MEDIAMTX_BIN`/`SRS_BIN`/`LIVEFORGE_BIN` at the resulting binaries;
 the nginx-rtmp and librtmp2-server legs run without them. Build LiveForge
 from [github.com/im-pingo/liveforge](https://github.com/im-pingo/liveforge)
-with `go build -o liveforge ./cmd/liveforge` (needs Go 1.26+). Build SRS 8.0 from
-[github.com/ossrs/srs](https://github.com/ossrs/srs) at the `v8.0-d0` tag with
-`(cd trunk && ./configure --ffmpeg-fit=on --sys-ffmpeg=off --https=off --gb28181=off && make)`; the resulting `trunk/objs/srs` binary
+with `go build -o liveforge ./cmd/liveforge` (needs Go 1.26+). Build SRS from
+[github.com/ossrs/srs](https://github.com/ossrs/srs) at the `v6.0-r3` tag (the
+current stable release) with
+`(cd trunk && ./configure --rtc=off --srt=off --gb28181=off --https=off --sanitizer=off --debug=off && make)`; the resulting `trunk/objs/srs` binary
 is what `SRS_BIN` should point at.
