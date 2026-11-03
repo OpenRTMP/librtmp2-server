@@ -1487,10 +1487,13 @@ async fn wait_and_finalize_stream_delete(state: Arc<AppState>, id: String) {
                 tokio::time::sleep(FINALIZE_RETRY_DELAY).await;
             }
             Err(()) => {
-                mark_http_delete_sticky(&state, &id);
+                // Release the marker so a later DELETE can restart the whole
+                // reconciliation: keeping it sticky would make
+                // `handle_stream_delete` answer 202 forever while no task runs.
+                clear_http_delete_marker(&state, &id);
                 crate::log_error!(
                     "HTTP: failed to finalize delete for stream '{id}' after {FINALIZE_ATTEMPTS} attempts; \
-                     the stream stays disabled and marked for retry"
+                     the stream stays disabled and a later DELETE will retry"
                 );
                 break;
             }

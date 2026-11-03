@@ -199,15 +199,17 @@ pub fn measure_interface_utilization(
             }
         }
 
-        // Take two samples 200 ms apart, exactly like the Linux arm: a single
-        // reading cannot yield a rate, and silently returning 0.0 made the
-        // configured bandwidth admission inert while still spawning a
-        // PowerShell process on every heartbeat.
+        // Take two samples like the Linux arm. The interval includes both
+        // PowerShell startups, so divide by the measured elapsed time instead
+        // of the nominal sleep: assuming 0.2 s would overstate utilization and
+        // can drain a node whose real traffic is below the threshold.
+        let started = std::time::Instant::now();
         let (rx1, tx1) = sample(iface)?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         let (rx2, tx2) = sample(iface)?;
-        let rx_bps = rx2.saturating_sub(rx1) as f64 / 0.2;
-        let tx_bps = tx2.saturating_sub(tx1) as f64 / 0.2;
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let rx_bps = rx2.saturating_sub(rx1) as f64 / elapsed;
+        let tx_bps = tx2.saturating_sub(tx1) as f64 / elapsed;
         let bytes_per_sec = mode.combine(rx_bps, tx_bps);
         let mbps = bytes_per_sec * 8.0 / 1_000_000.0;
         Ok((mbps / max_mbps).clamp(0.0, 1.0))
