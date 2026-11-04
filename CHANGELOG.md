@@ -14,9 +14,6 @@ begin at `1.0.0`.
 ## [Unreleased]
 
 ### Security
-- The HTTP API binds `127.0.0.1:8080` by default. The bundled docker-compose
-  sets `LRTMP2_HTTP_BIND=0.0.0.0:8080` explicitly; bare-metal deployments that
-  need a routable API must set it and should terminate TLS in front of it.
 - Unauthenticated RTMP connections may hold at most half of
   `RTMP_MAX_CONNECTIONS` (at least one pre-auth slot); established publish/play
   sessions keep the rest, and the oldest idle sockets are evicted first.

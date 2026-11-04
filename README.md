@@ -196,9 +196,8 @@ TLS_CERT_FILE=/etc/librtmp2-server/fullchain.pem
 TLS_KEY_FILE=/etc/librtmp2-server/privkey.pem
 RTMPS_BIND=0.0.0.0:1936
 
-# HTTP API and UI listener address (loopback by default; bind a routable
-# address only behind a TLS terminator)
-HTTP_BIND=127.0.0.1:8080
+# HTTP API and UI listener address
+HTTP_BIND=0.0.0.0:8080
 
 # Log level: 0=error 1=warn 2=info 3=debug
 # Applies to librtmp2's protocol lines too (prefixed "librtmp2:"). Every
