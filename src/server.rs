@@ -2826,21 +2826,15 @@ impl ShardLoop {
         );
         // Runs for every shard shape (single shard, plaintext shards, TLS
         // shards): the pre-auth reservation must not depend on the dynamic
-        // global cap budget existing.
-        let pending_trimmed = enforce_pre_auth_connections(
+        // global cap budget existing. The shard's published connection count
+        // is refreshed by `before_poll` on the next tick.
+        let _ = enforce_pre_auth_connections(
             server,
             &self.shared.bridge,
             self.shared.max_conn.max(1) as usize,
             &self.shared.pending_counts,
             self.index,
         );
-        if pending_trimmed > 0 && self.conn_budget.is_some() {
-            let _ = self.shared.conn_counts[self.index].fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |value| Some(value.saturating_sub(pending_trimmed)),
-            );
-        }
 
         // A publisher/player deactivation that failed on connection close has
         // no later lifecycle event to retry it, so the poll loop does it.
