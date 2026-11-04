@@ -402,6 +402,9 @@ fn shard_connection_cap(
 /// not-yet-authorized connections.
 struct ShardConnBudget {
     counts: Arc<Vec<AtomicUsize>>,
+    /// Pre-auth connection counts per shard; the reservation is global, so a
+    /// shard must subtract what the others already hold.
+    pending_counts: Arc<Vec<AtomicUsize>>,
     index: usize,
     global: usize,
 }
@@ -453,8 +456,17 @@ impl ShardConnBudget {
         // that only opens sockets (handshake done, no publish/play yet) may
         // not hold more than half of the global budget, so one address's
         // connect flood cannot deny every publish/play. A connection with an
-        // authorization in flight is not counted as idle squatter.
+        // authorization in flight is not counted as idle squatter. The
+        // reservation is process-wide: each shard subtracts the pending count
+        // the others published.
         let pending_cap = (self.global / 2).max(1);
+        let others_pending: usize = self
+            .pending_counts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.index)
+            .map(|(_, c)| c.load(Ordering::Relaxed))
+            .sum();
         let mut pending: Vec<(u64, usize)> = server
             .connections
             .iter()
@@ -466,9 +478,11 @@ impl ShardConnBudget {
             })
             .map(|(i, c)| (c.conn_id, i))
             .collect();
-        if pending.len() > pending_cap {
+        let total_pending = pending.len() + others_pending;
+        if total_pending > pending_cap {
             pending.sort_unstable_by_key(|&(conn_id, _)| std::cmp::Reverse(conn_id));
-            let excess = pending.len() - pending_cap;
+            let excess = (total_pending - pending_cap).min(pending.len());
+            let remaining_pending = pending.len() - excess;
             for (_, idx) in pending.into_iter().take(excess) {
                 server.connections[idx].disconnect_transport();
                 trimmed += 1;
@@ -477,6 +491,9 @@ impl ShardConnBudget {
                 "RTMP: pre-auth connection budget {pending_cap} reached; \
                  closed {excess} unauthenticated connection(s)"
             );
+            self.pending_counts[self.index].store(remaining_pending, Ordering::Relaxed);
+        } else {
+            self.pending_counts[self.index].store(pending.len(), Ordering::Relaxed);
         }
         self.counts[self.index].store(own - trimmed, Ordering::Relaxed);
     }
@@ -1971,6 +1988,7 @@ impl ServerApp {
             relay_export_bytes: self.relay_export_bytes(&media_output_config, n_shards),
             n_shards,
             conn_counts: Arc::new((0..n_shards).map(|_| AtomicUsize::new(0)).collect()),
+            pending_counts: Arc::new((0..n_shards).map(|_| AtomicUsize::new(0)).collect()),
             // Every shard can wake every other one: cross-shard relay frames
             // land in the receiving shard's inbox and must be fanned out to
             // its viewers right away, not on that shard's next poll timeout.
@@ -2419,6 +2437,7 @@ struct ShardShared {
     relay_export_bytes: usize,
     n_shards: usize,
     conn_counts: Arc<Vec<AtomicUsize>>,
+    pending_counts: Arc<Vec<AtomicUsize>>,
     all_wakes: Arc<Vec<Option<Arc<WakeFd>>>>,
     bridge: Arc<DbRtmpBridge>,
     deleted_streams: Arc<Mutex<HashSet<String>>>,
@@ -2519,6 +2538,7 @@ fn run_rtmp_shard(shared: Arc<ShardShared>, spec: ShardSpec) {
     let mut shard = ShardLoop {
         conn_budget: dynamic_budget.then(|| ShardConnBudget {
             counts: Arc::clone(&shared.conn_counts),
+            pending_counts: Arc::clone(&shared.pending_counts),
             index: spec.index,
             global: shared.max_conn.max(1) as usize,
         }),
@@ -3479,10 +3499,12 @@ mod tests {
         use super::ShardConnBudget;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let counts: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
+        let pending_counts: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
         let budget = ShardConnBudget {
             counts: Arc::clone(&counts),
+            pending_counts: Arc::clone(&pending_counts),
             index: 0,
             global: 10,
         };
@@ -3506,6 +3528,7 @@ mod tests {
             "unauthenticated connections must not hold more than half of the pool"
         );
         assert_eq!(counts[0].load(Ordering::Relaxed), 5);
+        assert_eq!(pending_counts[0].load(Ordering::Relaxed), 5);
     }
 
     #[test]
@@ -3517,6 +3540,7 @@ mod tests {
         let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
         let budget = ShardConnBudget {
             counts: Arc::clone(&counts),
+            pending_counts: Arc::new((0..2).map(|_| AtomicUsize::new(0)).collect()),
             index: 0,
             global: 3,
         };
