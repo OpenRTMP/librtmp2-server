@@ -1495,23 +1495,16 @@ async fn wait_and_finalize_stream_delete(
         // original row was deleted: the identity is carried in the replicated
         // command so the check happens atomically with the mutation, and this
         // local read only short-circuits with a clear log message.
-        match &state.db.stream_get(&id) {
+        match &state.db.stream_get_with_token(&id) {
             crate::db::DbLookup::Missing => {
                 clear_http_delete_marker(&state, &id);
                 return;
             }
-            crate::db::DbLookup::Ok(current) if current.created_at != expected_created_at => {
-                crate::log_warn!(
-                    "HTTP: stream '{id}' was replaced while its delete was reconciling; \
-                     leaving the replacement untouched"
-                );
-                clear_http_delete_marker(&state, &id);
-                return;
-            }
-            crate::db::DbLookup::Ok(_)
-                if expected_delete_token.as_deref().is_some_and(|token| {
-                    state.db.stream_delete_token(&id).as_deref() != Some(token)
-                }) =>
+            crate::db::DbLookup::Ok((current, token))
+                if current.created_at != expected_created_at
+                    || expected_delete_token
+                        .as_deref()
+                        .is_some_and(|expected| token != expected) =>
             {
                 crate::log_warn!(
                     "HTTP: stream '{id}' was replaced while its delete was reconciling; \
@@ -1520,9 +1513,9 @@ async fn wait_and_finalize_stream_delete(
                 clear_http_delete_marker(&state, &id);
                 return;
             }
-            // The local read failed, but the replicated command still carries
-            // the expected identity, so the authoritative apply refuses to
-            // disable a replacement on its own.
+            // A failed local read is not evidence of a replacement: the
+            // replicated command still carries the expected identity, so keep
+            // retrying until the row is readable or the attempts are spent.
             crate::db::DbLookup::Failed | crate::db::DbLookup::Ok(_) => {}
         }
         match state.coordinator.begin_delete_stream_expecting(
@@ -1621,7 +1614,7 @@ async fn handle_stream_delete(
         );
         return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
     }
-    let (expected_created_at, expected_delete_token) = match state.db.stream_get(&id) {
+    let (expected_created_at, expected_delete_token) = match state.db.stream_get_with_token(&id) {
         DbLookup::Missing => {
             log_http_access(
                 "DELETE",
@@ -1646,7 +1639,7 @@ async fn handle_stream_delete(
                 "Failed to load stream",
             );
         }
-        DbLookup::Ok(stream) => (stream.created_at, state.db.stream_delete_token(&id)),
+        DbLookup::Ok((stream, token)) => (stream.created_at, Some(token)),
     };
 
     mark_http_delete_sticky(&state, &id);

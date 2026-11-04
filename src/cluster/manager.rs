@@ -812,9 +812,12 @@ impl ClusterManager {
             enabled: true,
             created_at: stream.created_at,
         };
+        let delete_token = crate::keygen::keygen_delete_token()
+            .unwrap_or_else(|_| crate::db::legacy_delete_token(&stream.id, &stream.publish_key));
         self.block_on_write(ClusterCommand::CreateStream {
             stream: stream.clone(),
             default_viewer: default_viewer.clone(),
+            delete_token,
         })?
         .into_coord_result()?;
         Ok(default_viewer)

@@ -301,6 +301,27 @@ pub enum StreamDisableOutcome {
     Stale,
 }
 
+/// Deterministic fencing identity for a stream restored from a pre-token
+/// snapshot or database. Every replica derives the same value from fields that
+/// are identical in the replicated state, so an old snapshot cannot make one
+/// node reject a valid begin-delete.
+pub(crate) fn legacy_delete_token(id: &str, publish_key: &str) -> String {
+    fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
+        let mut hash = seed;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+    let mut out = String::with_capacity(32);
+    for seed in [0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c15u64] {
+        let hash = fnv1a64(fnv1a64(seed, id.as_bytes()), publish_key.as_bytes());
+        out.push_str(&format!("{hash:016x}"));
+    }
+    out
+}
+
 fn map_optional<T>(result: rusqlite::Result<T>) -> DbLookup<T> {
     match result.optional() {
         Ok(Some(v)) => DbLookup::Ok(v),
@@ -567,14 +588,22 @@ impl Db {
                 Err(e) => return Err(e),
             }
         }
-        // Backfill a unique per-row identity for databases created before
-        // `delete_token` existed. Unlike `created_at` (one-second resolution)
-        // this cannot collide with a replacement row that reuses the id.
-        conn.execute(
-            "UPDATE streams SET delete_token = lower(hex(randomblob(16))) \
-             WHERE delete_token = ''",
-            [],
-        )?;
+        // Backfill a deterministic per-row identity for databases created
+        // before `delete_token` existed. It must be identical on every node
+        // (a random value per replica would make one node reject a valid
+        // begin-delete), hence the derivation from replicated fields.
+        let missing_tokens: Vec<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT id, publish_key FROM streams WHERE delete_token = ''")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, publish_key) in missing_tokens {
+            conn.execute(
+                "UPDATE streams SET delete_token=? WHERE id=? AND delete_token=''",
+                params![legacy_delete_token(&id, &publish_key), id],
+            )?;
+        }
         // `idx_player_viewer` is deliberately created here rather than in the
         // SCHEMA batch above: SCHEMA runs before these ALTERs, and on a database
         // created before `viewer_id` existed the `CREATE INDEX ... ON
@@ -816,6 +845,22 @@ impl Db {
         s: &Stream,
         viewer: &StreamViewer,
     ) -> std::result::Result<(), StreamAddError> {
+        let token = crate::keygen::keygen_delete_token()
+            .unwrap_or_else(|_| legacy_delete_token(&s.id, &s.publish_key));
+        self.stream_add_with_viewer_with_token(s, viewer, &token)
+    }
+
+    /// Insert stream + viewer with an explicit delete identity.
+    ///
+    /// Clustered applies must pass the token carried in the replicated command
+    /// so every replica stores the same value; generating it here would make a
+    /// later begin-delete conflict on the other replicas.
+    pub fn stream_add_with_viewer_with_token(
+        &self,
+        s: &Stream,
+        viewer: &StreamViewer,
+        delete_token: &str,
+    ) -> std::result::Result<(), StreamAddError> {
         if viewer.stream_id != s.id || viewer.play_key != s.play_key {
             crate::log_error!(
                 "stream_add_with_viewer: viewer stream_id/play_key mismatch for {}",
@@ -839,7 +884,7 @@ impl Db {
         let stream_rc = tx.execute(
             "INSERT INTO streams \
              (id,name,app,publish_key,play_key,stats_key,enabled,created_at,delete_token) \
-             VALUES (?,?,?,?,?,?,?,?,lower(hex(randomblob(16))))",
+             VALUES (?,?,?,?,?,?,?,?,?)",
             params![
                 s.id,
                 s.name,
@@ -848,7 +893,8 @@ impl Db {
                 s.play_key,
                 s.stats_key,
                 s.enabled,
-                s.created_at
+                s.created_at,
+                delete_token
             ],
         );
         match stream_rc {
@@ -968,6 +1014,23 @@ impl Db {
             &format!("SELECT {} FROM streams WHERE id=?", Self::STREAM_COLS),
             params![id],
             Self::load_stream_row,
+        ))
+    }
+
+    /// Stream row and its delete identity from one read.
+    ///
+    /// The delete handler must not read `created_at` and the token with two
+    /// queries: a replacement inserted between them would pair the old
+    /// timestamp with the new token and disable the replacement.
+    pub fn stream_get_with_token(&self, id: &str) -> DbLookup<(Stream, String)> {
+        let conn = self.conn.lock();
+        map_optional(conn.query_row(
+            &format!(
+                "SELECT {},delete_token FROM streams WHERE id=?",
+                Self::STREAM_COLS
+            ),
+            params![id],
+            |row| Ok((Self::load_stream_row(row)?, row.get(8)?)),
         ))
     }
 
@@ -1100,18 +1163,12 @@ impl Db {
         }
     }
 
-    /// Per-row identity used to fence a retried begin-delete.
-    ///
-    /// `None` when the row is missing or unreadable; the caller then falls back
-    /// to `created_at` (legacy rows) or reports the delete as not found.
-    pub fn stream_delete_token(&self, id: &str) -> Option<String> {
+    /// All per-stream delete identities, for the Raft app snapshot.
+    pub fn stream_delete_tokens_result(&self) -> rusqlite::Result<Vec<(String, String)>> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT delete_token FROM streams WHERE id=?",
-            params![id],
-            |row| row.get(0),
-        )
-        .ok()
+        let mut stmt = conn.prepare("SELECT id, delete_token FROM streams")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
     }
 
     /// Re-enable a stream after a failed delete rollback, clearing the
@@ -3347,7 +3404,10 @@ mod tests {
         let DbLookup::Ok(original) = db.stream_get("tok") else {
             panic!("stream missing");
         };
-        let token = db.stream_delete_token("tok").expect("token");
+        let (_, token) = match db.stream_get_with_token("tok") {
+            DbLookup::Ok(pair) => pair,
+            _ => panic!("stream missing"),
+        };
         assert_eq!(token.len(), 32, "the token must be a random 128-bit hex id");
 
         // Same id, same second, different row identity: the token refuses it.
@@ -3358,7 +3418,10 @@ mod tests {
             ..sample_stream("tok", "pub_t2", "pl_t2", "st_t2")
         })
         .unwrap();
-        let replacement_token = db.stream_delete_token("tok").expect("token");
+        let (_, replacement_token) = match db.stream_get_with_token("tok") {
+            DbLookup::Ok(pair) => pair,
+            _ => panic!("stream missing"),
+        };
         assert_ne!(token, replacement_token);
         assert_eq!(
             db.stream_disable_expecting("tok", Some(original.created_at), Some(&token)),
@@ -3372,6 +3435,39 @@ mod tests {
         assert_eq!(
             db.stream_disable_expecting("tok", Some(original.created_at), Some(&replacement_token)),
             Some(StreamDisableOutcome::Disabled)
+        );
+    }
+
+    #[test]
+    fn explicit_delete_token_is_stored_verbatim() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("repl", "pub_repl", "pl_repl", "st_repl");
+        let viewer = StreamViewer {
+            id: "v_repl".into(),
+            stream_id: "repl".into(),
+            name: "Player 1".into(),
+            play_key: s.play_key.clone(),
+            enabled: true,
+            created_at: s.created_at,
+        };
+        let token = "0123456789abcdef0123456789abcdef";
+        db.stream_add_with_viewer_with_token(&s, &viewer, token)
+            .unwrap();
+        assert!(matches!(
+            db.stream_get_with_token("repl"),
+            DbLookup::Ok((_, stored)) if stored == token
+        ));
+    }
+
+    #[test]
+    fn legacy_delete_token_is_deterministic() {
+        assert_eq!(
+            legacy_delete_token("stream-a", "pub_key_a"),
+            legacy_delete_token("stream-a", "pub_key_a")
+        );
+        assert_ne!(
+            legacy_delete_token("stream-a", "pub_key_a"),
+            legacy_delete_token("stream-a", "pub_key_b")
         );
     }
 

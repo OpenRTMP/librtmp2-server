@@ -171,11 +171,22 @@ impl SqliteStateMachine {
             ClusterCommand::CreateStream {
                 stream,
                 default_viewer,
-            } => match self.db.stream_add_with_viewer(stream, default_viewer) {
-                Ok(()) => ClusterResponse::Ok,
-                Err(StreamAddError::Duplicate) => ClusterResponse::Duplicate,
-                Err(StreamAddError::Db) => ClusterResponse::Error("db".into()),
-            },
+                delete_token,
+            } => {
+                let token = if delete_token.is_empty() {
+                    crate::db::legacy_delete_token(&stream.id, &stream.publish_key)
+                } else {
+                    delete_token.clone()
+                };
+                match self
+                    .db
+                    .stream_add_with_viewer_with_token(stream, default_viewer, &token)
+                {
+                    Ok(()) => ClusterResponse::Ok,
+                    Err(StreamAddError::Duplicate) => ClusterResponse::Duplicate,
+                    Err(StreamAddError::Db) => ClusterResponse::Error("db".into()),
+                }
+            }
             ClusterCommand::BeginDeleteStream {
                 id,
                 expected_created_at,
@@ -409,6 +420,10 @@ impl SqliteStateMachine {
     fn build_app_snapshot(&self, last_applied: Option<LogId<u64>>) -> Result<AppSnapshot, String> {
         let (streams, viewers, owners, api_token, cluster_id, pending_delete_stream_ids) =
             self.db.read_replicated_snapshot()?;
+        let delete_tokens = self
+            .db
+            .stream_delete_tokens_result()
+            .map_err(|e| e.to_string())?;
         Ok(AppSnapshot {
             streams,
             viewers,
@@ -417,6 +432,7 @@ impl SqliteStateMachine {
             cluster_id,
             last_applied_index: last_applied.map(|l| l.index),
             pending_delete_stream_ids,
+            delete_tokens,
         })
     }
 
@@ -553,6 +569,32 @@ impl SqliteStateMachine {
                         s.enabled,
                         s.created_at,
                     ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            // Restore the replicated delete identities, then derive a stable
+            // value for rows from a snapshot written before the field existed.
+            for (id, token) in &snap.delete_tokens {
+                tx.execute(
+                    "UPDATE streams SET delete_token=? WHERE id=?",
+                    params![token, id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            let missing_tokens: Vec<(String, String)> = {
+                let mut stmt = tx
+                    .prepare("SELECT id, publish_key FROM streams WHERE delete_token=''")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|e| e.to_string())?
+            };
+            for (id, publish_key) in missing_tokens {
+                tx.execute(
+                    "UPDATE streams SET delete_token=? WHERE id=?",
+                    params![crate::db::legacy_delete_token(&id, &publish_key), id],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -1256,6 +1298,7 @@ mod tests {
         ClusterCommand::CreateStream {
             stream: s.clone(),
             default_viewer: default_viewer(s),
+            delete_token: String::new(),
         }
     }
 
@@ -1941,7 +1984,8 @@ mod tests {
                 1,
                 ClusterCommand::CreateStream {
                     stream: s.clone(),
-                    default_viewer: bad_viewer
+                    default_viewer: bad_viewer,
+                    delete_token: String::new(),
                 }
             )
             .await
@@ -2345,6 +2389,10 @@ mod tests {
             cluster_id: Some("snap-cluster".into()),
             last_applied_index: Some(20),
             pending_delete_stream_ids: vec!["pend".into()],
+            delete_tokens: vec![
+                ("keep".into(), "keep-token".into()),
+                ("pend".into(), "pend-token".into()),
+            ],
         };
         let meta = snap_meta(Some(log_id(20)), membership(&[1, 2]));
         let data = serde_json::to_vec(&snap).unwrap();
@@ -2357,6 +2405,12 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"keep".to_string()) && ids.contains(&"pend".to_string()));
         assert_eq!(db.stream_pending_delete("pend"), Some(true));
+        // Delete identities survive the snapshot, so a later begin-delete
+        // carrying the leader's token is accepted on the restored node.
+        assert!(matches!(
+            db.stream_get_with_token("keep"),
+            crate::db::DbLookup::Ok((_, token)) if token == "keep-token"
+        ));
         assert_eq!(db.stream_owner_get("keep").map(|o| o.epoch), Some(11));
         assert_eq!(db.token_get().unwrap().as_deref(), Some("snap-token"));
         assert_eq!(

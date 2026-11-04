@@ -27,6 +27,11 @@ pub enum ClusterCommand {
     CreateStream {
         stream: Stream,
         default_viewer: StreamViewer,
+        /// Per-row delete identity, generated before propose so every replica
+        /// stores the same value. Empty for entries written before the field
+        /// existed; the apply path derives a deterministic value in that case.
+        #[serde(default)]
+        delete_token: String,
     },
     BeginDeleteStream {
         id: String,
@@ -199,6 +204,7 @@ mod tests {
                     enabled: true,
                     created_at: 0,
                 },
+                delete_token: "tok".into(),
             }
             .requires_admin_proof()
         );
