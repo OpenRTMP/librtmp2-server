@@ -99,7 +99,7 @@ impl Default for ServerConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             rtmps_bind: "0.0.0.0:1936".to_string(),
-            http_bind: "0.0.0.0:8080".to_string(),
+            http_bind: "127.0.0.1:8080".to_string(),
             http_trusted_proxies: Vec::new(),
             http_rate_limit_window_secs: 60,
             http_rate_limit_api: 120,
@@ -622,7 +622,7 @@ mod tests {
     fn defaults() {
         let config = ServerConfig::default();
         assert_eq!(config.rtmp_bind, "0.0.0.0:1935");
-        assert_eq!(config.http_bind, "0.0.0.0:8080");
+        assert_eq!(config.http_bind, "127.0.0.1:8080");
         assert_eq!(config.rtmp_max_conn, 100);
         assert_eq!(config.rtmp_max_connections_per_addr, i32::MAX);
         assert_eq!(config.rtmp_max_pending_tls_per_addr, i32::MAX);

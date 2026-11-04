@@ -346,6 +346,7 @@ CREATE TABLE IF NOT EXISTS streams (
   stats_key TEXT UNIQUE NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   pending_delete INTEGER NOT NULL DEFAULT 0,
+  delete_token TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS publishers (
@@ -553,6 +554,7 @@ impl Db {
             Err(e) => return Err(e),
         }
         for sql in [
+            "ALTER TABLE streams ADD COLUMN delete_token TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE publishers ADD COLUMN audio_sample_rate INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE publishers ADD COLUMN audio_channels INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE publishers ADD COLUMN rtt_ms INTEGER NOT NULL DEFAULT 0",
@@ -565,6 +567,14 @@ impl Db {
                 Err(e) => return Err(e),
             }
         }
+        // Backfill a unique per-row identity for databases created before
+        // `delete_token` existed. Unlike `created_at` (one-second resolution)
+        // this cannot collide with a replacement row that reuses the id.
+        conn.execute(
+            "UPDATE streams SET delete_token = lower(hex(randomblob(16))) \
+             WHERE delete_token = ''",
+            [],
+        )?;
         // `idx_player_viewer` is deliberately created here rather than in the
         // SCHEMA batch above: SCHEMA runs before these ALTERs, and on a database
         // created before `viewer_id` existed the `CREATE INDEX ... ON
@@ -769,8 +779,9 @@ impl Db {
             }
         }
         match conn.execute(
-            "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
-             VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO streams \
+             (id,name,app,publish_key,play_key,stats_key,enabled,created_at,delete_token) \
+             VALUES (?,?,?,?,?,?,?,?,lower(hex(randomblob(16))))",
             params![
                 s.id,
                 s.name,
@@ -826,8 +837,9 @@ impl Db {
             }
         };
         let stream_rc = tx.execute(
-            "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
-             VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO streams \
+             (id,name,app,publish_key,play_key,stats_key,enabled,created_at,delete_token) \
+             VALUES (?,?,?,?,?,?,?,?,lower(hex(randomblob(16))))",
             params![
                 s.id,
                 s.name,
@@ -1024,7 +1036,7 @@ impl Db {
     /// `stream_ids_pending_delete`). Returns `Some(true)` if updated,
     /// `Some(false)` if not found, `None` on DB error.
     pub fn stream_disable(&self, id: &str) -> Option<bool> {
-        match self.stream_disable_expecting(id, None)? {
+        match self.stream_disable_expecting(id, None, None)? {
             StreamDisableOutcome::Disabled => Some(true),
             StreamDisableOutcome::Missing | StreamDisableOutcome::Stale => Some(false),
         }
@@ -1036,20 +1048,33 @@ impl Db {
     /// A retried begin-delete is replicated, so the check has to happen in the
     /// same statement as the mutation: a local pre-read on a follower can lag
     /// behind the leader and would mark a *replacement* (same id, new row)
-    /// pending, which the following finalize then deletes.
+    /// pending, which the following finalize then deletes. `delete_token` is a
+    /// per-row random value and is preferred over `created_at`, whose
+    /// one-second resolution cannot distinguish a same-second replacement.
     pub fn stream_disable_expecting(
         &self,
         id: &str,
         expected_created_at: Option<i64>,
+        expected_delete_token: Option<&str>,
     ) -> Option<StreamDisableOutcome> {
         let conn = self.conn.lock();
-        let updated = match expected_created_at {
-            Some(expected) => conn.execute(
+        let updated = match (expected_created_at, expected_delete_token) {
+            (Some(expected), Some(token)) => conn.execute(
+                "UPDATE streams SET enabled=0, pending_delete=1 \
+                 WHERE id=? AND created_at=? AND delete_token=?",
+                params![id, expected, token],
+            ),
+            (Some(expected), None) => conn.execute(
                 "UPDATE streams SET enabled=0, pending_delete=1 \
                  WHERE id=? AND created_at=?",
                 params![id, expected],
             ),
-            None => conn.execute(
+            (None, Some(token)) => conn.execute(
+                "UPDATE streams SET enabled=0, pending_delete=1 \
+                 WHERE id=? AND delete_token=?",
+                params![id, token],
+            ),
+            (None, None) => conn.execute(
                 "UPDATE streams SET enabled=0, pending_delete=1 WHERE id=?",
                 params![id],
             ),
@@ -1073,6 +1098,20 @@ impl Db {
                 None
             }
         }
+    }
+
+    /// Per-row identity used to fence a retried begin-delete.
+    ///
+    /// `None` when the row is missing or unreadable; the caller then falls back
+    /// to `created_at` (legacy rows) or reports the delete as not found.
+    pub fn stream_delete_token(&self, id: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT delete_token FROM streams WHERE id=?",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok()
     }
 
     /// Re-enable a stream after a failed delete rollback, clearing the
@@ -3301,6 +3340,42 @@ mod tests {
     }
 
     #[test]
+    fn stream_delete_token_fences_a_same_second_replacement() {
+        let db = Db::open(":memory:").unwrap();
+        db.stream_add(&sample_stream("tok", "pub_t", "pl_t", "st_t"))
+            .unwrap();
+        let DbLookup::Ok(original) = db.stream_get("tok") else {
+            panic!("stream missing");
+        };
+        let token = db.stream_delete_token("tok").expect("token");
+        assert_eq!(token.len(), 32, "the token must be a random 128-bit hex id");
+
+        // Same id, same second, different row identity: the token refuses it.
+        assert_eq!(db.stream_disable("tok"), Some(true));
+        assert_eq!(db.stream_delete_if_pending("tok"), Some(true));
+        db.stream_add(&Stream {
+            created_at: original.created_at,
+            ..sample_stream("tok", "pub_t2", "pl_t2", "st_t2")
+        })
+        .unwrap();
+        let replacement_token = db.stream_delete_token("tok").expect("token");
+        assert_ne!(token, replacement_token);
+        assert_eq!(
+            db.stream_disable_expecting("tok", Some(original.created_at), Some(&token)),
+            Some(StreamDisableOutcome::Stale)
+        );
+        assert!(matches!(
+            db.stream_get("tok"),
+            DbLookup::Ok(stream) if stream.enabled
+        ));
+        // The replacement's own token still applies.
+        assert_eq!(
+            db.stream_disable_expecting("tok", Some(original.created_at), Some(&replacement_token)),
+            Some(StreamDisableOutcome::Disabled)
+        );
+    }
+
+    #[test]
     fn stream_disable_expecting_fences_a_replacement_row() {
         let db = Db::open(":memory:").unwrap();
         db.stream_add(&sample_stream("fenced", "pub_f", "pl_f", "st_f"))
@@ -3310,7 +3385,7 @@ mod tests {
         };
         // Wrong identity: the row stays enabled and not pending.
         assert_eq!(
-            db.stream_disable_expecting("fenced", Some(original.created_at + 1)),
+            db.stream_disable_expecting("fenced", Some(original.created_at + 1), None),
             Some(StreamDisableOutcome::Stale)
         );
         assert!(matches!(
@@ -3319,13 +3394,13 @@ mod tests {
         ));
         // Right identity disables it.
         assert_eq!(
-            db.stream_disable_expecting("fenced", Some(original.created_at)),
+            db.stream_disable_expecting("fenced", Some(original.created_at), None),
             Some(StreamDisableOutcome::Disabled)
         );
         assert_eq!(db.stream_ids_pending_delete(), vec!["fenced".to_string()]);
         // An absent row is reported separately from a replaced one.
         assert_eq!(
-            db.stream_disable_expecting("gone", Some(1)),
+            db.stream_disable_expecting("gone", Some(1), None),
             Some(StreamDisableOutcome::Missing)
         );
     }
@@ -3815,8 +3890,9 @@ mod tests {
             let conn = Connection::open(path_str).unwrap();
             let colliding_key = crate::keygen::test_pad_access_key("pub_audit_a");
             conn.execute(
-                "INSERT INTO streams (id,name,app,publish_key,play_key,stats_key,enabled,created_at) \
-                 VALUES ('audit_b','Stream B','live',?,?,?,1,0)",
+                "INSERT INTO streams \
+                 (id,name,app,publish_key,play_key,stats_key,enabled,created_at,delete_token) \
+                 VALUES ('audit_b','Stream B','live',?,?,?,1,0,'auditbtoken')",
                 params![
                     crate::keygen::test_pad_access_key("pub_audit_b"),
                     colliding_key,

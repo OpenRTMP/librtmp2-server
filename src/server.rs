@@ -449,6 +449,35 @@ impl ShardConnBudget {
                 );
             }
         }
+        // Reserve at least half of the pool for established sessions: a peer
+        // that only opens sockets (handshake done, no publish/play yet) may
+        // not hold more than half of the global budget, so one address's
+        // connect flood cannot deny every publish/play. A connection with an
+        // authorization in flight is not counted as idle squatter.
+        let pending_cap = (self.global / 2).max(1);
+        let mut pending: Vec<(u64, usize)> = server
+            .connections
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.client_fd >= 0
+                    && !rtmp_bridge.has_authorized_session(c.conn_id)
+                    && !c.has_pending_authorization()
+            })
+            .map(|(i, c)| (c.conn_id, i))
+            .collect();
+        if pending.len() > pending_cap {
+            pending.sort_unstable_by_key(|&(conn_id, _)| std::cmp::Reverse(conn_id));
+            let excess = pending.len() - pending_cap;
+            for (_, idx) in pending.into_iter().take(excess) {
+                server.connections[idx].disconnect_transport();
+                trimmed += 1;
+            }
+            crate::log_warn!(
+                "RTMP: pre-auth connection budget {pending_cap} reached; \
+                 closed {excess} unauthenticated connection(s)"
+            );
+        }
         self.counts[self.index].store(own - trimmed, Ordering::Relaxed);
     }
 }
@@ -3443,6 +3472,40 @@ mod tests {
             .map(|i| shard_connection_cap(4, 4, i, true).0)
             .collect();
         assert_eq!(shares, vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn shard_conn_budget_reserves_half_the_pool_for_authenticated_sessions() {
+        use super::ShardConnBudget;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counts: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
+        let budget = ShardConnBudget {
+            counts: Arc::clone(&counts),
+            index: 0,
+            global: 10,
+        };
+        let mut server = unbound_rtmp_server(10);
+        for id in 1..=10u64 {
+            let mut conn = librtmp2::session::conn::Conn::new();
+            conn.conn_id = id;
+            conn.client_fd = 1000 + id as i32;
+            server.connections.push(conn);
+        }
+        budget.after_poll(&mut server, &bridge);
+        let open: Vec<u64> = server
+            .connections
+            .iter()
+            .filter(|c| c.client_fd >= 0)
+            .map(|c| c.conn_id)
+            .collect();
+        assert_eq!(
+            open,
+            vec![1, 2, 3, 4, 5],
+            "unauthenticated connections must not hold more than half of the pool"
+        );
+        assert_eq!(counts[0].load(Ordering::Relaxed), 5);
     }
 
     #[test]

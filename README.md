@@ -158,6 +158,10 @@ RTMP_BIND=0.0.0.0:1935
 # Maximum concurrent RTMP/RTMPS connections across all listeners combined
 RTMP_MAX_CONNECTIONS=100
 
+# Unauthenticated connections (handshake done, no publish/play yet) may hold at
+# most half of RTMP_MAX_CONNECTIONS; the rest is reserved for established
+# sessions, so one peer's connect flood cannot deny every publish/play.
+
 # Maximum concurrent RTMP/RTMPS connections from a single remote IP. Unset
 # (or non-positive) means no per-IP cap, only RTMP_MAX_CONNECTIONS above
 # applies - keep it unset behind NAT/a load balancer/a proxy.
@@ -191,8 +195,9 @@ TLS_CERT_FILE=/etc/librtmp2-server/fullchain.pem
 TLS_KEY_FILE=/etc/librtmp2-server/privkey.pem
 RTMPS_BIND=0.0.0.0:1936
 
-# HTTP API and UI listener address
-HTTP_BIND=0.0.0.0:8080
+# HTTP API and UI listener address (loopback by default; bind a routable
+# address only behind a TLS terminator)
+HTTP_BIND=127.0.0.1:8080
 
 # Log level: 0=error 1=warn 2=info 3=debug
 # Applies to librtmp2's protocol lines too (prefixed "librtmp2:"). Every
