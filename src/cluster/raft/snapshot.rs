@@ -21,4 +21,11 @@ pub struct AppSnapshot {
     /// 0, silently abandoning the in-flight deletion forever.
     #[serde(default)]
     pub pending_delete_stream_ids: Vec<String>,
+    /// Per-stream delete identities. `Stream` itself does not carry the token,
+    /// so a snapshot must preserve it explicitly; otherwise a restored node
+    /// would reject every later begin-delete as a stale identity. Entries
+    /// written before this field existed are empty and are derived
+    /// deterministically on install.
+    #[serde(default)]
+    pub delete_tokens: Vec<(String, String)>,
 }

@@ -480,7 +480,12 @@ impl ShardConnBudget {
             .collect();
         let total_pending = pending.len() + others_pending;
         if total_pending > pending_cap {
-            pending.sort_unstable_by_key(|&(conn_id, _)| std::cmp::Reverse(conn_id));
+            // Evict the oldest idle connections, not the newest: a client that
+            // just connected still needs its handshake/connect/createStream
+            // round trips before it can authorize, so trimming newcomers would
+            // let a squatter deny every new session. The oldest sockets are the
+            // ones holding a slot without progress.
+            pending.sort_unstable_by_key(|&(conn_id, _)| conn_id);
             let excess = (total_pending - pending_cap).min(pending.len());
             let remaining_pending = pending.len() - excess;
             for (_, idx) in pending.into_iter().take(excess) {
@@ -3524,8 +3529,8 @@ mod tests {
             .collect();
         assert_eq!(
             open,
-            vec![1, 2, 3, 4, 5],
-            "unauthenticated connections must not hold more than half of the pool"
+            vec![6, 7, 8, 9, 10],
+            "the oldest idle connections are evicted so new clients can authenticate"
         );
         assert_eq!(counts[0].load(Ordering::Relaxed), 5);
         assert_eq!(pending_counts[0].load(Ordering::Relaxed), 5);

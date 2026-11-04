@@ -74,6 +74,12 @@ pub fn keygen_api_token() -> Result<String, String> {
     keygen_with_entropy("", API_TOKEN_ENTROPY_BYTES)
 }
 
+/// Per-stream delete identity (128-bit entropy, no prefix). Generated before a
+/// `CreateStream` command is proposed so every replica stores the same value.
+pub fn keygen_delete_token() -> Result<String, String> {
+    keygen_with_entropy("", STREAM_KEY_ENTROPY_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
