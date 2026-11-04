@@ -37,6 +37,12 @@ pub enum ClusterCommand {
         /// carry `None` (no identity check).
         #[serde(default)]
         expected_created_at: Option<i64>,
+        /// Per-row random identity captured when the delete was accepted.
+        /// Preferred over `created_at` (one-second resolution) so a
+        /// same-second replacement cannot be disabled by a retried begin.
+        /// Commands written before this field existed carry `None`.
+        #[serde(default)]
+        expected_delete_token: Option<String>,
     },
     FinalizeDeleteStream {
         id: String,
@@ -99,6 +105,10 @@ pub enum ClusterResponse {
     Conflict,
     /// Successful ownership acquire returns the epoch that was stored.
     OwnerEpoch(u64),
+    /// Successful node-wide ownership release returns the log index the
+    /// release was applied at. Callers use it as an upper bound for a repair
+    /// pass: every ownership row acquired before this entry has a lower epoch.
+    Released(u64),
     Error(String),
 }
 
@@ -118,7 +128,9 @@ impl ClusterCommand {
 impl ClusterResponse {
     pub fn into_coord_result(self) -> Result<(), crate::state::CoordError> {
         match self {
-            ClusterResponse::Ok | ClusterResponse::OwnerEpoch(_) => Ok(()),
+            ClusterResponse::Ok | ClusterResponse::OwnerEpoch(_) | ClusterResponse::Released(_) => {
+                Ok(())
+            }
             ClusterResponse::Duplicate => Err(crate::state::CoordError::Duplicate),
             ClusterResponse::NotFound => Err(crate::state::CoordError::NotFound),
             ClusterResponse::Conflict => Err(crate::state::CoordError::Conflict),

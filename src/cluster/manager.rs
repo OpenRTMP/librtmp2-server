@@ -821,7 +821,7 @@ impl ClusterManager {
     }
 
     pub fn begin_delete_stream(&self, id: &str) -> Result<(), CoordError> {
-        self.begin_delete_stream_expecting(id, None)
+        self.begin_delete_stream_expecting(id, None, None)
     }
 
     /// Begin a delete that only applies while `expected_created_at` still
@@ -830,10 +830,12 @@ impl ClusterManager {
         &self,
         id: &str,
         expected_created_at: Option<i64>,
+        expected_delete_token: Option<String>,
     ) -> Result<(), CoordError> {
         self.block_on_write(ClusterCommand::BeginDeleteStream {
             id: id.to_string(),
             expected_created_at,
+            expected_delete_token,
         })?
         .into_coord_result()
     }
@@ -982,8 +984,30 @@ impl ClusterManager {
                 fence
             }
         };
-        self.release_owners_for_node_fenced(node_id, fence)
+        let applied = self
+            .release_owners_for_node_fenced(node_id, fence)
             .map_err(|error| NodeReleaseError { fence, error })?;
+        // The fence above comes from this node's local view and can be lower
+        // than rows already committed for the node (a follower that has not
+        // applied them yet). The release's own apply index is an exact upper
+        // bound for every row that existed when it was appended, so one repair
+        // pass at index-1 removes those leftovers; a row the node acquires
+        // after the release carries a higher epoch and survives. Old leaders
+        // that do not report the index return 0 and are left to the fenced
+        // retry path.
+        if applied > 1 {
+            let repair_fence = applied - 1;
+            if let Err(error) = self.release_owners_for_node_fenced(node_id, repair_fence) {
+                crate::log_warn!(
+                    "Cluster: repair release for node {node_id} (epoch <= {repair_fence}) \
+                     failed: {error:?}"
+                );
+                return Err(NodeReleaseError {
+                    fence: repair_fence,
+                    error,
+                });
+            }
+        }
         Ok(fence)
     }
 
@@ -1003,7 +1027,10 @@ impl ClusterManager {
     }
 
     /// Release every ownership row of `node_id` whose epoch is at most `fence`.
-    fn release_owners_for_node_fenced(&self, node_id: u64, fence: u64) -> Result<(), CoordError> {
+    ///
+    /// Returns the Raft apply index of the release, or 0 when the leader did
+    /// not report one (mixed-version cluster).
+    fn release_owners_for_node_fenced(&self, node_id: u64, fence: u64) -> Result<u64, CoordError> {
         let affected: Vec<String> = match self.db.stream_owner_list_result() {
             Ok(owners) => owners
                 .into_iter()
@@ -1028,11 +1055,17 @@ impl ClusterManager {
             .iter()
             .map(|sid| (sid.clone(), self.ownership.get(sid)))
             .collect();
-        self.block_on_write(ClusterCommand::ReleaseOwnersForNode {
+        let response = self.block_on_write(ClusterCommand::ReleaseOwnersForNode {
             node_id,
             max_epoch: fence,
-        })?
-        .into_coord_result()?;
+        })?;
+        let applied = match response {
+            ClusterResponse::Released(index) => index,
+            other => {
+                other.into_coord_result()?;
+                0
+            }
+        };
         self.ownership.clear_for_node(node_id);
         // The release itself must not be retried: a later retry would run
         // unfenced after the node re-joined and could delete its new rows, so
@@ -1044,7 +1077,7 @@ impl ClusterManager {
         }
         self.unsubscribe_captured_remote_owners(&previous);
         self.resubscribe_active_players(&affected);
-        Ok(())
+        Ok(applied)
     }
 
     /// Re-hydrate the local ownership tracker from SQLite.
@@ -3303,7 +3336,7 @@ impl ClusterManager {
                 self.pending_node_cleanups.lock().iter().copied().collect();
             for (id, fence) in pending_cleanups {
                 match self.release_owners_for_node_fenced(id, fence) {
-                    Ok(()) => {
+                    Ok(_) => {
                         self.pending_node_cleanups.lock().remove(&(id, fence));
                         crate::log_info!(
                             "Cluster: finished pending ownership cleanup for removed node {id} \

@@ -1393,6 +1393,24 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
     }
 }
 
+/// Keep a stream whose accepted delete could not be finalized unpublishable.
+///
+/// [`finalize_stream_delete`] re-enables the row on a generic error when the
+/// row still exists. When the whole reconciliation then gives up, the row must
+/// not stay enabled and publishable after the caller was told the DELETE was
+/// accepted, so the terminal arm disables it again (best effort) before it
+/// releases the sticky marker.
+fn keep_stream_disabled_after_failed_delete(state: &Arc<AppState>, id: &str) {
+    if !matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
+        return;
+    }
+    if let Err(e) = state.coordinator.set_stream_enabled(id, false) {
+        crate::log_error!(
+            "HTTP: could not re-disable stream '{id}' after its delete failed: {e:?}"
+        );
+    }
+}
+
 /// How long to wait before logging that an async stream delete is taking
 /// longer than expected. The drain loop keeps `deleted_streams` populated so
 /// the poll loop can kick live sessions; after [`DELETE_DRAIN_TIMEOUT`] it
@@ -1431,6 +1449,7 @@ async fn wait_and_finalize_stream_delete(
     state: Arc<AppState>,
     id: String,
     expected_created_at: i64,
+    expected_delete_token: Option<String>,
 ) {
     let started = Instant::now();
     let mut last_warn = started;
@@ -1489,15 +1508,28 @@ async fn wait_and_finalize_stream_delete(
                 clear_http_delete_marker(&state, &id);
                 return;
             }
+            crate::db::DbLookup::Ok(_)
+                if expected_delete_token.as_deref().is_some_and(|token| {
+                    state.db.stream_delete_token(&id).as_deref() != Some(token)
+                }) =>
+            {
+                crate::log_warn!(
+                    "HTTP: stream '{id}' was replaced while its delete was reconciling; \
+                     leaving the replacement untouched"
+                );
+                clear_http_delete_marker(&state, &id);
+                return;
+            }
             // The local read failed, but the replicated command still carries
             // the expected identity, so the authoritative apply refuses to
             // disable a replacement on its own.
             crate::db::DbLookup::Failed | crate::db::DbLookup::Ok(_) => {}
         }
-        match state
-            .coordinator
-            .begin_delete_stream_expecting(&id, Some(expected_created_at))
-        {
+        match state.coordinator.begin_delete_stream_expecting(
+            &id,
+            Some(expected_created_at),
+            expected_delete_token.clone(),
+        ) {
             Ok(()) | Err(CoordError::NotFound) => {}
             Err(CoordError::Conflict) => {
                 crate::log_warn!(
@@ -1524,9 +1556,12 @@ async fn wait_and_finalize_stream_delete(
                 tokio::time::sleep(FINALIZE_RETRY_DELAY).await;
             }
             Err(()) => {
-                // Release the marker so a later DELETE can restart the whole
-                // reconciliation: keeping it sticky would make
-                // `handle_stream_delete` answer 202 forever while no task runs.
+                // The accepted delete must never leave the stream publishable:
+                // the last finalize attempt may have been preceded by a
+                // successful re-enable in `finalize_stream_delete`'s generic
+                // error arm. Keep the row disabled, then release the marker so
+                // a later DELETE can restart the whole reconciliation.
+                keep_stream_disabled_after_failed_delete(&state, &id);
                 clear_http_delete_marker(&state, &id);
                 crate::log_error!(
                     "HTTP: failed to finalize delete for stream '{id}' after {FINALIZE_ATTEMPTS} attempts; \
@@ -1586,7 +1621,7 @@ async fn handle_stream_delete(
         );
         return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
     }
-    let expected_created_at = match state.db.stream_get(&id) {
+    let (expected_created_at, expected_delete_token) = match state.db.stream_get(&id) {
         DbLookup::Missing => {
             log_http_access(
                 "DELETE",
@@ -1611,14 +1646,15 @@ async fn handle_stream_delete(
                 "Failed to load stream",
             );
         }
-        DbLookup::Ok(stream) => stream.created_at,
+        DbLookup::Ok(stream) => (stream.created_at, state.db.stream_delete_token(&id)),
     };
 
     mark_http_delete_sticky(&state, &id);
-    if let Err(e) = state
-        .coordinator
-        .begin_delete_stream_expecting(&id, Some(expected_created_at))
-    {
+    if let Err(e) = state.coordinator.begin_delete_stream_expecting(
+        &id,
+        Some(expected_created_at),
+        expected_delete_token.clone(),
+    ) {
         // The row is gone as far as the coordinator is concerned (a cluster
         // follower's local read at the check above can lag behind the leader):
         // the resource simply does not exist, so answer 404 like the
@@ -1672,7 +1708,13 @@ async fn handle_stream_delete(
             let state_bg = Arc::clone(&state);
             let id_bg = id.clone();
             tokio::spawn(async move {
-                wait_and_finalize_stream_delete(state_bg, id_bg, expected_created_at).await;
+                wait_and_finalize_stream_delete(
+                    state_bg,
+                    id_bg,
+                    expected_created_at,
+                    expected_delete_token.clone(),
+                )
+                .await;
             });
             return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
         }
@@ -1728,7 +1770,13 @@ async fn handle_stream_delete(
     let state_bg = Arc::clone(&state);
     let id_bg = id.clone();
     tokio::spawn(async move {
-        wait_and_finalize_stream_delete(state_bg, id_bg, expected_created_at).await;
+        wait_and_finalize_stream_delete(
+            state_bg,
+            id_bg,
+            expected_created_at,
+            expected_delete_token.clone(),
+        )
+        .await;
     });
     (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response()
 }
@@ -4336,6 +4384,26 @@ mod tests {
         })
         .await;
         assert!(!state.sticky_deleted_streams.lock().contains("vanish"));
+    }
+
+    #[tokio::test]
+    async fn failed_delete_terminal_state_keeps_the_stream_disabled() {
+        let state = roomy_state();
+        add_stream(&state, "keepdisabled");
+        assert!(matches!(
+            state.db.stream_get("keepdisabled"),
+            DbLookup::Ok(stream) if stream.enabled
+        ));
+
+        // `finalize_stream_delete` re-enables on a generic error; the terminal
+        // arm must undo that so an accepted DELETE never leaves the stream
+        // publishable.
+        keep_stream_disabled_after_failed_delete(&state, "keepdisabled");
+
+        assert!(matches!(
+            state.db.stream_get("keepdisabled"),
+            DbLookup::Ok(stream) if !stream.enabled
+        ));
     }
 
     #[tokio::test]

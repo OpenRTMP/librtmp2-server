@@ -13,6 +13,23 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- The HTTP API binds `127.0.0.1:8080` by default. The bundled docker-compose
+  sets `LRTMP2_HTTP_BIND=0.0.0.0:8080` explicitly; bare-metal deployments that
+  need a routable API must set it and should terminate TLS in front of it.
+- Unauthenticated RTMP connections may hold at most half of
+  `RTMP_MAX_CONNECTIONS`; established publish/play sessions keep the rest.
+
+### Fixed
+- A retried begin-delete is fenced on a per-row random `delete_token`, so a
+  replacement that reuses the stream id within the same second cannot be
+  disabled by the retry.
+- A node-ownership release adds one repair pass bounded by the release's own
+  apply index, so rows that were committed but not yet applied on the caller's
+  node no longer survive the release.
+- An accepted DELETE that cannot be finalized keeps the stream disabled instead
+  of silently re-enabling it.
+
 ## [0.6.8] — 2026-11-01
 
 ### Fixed

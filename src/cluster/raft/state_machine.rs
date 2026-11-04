@@ -179,7 +179,12 @@ impl SqliteStateMachine {
             ClusterCommand::BeginDeleteStream {
                 id,
                 expected_created_at,
-            } => match self.db.stream_disable_expecting(id, *expected_created_at) {
+                expected_delete_token,
+            } => match self.db.stream_disable_expecting(
+                id,
+                *expected_created_at,
+                expected_delete_token.as_deref(),
+            ) {
                 Some(crate::db::StreamDisableOutcome::Disabled) => {
                     self.emit_effect(StateEffect::DrainStream(id.clone()));
                     ClusterResponse::Ok
@@ -944,6 +949,18 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                                 }
                             }
                         }
+                        ClusterCommand::ReleaseOwnersForNode { .. } => {
+                            let index = entry.log_id.index.max(1);
+                            match self.apply_command(cmd) {
+                                // The apply index is the exact upper bound for
+                                // every ownership row that existed when this
+                                // release was appended; the caller uses it for
+                                // a repair pass that cannot touch a later
+                                // (rejoin) acquisition.
+                                ClusterResponse::Ok => ClusterResponse::Released(index),
+                                other => other,
+                            }
+                        }
                         other => self.apply_command(other),
                     };
                     // Any apply-time Error (not only the literal "db") must
@@ -1386,7 +1403,8 @@ mod tests {
                 7,
                 ClusterCommand::BeginDeleteStream {
                     id: "nope".into(),
-                    expected_created_at: None
+                    expected_created_at: None,
+                    expected_delete_token: None,
                 }
             )
             .await
@@ -1401,7 +1419,8 @@ mod tests {
                 8,
                 ClusterCommand::BeginDeleteStream {
                     id: "s1".into(),
-                    expected_created_at: None
+                    expected_created_at: None,
+                    expected_delete_token: None,
                 }
             )
             .await
@@ -1606,6 +1625,7 @@ mod tests {
                 ClusterCommand::BeginDeleteStream {
                     id: "rep".into(),
                     expected_created_at: Some(original + 1),
+                    expected_delete_token: None,
                 }
             )
             .await
@@ -1622,6 +1642,7 @@ mod tests {
                 ClusterCommand::BeginDeleteStream {
                     id: "rep".into(),
                     expected_created_at: Some(original),
+                    expected_delete_token: None,
                 }
             )
             .await
@@ -1706,7 +1727,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            ClusterResponse::Ok
+            ClusterResponse::Released(13)
         );
         assert!(sm.db().stream_owner_list().is_empty());
         // Every release apply (even the stale-epoch no-op) refreshes owners.
@@ -1957,6 +1978,7 @@ mod tests {
             ClusterCommand::BeginDeleteStream {
                 id: "e1".into(),
                 expected_created_at: None,
+                expected_delete_token: None,
             },
             ClusterCommand::FinalizeDeleteStream { id: "e1".into() },
             ClusterCommand::SetStreamEnabled {
