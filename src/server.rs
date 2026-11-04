@@ -402,9 +402,6 @@ fn shard_connection_cap(
 /// not-yet-authorized connections.
 struct ShardConnBudget {
     counts: Arc<Vec<AtomicUsize>>,
-    /// Pre-auth connection counts per shard; the reservation is global, so a
-    /// shard must subtract what the others already hold.
-    pending_counts: Arc<Vec<AtomicUsize>>,
     index: usize,
     global: usize,
 }
@@ -452,56 +449,78 @@ impl ShardConnBudget {
                 );
             }
         }
-        // Reserve at least half of the pool for established sessions: a peer
-        // that only opens sockets (handshake done, no publish/play yet) may
-        // not hold more than half of the global budget, so one address's
-        // connect flood cannot deny every publish/play. A connection with an
-        // authorization in flight is not counted as idle squatter. The
-        // reservation is process-wide: each shard subtracts the pending count
-        // the others published.
-        let pending_cap = (self.global / 2).max(1);
-        let others_pending: usize = self
-            .pending_counts
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != self.index)
-            .map(|(_, c)| c.load(Ordering::Relaxed))
-            .sum();
-        let mut pending: Vec<(u64, usize)> = server
-            .connections
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                c.client_fd >= 0
-                    && !rtmp_bridge.has_authorized_session(c.conn_id)
-                    && !c.has_pending_authorization()
-            })
-            .map(|(i, c)| (c.conn_id, i))
-            .collect();
-        let total_pending = pending.len() + others_pending;
-        if total_pending > pending_cap {
-            // Evict the oldest idle connections, not the newest: a client that
-            // just connected still needs its handshake/connect/createStream
-            // round trips before it can authorize, so trimming newcomers would
-            // let a squatter deny every new session. The oldest sockets are the
-            // ones holding a slot without progress.
-            pending.sort_unstable_by_key(|&(conn_id, _)| conn_id);
-            let excess = (total_pending - pending_cap).min(pending.len());
-            let remaining_pending = pending.len() - excess;
-            for (_, idx) in pending.into_iter().take(excess) {
-                server.connections[idx].disconnect_transport();
-                trimmed += 1;
-            }
-            crate::log_warn!(
-                "RTMP: pre-auth connection budget {pending_cap} reached; \
-                 closed {excess} unauthenticated connection(s)"
-            );
-            self.pending_counts[self.index].store(remaining_pending, Ordering::Relaxed);
-        } else {
-            self.pending_counts[self.index].store(pending.len(), Ordering::Relaxed);
-        }
         self.counts[self.index].store(own - trimmed, Ordering::Relaxed);
     }
+}
+
+/// Reserve at least half of the RTMP pool for established sessions.
+///
+/// A peer that only opens sockets (handshake done, no publish/play yet) may not
+/// hold more than half of the global budget, so one address's connect flood
+/// cannot deny every publish/play. A connection with an authorization in flight
+/// is not counted as an idle squatter. The reservation is process-wide: each
+/// shard subtracts the pending count the others published, and applies the trim
+/// even when no dynamic shard budget exists (single shard or TLS shards).
+/// Returns the number of connections closed.
+fn enforce_pre_auth_connections(
+    server: &mut librtmp2::server::Server,
+    rtmp_bridge: &DbRtmpBridge,
+    global: usize,
+    pending_counts: &[std::sync::atomic::AtomicUsize],
+    shard_index: usize,
+) -> usize {
+    let pending_cap = (global / 2).max(1);
+    let others_pending: usize = pending_counts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != shard_index)
+        .map(|(_, c)| c.load(Ordering::Relaxed))
+        .sum();
+    let mut pending: Vec<(u64, usize)> = server
+        .connections
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.client_fd >= 0
+                && !rtmp_bridge.has_authorized_session(c.conn_id)
+                && !c.has_pending_authorization()
+        })
+        .map(|(i, c)| (c.conn_id, i))
+        .collect();
+    let total_pending = pending.len() + others_pending;
+    let mut trimmed = 0;
+    if total_pending > pending_cap {
+        // Evict the oldest idle connections, not the newest: a client that
+        // just connected still needs its handshake/connect/createStream round
+        // trips before it can authorize, so trimming newcomers would let a
+        // squatter deny every new session. The oldest sockets are the ones
+        // holding a slot without progress.
+        pending.sort_unstable_by_key(|&(conn_id, _)| conn_id);
+        let excess = (total_pending - pending_cap).min(pending.len());
+        trimmed = excess;
+        for (_, idx) in pending.into_iter().take(excess) {
+            server.connections[idx].disconnect_transport();
+        }
+        crate::log_warn!(
+            "RTMP: pre-auth connection budget {pending_cap} reached; \
+             closed {excess} unauthenticated connection(s)"
+        );
+    }
+    if let Some(slot) = pending_counts.get(shard_index) {
+        slot.store(
+            server
+                .connections
+                .iter()
+                .filter(|c| {
+                    c.client_fd >= 0
+                        && !rtmp_bridge.has_authorized_session(c.conn_id)
+                        && !c.has_pending_authorization()
+                })
+                .count(),
+            Ordering::Relaxed,
+        );
+    }
+    trimmed
 }
 
 /// Block until a listener or tracked connection socket becomes readable, or
@@ -2543,7 +2562,6 @@ fn run_rtmp_shard(shared: Arc<ShardShared>, spec: ShardSpec) {
     let mut shard = ShardLoop {
         conn_budget: dynamic_budget.then(|| ShardConnBudget {
             counts: Arc::clone(&shared.conn_counts),
-            pending_counts: Arc::clone(&shared.pending_counts),
             index: spec.index,
             global: shared.max_conn.max(1) as usize,
         }),
@@ -2806,6 +2824,23 @@ impl ShardLoop {
             &revoked_now,
             self.shared.idle_timeout,
         );
+        // Runs for every shard shape (single shard, plaintext shards, TLS
+        // shards): the pre-auth reservation must not depend on the dynamic
+        // global cap budget existing.
+        let pending_trimmed = enforce_pre_auth_connections(
+            server,
+            &self.shared.bridge,
+            self.shared.max_conn.max(1) as usize,
+            &self.shared.pending_counts,
+            self.index,
+        );
+        if pending_trimmed > 0 && self.conn_budget.is_some() {
+            let _ = self.shared.conn_counts[self.index].fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |value| Some(value.saturating_sub(pending_trimmed)),
+            );
+        }
 
         // A publisher/player deactivation that failed on connection close has
         // no later lifecycle event to retry it, so the poll loop does it.
@@ -3500,19 +3535,12 @@ mod tests {
     }
 
     #[test]
-    fn shard_conn_budget_reserves_half_the_pool_for_authenticated_sessions() {
-        use super::ShardConnBudget;
+    fn pre_auth_budget_reserves_half_the_pool_for_authenticated_sessions() {
+        use super::enforce_pre_auth_connections;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let counts: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
         let pending_counts: Arc<Vec<AtomicUsize>> = Arc::new(vec![AtomicUsize::new(0)]);
         let db = Arc::new(Db::open(":memory:").unwrap());
         let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
-        let budget = ShardConnBudget {
-            counts: Arc::clone(&counts),
-            pending_counts: Arc::clone(&pending_counts),
-            index: 0,
-            global: 10,
-        };
         let mut server = unbound_rtmp_server(10);
         for id in 1..=10u64 {
             let mut conn = librtmp2::session::conn::Conn::new();
@@ -3520,7 +3548,7 @@ mod tests {
             conn.client_fd = 1000 + id as i32;
             server.connections.push(conn);
         }
-        budget.after_poll(&mut server, &bridge);
+        let trimmed = enforce_pre_auth_connections(&mut server, &bridge, 10, &pending_counts, 0);
         let open: Vec<u64> = server
             .connections
             .iter()
@@ -3532,7 +3560,7 @@ mod tests {
             vec![6, 7, 8, 9, 10],
             "the oldest idle connections are evicted so new clients can authenticate"
         );
-        assert_eq!(counts[0].load(Ordering::Relaxed), 5);
+        assert_eq!(trimmed, 5);
         assert_eq!(pending_counts[0].load(Ordering::Relaxed), 5);
     }
 
@@ -3545,7 +3573,6 @@ mod tests {
         let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
         let budget = ShardConnBudget {
             counts: Arc::clone(&counts),
-            pending_counts: Arc::new((0..2).map(|_| AtomicUsize::new(0)).collect()),
             index: 0,
             global: 3,
         };
