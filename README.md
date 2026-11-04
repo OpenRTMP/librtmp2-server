@@ -159,8 +159,9 @@ RTMP_BIND=0.0.0.0:1935
 RTMP_MAX_CONNECTIONS=100
 
 # Unauthenticated connections (handshake done, no publish/play yet) may hold at
-# most half of RTMP_MAX_CONNECTIONS; the rest is reserved for established
-# sessions, so one peer's connect flood cannot deny every publish/play.
+# most half of RTMP_MAX_CONNECTIONS (at least one slot); the rest is reserved
+# for established sessions, so one peer's connect flood cannot deny every
+# publish/play. The oldest idle connections are evicted first.
 
 # Maximum concurrent RTMP/RTMPS connections from a single remote IP. Unset
 # (or non-positive) means no per-IP cap, only RTMP_MAX_CONNECTIONS above
