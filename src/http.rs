@@ -1359,7 +1359,11 @@ fn mark_http_delete_sticky(state: &AppState, id: &str) {
     state.sticky_deleted_streams.lock().insert(id.to_string());
 }
 
-async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), ()> {
+async fn finalize_stream_delete(
+    state: &Arc<AppState>,
+    id: &str,
+    rollback_on_error: bool,
+) -> Result<(), ()> {
     match state.coordinator.finalize_delete_stream(id) {
         Ok(()) => {
             clear_http_delete_marker(state, id);
@@ -1382,12 +1386,16 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
             Err(())
         }
         Err(_) => {
-            // Only re-enable when the stream still exists (disable-not-delete
-            // failure). Skip when Missing so we don't write a stalling apply.
-            if matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
-                let _ = state.coordinator.set_stream_enabled(id, true);
+            // A synchronous DELETE that could not finalize returns 500, so
+            // rolling the disable back keeps the stream usable. The async
+            // path already told the caller 202: it must keep the row disabled
+            // and pending so the retry loop or startup recovery can finish it.
+            if rollback_on_error {
+                if matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
+                    let _ = state.coordinator.set_stream_enabled(id, true);
+                }
+                clear_http_delete_marker(state, id);
             }
-            clear_http_delete_marker(state, id);
             Err(())
         }
     }
@@ -1434,6 +1442,16 @@ fn keep_stream_disabled_after_failed_delete(
                 && expected_delete_token.is_none_or(|expected| token == expected)
     );
     if !still_original {
+        return;
+    }
+    // The async retry path no longer re-enables the row, so a failed begin
+    // usually leaves it disabled and pending already. Do not run the generic
+    // disable then: its UPDATE clears pending_delete again.
+    let already_disabled_and_pending = matches!(
+        state.db.stream_get(id),
+        crate::db::DbLookup::Ok(stream) if !stream.enabled
+    ) && state.db.stream_pending_delete(id) == Some(true);
+    if already_disabled_and_pending {
         return;
     }
     if let Err(e) = state.coordinator.set_stream_enabled(id, false) {
@@ -1568,7 +1586,7 @@ async fn wait_and_finalize_stream_delete(
                 crate::log_warn!("HTTP: re-issuing begin_delete for stream '{id}' failed: {e:?}")
             }
         }
-        match finalize_stream_delete(&state, &id).await {
+        match finalize_stream_delete(&state, &id, false).await {
             Ok(()) => {
                 crate::log_info!("HTTP: stream '{id}' deleted after RTMP drain");
                 break;
@@ -1771,7 +1789,7 @@ async fn handle_stream_delete(
     let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
     let remote = remote_stream_sessions(&state, &id).await;
     if local == 0 && remote == 0 {
-        return match finalize_stream_delete(&state, &id).await {
+        return match finalize_stream_delete(&state, &id, true).await {
             Ok(()) => {
                 crate::log_info!(
                     "HTTP: DELETE /api/v1/streams/{id} from {peer} → 200 stream deleted"
@@ -4396,6 +4414,34 @@ mod tests {
         assert!(s.enabled, "a failed finalize must roll back the disable");
         assert!(state.db.stream_ids_pending_delete().is_empty());
         assert!(!state.deleted_streams.lock().contains("undead"));
+    }
+
+    #[tokio::test]
+    async fn async_finalize_failure_keeps_the_pending_marker() {
+        let state = roomy_state();
+        add_stream(&state, "async-pending");
+        assert_eq!(state.db.stream_disable("async-pending"), Some(true));
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_delete BEFORE DELETE ON streams \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+
+        assert!(
+            finalize_stream_delete(&state, "async-pending", false)
+                .await
+                .is_err()
+        );
+
+        assert!(matches!(
+            state.db.stream_get("async-pending"),
+            DbLookup::Ok(stream) if !stream.enabled
+        ));
+        assert_eq!(
+            state.db.stream_pending_delete("async-pending"),
+            Some(true),
+            "the async path must leave the accepted delete recoverable"
+        );
     }
 
     #[tokio::test]
