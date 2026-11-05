@@ -4495,6 +4495,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_delete_terminal_fallback_keeps_the_original_row_state() {
+        let state = roomy_state();
+        add_stream(&state, "fallback");
+        let (created_at, delete_token) = match state.db.stream_get_with_token("fallback") {
+            DbLookup::Ok((stream, token)) => (stream.created_at, token),
+            DbLookup::Missing | DbLookup::Failed => panic!("stream missing"),
+        };
+        // Both the fenced begin and the plain disable go through this UPDATE;
+        // the terminal fallback must log and leave the row alone when the DB
+        // refuses every write instead of panicking or deleting it.
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_update BEFORE UPDATE ON streams \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+
+        keep_stream_disabled_after_failed_delete(
+            &state,
+            "fallback",
+            created_at,
+            Some(&delete_token),
+        );
+
+        assert!(matches!(
+            state.db.stream_get("fallback"),
+            DbLookup::Ok(stream) if stream.enabled
+        ));
+        assert_eq!(state.db.stream_pending_delete("fallback"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn failed_delete_terminal_ignores_a_row_that_vanished() {
+        let state = roomy_state();
+        add_stream(&state, "vanished");
+        let (created_at, delete_token) = match state.db.stream_get_with_token("vanished") {
+            DbLookup::Ok((stream, token)) => (stream.created_at, token),
+            DbLookup::Missing | DbLookup::Failed => panic!("stream missing"),
+        };
+        assert_eq!(state.db.stream_delete("vanished"), Some(true));
+
+        keep_stream_disabled_after_failed_delete(
+            &state,
+            "vanished",
+            created_at,
+            Some(&delete_token),
+        );
+
+        assert!(matches!(state.db.stream_get("vanished"), DbLookup::Missing));
+    }
+
+    #[tokio::test]
     async fn background_finalize_reissues_a_rolled_back_begin() {
         let state = roomy_state();
         add_stream(&state, "revived");
