@@ -1393,15 +1393,47 @@ async fn finalize_stream_delete(state: &Arc<AppState>, id: &str) -> Result<(), (
     }
 }
 
-/// Keep a stream whose accepted delete could not be finalized unpublishable.
+/// Keep a stream whose accepted delete could not be finalized unpublishable
+/// and recoverable.
 ///
 /// [`finalize_stream_delete`] re-enables the row on a generic error when the
-/// row still exists. When the whole reconciliation then gives up, the row must
-/// not stay enabled and publishable after the caller was told the DELETE was
-/// accepted, so the terminal arm disables it again (best effort) before it
-/// releases the sticky marker.
-fn keep_stream_disabled_after_failed_delete(state: &Arc<AppState>, id: &str) {
-    if !matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
+/// row still exists, which also clears `pending_delete`. When the whole
+/// reconciliation then gives up, the row must stay disabled after the caller
+/// was told the DELETE was accepted, and the marker must survive so a process
+/// restart can finish the delete instead of leaving an orphaned row forever.
+///
+/// Re-issue the fenced begin-delete after the failed finalize: it disables the
+/// row and restores `pending_delete=1` in one identity-checked write. If the
+/// begin cannot be applied, fall back to a plain disable only when the local
+/// row still matches the identity captured when the delete was accepted.
+fn keep_stream_disabled_after_failed_delete(
+    state: &Arc<AppState>,
+    id: &str,
+    expected_created_at: i64,
+    expected_delete_token: Option<&str>,
+) {
+    match state.coordinator.begin_delete_stream_expecting(
+        id,
+        Some(expected_created_at),
+        expected_delete_token.map(str::to_owned),
+    ) {
+        Ok(()) => return,
+        // The row is gone, or the id now belongs to a replacement: never
+        // touch the replacement. Startup recovery only owns the original row.
+        Err(CoordError::NotFound) | Err(CoordError::Conflict) => return,
+        Err(e) => {
+            crate::log_warn!(
+                "HTTP: could not re-mark stream '{id}' pending after its delete failed: {e:?}"
+            );
+        }
+    }
+    let still_original = matches!(
+        state.db.stream_get_with_token(id),
+        crate::db::DbLookup::Ok((current, token))
+            if current.created_at == expected_created_at
+                && expected_delete_token.is_none_or(|expected| token == expected)
+    );
+    if !still_original {
         return;
     }
     if let Err(e) = state.coordinator.set_stream_enabled(id, false) {
@@ -1552,13 +1584,19 @@ async fn wait_and_finalize_stream_delete(
                 // The accepted delete must never leave the stream publishable:
                 // the last finalize attempt may have been preceded by a
                 // successful re-enable in `finalize_stream_delete`'s generic
-                // error arm. Keep the row disabled, then release the marker so
-                // a later DELETE can restart the whole reconciliation.
-                keep_stream_disabled_after_failed_delete(&state, &id);
+                // error arm. Re-disable it and restore the pending marker so
+                // startup recovery or a later DELETE can finish the accepted
+                // delete, then release the in-memory HTTP marker.
+                keep_stream_disabled_after_failed_delete(
+                    &state,
+                    &id,
+                    expected_created_at,
+                    expected_delete_token.as_deref(),
+                );
                 clear_http_delete_marker(&state, &id);
                 crate::log_error!(
                     "HTTP: failed to finalize delete for stream '{id}' after {FINALIZE_ATTEMPTS} attempts; \
-                     the stream stays disabled and a later DELETE will retry"
+                     the stream stays disabled and pending so startup recovery or a later DELETE retries"
                 );
                 break;
             }
@@ -4380,22 +4418,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_delete_terminal_state_keeps_the_stream_disabled() {
+    async fn failed_delete_terminal_state_keeps_the_stream_disabled_and_pending() {
         let state = roomy_state();
         add_stream(&state, "keepdisabled");
+        let (created_at, delete_token) = match state.db.stream_get_with_token("keepdisabled") {
+            DbLookup::Ok((stream, token)) => (stream.created_at, token),
+            DbLookup::Missing | DbLookup::Failed => panic!("stream missing"),
+        };
         assert!(matches!(
             state.db.stream_get("keepdisabled"),
             DbLookup::Ok(stream) if stream.enabled
         ));
 
-        // `finalize_stream_delete` re-enables on a generic error; the terminal
-        // arm must undo that so an accepted DELETE never leaves the stream
-        // publishable.
-        keep_stream_disabled_after_failed_delete(&state, "keepdisabled");
+        // Simulate the sequence in the terminal arm: the fenced begin marked
+        // the row pending, a generic finalize error re-enabled it (clearing the
+        // marker), and the terminal arm must restore both properties so a
+        // restart can finish the accepted delete.
+        assert_eq!(state.db.stream_disable("keepdisabled"), Some(true));
+        assert!(state.db.stream_set_enabled("keepdisabled", true));
+        assert!(!state.db.stream_pending_delete("keepdisabled").unwrap());
+
+        keep_stream_disabled_after_failed_delete(
+            &state,
+            "keepdisabled",
+            created_at,
+            Some(&delete_token),
+        );
 
         assert!(matches!(
             state.db.stream_get("keepdisabled"),
             DbLookup::Ok(stream) if !stream.enabled
+        ));
+        assert_eq!(
+            state.db.stream_pending_delete("keepdisabled"),
+            Some(true),
+            "the accepted delete must remain recoverable after a terminal failure"
+        );
+        assert_eq!(
+            state.db.stream_ids_pending_delete(),
+            vec!["keepdisabled".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_delete_terminal_state_does_not_touch_a_replacement() {
+        let state = roomy_state();
+        add_stream(&state, "replaced");
+        let (created_at, delete_token) = match state.db.stream_get_with_token("replaced") {
+            DbLookup::Ok((stream, token)) => (stream.created_at, token),
+            DbLookup::Missing | DbLookup::Failed => panic!("stream missing"),
+        };
+        assert_eq!(state.db.stream_delete("replaced"), Some(true));
+        add_stream(&state, "replaced");
+        let (_, replacement_token) = match state.db.stream_get_with_token("replaced") {
+            DbLookup::Ok((stream, token)) => (stream, token),
+            DbLookup::Missing | DbLookup::Failed => panic!("replacement missing"),
+        };
+        assert_ne!(delete_token, replacement_token);
+
+        keep_stream_disabled_after_failed_delete(
+            &state,
+            "replaced",
+            created_at,
+            Some(&delete_token),
+        );
+
+        assert!(matches!(
+            state.db.stream_get("replaced"),
+            DbLookup::Ok(stream) if stream.enabled
+        ));
+        assert_eq!(state.db.stream_pending_delete("replaced"), Some(false));
+        assert!(matches!(
+            state.db.stream_get_with_token("replaced"),
+            DbLookup::Ok((_, token)) if token == replacement_token
         ));
     }
 
