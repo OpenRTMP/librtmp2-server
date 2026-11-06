@@ -496,14 +496,28 @@ fn enforce_pre_auth_connections(
         // squatter deny every new session. The oldest sockets are the ones
         // holding a slot without progress.
         pending.sort_unstable_by_key(|&(conn_id, _)| conn_id);
-        let excess = (total_pending - pending_cap).min(pending.len());
-        trimmed = excess;
-        for (_, idx) in pending.into_iter().take(excess) {
+        let excess = total_pending - pending_cap;
+        // Every shard sees the same global excess. Applying the full excess
+        // to each shard's own pool multiplies the eviction rate under a
+        // concurrent connect burst. Take a proportional share instead; if a
+        // small shard rounds down to zero, close one connection so it still
+        // makes progress. The next tick trims any remainder the shares left
+        // behind.
+        let fair_share = if excess == 0 || pending.is_empty() {
+            0
+        } else {
+            let share = (excess as u128 * pending.len() as u128 / total_pending as u128) as usize;
+            share.max(1)
+        };
+        let evict = fair_share.min(pending.len());
+        trimmed = evict;
+        for (_, idx) in pending.into_iter().take(evict) {
             server.connections[idx].disconnect_transport();
         }
         crate::log_warn!(
             "RTMP: pre-auth connection budget {pending_cap} reached; \
-             closed {excess} unauthenticated connection(s)"
+             closed {evict} unauthenticated connection(s) from the global \
+             excess of {excess}"
         );
     }
     if let Some(slot) = pending_counts.get(shard_index) {
@@ -3556,6 +3570,50 @@ mod tests {
         );
         assert_eq!(trimmed, 5);
         assert_eq!(pending_counts[0].load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn concurrent_shards_share_the_global_pre_auth_excess() {
+        use super::enforce_pre_auth_connections;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pending_counts: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..4).map(|_| AtomicUsize::new(20)).collect());
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = DbRtmpBridge::new(db, Arc::new(parking_lot::Mutex::new(HashSet::new())));
+        let mut servers = Vec::new();
+        for shard in 0..4u64 {
+            let mut server = unbound_rtmp_server(100);
+            for id in 1..=20u64 {
+                let mut conn = librtmp2::session::conn::Conn::new();
+                conn.conn_id = shard * 100 + id;
+                conn.client_fd = 1000 + (shard * 100 + id) as i32;
+                server.connections.push(conn);
+            }
+            servers.push(server);
+        }
+
+        let mut total_trimmed = 0;
+        for (shard, server) in servers.iter_mut().enumerate() {
+            // Simulate the concurrent tick where every shard still sees the
+            // other shards' pre-trim counts.
+            for count in pending_counts.iter() {
+                count.store(20, Ordering::Relaxed);
+            }
+            total_trimmed +=
+                enforce_pre_auth_connections(server, &bridge, 100, &pending_counts, shard);
+        }
+
+        // cap = 50, total pending = 80, excess = 30. A proportional share is
+        // 7 per shard (28 total), not 20 per shard (80 total).
+        assert_eq!(total_trimmed, 28);
+        for server in &servers {
+            let open = server
+                .connections
+                .iter()
+                .filter(|c| c.client_fd >= 0)
+                .count();
+            assert_eq!(open, 13, "each shard keeps its non-evicted connections");
+        }
     }
 
     #[test]
