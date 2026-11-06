@@ -20,19 +20,25 @@ begin at `1.0.0`.
   `RTMP_MAX_CONNECTIONS` (at least one pre-auth slot); established publish/play
   sessions keep the rest. The reservation is process-wide across poll shards,
   applies to single-shard, TLS and plaintext shard shapes, and evicts the
-  oldest idle sockets first. A concurrent connect burst trims a proportional
-  share per shard instead of the full excess in every shard, so new clients can
-  still authenticate.
+  oldest idle sockets first; a connection with an authorization in flight is
+  not counted as an idle squatter. A concurrent connect burst trims a
+  proportional share per shard instead of the full excess in every shard, so
+  new clients can still authenticate.
 
 ### Fixed
 - A retried begin-delete is fenced on the row's `created_at` and a per-row
   random `delete_token`, and every replica stores the same token, so a
   replacement that reuses the stream id within the same second cannot be
-  disabled by the retry. A later DELETE can restart after a terminal failure.
-- A terminal finalize failure re-issues the identity-fenced begin-delete, so an
-  accepted delete keeps `pending_delete=1` for startup recovery. The async 202
-  path no longer re-enables the row when finalize fails; only the synchronous
-  500 path rolls the disable back.
+  disabled by the retry. Snapshots preserve the token map, pre-token rows
+  derive a deterministic identity, and the delete handler reads `created_at`
+  and the token in one query, retrying a failed read. A later DELETE can
+  restart after a terminal failure.
+- The background finalizer re-issues the identity-fenced begin-delete before
+  every finalize attempt, so a write the leader dropped after the caller-side
+  timeout cannot leave an accepted delete half-applied. After a terminal
+  failure it keeps `pending_delete=1` for startup recovery. The async 202 path
+  no longer re-enables the row when finalize fails; only the synchronous 500
+  path rolls the disable back.
 - A node-ownership release adds one repair pass bounded by the release's own
   apply index, so rows that were committed but not yet applied on the caller's
   node no longer survive the release. A release or cleanup is fenced by epoch
@@ -42,7 +48,8 @@ begin at `1.0.0`.
   Epoch-only changes keep the existing refs, a same-stream replay unsubscribes
   and re-subscribes the session, and a resubscribe tick no longer leaks a ref.
 - The health loop no longer awaits the bandwidth probe. Overlapping probes are
-  guarded, the PowerShell call is bounded by a deadline, the sampling interval
+  guarded, the PowerShell call is bounded by a deadline and takes its command
+  by mutable reference so the server builds on Windows, the sampling interval
   is measured from real samples, and the adapter name is escaped.
 - A cluster bind on port 0 is rejected, a port-only bind is normalized before
   it is advertised, and a valid advertised address spelling is preserved for
@@ -51,6 +58,8 @@ begin at `1.0.0`.
   roles revoked by the protocol layer are released in the same poll pass, the
   ownership tracker survives a failed database read, and forwarded Raft writes
   are bounded by the local write timeout.
+- Forwarded membership changes run in a detached task; the caller's wait stays
+  bounded and a timed-out transition is not cancelled.
 - Malformed JSON request bodies return the API error envelope.
 
 ### Changed
@@ -59,6 +68,7 @@ begin at `1.0.0`.
   are relied on: an older voter ignores the new serde-defaulted fence fields
   and falls back to the previous behavior.
 - The benchmark sweep compares against the stable SRS release v6.0-r3.
+- The Docker runtime image uses Alpine 3.24.4.
 - Dependency updates: cc 1.11.1, mime 0.3.18, smallvec 1.16.5, toml_edit
   0.25.19, winnow 1.0.5.
 
