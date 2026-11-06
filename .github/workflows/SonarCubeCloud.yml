@@ -36,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@61b160225e09dfa2ea62afd328f7c2eafb5d2e54 # cargo-llvm-cov
+        uses: taiki-e/install-action@db07720855ab1f9adf78d37929621da20c5775a4 # cargo-llvm-cov
 
       - name: Read crate version
         id: crate_version
