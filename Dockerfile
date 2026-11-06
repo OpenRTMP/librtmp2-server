@@ -63,7 +63,7 @@ RUN version="$APP_VERSION" && \
     printf '%s\n' "$version" > /build/VERSION
 
 # Runtime stage (Alpine — same musl libc as builder; no gcompat needed)
-FROM alpine:3.24.4
+FROM alpine:3.24
 
 # FFmpeg is used only by optional HLS, push-relay and transcoding outputs.
 # Keeping it in the standard image makes those features work when enabled
