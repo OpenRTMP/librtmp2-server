@@ -13,20 +13,54 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-11-06
+
 ### Security
 - Unauthenticated RTMP connections may hold at most half of
   `RTMP_MAX_CONNECTIONS` (at least one pre-auth slot); established publish/play
-  sessions keep the rest, and the oldest idle sockets are evicted first.
+  sessions keep the rest. The reservation is process-wide across poll shards,
+  applies to single-shard, TLS and plaintext shard shapes, and evicts the
+  oldest idle sockets first. A concurrent connect burst trims a proportional
+  share per shard instead of the full excess in every shard, so new clients can
+  still authenticate.
 
 ### Fixed
-- A retried begin-delete is fenced on a per-row random `delete_token`, so a
+- A retried begin-delete is fenced on the row's `created_at` and a per-row
+  random `delete_token`, and every replica stores the same token, so a
   replacement that reuses the stream id within the same second cannot be
-  disabled by the retry.
+  disabled by the retry. A later DELETE can restart after a terminal failure.
+- A terminal finalize failure re-issues the identity-fenced begin-delete, so an
+  accepted delete keeps `pending_delete=1` for startup recovery. The async 202
+  path no longer re-enables the row when finalize fails; only the synchronous
+  500 path rolls the disable back.
 - A node-ownership release adds one repair pass bounded by the release's own
   apply index, so rows that were committed but not yet applied on the caller's
-  node no longer survive the release.
-- An accepted DELETE that cannot be finalized keeps the stream disabled instead
-  of silently re-enabling it.
+  node no longer survive the release. A release or cleanup is fenced by epoch
+  and log index, and a failed ownership read neither queues an unfenced cleanup
+  nor retries a release whose hydration failed.
+- Cluster play refs are tracked per player session and per standby replica.
+  Epoch-only changes keep the existing refs, a same-stream replay unsubscribes
+  and re-subscribes the session, and a resubscribe tick no longer leaks a ref.
+- The health loop no longer awaits the bandwidth probe. Overlapping probes are
+  guarded, the PowerShell call is bounded by a deadline, the sampling interval
+  is measured from real samples, and the adapter name is escaped.
+- A cluster bind on port 0 is rejected, a port-only bind is normalized before
+  it is advertised, and a valid advertised address spelling is preserved for
+  join proofs.
+- A rolled-back auth group closes its connection through the normal poll path,
+  roles revoked by the protocol layer are released in the same poll pass, the
+  ownership tracker survives a failed database read, and forwarded Raft writes
+  are bounded by the local write timeout.
+- Malformed JSON request bodies return the API error envelope.
+
+### Changed
+- Built on librtmp2 0.17.0.
+- Raft voters must run the same build before the delete and ownership fences
+  are relied on: an older voter ignores the new serde-defaulted fence fields
+  and falls back to the previous behavior.
+- The benchmark sweep compares against the stable SRS release v6.0-r3.
+- Dependency updates: cc 1.11.1, mime 0.3.18, smallvec 1.16.5, toml_edit
+  0.25.19, winnow 1.0.5.
 
 ## [0.6.8] — 2026-11-01
 
@@ -1244,7 +1278,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.8...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.9...HEAD
+[0.6.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.5...v0.6.6
