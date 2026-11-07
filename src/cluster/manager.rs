@@ -1223,11 +1223,21 @@ impl ClusterManager {
                                 "no leader available to forward write".into(),
                             ))
                         })?;
-                    // The write is on the wire now: the leader may commit it
-                    // even when the answer never arrives.
-                    network::send_client_write(&addr, &secret, local_id, cmd, proof, tls_client)
-                        .await
-                        .map_err(|e| WriteFailure::Dispatched(CoordError::Cluster(e)))
+                    // Connect/auth failures never reached the leader; write or
+                    // response failures may still commit, so keep the outcome.
+                    match network::send_client_write_outcome(
+                        &addr, &secret, local_id, cmd, proof, tls_client,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok(response),
+                        Err(network::ClientWriteSendError::Undispatched(e)) => {
+                            Err(WriteFailure::Undispatched(CoordError::Cluster(e)))
+                        }
+                        Err(network::ClientWriteSendError::Dispatched(e)) => {
+                            Err(WriteFailure::Dispatched(CoordError::Cluster(e)))
+                        }
+                    }
                 }
                 Err(e) => Err(WriteFailure::Dispatched(CoordError::Cluster(format!(
                     "raft write: {e}"
