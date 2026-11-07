@@ -368,8 +368,15 @@ impl SqliteStateMachine {
                 let delete_tokens: std::collections::HashMap<String, String> =
                     delete_tokens.iter().cloned().collect();
                 for s in streams {
-                    let token = delete_tokens.get(&s.id).map(String::as_str);
-                    match self.db.stream_insert_only_with_token(s, token) {
+                    // A seed entry written before the field existed has no
+                    // token. Derive the same deterministic value the snapshot
+                    // install uses, so a log-replayed node and a
+                    // snapshot-restored node still agree.
+                    let token = delete_tokens
+                        .get(&s.id)
+                        .cloned()
+                        .unwrap_or_else(|| crate::db::legacy_delete_token(&s.id, &s.publish_key));
+                    match self.db.stream_insert_only_with_token(s, Some(&token)) {
                         Ok(()) | Err(StreamAddError::Duplicate) => {}
                         Err(StreamAddError::Db) => {
                             return ClusterResponse::Error(
@@ -1968,6 +1975,35 @@ mod tests {
             ClusterResponse::Ok
         );
         assert_eq!(follower.db().stream_pending_delete("seeded"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn seed_from_standalone_derives_a_deterministic_token_when_missing() {
+        let (mut first, _rx1) = sm_with_effects();
+        let (mut second, _rx2) = sm_with_effects();
+        let seeded = stream("legacy-seed");
+        let cmd = ClusterCommand::SeedFromStandalone {
+            streams: vec![seeded.clone()],
+            viewers: vec![default_viewer(&seeded)],
+            delete_tokens: vec![],
+            api_token: None,
+            pending_delete_stream_ids: vec![],
+        };
+        assert_eq!(
+            apply_one(&mut first, 1, cmd.clone()).await.unwrap(),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            apply_one(&mut second, 1, cmd).await.unwrap(),
+            ClusterResponse::Ok
+        );
+        let expected = crate::db::legacy_delete_token(&seeded.id, &seeded.publish_key);
+        for sm in [&first, &second] {
+            assert!(matches!(
+                sm.db().stream_get_with_token(&seeded.id),
+                crate::db::DbLookup::Ok((_, token)) if token == expected
+            ));
+        }
     }
 
     #[tokio::test]
