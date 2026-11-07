@@ -89,6 +89,12 @@ pub enum ClusterCommand {
     SeedFromStandalone {
         streams: Vec<Stream>,
         viewers: Vec<StreamViewer>,
+        /// Per-row delete identities captured from the standalone DB. Without
+        /// these the state-machine apply generates a fresh random token on
+        /// every replica, so a fenced delete conflicts on all non-bootstrap
+        /// nodes. Empty for entries written before the field existed.
+        #[serde(default)]
+        delete_tokens: Vec<(String, String)>,
         api_token: Option<String>,
         /// Streams the standalone DB had left mid-delete (`pending_delete=1`);
         /// the apply path re-marks them so `FinalizeDeleteStream` can complete

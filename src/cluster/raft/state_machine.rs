@@ -356,13 +356,20 @@ impl SqliteStateMachine {
             ClusterCommand::SeedFromStandalone {
                 streams,
                 viewers,
+                delete_tokens,
                 api_token,
                 pending_delete_stream_ids,
             } => {
                 // Bootstrap node already has these rows; Duplicate is expected.
                 // Any other failure must surface so last_applied does not advance.
+                // Seeded rows must keep the source row's delete identity: if
+                // each replica generated its own random token, a fenced delete
+                // would conflict on every node except the bootstrap node.
+                let delete_tokens: std::collections::HashMap<String, String> =
+                    delete_tokens.iter().cloned().collect();
                 for s in streams {
-                    match self.db.stream_insert_only(s) {
+                    let token = delete_tokens.get(&s.id).map(String::as_str);
+                    match self.db.stream_insert_only_with_token(s, token) {
                         Ok(()) | Err(StreamAddError::Duplicate) => {}
                         Err(StreamAddError::Db) => {
                             return ClusterResponse::Error(
@@ -1873,6 +1880,10 @@ mod tests {
         let cmd = ClusterCommand::SeedFromStandalone {
             streams: vec![a.clone(), b.clone()],
             viewers: vec![default_viewer(&a), default_viewer(&b)],
+            delete_tokens: vec![
+                ("a".into(), "token-a".into()),
+                ("b".into(), "token-b".into()),
+            ],
             api_token: Some("seed-token".into()),
             pending_delete_stream_ids: vec!["b".into()],
         };
@@ -1886,6 +1897,10 @@ mod tests {
         ));
         assert_eq!(sm.db().viewer_list("b").len(), 1);
         assert_eq!(sm.db().stream_pending_delete("b"), Some(true));
+        assert!(matches!(
+            sm.db().stream_get_with_token("b"),
+            crate::db::DbLookup::Ok((_, token)) if token == "token-b"
+        ));
         assert_eq!(sm.db().token_get().unwrap().as_deref(), Some("seed-token"));
         let effects = drain(&rx);
         assert!(matches!(
@@ -1898,6 +1913,7 @@ mod tests {
         let cmd = ClusterCommand::SeedFromStandalone {
             streams: vec![],
             viewers: vec![],
+            delete_tokens: vec![],
             api_token: None,
             pending_delete_stream_ids: vec![],
         };
@@ -1909,6 +1925,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_from_standalone_preserves_delete_tokens_across_replicas() {
+        let (mut bootstrap, _rx1) = sm_with_effects();
+        let (mut follower, _rx2) = sm_with_effects();
+        let seeded = stream("seeded");
+        let cmd = ClusterCommand::SeedFromStandalone {
+            streams: vec![seeded.clone()],
+            viewers: vec![default_viewer(&seeded)],
+            delete_tokens: vec![("seeded".into(), "shared-token".into())],
+            api_token: None,
+            pending_delete_stream_ids: vec![],
+        };
+        assert_eq!(
+            apply_one(&mut bootstrap, 1, cmd.clone()).await.unwrap(),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            apply_one(&mut follower, 1, cmd).await.unwrap(),
+            ClusterResponse::Ok
+        );
+
+        let bootstrap_token = match bootstrap.db().stream_get_with_token("seeded") {
+            crate::db::DbLookup::Ok((_, token)) => token,
+            _ => panic!("bootstrap row missing"),
+        };
+        let follower_token = match follower.db().stream_get_with_token("seeded") {
+            crate::db::DbLookup::Ok((_, token)) => token,
+            _ => panic!("follower row missing"),
+        };
+        assert_eq!(bootstrap_token, "shared-token");
+        assert_eq!(follower_token, bootstrap_token);
+
+        // A delete fenced by the bootstrap row's identity must apply on the
+        // follower too; before the token was replicated this returned Conflict.
+        let begin = ClusterCommand::BeginDeleteStream {
+            id: "seeded".into(),
+            expected_created_at: Some(seeded.created_at),
+            expected_delete_token: Some(bootstrap_token),
+        };
+        assert_eq!(
+            apply_one(&mut follower, 2, begin).await.unwrap(),
+            ClusterResponse::Ok
+        );
+        assert_eq!(follower.db().stream_pending_delete("seeded"), Some(true));
+    }
+
+    #[tokio::test]
     async fn seed_from_standalone_surfaces_storage_errors() {
         let seed = |streams: Vec<Stream>,
                     viewers: Vec<StreamViewer>,
@@ -1916,6 +1978,7 @@ mod tests {
                     pending: Vec<String>| ClusterCommand::SeedFromStandalone {
             streams,
             viewers,
+            delete_tokens: vec![],
             api_token,
             pending_delete_stream_ids: pending,
         };
