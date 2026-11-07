@@ -1362,7 +1362,7 @@ fn mark_http_delete_sticky(state: &AppState, id: &str) {
 async fn finalize_stream_delete(
     state: &Arc<AppState>,
     id: &str,
-    rollback_on_error: bool,
+    rollback_to_enabled: Option<bool>,
 ) -> Result<(), ()> {
     match state.coordinator.finalize_delete_stream(id) {
         Ok(()) => {
@@ -1387,12 +1387,14 @@ async fn finalize_stream_delete(
         }
         Err(_) => {
             // A synchronous DELETE that could not finalize returns 500, so
-            // rolling the disable back keeps the stream usable. The async
-            // path already told the caller 202: it must keep the row disabled
-            // and pending so the retry loop or startup recovery can finish it.
-            if rollback_on_error {
+            // rolling back to the state captured before the request keeps the
+            // stream usable (and keeps a previously disabled stream disabled).
+            // The async path already told the caller 202: it must keep the row
+            // disabled and pending so the retry loop or startup recovery can
+            // finish it.
+            if let Some(previous_enabled) = rollback_to_enabled {
                 if matches!(state.db.stream_get(id), crate::db::DbLookup::Ok(_)) {
-                    let _ = state.coordinator.set_stream_enabled(id, true);
+                    let _ = state.coordinator.set_stream_enabled(id, previous_enabled);
                 }
                 clear_http_delete_marker(state, id);
             }
@@ -1586,7 +1588,7 @@ async fn wait_and_finalize_stream_delete(
                 crate::log_warn!("HTTP: re-issuing begin_delete for stream '{id}' failed: {e:?}")
             }
         }
-        match finalize_stream_delete(&state, &id, false).await {
+        match finalize_stream_delete(&state, &id, None).await {
             Ok(()) => {
                 crate::log_info!("HTTP: stream '{id}' deleted after RTMP drain");
                 break;
@@ -1670,33 +1672,34 @@ async fn handle_stream_delete(
         );
         return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
     }
-    let (expected_created_at, expected_delete_token) = match state.db.stream_get_with_token(&id) {
-        DbLookup::Missing => {
-            log_http_access(
-                "DELETE",
-                &path,
-                &peer,
-                StatusCode::NOT_FOUND,
-                "stream not found",
-            );
-            return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
-        }
-        DbLookup::Failed => {
-            log_http_access(
-                "DELETE",
-                &path,
-                &peer,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "db error",
-            );
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Failed to load stream",
-            );
-        }
-        DbLookup::Ok((stream, token)) => (stream.created_at, Some(token)),
-    };
+    let (expected_created_at, expected_delete_token, previously_enabled) =
+        match state.db.stream_get_with_token(&id) {
+            DbLookup::Missing => {
+                log_http_access(
+                    "DELETE",
+                    &path,
+                    &peer,
+                    StatusCode::NOT_FOUND,
+                    "stream not found",
+                );
+                return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
+            }
+            DbLookup::Failed => {
+                log_http_access(
+                    "DELETE",
+                    &path,
+                    &peer,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db error",
+                );
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    "Failed to load stream",
+                );
+            }
+            DbLookup::Ok((stream, token)) => (stream.created_at, Some(token), stream.enabled),
+        };
 
     mark_http_delete_sticky(&state, &id);
     if let Err(e) = state.coordinator.begin_delete_stream_expecting(
@@ -1779,7 +1782,7 @@ async fn handle_stream_delete(
     let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
     let remote = remote_stream_sessions(&state, &id).await;
     if local == 0 && remote == 0 {
-        return match finalize_stream_delete(&state, &id, true).await {
+        return match finalize_stream_delete(&state, &id, Some(previously_enabled)).await {
             Ok(()) => {
                 crate::log_info!(
                     "HTTP: DELETE /api/v1/streams/{id} from {peer} → 200 stream deleted"
@@ -1848,12 +1851,18 @@ async fn handle_stream_players_list(
         }
         DbLookup::Ok(_) => {}
     }
-    let list: Vec<Value> = state
-        .db
-        .viewer_list(&id)
-        .iter()
-        .map(viewer_to_json)
-        .collect();
+    let viewers = match state.db.viewer_list_checked(&id) {
+        Ok(viewers) => viewers,
+        Err(e) => {
+            crate::log_error!("GET /api/v1/streams/{id}/players: {e}");
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB_ERROR",
+                "player list unavailable",
+            );
+        }
+    };
+    let list: Vec<Value> = viewers.iter().map(viewer_to_json).collect();
     Json(list).into_response()
 }
 
@@ -4407,6 +4416,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_delete_does_not_reenable_a_previously_disabled_stream() {
+        let state = roomy_state();
+        add_stream(&state, "keptoff");
+        assert!(state.db.stream_set_enabled("keptoff", false));
+        exec_sql(
+            &state,
+            "CREATE TRIGGER no_delete BEFORE DELETE ON streams \
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        );
+        let app = router(state.clone());
+        let (status, body) = send(&app, "DELETE", "/api/v1/streams/keptoff", true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to delete stream"));
+        let DbLookup::Ok(s) = state.db.stream_get("keptoff") else {
+            panic!("stream must survive a failed finalize");
+        };
+        assert!(
+            !s.enabled,
+            "rolling back a failed delete must restore the pre-request disabled state"
+        );
+        assert_eq!(state.db.stream_pending_delete("keptoff"), Some(false));
+        assert!(!state.deleted_streams.lock().contains("keptoff"));
+    }
+
+    #[tokio::test]
     async fn async_finalize_failure_keeps_the_pending_marker() {
         let state = roomy_state();
         add_stream(&state, "async-pending");
@@ -4418,7 +4452,7 @@ mod tests {
         );
 
         assert!(
-            finalize_stream_delete(&state, "async-pending", false)
+            finalize_stream_delete(&state, "async-pending", None)
                 .await
                 .is_err()
         );
@@ -4656,6 +4690,20 @@ mod tests {
         break_stream_reads(&state);
         let (status, _) = send(&app, "GET", "/api/v1/streams/plist/players", true, None).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn players_list_reports_a_viewer_read_failure_instead_of_an_empty_list() {
+        let state = roomy_state();
+        add_stream(&state, "plistdb");
+        let app = router(state.clone());
+        exec_sql(
+            &state,
+            "ALTER TABLE stream_viewers RENAME COLUMN name TO name_gone;",
+        );
+        let (status, body) = send(&app, "GET", "/api/v1/streams/plistdb/players", true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_code(&body), "DB_ERROR");
     }
 
     #[tokio::test]
