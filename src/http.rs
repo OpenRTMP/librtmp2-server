@@ -1737,21 +1737,11 @@ async fn handle_stream_delete(
             );
             return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Stream not found");
         }
-        #[cfg(feature = "cluster")]
-        let ambiguous_timeout = matches!(
-            &e,
-            CoordError::Cluster(msg) if msg == "raft write timed out"
-        );
-        #[cfg(not(feature = "cluster"))]
-        let ambiguous_timeout = {
-            let _ = &e;
-            false
-        };
-        if ambiguous_timeout {
-            // BeginDeleteStream may still commit after the caller timed out —
-            // keep the local marker and schedule finalize reconciliation.
+        if e.cluster_write_may_have_committed() {
+            // BeginDeleteStream may still commit after a timeout or a dropped
+            // forward: keep the local marker and schedule finalize reconciliation.
             crate::log_warn!(
-                "HTTP: DELETE /api/v1/streams/{id} begin_delete timed out; \
+                "HTTP: DELETE /api/v1/streams/{id} begin_delete outcome is unknown; \
                  reconciling via background finalize"
             );
             let state_bg = Arc::clone(&state);
