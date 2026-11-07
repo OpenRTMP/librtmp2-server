@@ -801,6 +801,19 @@ impl Db {
     /// Insert stream row only (no default viewer). Used by Raft snapshot/seed
     /// restores where viewers are applied explicitly with fixed IDs.
     pub fn stream_insert_only(&self, s: &Stream) -> std::result::Result<(), StreamAddError> {
+        self.stream_insert_only_with_token(s, None)
+    }
+
+    /// Like [`Self::stream_insert_only`], but stores an explicit delete
+    /// identity. Clustered seed applies must pass the token captured from the
+    /// standalone row so every replica stores the same value; generating a
+    /// fresh random token per replica would make a later fenced delete
+    /// conflict on every node except the bootstrap node.
+    pub fn stream_insert_only_with_token(
+        &self,
+        s: &Stream,
+        delete_token: Option<&str>,
+    ) -> std::result::Result<(), StreamAddError> {
         let conn = self.conn.lock();
         for key in [&s.publish_key, &s.play_key, &s.stats_key] {
             if Self::key_globally_in_use_locked(&conn, key) {
@@ -810,7 +823,7 @@ impl Db {
         match conn.execute(
             "INSERT INTO streams \
              (id,name,app,publish_key,play_key,stats_key,enabled,created_at,delete_token) \
-             VALUES (?,?,?,?,?,?,?,?,lower(hex(randomblob(16))))",
+             VALUES (?,?,?,?,?,?,?,?,COALESCE(?,lower(hex(randomblob(16)))))",
             params![
                 s.id,
                 s.name,
@@ -819,7 +832,8 @@ impl Db {
                 s.play_key,
                 s.stats_key,
                 s.enabled,
-                s.created_at
+                s.created_at,
+                delete_token
             ],
         ) {
             Ok(_) => Ok(()),

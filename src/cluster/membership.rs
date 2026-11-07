@@ -123,10 +123,14 @@ pub async fn seed_from_local_db(raft: &Raft, db: &Arc<Db>) -> Result<(), String>
     if streams.is_empty() && viewers.is_empty() && api_token.is_none() {
         return Ok(());
     }
+    let delete_tokens = db
+        .stream_delete_tokens_result()
+        .map_err(|e| format!("read delete tokens: {e}"))?;
     use crate::cluster::command::ClusterCommand;
     raft.client_write(ClusterCommand::SeedFromStandalone {
         streams,
         viewers,
+        delete_tokens,
         api_token,
         pending_delete_stream_ids,
     })
