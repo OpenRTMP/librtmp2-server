@@ -1799,6 +1799,90 @@ pub async fn send_stats_proxy(
 }
 
 /// Forward a durable `ClusterCommand` to the current Raft leader over the control plane.
+/// Failure to forward a client write to the leader, split by whether the
+/// command could have reached the leader's Raft log.
+#[derive(Debug)]
+pub enum ClientWriteSendError {
+    /// Connect, TLS or authentication failed before the command was sent.
+    Undispatched(String),
+    /// The command was written (or the write/flush may have partially
+    /// succeeded), so the leader may still commit it.
+    Dispatched(String),
+}
+
+impl ClientWriteSendError {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Undispatched(message) | Self::Dispatched(message) => message,
+        }
+    }
+}
+
+/// Forward a client write and preserve the pre-send/ambiguous distinction for
+/// callers that must reconcile a possibly-committed write.
+pub async fn send_client_write_outcome(
+    leader_addr: &str,
+    secret: &str,
+    local_id: NodeId,
+    cmd: crate::cluster::command::ClusterCommand,
+    proof: String,
+    tls_client: Option<Arc<ClientConfig>>,
+) -> Result<crate::cluster::command::ClusterResponse, ClientWriteSendError> {
+    let req = serde_json::to_value(&cmd)
+        .map_err(|e| ClientWriteSendError::Undispatched(e.to_string()))?;
+    let msg = ControlMessage::ClientWrite { req, proof };
+    // Each phase is timed separately so a connect/auth failure is known not to
+    // have sent the command, while a write/read failure stays ambiguous.
+    let mut stream = tokio::time::timeout(ROUNDTRIP_TIMEOUT, connect_raw(leader_addr, tls_client))
+        .await
+        .map_err(|_| {
+            ClientWriteSendError::Undispatched(format!(
+                "control connect to {leader_addr} timed out"
+            ))
+        })?
+        .map_err(ClientWriteSendError::Undispatched)?;
+    tokio::time::timeout(
+        AUTH_TIMEOUT,
+        client_auth_handshake(&mut stream, secret, local_id),
+    )
+    .await
+    .map_err(|_| ClientWriteSendError::Undispatched("control auth timed out".into()))?
+    .map_err(|e| ClientWriteSendError::Undispatched(format!("control auth: {e}")))?;
+    tokio::time::timeout(ROUNDTRIP_TIMEOUT, write_frame(&mut stream, &msg))
+        .await
+        .map_err(|_| ClientWriteSendError::Dispatched("client write send timed out".into()))?
+        .map_err(|e| ClientWriteSendError::Dispatched(format!("client write send: {e}")))?;
+    let (msg, _read_budget) = tokio::time::timeout(ROUNDTRIP_TIMEOUT, read_frame(&mut stream))
+        .await
+        .map_err(|_| ClientWriteSendError::Dispatched("client write response timed out".into()))?
+        .map_err(|e| ClientWriteSendError::Dispatched(format!("client write response: {e}")))?;
+    match msg {
+        ControlMessage::ClientWriteResp(body) => {
+            let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            if ok {
+                let data = body.get("data").cloned().ok_or_else(|| {
+                    ClientWriteSendError::Dispatched(
+                        "client write response missing data".to_string(),
+                    )
+                })?;
+                serde_json::from_value(data)
+                    .map_err(|e| ClientWriteSendError::Dispatched(e.to_string()))
+            } else {
+                Err(ClientWriteSendError::Dispatched(
+                    body.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("client write failed")
+                        .to_string(),
+                ))
+            }
+        }
+        ControlMessage::AdminErr { message } => Err(ClientWriteSendError::Dispatched(message)),
+        _ => Err(ClientWriteSendError::Dispatched(
+            "unexpected client write response".into(),
+        )),
+    }
+}
+
 pub async fn send_client_write(
     leader_addr: &str,
     secret: &str,
@@ -1807,35 +1891,9 @@ pub async fn send_client_write(
     proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<crate::cluster::command::ClusterResponse, String> {
-    let req = serde_json::to_value(&cmd).map_err(|e| e.to_string())?;
-    let (msg, _read_budget) = authed_roundtrip_inner(
-        leader_addr,
-        secret,
-        local_id,
-        tls_client,
-        ControlMessage::ClientWrite { req, proof },
-    )
-    .await?;
-    match msg {
-        ControlMessage::ClientWriteResp(body) => {
-            let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-            if ok {
-                let data = body
-                    .get("data")
-                    .cloned()
-                    .ok_or_else(|| "client write response missing data".to_string())?;
-                serde_json::from_value(data).map_err(|e| e.to_string())
-            } else {
-                Err(body
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("client write failed")
-                    .to_string())
-            }
-        }
-        ControlMessage::AdminErr { message } => Err(message),
-        _ => Err("unexpected client write response".into()),
-    }
+    send_client_write_outcome(leader_addr, secret, local_id, cmd, proof, tls_client)
+        .await
+        .map_err(ClientWriteSendError::into_message)
 }
 
 /// Forward an OpenRaft membership change to the current leader.
@@ -3394,6 +3452,24 @@ mod tests {
         .await;
         assert!(err.is_err());
         node.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_write_connect_failure_is_undispatched() {
+        let err = send_client_write_outcome(
+            &dead_addr(),
+            SECRET,
+            1,
+            set_token("t"),
+            GOOD_PROOF.into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ClientWriteSendError::Undispatched(_)),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
