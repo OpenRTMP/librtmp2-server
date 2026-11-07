@@ -6,6 +6,9 @@ on:
       version:
         description: 'Version tag to publish alongside latest/beta/alpha (e.g. 0.1.0)'
         required: false
+      ref:
+        description: 'Git ref to build (e.g. release/v0.6.9-docker-fix; defaults to the selected branch)'
+        required: false
   workflow_call:
     inputs:
       version:
