@@ -1453,6 +1453,21 @@ fn should_evict_idle_conn(
         .is_some_and(|at| now.duration_since(at) >= idle_timeout)
 }
 
+/// Whether a connection's bridge publisher role should be torn down this
+/// cycle. A publish authorization that is still in flight may have already
+/// installed a new publisher row for the same connection; releasing at that
+/// point would deactivate the *new* row and strip its ownership epoch. Wait
+/// for the authorization to resolve (success keeps the role, failure drains
+/// on the next cycle) instead of tearing down on the tracked flag alone.
+fn publisher_release_due(
+    is_publishing: bool,
+    tracked_publishing: bool,
+    holds_publisher: bool,
+    pending_publish_authorization: bool,
+) -> bool {
+    !is_publishing && !pending_publish_authorization && (tracked_publishing || holds_publisher)
+}
+
 /// Drive one poll cycle's worth of connection bookkeeping: authorize new
 /// publish/play commands, reject connections the bridge doesn't own, kick
 /// connections whose stream/play-key was revoked, and flush stats. Returns
@@ -1554,9 +1569,12 @@ pub(crate) fn process_server_connections(
         // out of it: the worker installs the row just before the completion is
         // drained.
         let holds_publisher = rtmp_bridge.has_publisher(conn_id);
-        if !is_publishing
-            && (entry.publishing || (holds_publisher && !conn.has_pending_publish_authorization()))
-        {
+        if publisher_release_due(
+            is_publishing,
+            entry.publishing,
+            holds_publisher,
+            conn.has_pending_publish_authorization(),
+        ) {
             rtmp_bridge.release_publisher(conn_id);
             // If the DB deactivation failed, release_publisher keeps the
             // row in ConnState for a retry on close -- keep tracking this
@@ -3209,8 +3227,8 @@ mod tests {
         AUTH_COMPLETIONS_RX, ReadinessSource, ReadinessWaiter, ServerApp, TrackedConn,
         any_negotiating, bind_rtmp_listener_set, bind_with_default_port, drain_auth_completions,
         drain_deleted_stream_roles, eviction_stream_id, ipv6_wildcard_for,
-        live_stream_ids_for_deleted_markers, newest_conn_id, should_evict_idle_conn,
-        wait_for_readiness_or_timeout,
+        live_stream_ids_for_deleted_markers, newest_conn_id, publisher_release_due,
+        should_evict_idle_conn, wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -3224,6 +3242,25 @@ mod tests {
 
     fn stale_first_seen(now: Instant) -> Option<Instant> {
         now.checked_sub(Duration::from_secs(120))
+    }
+
+    #[test]
+    fn pending_publish_authorization_blocks_publisher_teardown() {
+        // A publish that is still being authorized may already have installed
+        // its new publisher row; releasing on the old tracked flag would
+        // deactivate that row and drop its ownership fence.
+        assert!(!publisher_release_due(false, true, true, true));
+        assert!(!publisher_release_due(false, true, false, true));
+        assert!(!publisher_release_due(false, false, true, true));
+
+        // Once the authorization resolves, the old role is torn down.
+        assert!(publisher_release_due(false, true, true, false));
+        assert!(publisher_release_due(false, false, true, false));
+
+        // A live publisher is never released, and neither is a connection
+        // that holds no publisher role.
+        assert!(!publisher_release_due(true, true, true, false));
+        assert!(!publisher_release_due(false, false, false, false));
     }
 
     #[test]
