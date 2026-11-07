@@ -7,6 +7,13 @@ use crate::db::{Db, Stream, StreamAddError, StreamViewer, ViewerDeleteResult};
 #[cfg(feature = "cluster")]
 use crate::cluster::ClusterManager;
 
+/// Marker prefixed to a cluster write whose outcome is unknown: the request
+/// was put on the wire (or handed to Raft), so it may still commit even though
+/// the caller saw an error. Callers must reconcile instead of reporting a
+/// definite failure.
+#[cfg(feature = "cluster")]
+pub(crate) const AMBIGUOUS_CLUSTER_WRITE_PREFIX: &str = "write outcome unknown: ";
+
 /// Result of a durable mutation routed through [`StateCoordinator`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordError {
@@ -16,6 +23,24 @@ pub enum CoordError {
     Db,
     #[cfg(feature = "cluster")]
     Cluster(String),
+}
+
+impl CoordError {
+    /// True when a cluster write may have committed despite the error.
+    pub fn cluster_write_may_have_committed(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            matches!(
+                self,
+                CoordError::Cluster(msg)
+                    if msg.starts_with(AMBIGUOUS_CLUSTER_WRITE_PREFIX)
+            )
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            false
+        }
+    }
 }
 
 impl std::fmt::Display for CoordError {

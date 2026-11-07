@@ -98,6 +98,20 @@ impl WriteFailure {
             WriteFailure::Undispatched(e) | WriteFailure::Dispatched(e) => e,
         }
     }
+
+    /// The error the caller sees, with dispatched writes marked as ambiguous.
+    /// Used by state transitions where a 500 response and a possibly committed
+    /// write would disagree (see `begin_delete_stream_expecting`).
+    fn into_ambiguous_coord_error(self) -> CoordError {
+        match self {
+            WriteFailure::Undispatched(e) => e,
+            WriteFailure::Dispatched(CoordError::Cluster(msg)) => CoordError::Cluster(format!(
+                "{}{msg}",
+                crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
+            )),
+            WriteFailure::Dispatched(e) => e,
+        }
+    }
 }
 
 /// Failure of a node-wide ownership release.
@@ -835,12 +849,17 @@ impl ClusterManager {
         expected_created_at: Option<i64>,
         expected_delete_token: Option<String>,
     ) -> Result<(), CoordError> {
-        self.block_on_write(ClusterCommand::BeginDeleteStream {
+        // Keep the "may still commit" distinction: the HTTP delete handler
+        // must reconcile a dispatched-but-unconfirmed begin instead of
+        // returning a definite 500 while the row stays disabled and pending.
+        match self.block_on_write_outcome(ClusterCommand::BeginDeleteStream {
             id: id.to_string(),
             expected_created_at,
             expected_delete_token,
-        })?
-        .into_coord_result()
+        }) {
+            Ok(response) => response.into_coord_result(),
+            Err(failure) => Err(failure.into_ambiguous_coord_error()),
+        }
     }
 
     pub fn finalize_delete_stream(&self, id: &str) -> Result<(), CoordError> {
@@ -4484,6 +4503,21 @@ mod tests {
                 .iter()
                 .any(|(s, _, _, _)| s == "amb")
         );
+    }
+
+    #[test]
+    fn dispatched_write_errors_are_marked_ambiguous() {
+        let dispatched = WriteFailure::Dispatched(CoordError::Cluster(
+            "connection reset after dispatch".into(),
+        ))
+        .into_ambiguous_coord_error();
+        assert!(dispatched.cluster_write_may_have_committed());
+
+        let undispatched = WriteFailure::Undispatched(CoordError::Cluster(
+            "no leader available to forward write".into(),
+        ))
+        .into_ambiguous_coord_error();
+        assert!(!undispatched.cluster_write_may_have_committed());
     }
 
     /// The pending ambiguous-acquire list is bounded: the overflow is reported
