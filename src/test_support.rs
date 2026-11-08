@@ -207,7 +207,7 @@ impl TestServer {
                 // Prune transient drain markers once no local session references
                 // them; keep HTTP sticky markers until finalize/rollback.
                 let live_stream_ids = live_stream_ids_for_deleted_markers(&tracked, &rtmp_bridge);
-                let sticky = sticky_for_rtmp.lock().clone();
+                let sticky = sticky_for_rtmp.lock();
                 deleted_for_rtmp
                     .lock()
                     .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));

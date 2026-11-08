@@ -620,6 +620,26 @@ impl DbRtmpBridge {
             .count()
     }
 
+    /// Durable active publisher/player rows for one stream.
+    ///
+    /// A publish/play authorization writes its row before the RTMP shard
+    /// installs the in-memory role. The stream-delete drain must count both
+    /// sources: otherwise a delete that starts in that window sees zero live
+    /// connections, finalizes the stream, and the authorization then installs
+    /// a ghost role on a row that no longer exists. On a database error this
+    /// returns 1 (fail closed) so the caller waits instead of deleting.
+    pub fn durable_session_count_for_stream(&self, stream_id: &str) -> usize {
+        match self.db.active_session_count_for_stream(stream_id) {
+            Ok(count) => count,
+            Err(e) => {
+                crate::log_error!(
+                    "RTMP: failed to count durable sessions for stream '{stream_id}': {e}"
+                );
+                1
+            }
+        }
+    }
+
     fn restore_publisher_row(&self, old_pub: &Publisher) -> bool {
         let mut restored = old_pub.clone();
         restored.active = true;
@@ -805,7 +825,7 @@ impl DbRtmpBridge {
         }
 
         for conn_id in abandoned_pubs {
-            self.try_release_ownership_for_conn(conn_id);
+            self.try_release_ownership_for_conn_if_stream(conn_id, stream_id);
         }
         #[cfg(feature = "cluster")]
         for session in &abandoned_plays {
@@ -865,14 +885,7 @@ impl DbRtmpBridge {
         // same-connection stream switch installs its ownership entry before it
         // swaps `ConnState.publisher`), and releasing that entry here would
         // strip fencing from a live publisher.
-        let owns_this_stream = self
-            .ownership_epochs
-            .lock()
-            .get(&conn)
-            .is_some_and(|(stream_id, _)| stream_id == &pub_row.stream_id);
-        if owns_this_stream {
-            self.try_release_ownership_for_conn(conn);
-        }
+        self.try_release_ownership_for_conn_if_stream(conn, &pub_row.stream_id);
 
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -937,7 +950,7 @@ impl DbRtmpBridge {
             .get(&conn)
             .is_some_and(|(stream_id, _)| stream_id == &row.stream_id);
         if owns_this_stream {
-            self.try_release_ownership_for_conn(conn);
+            self.try_release_ownership_for_conn_if_stream(conn, &row.stream_id);
         }
         let mut guard = self.conns.lock();
         let Some(cs) = guard.get_mut(&conn) else {
@@ -2138,28 +2151,43 @@ impl DbRtmpBridge {
     // records a per-connection ownership epoch on publish, so the entry must be
     // removed on close/release to keep `ownership_epochs` bounded.
     fn try_release_ownership_for_conn(&self, conn: ConnId) {
-        let release = {
-            let epochs = self.ownership_epochs.lock();
-            let Some((stream_id, epoch)) = epochs.get(&conn).map(|(s, e)| (s.clone(), *e)) else {
-                return;
-            };
-            let Some(coord) = self.coordinator.lock().clone() else {
-                return;
-            };
-            Some((stream_id, epoch, coord))
+        let entry = self.ownership_epochs.lock().remove(&conn);
+        if let Some((stream_id, epoch)) = entry {
+            self.release_ownership_entry(stream_id, epoch);
+        }
+    }
+
+    /// Release ownership for `conn` only when its current entry still names
+    /// `expected_stream`.
+    ///
+    /// The entry is removed under the same lock that checks it: a
+    /// same-connection republish can install a different stream between an
+    /// unlocked check and the release, and releasing that entry would strip
+    /// fencing from a live publisher. A newer epoch for the *same* stream is
+    /// still this connection's ownership and is released too.
+    fn try_release_ownership_for_conn_if_stream(&self, conn: ConnId, expected_stream: &str) {
+        let entry = {
+            let mut epochs = self.ownership_epochs.lock();
+            match epochs.get(&conn) {
+                Some((stream_id, _)) if stream_id == expected_stream => epochs.remove(&conn),
+                _ => None,
+            }
         };
-        let Some((stream_id, epoch, coord)) = release else {
+        if let Some((stream_id, epoch)) = entry {
+            self.release_ownership_entry(stream_id, epoch);
+        }
+    }
+
+    fn release_ownership_entry(&self, stream_id: String, epoch: u64) {
+        let Some(coord) = self.coordinator.lock().clone() else {
             return;
         };
         match coord.release_stream_owner(&stream_id, epoch) {
-            Ok(()) => {
-                self.ownership_epochs.lock().remove(&conn);
-            }
+            Ok(()) => {}
             Err(e) => {
                 crate::log_error!(
-                    "RTMP: failed to release stream ownership conn={conn} stream={stream_id}: {e}"
+                    "RTMP: failed to release stream ownership stream={stream_id} epoch={epoch}: {e}"
                 );
-                self.ownership_epochs.lock().remove(&conn);
                 #[cfg(feature = "cluster")]
                 self.pending_ownership_releases
                     .lock()
@@ -3727,6 +3755,35 @@ mod tests {
             bridge.session_rows(1).0.is_none(),
             "the released publisher session itself is still cleared"
         );
+    }
+
+    #[test]
+    fn ownership_release_does_not_take_a_newer_stream_entry() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.set_coordinator(Arc::new(StateCoordinator::standalone(Arc::clone(&db))));
+
+        // The publisher role still names s1, but a same-connection republish
+        // has already installed s2's ownership entry by the time the release
+        // takes the map lock. The guarded release must leave s2 alone.
+        bridge
+            .ownership_epochs
+            .lock()
+            .insert(1, ("s2".to_string(), 7));
+        bridge.try_release_ownership_for_conn_if_stream(1, "s1");
+        assert_eq!(
+            bridge.ownership_epochs.lock().get(&1).cloned(),
+            Some(("s2".to_string(), 7))
+        );
+
+        // A retagged newer epoch for the same stream is still this
+        // connection's ownership and is released.
+        bridge
+            .ownership_epochs
+            .lock()
+            .insert(1, ("s1".to_string(), 9));
+        bridge.try_release_ownership_for_conn_if_stream(1, "s1");
+        assert!(bridge.ownership_epochs.lock().get(&1).is_none());
     }
 
     #[test]
