@@ -1355,8 +1355,31 @@ fn clear_http_delete_marker(state: &AppState, id: &str) {
 }
 
 fn mark_http_delete_sticky(state: &AppState, id: &str) {
-    state.deleted_streams.lock().insert(id.to_string());
-    state.sticky_deleted_streams.lock().insert(id.to_string());
+    // Hold both sets together, in the sticky -> deleted order used by
+    // `Server::prune_markers_if_due`. Ordering the two inserts alone is not
+    // enough: a prune can snapshot an empty sticky set, then observe the
+    // freshly inserted `deleted_streams` entry and drop it. With both locks
+    // held, the prune either runs before the marker exists (nothing to drop)
+    // or after both inserts (it sees the sticky entry and retains it).
+    let mut sticky = state.sticky_deleted_streams.lock();
+    let mut deleted = state.deleted_streams.lock();
+    sticky.insert(id.to_string());
+    deleted.insert(id.to_string());
+}
+
+/// Count the local RTMP sessions a stream-delete drain must wait for:
+/// in-memory roles plus durable active rows whose authorization has not yet
+/// installed its `ConnState` role.
+///
+/// The in-memory role set alone is not enough: an authorization in the worker
+/// has already written its durable row but has not installed the role yet. A
+/// delete that only counted roles would finalize in that window; the worker
+/// then installs a publisher/player on a stream row that no longer exists.
+fn stream_delete_local_sessions(state: &AppState, id: &str) -> (usize, usize) {
+    (
+        state.rtmp_bridge.live_conn_count_for_stream(id),
+        state.rtmp_bridge.durable_session_count_for_stream(id),
+    )
 }
 
 async fn finalize_stream_delete(
@@ -1508,18 +1531,19 @@ async fn wait_and_finalize_stream_delete(
     let mut last_remote_poll = started;
     let mut remote = remote_stream_sessions(&state, &id).await;
     loop {
-        let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
+        let (local, durable) = stream_delete_local_sessions(&state, &id);
         if last_remote_poll.elapsed() >= REMOTE_DRAIN_POLL_INTERVAL {
             remote = remote_stream_sessions(&state, &id).await;
             last_remote_poll = Instant::now();
         }
-        if local == 0 && remote == 0 {
+        if local == 0 && durable == 0 && remote == 0 {
             break;
         }
         if started.elapsed() >= DELETE_DRAIN_TIMEOUT {
             crate::log_error!(
                 "Delete drain timed out for stream '{id}' after {}s \
-                 (local={local} remote={remote}); abandoning local roles and finalizing",
+                 (local={local} durable={durable} remote={remote}); \
+                 abandoning local roles and finalizing",
                 DELETE_DRAIN_TIMEOUT.as_secs().max(1)
             );
             state.rtmp_bridge.abandon_roles_for_stream(&id);
@@ -1528,8 +1552,8 @@ async fn wait_and_finalize_stream_delete(
         if last_warn.elapsed() >= DELETE_DRAIN_WARN_AFTER {
             crate::log_warn!(
                 "Still deleting stream '{id}' — stream stays disabled; \
-                 waiting for {} local + {remote} remote RTMP session(s) to drain",
-                local
+                 waiting for {local} local + {durable} durable + {remote} remote \
+                 RTMP session(s) to drain"
             );
             last_warn = Instant::now();
         }
@@ -1779,9 +1803,9 @@ async fn handle_stream_delete(
         mgr.broadcast_drain_stream(&id).await;
     }
 
-    let local = state.rtmp_bridge.live_conn_count_for_stream(&id);
+    let (local, durable) = stream_delete_local_sessions(&state, &id);
     let remote = remote_stream_sessions(&state, &id).await;
-    if local == 0 && remote == 0 {
+    if local == 0 && durable == 0 && remote == 0 {
         return match finalize_stream_delete(&state, &id, Some(previously_enabled)).await {
             Ok(()) => {
                 crate::log_info!(
@@ -3881,6 +3905,62 @@ mod tests {
         assert_eq!(json["status"], "deleted");
         assert!(matches!(state.db.stream_get("gone"), DbLookup::Missing));
         assert!(!state.deleted_streams.lock().contains("gone"));
+    }
+
+    #[tokio::test]
+    async fn delete_stream_waits_for_a_persisted_publisher_without_conn_state() {
+        // An authorization in the worker writes its durable row before the
+        // shard installs the in-memory role. A delete in that window must
+        // not finalize: otherwise the worker installs a publisher on a
+        // stream row that no longer exists.
+        let state = test_state("a-strong-random-secret-value");
+        let stream = Stream {
+            id: "pending-auth".to_string(),
+            name: "Pending auth".to_string(),
+            app: "live".to_string(),
+            publish_key: "pub_pending_key_with_sufficient_length".to_string(),
+            play_key: "play_pending_key_with_sufficient_length".to_string(),
+            stats_key: "st_pending_key_with_sufficient_length".to_string(),
+            enabled: true,
+            created_at: now_ts(),
+        };
+        state.db.stream_add(&stream).unwrap();
+        let publisher = crate::db::Publisher {
+            id: "pub_session_pending_auth".to_string(),
+            stream_id: stream.id.clone(),
+            app: "live".to_string(),
+            stream_name: stream.name.clone(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(state.db.publisher_try_acquire(&publisher));
+        assert_eq!(
+            state
+                .rtmp_bridge
+                .durable_session_count_for_stream(&stream.id),
+            1
+        );
+
+        let app = router(state.clone());
+        let (header, value) = bearer("a-strong-random-secret-value");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/streams/pending-auth")
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let DbLookup::Ok(st) = state.db.stream_get("pending-auth") else {
+            panic!("stream must wait for the durable publisher row");
+        };
+        assert!(!st.enabled);
+        assert!(state.deleted_streams.lock().contains("pending-auth"));
     }
 
     #[tokio::test]

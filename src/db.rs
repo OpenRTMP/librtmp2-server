@@ -2219,7 +2219,8 @@ impl Db {
             .prepare_cached(
                 "INSERT INTO publishers \
                  (id,stream_id,app,stream_name,video_codec,audio_codec,video_width,video_height,fps,audio_sample_rate,audio_channels,bytes_in,bitrate_kbps,rtt_ms,connected_at,active) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                 SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1 \
+                 WHERE EXISTS (SELECT 1 FROM streams WHERE id=? AND enabled=1 AND pending_delete=0)",
             )
             .and_then(|mut stmt| stmt.execute(params![
                     p.id,
@@ -2236,13 +2237,23 @@ impl Db {
                     bytes_in,
                     p.bitrate_kbps,
                     p.rtt_ms,
-                    p.connected_at
+                    p.connected_at,
+                    p.stream_id
                 ]));
-        if let Err(e) = inserted {
-            // Do not let a storage fault masquerade as "stream already has an
-            // active publisher": callers map false to that user-facing error.
-            crate::log_error!("publisher_try_acquire: insert failed: {e}");
-            return false;
+        match inserted {
+            Ok(1) => {}
+            Ok(_) => {
+                // INSERT ... SELECT matched no parent row: the stream is
+                // disabled, mid-delete, or gone. This is not a successful
+                // insert even though SQLite reports no error.
+                return false;
+            }
+            Err(e) => {
+                // Do not let a storage fault masquerade as "stream already has an
+                // active publisher": callers map false to that user-facing error.
+                crate::log_error!("publisher_try_acquire: insert failed: {e}");
+                return false;
+            }
         }
         match tx.commit() {
             Ok(()) => true,
@@ -2719,7 +2730,8 @@ impl Db {
             .prepare_cached(
                 "INSERT INTO players \
                  (id,stream_id,viewer_id,app,stream_name,bytes_out,bitrate_kbps,rtt_ms,connected_at,active) \
-                 VALUES (?,?,?,?,?,?,?,?,?,1)",
+                 SELECT ?,?,?,?,?,?,?,?,?,1 \
+                 WHERE EXISTS (SELECT 1 FROM streams WHERE id=? AND enabled=1 AND pending_delete=0)",
             )
             .and_then(|mut stmt| {
                 stmt.execute(params![
@@ -2731,14 +2743,21 @@ impl Db {
                     bytes_out,
                     p.bitrate_kbps,
                     p.rtt_ms,
-                    p.connected_at
+                    p.connected_at,
+                    p.stream_id
                 ])
             });
-        if let Err(e) = inserted {
-            // A failed INSERT is a storage fault, not "connection limit
-            // reached"; log it so the caller's message is not the only signal.
-            crate::log_error!("player insert: insert failed: {e}");
-            return false;
+        match inserted {
+            Ok(1) => {}
+            Ok(_) => {
+                return false;
+            }
+            Err(e) => {
+                // A failed INSERT is a storage fault, not "connection limit
+                // reached"; log it so the caller's message is not the only signal.
+                crate::log_error!("player insert: insert failed: {e}");
+                return false;
+            }
         }
         match tx.commit() {
             Ok(()) => true,
@@ -2964,6 +2983,33 @@ impl Db {
 
     pub fn player_list_all(&self) -> Vec<Player> {
         self.player_list(None)
+    }
+
+    /// Count the durable active publisher and player rows for one stream.
+    ///
+    /// Used by the stream-delete drain: a publish/play authorization can
+    /// insert its row before the RTMP shard installs the in-memory role, so
+    /// counting only `DbRtmpBridge` connection state would finalize the
+    /// delete in that window and leave the authorized session pointing at a
+    /// deleted stream. Errors are surfaced so the caller can fail closed
+    /// instead of treating an unreadable table as "no sessions".
+    pub fn active_session_count_for_stream(&self, stream_id: &str) -> Result<usize, String> {
+        let conn = self.conn.lock();
+        let publishers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM publishers WHERE stream_id=? AND active=1",
+                params![stream_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("active_session_count_for_stream publishers: {e}"))?;
+        let players: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM players WHERE stream_id=? AND active=1",
+                params![stream_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("active_session_count_for_stream players: {e}"))?;
+        Ok(usize::try_from(publishers.saturating_add(players)).unwrap_or(usize::MAX))
     }
 
     /// Active player sessions for a configured viewer (play-key row), from
@@ -3777,6 +3823,49 @@ mod tests {
             MAX_CONNECTIONS_PER_PLAY_KEY as u64,
             "a rejected (over-cap) acquire must not increment the counter"
         );
+    }
+
+    #[test]
+    fn disabled_or_pending_stream_rejects_new_session_rows() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "st_key_789");
+        db.stream_add(&s).unwrap();
+        // begin_delete / disable sets enabled=0 and pending_delete=1. A worker
+        // authorization that already passed its earlier lookup must not be
+        // able to insert a session row for the stream after that point.
+        assert_eq!(db.stream_disable("stream1"), Some(true));
+
+        let publisher = Publisher {
+            id: "pub_after_disable".to_string(),
+            stream_id: "stream1".to_string(),
+            app: "live".to_string(),
+            stream_name: s.name.clone(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        };
+        assert!(!db.publisher_try_acquire(&publisher));
+
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert!(!db.player_try_acquire(&Player {
+            id: "pl_after_disable".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            0,
+            "a rejected insert must release the in-memory slot"
+        );
+
+        // Re-enabling the stream clears pending_delete and admits sessions.
+        assert!(db.stream_set_enabled("stream1", true));
+        assert!(db.publisher_try_acquire(&publisher));
     }
 
     #[test]

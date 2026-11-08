@@ -3190,7 +3190,11 @@ impl ShardLoop {
         // begin_delete timeouts lose rejection cover when the node has no
         // live RTMP sessions for the stream.
         let live_stream_ids = live_stream_ids_for_deleted_markers(&self.tracked, bridge);
-        let sticky = self.shared.sticky_deleted_streams.lock().clone();
+        // Hold the sticky set and the deleted set together (sticky first) so a
+        // concurrent `mark_http_delete_sticky` cannot insert a sticky marker
+        // after this snapshot but before the retain, which would drop the
+        // fresh delete marker for live sessions.
+        let sticky = self.shared.sticky_deleted_streams.lock();
         self.shared
             .deleted_streams
             .lock()
