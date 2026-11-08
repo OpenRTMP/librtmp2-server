@@ -3199,6 +3199,7 @@ impl ShardLoop {
             .deleted_streams
             .lock()
             .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
+        drop(sticky);
 
         let live_viewer_ids: HashSet<String> = self
             .tracked

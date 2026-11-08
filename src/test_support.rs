@@ -211,6 +211,7 @@ impl TestServer {
                 deleted_for_rtmp
                     .lock()
                     .retain(|id| live_stream_ids.contains(id) || sticky.contains(id));
+                drop(sticky);
 
                 let live_viewer_ids: HashSet<String> = tracked
                     .keys()
