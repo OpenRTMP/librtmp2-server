@@ -1468,6 +1468,18 @@ fn publisher_release_due(
     !is_publishing && !pending_publish_authorization && (tracked_publishing || holds_publisher)
 }
 
+/// Player-role counterpart of [`publisher_release_due`]: an in-flight play
+/// authorization may already have installed a new player row, so the old
+/// tracked role must not be torn down until that decision resolves.
+fn player_release_due(
+    is_playing: bool,
+    tracked_playing: bool,
+    holds_player: bool,
+    pending_play_authorization: bool,
+) -> bool {
+    !is_playing && !pending_play_authorization && (tracked_playing || holds_player)
+}
+
 /// Drive one poll cycle's worth of connection bookkeeping: authorize new
 /// publish/play commands, reject connections the bridge doesn't own, kick
 /// connections whose stream/play-key was revoked, and flush stats. Returns
@@ -1606,9 +1618,12 @@ pub(crate) fn process_server_connections(
             }
         }
         let holds_player = rtmp_bridge.has_player(conn_id);
-        if !is_playing
-            && (entry.playing || (holds_player && !conn.has_pending_play_authorization()))
-        {
+        if player_release_due(
+            is_playing,
+            entry.playing,
+            holds_player,
+            conn.has_pending_play_authorization(),
+        ) {
             rtmp_bridge.release_player(conn_id);
             if !rtmp_bridge.has_player(conn_id) {
                 entry.playing = false;
@@ -3227,8 +3242,8 @@ mod tests {
         AUTH_COMPLETIONS_RX, ReadinessSource, ReadinessWaiter, ServerApp, TrackedConn,
         any_negotiating, bind_rtmp_listener_set, bind_with_default_port, drain_auth_completions,
         drain_deleted_stream_roles, eviction_stream_id, ipv6_wildcard_for,
-        live_stream_ids_for_deleted_markers, newest_conn_id, publisher_release_due,
-        should_evict_idle_conn, wait_for_readiness_or_timeout,
+        live_stream_ids_for_deleted_markers, newest_conn_id, player_release_due,
+        publisher_release_due, should_evict_idle_conn, wait_for_readiness_or_timeout,
     };
     use crate::auth_worker::{AuthCompletion, AuthKind};
     use crate::config::ServerConfig;
@@ -3261,6 +3276,20 @@ mod tests {
         // that holds no publisher role.
         assert!(!publisher_release_due(true, true, true, false));
         assert!(!publisher_release_due(false, false, false, false));
+    }
+
+    #[test]
+    fn pending_play_authorization_blocks_player_teardown() {
+        // Symmetric to the publisher case: a play pair in one poll pass can
+        // leave the old tracked role set while the new authorization is still
+        // in flight. Releasing now would deactivate the new player row.
+        assert!(!player_release_due(false, true, true, true));
+        assert!(!player_release_due(false, true, false, true));
+        assert!(!player_release_due(false, false, true, true));
+        assert!(player_release_due(false, true, true, false));
+        assert!(player_release_due(false, false, true, false));
+        assert!(!player_release_due(true, true, true, false));
+        assert!(!player_release_due(false, false, false, false));
     }
 
     #[test]
