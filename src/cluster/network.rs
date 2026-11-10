@@ -9,7 +9,6 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use openraft::BasicNode;
-use openraft::async_runtime::WatchReceiver;
 use openraft::error::{NetworkError, RPCError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory};
 use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
@@ -1930,6 +1929,7 @@ mod tests {
     use crate::cluster::command::{ClusterCommand, ClusterResponse};
     use crate::cluster::raft::{LogStore, StateMachineStore};
     use crate::db::Db;
+    use openraft::async_runtime::WatchReceiver;
     use openraft::error::{Fatal, RaftError, Timeout};
     use openraft::network::RPCTypes;
     use openraft::{LogId, Vote};
