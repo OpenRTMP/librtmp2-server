@@ -3210,6 +3210,7 @@ mod tests {
                 },
             )
             .await
+            .into_inner()
     }
 
     #[tokio::test]
@@ -3246,7 +3247,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_rpcs_map_remote_errors_and_bad_payloads() {
-        let fatal = || RaftError::<NodeId>::Fatal(Fatal::Stopped);
+        let fatal = || RaftError::<TypeConfig>::Fatal(Fatal::Stopped);
         let remote_append =
             serde_json::to_value(Err::<AppendEntriesResponse<TypeConfig>, _>(fatal())).unwrap();
         let remote_vote = serde_json::to_value(Err::<VoteResponse<TypeConfig>, _>(fatal())).unwrap();
