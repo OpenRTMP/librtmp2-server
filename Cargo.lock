@@ -1534,6 +1534,7 @@ dependencies = [
  "futures",
  "openraft",
  "openraft-macros",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
