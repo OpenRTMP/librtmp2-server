@@ -3448,7 +3448,11 @@ impl ClusterManager {
         let (is_leader, leader_id, term, last_applied, voter_count, learner_count) = match m {
             Some(ref m) => {
                 let voters = m.membership_config.membership().voter_ids().count();
-                let learners = m.membership_config.membership().non_write_voter_ids().count();
+                let learners = m
+                    .membership_config
+                    .membership()
+                    .non_write_voter_ids()
+                    .count();
                 (
                     m.current_leader == Some(self.config.node_id),
                     m.current_leader,
