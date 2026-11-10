@@ -308,6 +308,11 @@ impl ClusterManager {
             return Err("ClusterManager::start called with CLUSTER_ENABLED=false".into());
         }
         config.validate()?;
+        // Raft's storage contract requires votes and appended entries to be
+        // durable before they are acknowledged; WAL+NORMAL is only process-crash
+        // safe. Do this before any Raft state is read or written.
+        db.require_durable_commits()
+            .map_err(|e| format!("failed to enable durable Raft commits: {e}"))?;
 
         let joining = config.join.is_some();
         let join_action = check_join_reseed(&db, joining)?;

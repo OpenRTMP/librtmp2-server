@@ -2117,6 +2117,18 @@ impl Db {
         f(&conn)
     }
 
+    /// Upgrade commits to power-loss durability for the cluster's Raft storage.
+    ///
+    /// Openraft requires `save_vote` and `append` to be on disk before they
+    /// return. WAL with `synchronous=NORMAL` survives a process crash but not a
+    /// power loss, so a node could forget a vote it granted (two leaders in one
+    /// term) or an entry it acknowledged. Cluster mode therefore pays the
+    /// fsync-per-commit cost that standalone mode deliberately avoids.
+    #[cfg(any(feature = "cluster", feature = "test-support", test))]
+    pub fn require_durable_commits(&self) -> rusqlite::Result<()> {
+        self.with_conn(|conn| conn.pragma_update(None, "synchronous", "FULL"))
+    }
+
     /// Group commit: run `f` -- typically several independent operations,
     /// each using its own [`DbTx`] as usual -- inside one SQLite transaction
     /// on this thread, holding the connection for the duration so no other
@@ -3081,6 +3093,29 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_commits_upgrade_synchronous_from_normal_to_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable.db");
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        let synchronous = |db: &Db| {
+            db.with_conn(|conn| {
+                conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .unwrap()
+            })
+        };
+        assert_eq!(synchronous(&db), 1, "default is WAL synchronous=NORMAL");
+        db.require_durable_commits().unwrap();
+        assert_eq!(
+            synchronous(&db),
+            2,
+            "cluster mode must fsync votes and log entries before acknowledging"
+        );
+        // Re-applying is harmless and keeps an idempotent startup path.
+        db.require_durable_commits().unwrap();
+        assert_eq!(synchronous(&db), 2);
+    }
 
     #[cfg(unix)]
     #[test]
