@@ -36,7 +36,7 @@ libc = "0.2"
 openssl = { version = "0.10.70", optional = true, features = ["vendored"] }
 
 # Optional HA clustering (OpenRaft). Off by default; enable with `--features cluster`.
-openraft = { version = "=0.10.0", optional = true, features = ["serde"] }
+openraft = { version = "=0.10.0", optional = true, features = ["serde", "type-alias"] }
 openraft-legacy = { version = "=0.10.0", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
