@@ -9,16 +9,13 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use openraft::BasicNode;
+use openraft::async_runtime::WatchReceiver;
 use openraft::error::{NetworkError, RPCError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory};
-use openraft::async_runtime::WatchReceiver;
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
 use openraft_legacy::network_v1::{
     Adapter, ChunkedSnapshotReceiver, InstallSnapshotError, InstallSnapshotRequest,
     InstallSnapshotResponse, RaftNetwork,
-};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse,
-    VoteRequest, VoteResponse,
 };
 use parking_lot::RwLock;
 use rustls::{ClientConfig, ServerConfig};
@@ -565,7 +562,8 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             secret: self.secret.clone(),
             local_id: self.local_id,
             tls_client: self.tls_client.clone(),
-        }.into_v2()
+        }
+        .into_v2()
     }
 }
 
@@ -612,9 +610,7 @@ impl NetworkConnection {
 }
 
 /// Remap transport-level `RPCError` to a different Raft error payload type.
-fn map_rpc_transport_err<E: std::error::Error>(
-    e: typ::RPCError,
-) -> typ::RPCError<E> {
+fn map_rpc_transport_err<E: std::error::Error>(e: typ::RPCError) -> typ::RPCError<E> {
     match e {
         RPCError::Timeout(x) => RPCError::Timeout(x),
         RPCError::Unreachable(x) => RPCError::Unreachable(x),
@@ -656,8 +652,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<TypeConfig>, typ::RPCError<InstallSnapshotError>>
-    {
+    ) -> Result<InstallSnapshotResponse<TypeConfig>, typ::RPCError<InstallSnapshotError>> {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let msg = self
@@ -1099,7 +1094,10 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             // `is_member` here would deadlock every new node's bootstrap.
             let parsed: AppendEntriesRequest<TypeConfig> =
                 serde_json::from_value(req).map_err(std::io::Error::other)?;
-            let r = raft.append_entries(parsed).await.map(AppendEntriesResponse::from);
+            let r = raft
+                .append_entries(parsed)
+                .await
+                .map(AppendEntriesResponse::from);
             let v =
                 serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
             ControlMessage::RaftAppendResp(v)
@@ -3188,7 +3186,13 @@ mod tests {
         InstallSnapshotRequest {
             vote: Vote::new_committed(1, 7),
             meta: SnapshotMeta {
-                last_log_id: Some(LogId::new(openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 7 }, 0)),
+                last_log_id: Some(LogId::new(
+                    openraft::impls::leader_id_adv::LeaderId {
+                        term: 1,
+                        node_id: 7,
+                    },
+                    0,
+                )),
                 last_membership: Default::default(),
                 snapshot_id: "snap-1".into(),
             },
@@ -3343,8 +3347,7 @@ mod tests {
             map_rpc_transport_err::<InstallSnapshotError>(remote),
             RPCError::Network(_)
         ));
-        let net: typ::RPCError =
-            RPCError::Network(NetworkError::new(&std::io::Error::other("x")));
+        let net: typ::RPCError = RPCError::Network(NetworkError::new(&std::io::Error::other("x")));
         assert!(matches!(
             map_rpc_transport_err::<InstallSnapshotError>(net),
             RPCError::Network(_)
