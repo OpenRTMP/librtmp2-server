@@ -1,6 +1,7 @@
 //! Raft application commands and responses.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::db::{Stream, StreamViewer};
 
@@ -121,6 +122,13 @@ pub enum ClusterResponse {
     /// pass: every ownership row acquired before this entry has a lower epoch.
     Released(u64),
     Error(String),
+}
+
+impl fmt::Display for ClusterCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Do not log the command payload: it can contain tokens and stream keys.
+        write!(f, "ClusterCommand({:?})", std::mem::discriminant(self))
+    }
 }
 
 impl ClusterCommand {
