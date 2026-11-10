@@ -17,19 +17,17 @@ openraft::declare_raft_types!(
 );
 
 pub type NodeId = u64;
-pub type Raft = openraft::Raft<TypeConfig>;
+pub type Raft = openraft::Raft<TypeConfig, StateMachineStore>;
 pub type LogStore = log_store::SqliteLogStore;
 pub type StateMachineStore = state_machine::SqliteStateMachine;
 
 pub mod typ {
-    use openraft::BasicNode;
+    use super::TypeConfig;
 
-    use super::{NodeId, TypeConfig};
-
-    pub type RaftError<E = openraft::error::Infallible> = openraft::error::RaftError<NodeId, E>;
+    pub type RaftError<E = openraft::error::Infallible> = openraft::error::RaftError<TypeConfig, E>;
     pub type RPCError<E = openraft::error::Infallible> =
-        openraft::error::RPCError<NodeId, BasicNode, RaftError<E>>;
-    pub type ClientWriteError = openraft::error::ClientWriteError<NodeId, BasicNode>;
-    pub type InitializeError = openraft::error::InitializeError<NodeId, BasicNode>;
+        openraft::error::RPCError<TypeConfig, RaftError<E>>;
+    pub type ClientWriteError = openraft::error::ClientWriteError<TypeConfig>;
+    pub type InitializeError = openraft::error::InitializeError<TypeConfig>;
     pub type ClientWriteResponse = openraft::raft::ClientWriteResponse<TypeConfig>;
 }
