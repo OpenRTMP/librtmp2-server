@@ -9,6 +9,7 @@ use openraft::BasicNode;
 use openraft::ChangeMembers;
 use openraft::Config as RaftConfig;
 use openraft::RaftMetrics;
+use openraft::async_runtime::WatchReceiver;
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
 
@@ -186,7 +187,7 @@ pub struct ClusterManager {
     /// Byte-bounded (drop-oldest) so librtmp2 drain cannot grow unbounded.
     export_q: Arc<ExportQueue>,
     rt_handle: tokio::runtime::Handle,
-    last_metrics: Mutex<Option<RaftMetrics<NodeId, BasicNode>>>,
+    last_metrics: Mutex<Option<RaftMetrics<crate::cluster::raft::TypeConfig>>>,
     /// Joins this node already accepted whose peer is not in the membership
     /// snapshot yet. Pruning keeps them until a snapshot lists them or
     /// [`JOIN_MEMBERSHIP_HOLD`] elapses. Ordering the two events by wall
@@ -1045,7 +1046,7 @@ impl ClusterManager {
     /// Epochs are Raft log indexes, so the last log index covers every applied
     /// acquisition while a later one is guaranteed a strictly higher index.
     fn ownership_fence_upper_bound(&self) -> u64 {
-        self.raft.metrics().borrow().last_log_index.unwrap_or(0)
+        self.raft.metrics().borrow_watched().last_log_index.unwrap_or(0)
     }
 
     /// Release every ownership row of `node_id` whose epoch is at most `fence`.
@@ -1846,7 +1847,7 @@ impl ClusterManager {
         use openraft::error::{ClientWriteError, RaftError};
         let in_membership = {
             let metrics = self.raft.metrics();
-            let m = metrics.borrow();
+            let m = metrics.borrow_watched();
             m.membership_config
                 .membership()
                 .nodes()
@@ -3191,7 +3192,7 @@ impl ClusterManager {
     async fn metrics_loop(self: Arc<Self>) {
         let mut metrics = self.raft.metrics();
         loop {
-            let m = metrics.borrow().clone();
+            let m = metrics.borrow_watched().clone();
             let prev_leader = self
                 .last_metrics
                 .lock()
@@ -4302,7 +4303,7 @@ mod tests {
         let n = bootstrap(1, |_| {}).await;
         let m = &n.mgr;
         assert_eq!(m.node_id(), 1);
-        assert!(m.raft().metrics().borrow().current_leader == Some(1));
+        assert!(m.raft().metrics().borrow_watched().current_leader == Some(1));
         assert!(m.meta().get(1).is_some());
         assert_eq!(m.media().peer_count(), 0);
         assert!(m.ownership().get("none").is_none());
@@ -5429,7 +5430,7 @@ mod tests {
         let mut fake = m.last_metrics.lock().clone().expect("metrics cached");
         fake.membership_config = Arc::new(openraft::StoredMembership::new(
             None,
-            openraft::Membership::new(vec![BTreeSet::from([7u64])], ()),
+            openraft::Membership::new_with_defaults(vec![BTreeSet::from([7u64])], ()).expect("valid test membership"),
         ));
         *m.last_metrics.lock() = Some(fake);
         m.prune_topology_to_membership();
@@ -5477,7 +5478,7 @@ mod tests {
         let mut included = m.last_metrics.lock().clone().expect("metrics cached");
         included.membership_config = Arc::new(openraft::StoredMembership::new(
             None,
-            openraft::Membership::new(vec![BTreeSet::from([m.config.node_id, 9u64])], ()),
+            openraft::Membership::new_with_defaults(vec![BTreeSet::from([m.config.node_id, 9u64])], ()).expect("valid test membership"),
         ));
         *m.last_metrics.lock() = Some(included);
         m.prune_topology_to_membership();
@@ -5487,7 +5488,7 @@ mod tests {
         let mut without = m.last_metrics.lock().clone().unwrap();
         without.membership_config = Arc::new(openraft::StoredMembership::new(
             None,
-            openraft::Membership::new(vec![BTreeSet::from([m.config.node_id])], ()),
+            openraft::Membership::new_with_defaults(vec![BTreeSet::from([m.config.node_id])], ()).expect("valid test membership"),
         ));
         *m.last_metrics.lock() = Some(without);
         m.prune_topology_to_membership();
