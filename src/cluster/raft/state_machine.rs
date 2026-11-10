@@ -1,13 +1,13 @@
 //! Raft state machine: applies ClusterCommand to local SQLite app tables.
 
+use futures::{Stream, TryStreamExt};
 use std::io::{self, Cursor};
 use std::sync::Arc;
-use futures::{Stream, TryStreamExt};
 use std::sync::atomic::Ordering;
 
+use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::RaftStateMachine;
 use openraft::{EntryPayload, RaftSnapshotBuilder};
-use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft_legacy::network_v1::SnapshotReceiverFactory;
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
@@ -85,9 +85,7 @@ impl SqliteStateMachine {
         })
     }
 
-    fn load_last_membership(
-        db: &Db,
-    ) -> Result<StoredMembership, io::Error> {
+    fn load_last_membership(db: &Db) -> Result<StoredMembership, io::Error> {
         db.with_conn(|conn| {
             match conn.query_row(
                 "SELECT val FROM raft_meta WHERE key='last_membership'",
@@ -128,9 +126,12 @@ impl SqliteStateMachine {
         log_id: LogId,
         membership_json: Option<&str>,
     ) -> Result<(), io::Error> {
-        let applied_json = serde_json::to_string(&log_id).map_err(|e| io::Error::other(e.to_string()))?;
+        let applied_json =
+            serde_json::to_string(&log_id).map_err(|e| io::Error::other(e.to_string()))?;
         self.db.with_conn(|conn| {
-            let tx = conn.unchecked_transaction().map_err(|e| io::Error::other(e.to_string()))?;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| io::Error::other(e.to_string()))?;
             if let Some(mem) = membership_json {
                 tx.execute(
                     "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
@@ -868,21 +869,17 @@ impl SqliteStateMachine {
                         // Raft log index is cluster-wide monotonic — use it as
                         // the fencing epoch so release cannot recycle tokens.
                         let epoch = entry.log_id.index.max(1);
-                        match self.db.stream_owner_acquire(
-                            stream_id,
-                            *node_id,
-                            epoch,
-                            *acquired_at,
-                        ) {
+                        match self
+                            .db
+                            .stream_owner_acquire(stream_id, *node_id, epoch, *acquired_at)
+                        {
                             Ok(ep) => {
                                 self.emit_effect(StateEffect::OwnershipChanged);
                                 ClusterResponse::OwnerEpoch(ep)
                             }
                             Err(crate::db::OwnerError::Conflict) => ClusterResponse::Conflict,
                             Err(crate::db::OwnerError::NotFound) => ClusterResponse::NotFound,
-                            Err(crate::db::OwnerError::Db) => {
-                                ClusterResponse::Error("db".into())
-                            }
+                            Err(crate::db::OwnerError::Db) => ClusterResponse::Error("db".into()),
                         }
                     }
                     ClusterCommand::ReleaseOwnersForNode { .. } => {
@@ -921,18 +918,21 @@ impl SqliteStateMachine {
                 // entry is compacted.
                 let _apply = self.apply_lock.lock();
                 let stored = StoredMembership::new(Some(entry.log_id), mem.clone());
-                let json = serde_json::to_string(&stored).map_err(|e| io::Error::other(e.to_string()))?;
+                let json =
+                    serde_json::to_string(&stored).map_err(|e| io::Error::other(e.to_string()))?;
                 self.persist_applied_tx(entry.log_id, Some(&json))?;
                 *self.last_membership.lock() = stored;
                 return Ok(ClusterResponse::Ok);
             }
         }
-
     }
 
     #[cfg(test)]
     async fn apply(&mut self, entries: Vec<Entry>) -> Result<Vec<ClusterResponse>, io::Error> {
-        entries.into_iter().map(|entry| self.apply_one_entry(entry)).collect()
+        entries
+            .into_iter()
+            .map(|entry| self.apply_one_entry(entry))
+            .collect()
     }
 }
 
@@ -988,7 +988,8 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 data: bytes.clone(),
             });
             // Persist snapshot blob for crash recovery.
-            let meta_json = serde_json::to_string(&meta).map_err(|e| io::Error::other(e.to_string()))?;
+            let meta_json =
+                serde_json::to_string(&meta).map_err(|e| io::Error::other(e.to_string()))?;
             self.db.with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO raft_snapshots(id, meta_json, data) VALUES(1, ?, ?) \
@@ -1010,15 +1011,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
     type SnapshotData = Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
 
-    async fn applied_state(
-        &mut self,
-    ) -> Result<
-        (
-            Option<LogId>,
-            StoredMembership,
-        ),
-        io::Error,
-    > {
+    async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), io::Error> {
         Ok((
             *self.last_applied.lock(),
             self.last_membership.lock().clone(),
@@ -1052,7 +1045,8 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         // payload is ahead of its own log boundary.
         let _apply = self.apply_lock.lock();
         let data = snapshot.into_inner();
-        let app: AppSnapshot = serde_json::from_slice(&data).map_err(|e| io::Error::other(e.to_string()))?;
+        let app: AppSnapshot =
+            serde_json::from_slice(&data).map_err(|e| io::Error::other(e.to_string()))?;
         self.install_app_snapshot(&app)
             .map_err(|e| io::Error::other(e.to_string()))?;
         *self.last_membership.lock() = meta.last_membership.clone();
@@ -1062,13 +1056,15 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         // that boundary are compacted, restart could resume with the wrong
         // voter set. When last_log_id is None, clear durable last_applied in
         // the same transaction so a prior high index cannot survive restart.
-        let membership_json =
-            serde_json::to_string(&meta.last_membership).map_err(|e| io::Error::other(e.to_string()))?;
+        let membership_json = serde_json::to_string(&meta.last_membership)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         if let Some(log_id) = meta.last_log_id {
             self.persist_applied_tx(log_id, Some(&membership_json))?;
         } else {
             self.db.with_conn(|conn| {
-                let tx = conn.unchecked_transaction().map_err(|e| io::Error::other(e.to_string()))?;
+                let tx = conn
+                    .unchecked_transaction()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 tx.execute(
                     "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
                      ON CONFLICT(key) DO UPDATE SET val=excluded.val",
@@ -1104,9 +1100,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot>, io::Error> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, io::Error> {
         if let Some(snap) = self.current_snapshot.lock().clone() {
             return Ok(Some(Snapshot {
                 meta: snap.meta,
@@ -1129,8 +1123,8 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
             })
             .map_err(|e| io::Error::other(e.to_string()))?;
         if let Some((meta_json, data)) = loaded {
-            let meta: SnapshotMeta = serde_json::from_str(&meta_json)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let meta: SnapshotMeta =
+                serde_json::from_str(&meta_json).map_err(|e| io::Error::other(e.to_string()))?;
             *self.current_snapshot.lock() = Some(StoredSnapshot {
                 meta: meta.clone(),
                 data: data.clone(),
@@ -1161,9 +1155,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::mpsc::Receiver;
 
-    use openraft::{BasicNode, Membership};
     use openraft::impls::leader_id_adv::LeaderId as CommittedLeaderId;
     use openraft::vote::RaftLeaderId;
+    use openraft::{BasicNode, Membership};
 
     use super::*;
     use crate::db::{Player, Publisher, StatSample, Stream, StreamViewer};
@@ -1240,7 +1234,8 @@ mod tests {
                 )
             })
             .collect();
-        Membership::new(vec![voters.iter().copied().collect::<BTreeSet<_>>()], nodes).expect("valid test membership")
+        Membership::new(vec![voters.iter().copied().collect::<BTreeSet<_>>()], nodes)
+            .expect("valid test membership")
     }
 
     fn sm_with_effects() -> (SqliteStateMachine, Receiver<StateEffect>) {
@@ -2318,8 +2313,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let result = rt
-                .block_on(installer.install_snapshot(&meta, std::io::Cursor::new(data)));
+            let result = rt.block_on(installer.install_snapshot(&meta, std::io::Cursor::new(data)));
             tx.blocking_send(result.is_ok()).unwrap();
         });
 
@@ -2398,10 +2392,7 @@ mod tests {
         }
     }
 
-    fn snap_meta(
-        last: Option<LogId>,
-        mem: Membership<u64, BasicNode>,
-    ) -> SnapshotMeta {
+    fn snap_meta(last: Option<LogId>, mem: Membership<u64, BasicNode>) -> SnapshotMeta {
         SnapshotMeta {
             last_log_id: last,
             last_membership: StoredMembership::new(last, mem),
