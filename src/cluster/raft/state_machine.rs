@@ -2598,7 +2598,7 @@ mod tests {
         assert!(
             sm.install_snapshot(
                 &meta,
-                Box::new(Cursor::new(serde_json::to_vec(&dup).unwrap()))
+                Cursor::new(serde_json::to_vec(&dup).unwrap())
             )
             .await
             .is_err()
