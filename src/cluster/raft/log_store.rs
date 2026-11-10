@@ -5,9 +5,9 @@ use std::io;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
+use openraft::alias::{EntryOf, LogIdOf, VoteOf};
 use openraft::storage::{IOFlushed, RaftLogStorage};
 use openraft::{LogState, RaftLogReader};
-use openraft::alias::{EntryOf, LogIdOf, VoteOf};
 
 type Entry = EntryOf<TypeConfig>;
 type LogId = LogIdOf<TypeConfig>;
@@ -93,7 +93,6 @@ impl RaftLogReader<TypeConfig> for SqliteLogStore {
             }
         })
     }
-
 }
 
 impl RaftLogStorage<TypeConfig> for SqliteLogStore {
@@ -128,8 +127,7 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
                         |r| r.get(0),
                     )
                     .map_err(Self::read_err)?;
-                let entry: Entry =
-                    serde_json::from_str(&json).map_err(Self::read_err)?;
+                let entry: Entry = serde_json::from_str(&json).map_err(Self::read_err)?;
                 Some(entry.log_id)
             } else {
                 last_purged_log_id
@@ -141,10 +139,7 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
         })
     }
 
-    async fn save_committed(
-        &mut self,
-        committed: Option<LogId>,
-    ) -> Result<(), io::Error> {
+    async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), io::Error> {
         let json = serde_json::to_string(&committed).map_err(Self::io_err)?;
         self.db.with_conn(|conn| {
             conn.execute(
