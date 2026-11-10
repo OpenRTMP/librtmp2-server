@@ -3,7 +3,6 @@
 use futures::{Stream, TryStreamExt};
 use std::io::{self, Cursor};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::RaftStateMachine;
@@ -852,7 +851,7 @@ impl SqliteStateMachine {
             EntryPayload::Blank => {
                 let _apply = self.apply_lock.lock();
                 self.persist_applied_tx(entry.log_id, None)?;
-                return Ok(ClusterResponse::Ok);
+                Ok(ClusterResponse::Ok)
             }
             EntryPayload::Normal(ref cmd) => {
                 // `apply_lock` spans the commit and the index update together so a
@@ -907,7 +906,7 @@ impl SqliteStateMachine {
                 // conn with Db helpers (non-reentrant mutex) — order still safe:
                 // lagging last_applied re-applies idempotently after crash.
                 self.persist_applied_tx(entry.log_id, None)?;
-                return Ok(resp);
+                Ok(resp)
             }
             EntryPayload::Membership(ref mem) => {
                 // Same lock as `apply`/`build_snapshot`/`install_snapshot`:
@@ -922,7 +921,7 @@ impl SqliteStateMachine {
                     serde_json::to_string(&stored).map_err(|e| io::Error::other(e.to_string()))?;
                 self.persist_applied_tx(entry.log_id, Some(&json))?;
                 *self.last_membership.lock() = stored;
-                return Ok(ClusterResponse::Ok);
+                Ok(ClusterResponse::Ok)
             }
         }
     }
@@ -1153,6 +1152,7 @@ impl SnapshotReceiverFactory<TypeConfig> for SqliteStateMachine {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc::Receiver;
 
     use openraft::impls::leader_id_adv::LeaderId as CommittedLeaderId;
