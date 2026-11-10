@@ -3,6 +3,7 @@
 use std::io::{self, Cursor};
 use std::sync::Arc;
 use futures::{Stream, TryStreamExt};
+use std::sync::atomic::Ordering;
 
 use openraft::storage::RaftStateMachine;
 use openraft::{EntryPayload, RaftSnapshotBuilder};
