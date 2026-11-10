@@ -1046,7 +1046,11 @@ impl ClusterManager {
     /// Epochs are Raft log indexes, so the last log index covers every applied
     /// acquisition while a later one is guaranteed a strictly higher index.
     fn ownership_fence_upper_bound(&self) -> u64 {
-        self.raft.metrics().borrow_watched().last_log_index.unwrap_or(0)
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .last_log_index
+            .unwrap_or(0)
     }
 
     /// Release every ownership row of `node_id` whose epoch is at most `fence`.
