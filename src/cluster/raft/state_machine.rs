@@ -1160,7 +1160,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::mpsc::Receiver;
 
-    use openraft::{BasicNode, CommittedLeaderId, Membership};
+    use openraft::{BasicNode, Membership};
+    use openraft::impls::leader_id_adv::LeaderId as CommittedLeaderId;
+    use openraft::vote::RaftLeaderId;
 
     use super::*;
     use crate::db::{Player, Publisher, StatSample, Stream, StreamViewer};
@@ -2209,7 +2211,6 @@ mod tests {
         .unwrap();
 
         let snap = builder.build_snapshot().await.unwrap();
-        assert_eq!(snap.meta.last_log_id, Some(log_id(5)));
         assert_eq!(snap.meta.last_log_id, Some(log_id(5)));
         let app: AppSnapshot = serde_json::from_slice(snap.snapshot.get_ref()).unwrap();
         assert_eq!(app.streams.len(), 1);
