@@ -4317,6 +4317,13 @@ mod tests {
         let m = &n.mgr;
         assert_eq!(m.node_id(), 1);
         assert!(m.raft().metrics().borrow_watched().current_leader == Some(1));
+        assert_eq!(
+            m.db.with_conn(|conn| conn
+                .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                .unwrap()),
+            2,
+            "cluster startup must make Raft votes/log entries power-loss durable"
+        );
         assert!(m.meta().get(1).is_some());
         assert_eq!(m.media().peer_count(), 0);
         assert!(m.ownership().get("none").is_none());
