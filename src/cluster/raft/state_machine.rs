@@ -2587,12 +2587,9 @@ mod tests {
         };
         let meta = snap_meta(Some(log_id(9)), membership(&[1]));
         assert!(
-            sm.install_snapshot(
-                &meta,
-                Cursor::new(serde_json::to_vec(&dup).unwrap())
-            )
-            .await
-            .is_err()
+            sm.install_snapshot(&meta, Cursor::new(serde_json::to_vec(&dup).unwrap()))
+                .await
+                .is_err()
         );
         assert!(matches!(
             sm.db().stream_get("orig"),
