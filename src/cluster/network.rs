@@ -10,9 +10,14 @@ use parking_lot::Mutex;
 
 use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RemoteError, Unreachable};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::network::{RPCOption, RaftNetworkFactory};
+use openraft::async_runtime::WatchReceiver;
+use openraft_legacy::network_v1::{
+    Adapter, ChunkedSnapshotReceiver, InstallSnapshotError, InstallSnapshotRequest,
+    InstallSnapshotResponse, RaftNetwork, SnapshotMeta,
+};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    AppendEntriesRequest, AppendEntriesResponse,
     VoteRequest, VoteResponse,
 };
 use parking_lot::RwLock;
@@ -551,7 +556,7 @@ impl NetworkFactory {
 }
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
-    type Network = NetworkConnection;
+    type Network = Adapter<TypeConfig, NetworkConnection, std::io::Cursor<Vec<u8>>>;
 
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
         NetworkConnection {
@@ -560,7 +565,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             secret: self.secret.clone(),
             local_id: self.local_id,
             tls_client: self.tls_client.clone(),
-        }
+        }.into_v2()
     }
 }
 
@@ -581,7 +586,7 @@ impl NetworkConnection {
         &mut self,
         req: ControlMessage,
         hard_deadline: Option<Duration>,
-    ) -> Result<ControlMessage, RPCError<NodeId, BasicNode, typ::RaftError>> {
+    ) -> Result<ControlMessage, typ::RPCError> {
         let addr = &self.target_node.addr;
         let call = authed_roundtrip_inner(
             addr,
@@ -608,13 +613,12 @@ impl NetworkConnection {
 
 /// Remap transport-level `RPCError` to a different Raft error payload type.
 fn map_rpc_transport_err<E: std::error::Error>(
-    e: RPCError<NodeId, BasicNode, typ::RaftError>,
-) -> RPCError<NodeId, BasicNode, typ::RaftError<E>> {
+    e: typ::RPCError,
+) -> typ::RPCError<E> {
     match e {
         RPCError::Timeout(x) => RPCError::Timeout(x),
         RPCError::Unreachable(x) => RPCError::Unreachable(x),
         RPCError::Network(x) => RPCError::Network(x),
-        RPCError::PayloadTooLarge(x) => RPCError::PayloadTooLarge(x),
         RPCError::RemoteError(r) => {
             RPCError::Network(NetworkError::new(&std::io::Error::other(format!("{r}"))))
         }
@@ -626,7 +630,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, typ::RPCError> {
+    ) -> Result<AppendEntriesResponse<TypeConfig>, typ::RPCError> {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         match self
@@ -634,7 +638,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
             .await?
         {
             ControlMessage::RaftAppendResp(v) => {
-                let parsed: Result<AppendEntriesResponse<NodeId>, typ::RaftError> =
+                let parsed: Result<AppendEntriesResponse<TypeConfig>, typ::RaftError> =
                     serde_json::from_value(v)
                         .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
                 match parsed {
@@ -652,7 +656,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<NodeId>, typ::RPCError<openraft::error::InstallSnapshotError>>
+    ) -> Result<InstallSnapshotResponse<TypeConfig>, typ::RPCError<InstallSnapshotError>>
     {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
@@ -663,8 +667,8 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         match msg {
             ControlMessage::RaftSnapshotResp(v) => {
                 let parsed: Result<
-                    InstallSnapshotResponse<NodeId>,
-                    typ::RaftError<openraft::error::InstallSnapshotError>,
+                    InstallSnapshotResponse<TypeConfig>,
+                    typ::RaftError<InstallSnapshotError>,
                 > = serde_json::from_value(v)
                     .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
                 match parsed {
@@ -680,14 +684,14 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
 
     async fn vote(
         &mut self,
-        rpc: VoteRequest<NodeId>,
+        rpc: VoteRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, typ::RPCError> {
+    ) -> Result<VoteResponse<TypeConfig>, typ::RPCError> {
         let req =
             serde_json::to_value(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         match self.roundtrip(ControlMessage::RaftVote(req), None).await? {
             ControlMessage::RaftVoteResp(v) => {
-                let parsed: Result<VoteResponse<NodeId>, typ::RaftError> =
+                let parsed: Result<VoteResponse<TypeConfig>, typ::RaftError> =
                     serde_json::from_value(v)
                         .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
                 match parsed {
@@ -1095,14 +1099,14 @@ async fn handle_authenticated_control_conn<S: AsyncRead + AsyncWrite + Unpin>(
             // `is_member` here would deadlock every new node's bootstrap.
             let parsed: AppendEntriesRequest<TypeConfig> =
                 serde_json::from_value(req).map_err(std::io::Error::other)?;
-            let r = raft.append_entries(parsed).await;
+            let r = raft.append_entries(parsed).await.map(AppendEntriesResponse::from);
             let v =
                 serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({"error":"encode"}));
             ControlMessage::RaftAppendResp(v)
         }
         ControlMessage::RaftVote(req) => {
             // See RaftAppend above: no is_member gate, same bootstrap reason.
-            let parsed: VoteRequest<NodeId> =
+            let parsed: VoteRequest<TypeConfig> =
                 serde_json::from_value(req).map_err(std::io::Error::other)?;
             let r = raft.vote(parsed).await;
             let v =
@@ -1928,9 +1932,9 @@ mod tests {
     use crate::cluster::command::{ClusterCommand, ClusterResponse};
     use crate::cluster::raft::{LogStore, StateMachineStore};
     use crate::db::Db;
-    use openraft::error::{Fatal, PayloadTooLarge, RaftError, Timeout};
+    use openraft::error::{Fatal, RaftError, Timeout};
     use openraft::network::RPCTypes;
-    use openraft::{LogId, SnapshotMeta, Vote};
+    use openraft::{LogId, Vote};
     use std::collections::BTreeSet;
     use std::net::Ipv4Addr;
 
@@ -2314,7 +2318,7 @@ mod tests {
         let mut m = raft.metrics();
         tokio::time::timeout(WAIT, async {
             loop {
-                if m.borrow().current_leader == Some(leader) {
+                if m.borrow_watched().current_leader == Some(leader) {
                     return;
                 }
                 m.changed().await.unwrap();
@@ -3166,7 +3170,7 @@ mod tests {
 
     // ---- raft RPC transport -------------------------------------------------
 
-    fn vote_req() -> VoteRequest<NodeId> {
+    fn vote_req() -> VoteRequest<TypeConfig> {
         VoteRequest::new(Vote::new(1, 7), None)
     }
 
@@ -3243,11 +3247,11 @@ mod tests {
     async fn raft_rpcs_map_remote_errors_and_bad_payloads() {
         let fatal = || RaftError::<NodeId>::Fatal(Fatal::Stopped);
         let remote_append =
-            serde_json::to_value(Err::<AppendEntriesResponse<NodeId>, _>(fatal())).unwrap();
-        let remote_vote = serde_json::to_value(Err::<VoteResponse<NodeId>, _>(fatal())).unwrap();
+            serde_json::to_value(Err::<AppendEntriesResponse<TypeConfig>, _>(fatal())).unwrap();
+        let remote_vote = serde_json::to_value(Err::<VoteResponse<TypeConfig>, _>(fatal())).unwrap();
         let remote_snap = serde_json::to_value(Err::<
-            InstallSnapshotResponse<NodeId>,
-            RaftError<NodeId, openraft::error::InstallSnapshotError>,
+            InstallSnapshotResponse<TypeConfig>,
+            RaftError<TypeConfig, InstallSnapshotError>,
         >(RaftError::Fatal(Fatal::Stopped)))
         .unwrap();
         let junk = serde_json::json!({"junk": true});
@@ -3321,32 +3325,26 @@ mod tests {
         assert!(matches!(err, RPCError::Network(_)), "{err:?}");
         drop(silent);
 
-        let timeout: RPCError<NodeId, BasicNode, typ::RaftError> = RPCError::Timeout(Timeout {
+        let timeout: typ::RPCError = RPCError::Timeout(Timeout {
             action: RPCTypes::Vote,
             id: 1,
             target: 2,
             timeout: Duration::from_millis(1),
         });
         assert!(matches!(
-            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(timeout),
+            map_rpc_transport_err::<InstallSnapshotError>(timeout),
             RPCError::Timeout(_)
         ));
-        let too_large: RPCError<NodeId, BasicNode, typ::RaftError> =
-            RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint(1));
-        assert!(matches!(
-            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(too_large),
-            RPCError::PayloadTooLarge(_)
-        ));
-        let remote: RPCError<NodeId, BasicNode, typ::RaftError> =
+        let remote: typ::RPCError =
             RPCError::RemoteError(RemoteError::new(2, RaftError::Fatal(Fatal::Stopped)));
         assert!(matches!(
-            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(remote),
+            map_rpc_transport_err::<InstallSnapshotError>(remote),
             RPCError::Network(_)
         ));
-        let net: RPCError<NodeId, BasicNode, typ::RaftError> =
+        let net: typ::RPCError =
             RPCError::Network(NetworkError::new(&std::io::Error::other("x")));
         assert!(matches!(
-            map_rpc_transport_err::<openraft::error::InstallSnapshotError>(net),
+            map_rpc_transport_err::<InstallSnapshotError>(net),
             RPCError::Network(_)
         ));
     }
