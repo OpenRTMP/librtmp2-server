@@ -198,7 +198,7 @@ impl RaftLogStorage<TypeConfig> for SqliteLogStore {
         let result = self.db.with_conn(|conn| {
             let tx = conn.unchecked_transaction().map_err(Self::io_err)?;
             for entry in &collected {
-                let idx = &entry.log_id.index as i64;
+                let idx = entry.log_id.index as i64;
                 let json = serde_json::to_string(entry).map_err(Self::io_err)?;
                 tx.execute(
                     "INSERT INTO raft_log(log_index, entry_json) VALUES(?,?) \
