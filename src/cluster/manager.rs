@@ -5430,7 +5430,7 @@ mod tests {
         let mut fake = m.last_metrics.lock().clone().expect("metrics cached");
         fake.membership_config = Arc::new(openraft::StoredMembership::new(
             None,
-            openraft::Membership::new_with_defaults(vec![BTreeSet::from([7u64])], ()),
+            openraft::Membership::new_with_defaults(vec![BTreeSet::from([7u64])], std::collections::BTreeMap::<u64, BasicNode>::new()),
         ));
         *m.last_metrics.lock() = Some(fake);
         m.prune_topology_to_membership();
@@ -5478,7 +5478,7 @@ mod tests {
         let mut included = m.last_metrics.lock().clone().expect("metrics cached");
         included.membership_config = Arc::new(openraft::StoredMembership::new(
             None,
-            openraft::Membership::new_with_defaults(vec![BTreeSet::from([m.config.node_id, 9u64])], ()),
+            openraft::Membership::new_with_defaults(vec![BTreeSet::from([m.config.node_id, 9u64])], std::collections::BTreeMap::<u64, BasicNode>::new()),
         ));
         *m.last_metrics.lock() = Some(included);
         m.prune_topology_to_membership();
@@ -5488,7 +5488,7 @@ mod tests {
         let mut without = m.last_metrics.lock().clone().unwrap();
         without.membership_config = Arc::new(openraft::StoredMembership::new(
             None,
-            openraft::Membership::new_with_defaults(vec![BTreeSet::from([m.config.node_id])], ()),
+            openraft::Membership::new_with_defaults(vec![BTreeSet::from([m.config.node_id])], std::collections::BTreeMap::<u64, BasicNode>::new()),
         ));
         *m.last_metrics.lock() = Some(without);
         m.prune_topology_to_membership();
