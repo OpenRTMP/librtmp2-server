@@ -14,7 +14,7 @@ use openraft::network::{RPCOption, RaftNetworkFactory};
 use openraft::async_runtime::WatchReceiver;
 use openraft_legacy::network_v1::{
     Adapter, ChunkedSnapshotReceiver, InstallSnapshotError, InstallSnapshotRequest,
-    InstallSnapshotResponse, RaftNetwork, SnapshotMeta,
+    InstallSnapshotResponse, RaftNetwork,
 };
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse,
@@ -1935,6 +1935,7 @@ mod tests {
     use openraft::error::{Fatal, RaftError, Timeout};
     use openraft::network::RPCTypes;
     use openraft::{LogId, Vote};
+    use openraft_legacy::network_v1::SnapshotMeta;
     use std::collections::BTreeSet;
     use std::net::Ipv4Addr;
 
@@ -3187,7 +3188,7 @@ mod tests {
         InstallSnapshotRequest {
             vote: Vote::new_committed(1, 7),
             meta: SnapshotMeta {
-                last_log_id: Some(LogId::new(openraft::CommittedLeaderId::new(1, 7), 0)),
+                last_log_id: Some(LogId::new(openraft::impls::leader_id_adv::LeaderId { term: 1, node_id: 7 }, 0)),
                 last_membership: Default::default(),
                 snapshot_id: "snap-1".into(),
             },
