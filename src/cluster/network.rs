@@ -3254,7 +3254,8 @@ mod tests {
         let fatal = || RaftError::<TypeConfig>::Fatal(Fatal::Stopped);
         let remote_append =
             serde_json::to_value(Err::<AppendEntriesResponse<TypeConfig>, _>(fatal())).unwrap();
-        let remote_vote = serde_json::to_value(Err::<VoteResponse<TypeConfig>, _>(fatal())).unwrap();
+        let remote_vote =
+            serde_json::to_value(Err::<VoteResponse<TypeConfig>, _>(fatal())).unwrap();
         let remote_snap = serde_json::to_value(Err::<
             InstallSnapshotResponse<TypeConfig>,
             RaftError<TypeConfig, InstallSnapshotError>,
