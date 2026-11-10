@@ -1796,7 +1796,7 @@ impl ClusterManager {
     /// this node is a follower.
     async fn forward_join_to_leader(
         &self,
-        ftl: openraft::error::ForwardToLeader<NodeId, BasicNode>,
+        ftl: openraft::error::ForwardToLeader<crate::cluster::raft::TypeConfig>,
         node_id: NodeId,
         control_addr: String,
         media_addr: String,
