@@ -1,14 +1,13 @@
 //! Raft state machine: applies ClusterCommand to local SQLite app tables.
 
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use futures::{Stream, TryStreamExt};
 
-use openraft::storage::{RaftStateMachine, Snapshot};
-use openraft::{
-    Entry, EntryPayload, LogId, RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError,
-    StoredMembership,
-};
+use openraft::storage::RaftStateMachine;
+use openraft::{EntryPayload, RaftSnapshotBuilder};
+use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
+use openraft_legacy::network_v1::SnapshotReceiverFactory;
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
 
@@ -16,6 +15,12 @@ use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::raft::TypeConfig;
 use crate::cluster::raft::snapshot::AppSnapshot;
 use crate::db::{Db, OwnerError, StreamAddError, ViewerAddError};
+
+type Entry = EntryOf<TypeConfig>;
+type LogId = LogIdOf<TypeConfig>;
+type SnapshotMeta = SnapshotMetaOf<TypeConfig>;
+type StoredMembership = StoredMembershipOf<TypeConfig>;
+type Snapshot = SnapshotOf<TypeConfig, Cursor<Vec<u8>>>;
 
 /// Side effects that must run after a Raft apply on every node (session markers,
 /// in-memory bearer refresh). Delivered via an optional channel set by
@@ -33,27 +38,26 @@ pub enum StateEffect {
 #[derive(Clone)]
 pub struct SqliteStateMachine {
     db: Arc<Db>,
-    last_applied: Arc<Mutex<Option<LogId<u64>>>>,
+    last_applied: Arc<Mutex<Option<LogId>>>,
     /// Serializes a command's database writes plus its `last_applied` update
     /// against [`Self::build_snapshot`]'s row read. OpenRaft moves the snapshot
     /// builder onto its own task and returns to the apply queue immediately
     /// (`sm::worker::build_snapshot`), so without this the snapshot can capture
     /// a command's rows while both indices still name the log entry before it.
     apply_lock: Arc<Mutex<()>>,
-    last_membership: Arc<Mutex<StoredMembership<u64, openraft::BasicNode>>>,
+    last_membership: Arc<Mutex<StoredMembership>>,
     current_snapshot: Arc<Mutex<Option<StoredSnapshot>>>,
-    snapshot_idx: Arc<AtomicU64>,
     effects: Arc<Mutex<Option<std::sync::mpsc::Sender<StateEffect>>>>,
 }
 
 #[derive(Debug, Clone)]
 struct StoredSnapshot {
-    meta: SnapshotMeta<u64, openraft::BasicNode>,
+    meta: SnapshotMeta,
     data: Vec<u8>,
 }
 
 impl SqliteStateMachine {
-    pub fn new(db: Arc<Db>) -> Result<Self, StorageError<u64>> {
+    pub fn new(db: Arc<Db>) -> Result<Self, io::Error> {
         let last_applied = Self::load_last_applied(&db)?;
         let last_membership = Self::load_last_membership(&db)?;
         Ok(Self {
@@ -62,47 +66,38 @@ impl SqliteStateMachine {
             apply_lock: Arc::new(Mutex::new(())),
             last_membership: Arc::new(Mutex::new(last_membership)),
             current_snapshot: Arc::new(Mutex::new(None)),
-            snapshot_idx: Arc::new(AtomicU64::new(0)),
             effects: Arc::new(Mutex::new(None)),
         })
     }
 
-    fn load_last_applied(db: &Db) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+    fn load_last_applied(db: &Db) -> Result<Option<LogId>, io::Error> {
         db.with_conn(|conn| {
             match conn.query_row(
                 "SELECT val FROM raft_meta WHERE key='last_applied'",
                 [],
                 |r| r.get::<_, String>(0),
             ) {
-                Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::read_state_machine(&e),
-                }),
+                Ok(j) => serde_json::from_str(&j).map_err(|e| io::Error::other(e.to_string())),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(StorageError::IO {
-                    source: StorageIOError::<u64>::read_state_machine(&e),
-                }),
+                Err(e) => Err(io::Error::other(e.to_string())),
             }
         })
     }
 
     fn load_last_membership(
         db: &Db,
-    ) -> Result<StoredMembership<u64, openraft::BasicNode>, StorageError<u64>> {
+    ) -> Result<StoredMembership, io::Error> {
         db.with_conn(|conn| {
             match conn.query_row(
                 "SELECT val FROM raft_meta WHERE key='last_membership'",
                 [],
                 |r| r.get::<_, String>(0),
             ) {
-                Ok(j) => serde_json::from_str(&j).map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::read_state_machine(&e),
-                }),
+                Ok(j) => serde_json::from_str(&j).map_err(|e| io::Error::other(e.to_string())),
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
                     Ok(StoredMembership::new(None, openraft::Membership::default()))
                 }
-                Err(e) => Err(StorageError::IO {
-                    source: StorageIOError::<u64>::read_state_machine(&e),
-                }),
+                Err(e) => Err(io::Error::other(e.to_string())),
             }
         })
     }
@@ -116,7 +111,7 @@ impl SqliteStateMachine {
         *self.effects.lock() = Some(tx);
     }
 
-    pub fn last_membership(&self) -> StoredMembership<u64, openraft::BasicNode> {
+    pub fn last_membership(&self) -> StoredMembership {
         self.last_membership.lock().clone()
     }
 
@@ -129,38 +124,28 @@ impl SqliteStateMachine {
     /// Persist `last_applied` (+ optional membership) in one SQLite transaction.
     fn persist_applied_tx(
         &self,
-        log_id: LogId<u64>,
+        log_id: LogId,
         membership_json: Option<&str>,
-    ) -> Result<(), StorageError<u64>> {
-        let applied_json = serde_json::to_string(&log_id).map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_state_machine(&e),
-        })?;
+    ) -> Result<(), io::Error> {
+        let applied_json = serde_json::to_string(&log_id).map_err(|e| io::Error::other(e.to_string()))?;
         self.db.with_conn(|conn| {
-            let tx = conn.unchecked_transaction().map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_state_machine(&e),
-            })?;
+            let tx = conn.unchecked_transaction().map_err(|e| io::Error::other(e.to_string()))?;
             if let Some(mem) = membership_json {
                 tx.execute(
                     "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
                      ON CONFLICT(key) DO UPDATE SET val=excluded.val",
                     params![mem],
                 )
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::write_state_machine(&e),
-                })?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
             }
             tx.execute(
                 "INSERT INTO raft_meta(key,val) VALUES('last_applied',?) \
                  ON CONFLICT(key) DO UPDATE SET val=excluded.val",
                 params![applied_json],
             )
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_state_machine(&e),
-            })?;
-            tx.commit().map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_state_machine(&e),
-            })?;
-            Ok::<(), StorageError<u64>>(())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
+            Ok::<(), io::Error>(())
         })?;
         *self.last_applied.lock() = Some(log_id);
         Ok(())
@@ -431,7 +416,7 @@ impl SqliteStateMachine {
     /// `last_applied` is passed in rather than read here so the caller can pin
     /// one `last_applied` acquisition across both this row read and the index
     /// it records as `last_applied_index`; see `build_snapshot`.
-    fn build_app_snapshot(&self, last_applied: Option<LogId<u64>>) -> Result<AppSnapshot, String> {
+    fn build_app_snapshot(&self, last_applied: Option<LogId>) -> Result<AppSnapshot, String> {
         let (streams, viewers, owners, api_token, cluster_id, pending_delete_stream_ids) =
             self.db.read_replicated_snapshot()?;
         let delete_tokens = self
@@ -848,7 +833,7 @@ impl SqliteStateMachine {
     }
 }
 
-fn log_id_ahead_of_boundary(current: Option<LogId<u64>>, boundary: Option<LogId<u64>>) -> bool {
+fn log_id_ahead_of_boundary(current: Option<LogId>, boundary: Option<LogId>) -> bool {
     match (current, boundary) {
         (Some(c), Some(b)) => c > b,
         (Some(_), None) => true,
@@ -856,8 +841,103 @@ fn log_id_ahead_of_boundary(current: Option<LogId<u64>>, boundary: Option<LogId<
     }
 }
 
+impl SqliteStateMachine {
+    /// Apply and durably persist one committed Raft entry before acknowledging it.
+    fn apply_one_entry(&self, entry: Entry) -> Result<ClusterResponse, io::Error> {
+        // Apply first, then advance last_applied. Never persist_applied before
+        // the command commits — a crash between would skip the mutation.
+        match entry.payload {
+            EntryPayload::Blank => {
+                let _apply = self.apply_lock.lock();
+                self.persist_applied_tx(entry.log_id, None)?;
+                return Ok(ClusterResponse::Ok);
+            }
+            EntryPayload::Normal(ref cmd) => {
+                // `apply_lock` spans the commit and the index update together so a
+                // concurrent `build_snapshot` (OpenRaft runs it on its own task)
+                // can never read this command's rows under a stale index.
+                let _apply = self.apply_lock.lock();
+                let resp = match cmd {
+                    ClusterCommand::AcquireStreamOwner {
+                        stream_id,
+                        node_id,
+                        epoch: _,
+                        acquired_at,
+                    } => {
+                        // Raft log index is cluster-wide monotonic — use it as
+                        // the fencing epoch so release cannot recycle tokens.
+                        let epoch = entry.log_id.index.max(1);
+                        match self.db.stream_owner_acquire(
+                            stream_id,
+                            *node_id,
+                            epoch,
+                            *acquired_at,
+                        ) {
+                            Ok(ep) => {
+                                self.emit_effect(StateEffect::OwnershipChanged);
+                                ClusterResponse::OwnerEpoch(ep)
+                            }
+                            Err(crate::db::OwnerError::Conflict) => ClusterResponse::Conflict,
+                            Err(crate::db::OwnerError::NotFound) => ClusterResponse::NotFound,
+                            Err(crate::db::OwnerError::Db) => {
+                                ClusterResponse::Error("db".into())
+                            }
+                        }
+                    }
+                    ClusterCommand::ReleaseOwnersForNode { .. } => {
+                        let index = entry.log_id.index.max(1);
+                        match self.apply_command(cmd) {
+                            // The apply index is the exact upper bound for
+                            // every ownership row that existed when this
+                            // release was appended; the caller uses it for
+                            // a repair pass that cannot touch a later
+                            // (rejoin) acquisition.
+                            ClusterResponse::Ok => ClusterResponse::Released(index),
+                            other => other,
+                        }
+                    }
+                    other => self.apply_command(other),
+                };
+                // Any apply-time Error (not only the literal "db") must
+                // fail the storage apply so last_applied does not advance
+                // past a partially omitted mutation.
+                if let ClusterResponse::Error(ref msg) = resp {
+                    return Err(io::Error::other(msg.clone()));
+                }
+                // Command SQL already committed via Db helpers; persist index next.
+                // Membership+index use a single tx; command+index cannot share a
+                // conn with Db helpers (non-reentrant mutex) — order still safe:
+                // lagging last_applied re-applies idempotently after crash.
+                self.persist_applied_tx(entry.log_id, None)?;
+                return Ok(resp);
+            }
+            EntryPayload::Membership(ref mem) => {
+                // Same lock as `apply`/`build_snapshot`/`install_snapshot`:
+                // without it a concurrent builder could observe the new
+                // membership log ID (persisted by `persist_applied_tx`)
+                // while still cloning the previous membership, recording a
+                // snapshot that restores the wrong voter set once that
+                // entry is compacted.
+                let _apply = self.apply_lock.lock();
+                let stored = StoredMembership::new(Some(entry.log_id), mem.clone());
+                let json = serde_json::to_string(&stored).map_err(|e| io::Error::other(e.to_string()))?;
+                self.persist_applied_tx(entry.log_id, Some(&json))?;
+                *self.last_membership.lock() = stored;
+                return Ok(ClusterResponse::Ok);
+            }
+        }
+
+    }
+
+    #[cfg(test)]
+    async fn apply(&mut self, entries: Vec<Entry>) -> Result<Vec<ClusterResponse>, io::Error> {
+        entries.into_iter().map(|entry| self.apply_one_entry(entry)).collect()
+    }
+}
+
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
+    type SnapshotData = Cursor<Vec<u8>>;
+    async fn build_snapshot(&mut self) -> Result<Snapshot, io::Error> {
         // Usually serialize outside apply_lock to keep apply latency low.
         // After repeated concurrent advances, hold the lock through encoding
         // so sustained writes cannot starve snapshot creation indefinitely.
@@ -871,29 +951,17 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 let applied = *self.last_applied.lock();
                 let data = self
                     .build_app_snapshot(applied)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::read_state_machine(&std::io::Error::other(
-                            e,
-                        )),
-                    })?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 (data, applied, self.last_membership.lock().clone())
             };
             if retries < MAX_UNLOCKED_ATTEMPTS {
                 // Optimistic capture: release the lock for expensive encoding.
                 apply_guard = None;
             }
-            let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::read_state_machine(&e),
-            })?;
-            let idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
-            let snapshot_id = match captured_applied {
-                Some(last) => format!("{}-{}-{}", last.leader_id, last.index, idx),
-                None => format!("--{idx}"),
-            };
+            let bytes = serde_json::to_vec(&data).map_err(|e| io::Error::other(e.to_string()))?;
             let meta = SnapshotMeta {
                 last_log_id: captured_applied,
                 last_membership,
-                snapshot_id,
             };
             // In the bounded fallback this is the original capture lock:
             // nothing can apply between capture, encoding and publication.
@@ -906,7 +974,7 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 // regressing the stored copies.
                 return Ok(Snapshot {
                     meta: existing.meta,
-                    snapshot: Box::new(Cursor::new(existing.data)),
+                    snapshot: Cursor::new(existing.data),
                 });
             }
             let current_applied = *self.last_applied.lock();
@@ -919,39 +987,36 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 data: bytes.clone(),
             });
             // Persist snapshot blob for crash recovery.
-            let meta_json = serde_json::to_string(&meta).map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_snapshot(None, &e),
-            })?;
+            let meta_json = serde_json::to_string(&meta).map_err(|e| io::Error::other(e.to_string()))?;
             self.db.with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO raft_snapshots(id, meta_json, data) VALUES(1, ?, ?) \
                      ON CONFLICT(id) DO UPDATE SET meta_json=excluded.meta_json, data=excluded.data",
                     params![meta_json, bytes],
                 )
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::write_snapshot(None, &e),
-                })?;
-                Ok::<(), StorageError<u64>>(())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+                Ok::<(), io::Error>(())
             })?;
             return Ok(Snapshot {
                 meta,
-                snapshot: Box::new(Cursor::new(bytes)),
+                snapshot: Cursor::new(bytes),
             });
         }
     }
 }
 
 impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
+    type SnapshotData = Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
 
     async fn applied_state(
         &mut self,
     ) -> Result<
         (
-            Option<LogId<u64>>,
-            StoredMembership<u64, openraft::BasicNode>,
+            Option<LogId>,
+            StoredMembership,
         ),
-        StorageError<u64>,
+        io::Error,
     > {
         Ok((
             *self.last_applied.lock(),
@@ -959,115 +1024,26 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         ))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ClusterResponse>, StorageError<u64>>
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
     where
-        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+        Strm: Stream<Item = Result<openraft::storage::EntryResponder<TypeConfig>, io::Error>>
+            + Unpin
+            + Send,
     {
-        let mut responses = Vec::new();
-        for entry in entries {
-            // Apply first, then advance last_applied. Never persist_applied before
-            // the command commits — a crash between would skip the mutation.
-            match entry.payload {
-                EntryPayload::Blank => {
-                    let _apply = self.apply_lock.lock();
-                    self.persist_applied_tx(entry.log_id, None)?;
-                    responses.push(ClusterResponse::Ok);
-                }
-                EntryPayload::Normal(ref cmd) => {
-                    // `apply_lock` spans the commit and the index update together so a
-                    // concurrent `build_snapshot` (OpenRaft runs it on its own task)
-                    // can never read this command's rows under a stale index.
-                    let _apply = self.apply_lock.lock();
-                    let resp = match cmd {
-                        ClusterCommand::AcquireStreamOwner {
-                            stream_id,
-                            node_id,
-                            epoch: _,
-                            acquired_at,
-                        } => {
-                            // Raft log index is cluster-wide monotonic — use it as
-                            // the fencing epoch so release cannot recycle tokens.
-                            let epoch = entry.log_id.index.max(1);
-                            match self.db.stream_owner_acquire(
-                                stream_id,
-                                *node_id,
-                                epoch,
-                                *acquired_at,
-                            ) {
-                                Ok(ep) => {
-                                    self.emit_effect(StateEffect::OwnershipChanged);
-                                    ClusterResponse::OwnerEpoch(ep)
-                                }
-                                Err(crate::db::OwnerError::Conflict) => ClusterResponse::Conflict,
-                                Err(crate::db::OwnerError::NotFound) => ClusterResponse::NotFound,
-                                Err(crate::db::OwnerError::Db) => {
-                                    ClusterResponse::Error("db".into())
-                                }
-                            }
-                        }
-                        ClusterCommand::ReleaseOwnersForNode { .. } => {
-                            let index = entry.log_id.index.max(1);
-                            match self.apply_command(cmd) {
-                                // The apply index is the exact upper bound for
-                                // every ownership row that existed when this
-                                // release was appended; the caller uses it for
-                                // a repair pass that cannot touch a later
-                                // (rejoin) acquisition.
-                                ClusterResponse::Ok => ClusterResponse::Released(index),
-                                other => other,
-                            }
-                        }
-                        other => self.apply_command(other),
-                    };
-                    // Any apply-time Error (not only the literal "db") must
-                    // fail the storage apply so last_applied does not advance
-                    // past a partially omitted mutation.
-                    if let ClusterResponse::Error(ref msg) = resp {
-                        return Err(StorageError::IO {
-                            source: StorageIOError::<u64>::write_state_machine(
-                                &std::io::Error::other(msg.clone()),
-                            ),
-                        });
-                    }
-                    // Command SQL already committed via Db helpers; persist index next.
-                    // Membership+index use a single tx; command+index cannot share a
-                    // conn with Db helpers (non-reentrant mutex) — order still safe:
-                    // lagging last_applied re-applies idempotently after crash.
-                    self.persist_applied_tx(entry.log_id, None)?;
-                    responses.push(resp);
-                }
-                EntryPayload::Membership(ref mem) => {
-                    // Same lock as `apply`/`build_snapshot`/`install_snapshot`:
-                    // without it a concurrent builder could observe the new
-                    // membership log ID (persisted by `persist_applied_tx`)
-                    // while still cloning the previous membership, recording a
-                    // snapshot that restores the wrong voter set once that
-                    // entry is compacted.
-                    let _apply = self.apply_lock.lock();
-                    let stored = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    let json = serde_json::to_string(&stored).map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::write_state_machine(&e),
-                    })?;
-                    self.persist_applied_tx(entry.log_id, Some(&json))?;
-                    *self.last_membership.lock() = stored;
-                    responses.push(ClusterResponse::Ok);
-                }
+        while let Some((entry, responder)) = entries.try_next().await? {
+            let response = self.apply_one_entry(entry)?;
+            if let Some(responder) = responder {
+                responder.send(response);
             }
         }
-        Ok(responses)
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+        Ok(())
     }
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<u64, openraft::BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<u64>> {
+        meta: &SnapshotMeta,
+        snapshot: Cursor<Vec<u8>>,
+    ) -> Result<(), io::Error> {
         // Same single-writer lock as `apply` and `build_snapshot`: OpenRaft
         // runs the snapshot builder on its own task while this installs, so
         // without it the builder could read the post-install rows while
@@ -1075,16 +1051,9 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         // payload is ahead of its own log boundary.
         let _apply = self.apply_lock.lock();
         let data = snapshot.into_inner();
-        let app: AppSnapshot = serde_json::from_slice(&data).map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::read_snapshot(Some(meta.signature()), &e),
-        })?;
+        let app: AppSnapshot = serde_json::from_slice(&data).map_err(|e| io::Error::other(e.to_string()))?;
         self.install_app_snapshot(&app)
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e),
-                ),
-            })?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         *self.last_membership.lock() = meta.last_membership.clone();
         // Persist both values in a single transaction (persist_applied_tx):
         // a crash between two separate writes here would leave the snapshot
@@ -1093,32 +1062,22 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         // voter set. When last_log_id is None, clear durable last_applied in
         // the same transaction so a prior high index cannot survive restart.
         let membership_json =
-            serde_json::to_string(&meta.last_membership).map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_state_machine(&e),
-            })?;
+            serde_json::to_string(&meta.last_membership).map_err(|e| io::Error::other(e.to_string()))?;
         if let Some(log_id) = meta.last_log_id {
             self.persist_applied_tx(log_id, Some(&membership_json))?;
         } else {
             self.db.with_conn(|conn| {
-                let tx = conn.unchecked_transaction().map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::write_state_machine(&e),
-                })?;
+                let tx = conn.unchecked_transaction().map_err(|e| io::Error::other(e.to_string()))?;
                 tx.execute(
                     "INSERT INTO raft_meta(key,val) VALUES('last_membership',?) \
                      ON CONFLICT(key) DO UPDATE SET val=excluded.val",
                     params![membership_json],
                 )
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::write_state_machine(&e),
-                })?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
                 tx.execute("DELETE FROM raft_meta WHERE key='last_applied'", [])
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::<u64>::write_state_machine(&e),
-                    })?;
-                tx.commit().map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::write_state_machine(&e),
-                })?;
-                Ok::<(), StorageError<u64>>(())
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
+                Ok::<(), io::Error>(())
             })?;
             *self.last_applied.lock() = None;
         }
@@ -1131,30 +1090,26 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         // would lose it even though last_applied already records the newer
         // boundary and the corresponding logs may already be compacted,
         // leaving this node unable to supply a lagging peer's recovery point.
-        let meta_json = serde_json::to_string(meta).map_err(|e| StorageError::IO {
-            source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), &e),
-        })?;
+        let meta_json = serde_json::to_string(meta).map_err(|e| io::Error::other(e.to_string()))?;
         self.db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO raft_snapshots(id, meta_json, data) VALUES(1, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET meta_json=excluded.meta_json, data=excluded.data",
                 params![meta_json, data],
             )
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::write_snapshot(Some(meta.signature()), &e),
-            })?;
-            Ok::<(), StorageError<u64>>(())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok::<(), io::Error>(())
         })?;
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+    ) -> Result<Option<Snapshot>, io::Error> {
         if let Some(snap) = self.current_snapshot.lock().clone() {
             return Ok(Some(Snapshot {
                 meta: snap.meta,
-                snapshot: Box::new(Cursor::new(snap.data)),
+                snapshot: Cursor::new(snap.data),
             }));
         }
         // Try load from DB. A genuine read failure (I/O, corruption,
@@ -1171,21 +1126,17 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                 )
                 .optional()
             })
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::<u64>::read_snapshot(None, &e),
-            })?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         if let Some((meta_json, data)) = loaded {
-            let meta: SnapshotMeta<u64, openraft::BasicNode> = serde_json::from_str(&meta_json)
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::<u64>::read_snapshot(None, &e),
-                })?;
+            let meta: SnapshotMeta = serde_json::from_str(&meta_json)
+                .map_err(|e| io::Error::other(e.to_string()))?;
             *self.current_snapshot.lock() = Some(StoredSnapshot {
                 meta: meta.clone(),
                 data: data.clone(),
             });
             return Ok(Some(Snapshot {
                 meta,
-                snapshot: Box::new(Cursor::new(data)),
+                snapshot: Cursor::new(data),
             }));
         }
         Ok(None)
@@ -1193,6 +1144,14 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
+    }
+}
+
+impl SnapshotReceiverFactory<TypeConfig> for SqliteStateMachine {
+    type SnapshotReceiver = Cursor<Vec<u8>>;
+
+    async fn begin_receiving_snapshot(&mut self) -> Result<Self::SnapshotReceiver, io::Error> {
+        Ok(Cursor::new(Vec::new()))
     }
 }
 
@@ -1245,7 +1204,7 @@ mod tests {
         }
     }
 
-    fn log_id(index: u64) -> LogId<u64> {
+    fn log_id(index: u64) -> LogId {
         LogId::new(CommittedLeaderId::new(1, 1), index)
     }
 
@@ -1259,7 +1218,7 @@ mod tests {
         assert!(!log_id_ahead_of_boundary(Some(log_id(2)), Some(log_id(3))));
     }
 
-    fn normal(index: u64, cmd: ClusterCommand) -> Entry<TypeConfig> {
+    fn normal(index: u64, cmd: ClusterCommand) -> Entry {
         Entry {
             log_id: log_id(index),
             payload: EntryPayload::Normal(cmd),
@@ -1278,7 +1237,7 @@ mod tests {
                 )
             })
             .collect();
-        Membership::new(vec![voters.iter().copied().collect::<BTreeSet<_>>()], nodes)
+        Membership::new(vec![voters.iter().copied().collect::<BTreeSet<_>>()], nodes).expect("valid test membership")
     }
 
     fn sm_with_effects() -> (SqliteStateMachine, Receiver<StateEffect>) {
@@ -1302,7 +1261,7 @@ mod tests {
         sm: &mut SqliteStateMachine,
         index: u64,
         cmd: ClusterCommand,
-    ) -> Result<ClusterResponse, StorageError<u64>> {
+    ) -> Result<ClusterResponse, io::Error> {
         sm.apply(vec![normal(index, cmd)])
             .await
             .map(|mut v| v.pop().unwrap())
@@ -2211,7 +2170,7 @@ mod tests {
         // Snapshot before anything was applied has an index-less id.
         let mut builder = sm.get_snapshot_builder().await;
         let empty = builder.build_snapshot().await.unwrap();
-        assert_eq!(empty.meta.snapshot_id, "--1");
+        assert!(empty.meta.last_log_id.is_none());
         assert!(empty.meta.last_log_id.is_none());
 
         sm.apply(vec![Entry {
@@ -2251,7 +2210,7 @@ mod tests {
 
         let snap = builder.build_snapshot().await.unwrap();
         assert_eq!(snap.meta.last_log_id, Some(log_id(5)));
-        assert!(snap.meta.snapshot_id.ends_with("-5-2"));
+        assert_eq!(snap.meta.last_log_id, Some(log_id(5)));
         let app: AppSnapshot = serde_json::from_slice(snap.snapshot.get_ref()).unwrap();
         assert_eq!(app.streams.len(), 1);
         assert_eq!(app.viewers.len(), 1);
@@ -2358,7 +2317,7 @@ mod tests {
                 .build()
                 .unwrap();
             let result = rt
-                .block_on(installer.install_snapshot(&meta, Box::new(std::io::Cursor::new(data))));
+                .block_on(installer.install_snapshot(&meta, std::io::Cursor::new(data)));
             tx.blocking_send(result.is_ok()).unwrap();
         });
 
@@ -2438,13 +2397,12 @@ mod tests {
     }
 
     fn snap_meta(
-        last: Option<LogId<u64>>,
+        last: Option<LogId>,
         mem: Membership<u64, BasicNode>,
-    ) -> SnapshotMeta<u64, BasicNode> {
+    ) -> SnapshotMeta {
         SnapshotMeta {
             last_log_id: last,
             last_membership: StoredMembership::new(last, mem),
-            snapshot_id: "test-snap".into(),
         }
     }
 
@@ -2495,7 +2453,7 @@ mod tests {
         };
         let meta = snap_meta(Some(log_id(20)), membership(&[1, 2]));
         let data = serde_json::to_vec(&snap).unwrap();
-        sm.install_snapshot(&meta, Box::new(Cursor::new(data.clone())))
+        sm.install_snapshot(&meta, Cursor::new(data.clone()))
             .await
             .unwrap();
 
@@ -2571,7 +2529,7 @@ mod tests {
         let (mut sm, rx) = sm_with_effects();
         let empty = serde_json::to_vec(&AppSnapshot::default()).unwrap();
         let meta = snap_meta(None, Membership::default());
-        sm.install_snapshot(&meta, Box::new(Cursor::new(empty.clone())))
+        sm.install_snapshot(&meta, Cursor::new(empty.clone()))
             .await
             .unwrap();
         assert!(sm.applied_state().await.unwrap().0.is_none());
@@ -2603,7 +2561,7 @@ mod tests {
         assert!(sm_cid.db().token_replace("stale-token").is_ok());
         let empty_legacy = serde_json::to_vec(&AppSnapshot::default()).unwrap();
         sm_cid
-            .install_snapshot(&meta, Box::new(Cursor::new(empty_legacy)))
+            .install_snapshot(&meta, Cursor::new(empty_legacy))
             .await
             .unwrap();
         assert_eq!(
@@ -2619,7 +2577,7 @@ mod tests {
 
         // Undecodable payload.
         assert!(
-            sm.install_snapshot(&meta, Box::new(Cursor::new(b"not json".to_vec())))
+            sm.install_snapshot(&meta, Cursor::new(b"not json".to_vec()))
                 .await
                 .is_err()
         );
@@ -2653,7 +2611,7 @@ mod tests {
         let (mut sm, _rx) = sm_with_effects();
         exec(&sm, "DROP TABLE raft_snapshots");
         assert!(
-            sm.install_snapshot(&meta, Box::new(Cursor::new(empty.clone())))
+            sm.install_snapshot(&meta, Cursor::new(empty.clone()))
                 .await
                 .is_err()
         );
@@ -2662,7 +2620,7 @@ mod tests {
         let (mut sm, _rx) = sm_with_effects();
         exec(&sm, "DROP TABLE raft_meta");
         assert!(
-            sm.install_snapshot(&meta, Box::new(Cursor::new(empty)))
+            sm.install_snapshot(&meta, Cursor::new(empty))
                 .await
                 .is_err()
         );
