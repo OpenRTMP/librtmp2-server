@@ -4278,7 +4278,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn start_rejects_invalid_configs() {
         let rt = tokio::runtime::Handle::current();
-        let db = || Arc::new(Db::open(":memory:").unwrap());
+        // Cluster startup rejects in-memory databases: Raft needs a file to
+        // fsync. Keep every case here file-backed so each one reaches the
+        // config/bind failure it is actually asserting.
+        let dir = tempfile::tempdir().unwrap();
+        let next_db = std::sync::atomic::AtomicU32::new(0);
+        let db = || {
+            let n = next_db.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = dir.path().join(format!("cfg-{n}.db"));
+            Arc::new(Db::open(path.to_str().unwrap()).unwrap())
+        };
 
         let mut cfg = node_cfg(1, true, None);
         cfg.enabled = false;
