@@ -2124,9 +2124,25 @@ impl Db {
     /// power loss, so a node could forget a vote it granted (two leaders in one
     /// term) or an entry it acknowledged. Cluster mode therefore pays the
     /// fsync-per-commit cost that standalone mode deliberately avoids.
+    ///
+    /// An in-memory database has no file to fsync; accepting one here would
+    /// silently break the same contract, so cluster mode rejects it.
     #[cfg(any(feature = "cluster", feature = "test-support", test))]
-    pub fn require_durable_commits(&self) -> rusqlite::Result<()> {
-        self.with_conn(|conn| conn.pragma_update(None, "synchronous", "FULL"))
+    pub fn require_durable_commits(&self) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let file: String = conn
+                .query_row("PRAGMA database_list", [], |row| row.get(2))
+                .map_err(|e| e.to_string())?;
+            if file.is_empty() {
+                return Err(
+                    "cluster mode requires a file-backed database; in-memory SQLite \
+                     cannot persist Raft votes or log entries"
+                        .to_string(),
+                );
+            }
+            conn.pragma_update(None, "synchronous", "FULL")
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Group commit: run `f` -- typically several independent operations,
@@ -3115,6 +3131,14 @@ mod tests {
         // Re-applying is harmless and keeps an idempotent startup path.
         db.require_durable_commits().unwrap();
         assert_eq!(synchronous(&db), 2);
+
+        // An in-memory database cannot honour the same contract.
+        let memory = Db::open(":memory:").unwrap();
+        let error = memory.require_durable_commits().unwrap_err();
+        assert!(
+            error.contains("file-backed database"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]
