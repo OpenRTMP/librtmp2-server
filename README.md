@@ -490,7 +490,8 @@ them.
 ## Docker
 
 Prebuilt multi-arch images (`amd64`/`arm64`/`riscv64`) are published to
-`ghcr.io/openrtmp/librtmp2-server` on every release — no local build needed:
+`ghcr.io/openrtmp/librtmp2-server` and [Docker Hub](https://hub.docker.com/r/openrtmp/librtmp2-server)
+(`openrtmp/librtmp2-server`) on every release — no local build needed:
 
 ```bash
 docker run -d \
