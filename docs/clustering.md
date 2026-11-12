@@ -1,6 +1,6 @@
 # Clustering (optional HA)
 
-`librtmp2-server` can run as a multi-node cluster using **OpenRaft 0.9** for
+`librtmp2-server` can run as a multi-node cluster using **OpenRaft 0.10** for
 durable state and a separate **media mesh** for inter-node relay. Clustering is
 **off by default**. Standalone behavior is unchanged when `CLUSTER_ENABLED=false`.
 

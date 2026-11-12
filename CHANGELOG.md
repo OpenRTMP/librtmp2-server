@@ -13,6 +13,60 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-12
+
+### Added
+- Docker Hub images. Every release and channel build now also publishes
+  `docker.io/openrtmp/librtmp2-server` next to GHCR and Quay, using the
+  org-level `DOCKERHUB_*` secrets. `README.dockerhub.md` is the paste-ready
+  repository description.
+
+### Security
+- A cluster delete keeps its per-row random `delete_token` through
+  `SeedFromStandalone`; a seed entry written before tokens existed derives
+  the same deterministic fallback on every replica. A stream seeded on a
+  fresh learner can be deleted through that node again, and log-replayed and
+  snapshot-restored nodes no longer diverge.
+- Cluster startup upgrades the shared SQLite connection to
+  `synchronous=FULL` before any Raft state is read or written, so a granted
+  vote or acknowledged log entry survives a power loss. An in-memory
+  database is rejected for durable Raft commits; standalone keeps `NORMAL`
+  for join latency.
+- A stream drain counts durable active session rows, and a disabled or
+  pending-delete stream refuses new publisher and player rows, so an
+  authorization that finishes after finalize cannot install a ghost role.
+  Ownership release takes the per-connection entry under one lock and only
+  for the stream being released, and delete markers are published under a
+  consistent sticky-then-deleted lock order.
+
+### Fixed
+- A publish or play authorization that is still in flight no longer lets the
+  old tracked role deactivate the row it just installed; the old role is
+  released only after the pending authorization resolves, for publishers
+  and players alike.
+- A cluster delete whose forwarded write fails after dispatch is treated as
+  ambiguous and finalized in the background, while a connect, TLS or auth
+  failure that never reached the leader stays a definite 500. A failed
+  DELETE restores the stream's pre-request enabled state instead of always
+  enabling it.
+- The players list uses the checked viewer reader, so a viewer-table failure
+  returns the DB error envelope instead of `200 []`.
+- The sticky-marker lock is released before viewer lookups and the idle
+  sleep, so a poll pass cannot hold it across an unrelated viewer lookup.
+
+### Changed
+- Package version `0.6.9` → `0.7.0`.
+- The HA control plane is built on OpenRaft 0.10 through the v1 RPC and
+  snapshot adapter. Raft voters must still run the same build before relying
+  on the delete/ownership fences; see `docs/clustering.md`.
+- Built on librtmp2 0.17.1.
+- The Docker runtime image tracks the `alpine:3.24` tag, which provides the
+  riscv64 variant, instead of pinning `3.24.4`.
+- The multi-arch Docker workflow accepts a `ref` input so a release image
+  can be rebuilt from the exact tag.
+- Dependency updates: rusqlite 0.42 (bundled SQLite) and uuid 1.29.2.
+- CI workflows pin third-party GitHub Actions to commit SHAs.
+
 ## [0.6.9] — 2026-11-06
 
 ### Security
@@ -1288,7 +1342,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.9...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.9...v0.7.0
 [0.6.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.6...v0.6.7
