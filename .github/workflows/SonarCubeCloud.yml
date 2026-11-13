@@ -37,10 +37,12 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-llvm-cov
 
       - name: Read crate version
         id: crate_version
-        run: echo "version=$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(awk -F'\"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)" >> "$GITHUB_OUTPUT"
 
       - name: Generate test coverage
         run: |
