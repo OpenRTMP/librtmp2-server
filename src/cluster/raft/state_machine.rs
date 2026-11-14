@@ -1,8 +1,10 @@
 //! Raft state machine: applies ClusterCommand to local SQLite app tables.
 
 use futures::{Stream, TryStreamExt};
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, SeekFrom};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::RaftStateMachine;
@@ -10,6 +12,7 @@ use openraft::{EntryPayload, RaftSnapshotBuilder};
 use openraft_legacy::network_v1::SnapshotReceiverFactory;
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 use crate::cluster::command::{ClusterCommand, ClusterResponse};
 use crate::cluster::raft::TypeConfig;
@@ -20,7 +23,93 @@ type Entry = EntryOf<TypeConfig>;
 type LogId = LogIdOf<TypeConfig>;
 type SnapshotMeta = SnapshotMetaOf<TypeConfig>;
 type StoredMembership = StoredMembershipOf<TypeConfig>;
-type Snapshot = SnapshotOf<TypeConfig, Cursor<Vec<u8>>>;
+type Snapshot = SnapshotOf<TypeConfig, SnapshotBuf>;
+
+/// Snapshot data buffer that refuses to zero-fill a gap the peer never sent.
+///
+/// OpenRaft's legacy chunked receiver seeks its snapshot writer to the
+/// peer-supplied `offset` before every `RaftSnapshot` chunk. `Cursor<Vec<u8>>`
+/// satisfies a forward seek by resizing the vector, so a single small chunk
+/// carrying a huge offset would make the process allocate that much memory and
+/// abort. Rejecting a seek past the bytes already received removes the
+/// amplification: the buffer can only grow by data that actually arrived.
+#[derive(Clone, Default)]
+pub struct SnapshotBuf {
+    inner: Cursor<Vec<u8>>,
+}
+
+impl SnapshotBuf {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            inner: Cursor::new(data),
+        }
+    }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.inner.into_inner()
+    }
+
+    pub fn get_ref(&self) -> &Vec<u8> {
+        self.inner.get_ref()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.get_ref().len()
+    }
+}
+
+impl AsyncRead for SnapshotBuf {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SnapshotBuf {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl AsyncSeek for SnapshotBuf {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        let received = self.inner.get_ref().len() as u64;
+        let target = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(offset) => received.checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.inner.position().checked_add_signed(offset),
+        };
+        // A seek may target any byte already written, and nothing further. An
+        // overflowing target fails closed for the same reason.
+        if target.is_none_or(|offset| offset > received) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot seek is beyond the bytes received",
+            ));
+        }
+        Pin::new(&mut self.inner).start_seek(position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Pin::new(&mut self.inner).poll_complete(cx)
+    }
+}
 
 /// Side effects that must run after a Raft apply on every node (session markers,
 /// in-memory bearer refresh). Delivered via an optional channel set by
@@ -936,7 +1025,7 @@ impl SqliteStateMachine {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
-    type SnapshotData = Cursor<Vec<u8>>;
+    type SnapshotData = SnapshotBuf;
     async fn build_snapshot(&mut self) -> Result<Snapshot, io::Error> {
         // Usually serialize outside apply_lock to keep apply latency low.
         // After repeated concurrent advances, hold the lock through encoding
@@ -974,7 +1063,7 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 // regressing the stored copies.
                 return Ok(Snapshot {
                     meta: existing.meta,
-                    snapshot: Cursor::new(existing.data),
+                    snapshot: SnapshotBuf::new(existing.data),
                 });
             }
             let current_applied = *self.last_applied.lock();
@@ -1000,14 +1089,14 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
             })?;
             return Ok(Snapshot {
                 meta,
-                snapshot: Cursor::new(bytes),
+                snapshot: SnapshotBuf::new(bytes),
             });
         }
     }
 }
 
 impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
-    type SnapshotData = Cursor<Vec<u8>>;
+    type SnapshotData = SnapshotBuf;
     type SnapshotBuilder = Self;
 
     async fn applied_state(&mut self) -> Result<(Option<LogId>, StoredMembership), io::Error> {
@@ -1035,7 +1124,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta,
-        snapshot: Cursor<Vec<u8>>,
+        snapshot: SnapshotBuf,
     ) -> Result<(), io::Error> {
         // Same single-writer lock as `apply` and `build_snapshot`: OpenRaft
         // runs the snapshot builder on its own task while this installs, so
@@ -1103,7 +1192,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         if let Some(snap) = self.current_snapshot.lock().clone() {
             return Ok(Some(Snapshot {
                 meta: snap.meta,
-                snapshot: Cursor::new(snap.data),
+                snapshot: SnapshotBuf::new(snap.data),
             }));
         }
         // Try load from DB. A genuine read failure (I/O, corruption,
@@ -1130,7 +1219,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
             });
             return Ok(Some(Snapshot {
                 meta,
-                snapshot: Cursor::new(data),
+                snapshot: SnapshotBuf::new(data),
             }));
         }
         Ok(None)
@@ -1142,10 +1231,10 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
 }
 
 impl SnapshotReceiverFactory<TypeConfig> for SqliteStateMachine {
-    type SnapshotReceiver = Cursor<Vec<u8>>;
+    type SnapshotReceiver = SnapshotBuf;
 
     async fn begin_receiving_snapshot(&mut self) -> Result<Self::SnapshotReceiver, io::Error> {
-        Ok(Cursor::new(Vec::new()))
+        Ok(SnapshotBuf::default())
     }
 }
 
@@ -1161,6 +1250,52 @@ mod tests {
 
     use super::*;
     use crate::db::{Player, Publisher, StatSample, Stream, StreamViewer};
+    use std::io::SeekFrom;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    /// A peer-supplied chunk offset must never extend the receiver buffer by
+    /// bytes the peer did not send: `Cursor<Vec<u8>>` would zero-fill the gap
+    /// and abort the process on allocation for a huge offset.
+    #[tokio::test]
+    async fn snapshot_buf_rejects_offset_past_received_bytes() {
+        let mut buf = SnapshotBuf::default();
+
+        let error = buf
+            .seek(SeekFrom::Start(256 * 1024 * 1024 * 1024 * 1024))
+            .await
+            .expect_err("an offset far past the received bytes must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(buf.len(), 0, "a rejected seek must not allocate");
+        assert!(
+            buf.seek(SeekFrom::End(1)).await.is_err(),
+            "a forward End seek must be rejected too"
+        );
+        assert!(
+            buf.seek(SeekFrom::Current(1)).await.is_err(),
+            "a forward Current seek must be rejected too"
+        );
+
+        buf.write_all(b"abc").await.unwrap();
+        assert_eq!(buf.len(), 3);
+
+        // A forward seek to the bytes already received is harmless and is what
+        // a legitimate retry can request.
+        buf.seek(SeekFrom::Start(3)).await.unwrap();
+        buf.write_all(b"def").await.unwrap();
+        assert_eq!(buf.len(), 6);
+
+        // The sender asks for the length with End(0) and may step backwards.
+        assert_eq!(buf.seek(SeekFrom::End(0)).await.unwrap(), 6);
+        assert_eq!(buf.seek(SeekFrom::Current(-1)).await.unwrap(), 5);
+
+        // A rewind is legitimate (the sender restarts a segment).
+        buf.seek(SeekFrom::Start(1)).await.unwrap();
+        buf.write_all(b"Z").await.unwrap();
+        buf.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut out = Vec::new();
+        buf.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"aZcdef");
+    }
 
     fn key(prefix: &str, id: &str) -> String {
         format!("{prefix}_{id:x<32}")
@@ -2313,7 +2448,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let result = rt.block_on(installer.install_snapshot(&meta, std::io::Cursor::new(data)));
+            let result = rt.block_on(installer.install_snapshot(&meta, SnapshotBuf::new(data)));
             tx.blocking_send(result.is_ok()).unwrap();
         });
 
@@ -2446,7 +2581,7 @@ mod tests {
         };
         let meta = snap_meta(Some(log_id(20)), membership(&[1, 2]));
         let data = serde_json::to_vec(&snap).unwrap();
-        sm.install_snapshot(&meta, Cursor::new(data.clone()))
+        sm.install_snapshot(&meta, SnapshotBuf::new(data.clone()))
             .await
             .unwrap();
 
@@ -2522,7 +2657,7 @@ mod tests {
         let (mut sm, rx) = sm_with_effects();
         let empty = serde_json::to_vec(&AppSnapshot::default()).unwrap();
         let meta = snap_meta(None, Membership::default());
-        sm.install_snapshot(&meta, Cursor::new(empty.clone()))
+        sm.install_snapshot(&meta, SnapshotBuf::new(empty.clone()))
             .await
             .unwrap();
         assert!(sm.applied_state().await.unwrap().0.is_none());
@@ -2554,7 +2689,7 @@ mod tests {
         assert!(sm_cid.db().token_replace("stale-token").is_ok());
         let empty_legacy = serde_json::to_vec(&AppSnapshot::default()).unwrap();
         sm_cid
-            .install_snapshot(&meta, Cursor::new(empty_legacy))
+            .install_snapshot(&meta, SnapshotBuf::new(empty_legacy))
             .await
             .unwrap();
         assert_eq!(
@@ -2570,7 +2705,7 @@ mod tests {
 
         // Undecodable payload.
         assert!(
-            sm.install_snapshot(&meta, Cursor::new(b"not json".to_vec()))
+            sm.install_snapshot(&meta, SnapshotBuf::new(b"not json".to_vec()))
                 .await
                 .is_err()
         );
@@ -2587,7 +2722,7 @@ mod tests {
         };
         let meta = snap_meta(Some(log_id(9)), membership(&[1]));
         assert!(
-            sm.install_snapshot(&meta, Cursor::new(serde_json::to_vec(&dup).unwrap()))
+            sm.install_snapshot(&meta, SnapshotBuf::new(serde_json::to_vec(&dup).unwrap()))
                 .await
                 .is_err()
         );
@@ -2601,7 +2736,7 @@ mod tests {
         let (mut sm, _rx) = sm_with_effects();
         exec(&sm, "DROP TABLE raft_snapshots");
         assert!(
-            sm.install_snapshot(&meta, Cursor::new(empty.clone()))
+            sm.install_snapshot(&meta, SnapshotBuf::new(empty.clone()))
                 .await
                 .is_err()
         );
@@ -2610,7 +2745,7 @@ mod tests {
         let (mut sm, _rx) = sm_with_effects();
         exec(&sm, "DROP TABLE raft_meta");
         assert!(
-            sm.install_snapshot(&meta, Cursor::new(empty))
+            sm.install_snapshot(&meta, SnapshotBuf::new(empty))
                 .await
                 .is_err()
         );
