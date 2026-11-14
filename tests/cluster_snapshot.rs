@@ -3,8 +3,13 @@
 #![cfg(feature = "cluster")]
 
 use std::io::SeekFrom;
+use std::sync::Arc;
 
-use librtmp2_server::cluster::raft::state_machine::SnapshotBuf;
+use librtmp2_server::cluster::raft::TypeConfig;
+use librtmp2_server::cluster::raft::state_machine::{SnapshotBuf, SqliteStateMachine};
+use librtmp2_server::db::Db;
+use openraft::alias::SnapshotMetaOf;
+use openraft::storage::RaftStateMachine;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// A peer-supplied chunk offset must never extend the receiver buffer by bytes
@@ -54,4 +59,33 @@ async fn snapshot_buf_rejects_offset_past_received_bytes() {
     buf.read_to_end(&mut out).await.unwrap();
     assert_eq!(out, b"aZcdef");
     assert_eq!(buf.into_inner(), b"aZcdef");
+}
+
+/// The cached-snapshot path must return the same bytes the database load
+/// produced, so a second install or send does not switch data types.
+#[tokio::test]
+async fn get_current_snapshot_reuses_the_cached_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot-cache.db");
+    let db = Arc::new(Db::open(path.to_str().unwrap()).unwrap());
+    let meta: SnapshotMetaOf<TypeConfig> = SnapshotMetaOf::<TypeConfig> {
+        last_log_id: None,
+        last_membership: Default::default(),
+    };
+    let meta_json = serde_json::to_string(&meta).unwrap();
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO raft_snapshots(id, meta_json, data) VALUES(1, ?, ?)",
+            rusqlite::params![meta_json, b"cached-bytes".to_vec()],
+        )
+        .unwrap();
+    });
+
+    let mut sm = SqliteStateMachine::new(db).unwrap();
+    let loaded = sm.get_current_snapshot().await.unwrap().unwrap();
+    assert_eq!(loaded.snapshot.get_ref().as_slice(), b"cached-bytes");
+
+    // Second call is served from `current_snapshot`, not the database.
+    let cached = sm.get_current_snapshot().await.unwrap().unwrap();
+    assert_eq!(cached.snapshot.get_ref().as_slice(), b"cached-bytes");
 }
