@@ -552,7 +552,8 @@ impl NetworkFactory {
 }
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
-    type Network = Adapter<TypeConfig, NetworkConnection, std::io::Cursor<Vec<u8>>>;
+    type Network =
+        Adapter<TypeConfig, NetworkConnection, crate::cluster::raft::state_machine::SnapshotBuf>;
 
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
         NetworkConnection {
