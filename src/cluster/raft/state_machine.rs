@@ -89,14 +89,19 @@ impl AsyncWrite for SnapshotBuf {
 
 impl AsyncSeek for SnapshotBuf {
     fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
-        if let SeekFrom::Start(offset) = position {
-            let received = self.inner.get_ref().len() as u64;
-            if offset > received {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "snapshot chunk offset is beyond the bytes received",
-                ));
-            }
+        let received = self.inner.get_ref().len() as u64;
+        let target = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(offset) => received.checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.inner.position().checked_add_signed(offset),
+        };
+        // A seek may target any byte already written, and nothing further. An
+        // overflowing target fails closed for the same reason.
+        if target.is_none_or(|offset| offset > received) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot seek is beyond the bytes received",
+            ));
         }
         Pin::new(&mut self.inner).start_seek(position)
     }
@@ -1261,6 +1266,14 @@ mod tests {
             .expect_err("an offset far past the received bytes must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(buf.len(), 0, "a rejected seek must not allocate");
+        assert!(
+            buf.seek(SeekFrom::End(1)).await.is_err(),
+            "a forward End seek must be rejected too"
+        );
+        assert!(
+            buf.seek(SeekFrom::Current(1)).await.is_err(),
+            "a forward Current seek must be rejected too"
+        );
 
         buf.write_all(b"abc").await.unwrap();
         assert_eq!(buf.len(), 3);
@@ -1270,6 +1283,10 @@ mod tests {
         buf.seek(SeekFrom::Start(3)).await.unwrap();
         buf.write_all(b"def").await.unwrap();
         assert_eq!(buf.len(), 6);
+
+        // The sender asks for the length with End(0) and may step backwards.
+        assert_eq!(buf.seek(SeekFrom::End(0)).await.unwrap(), 6);
+        assert_eq!(buf.seek(SeekFrom::Current(-1)).await.unwrap(), 5);
 
         // A rewind is legitimate (the sender restarts a segment).
         buf.seek(SeekFrom::Start(1)).await.unwrap();
