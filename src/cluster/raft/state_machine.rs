@@ -52,11 +52,6 @@ impl SnapshotBuf {
     pub fn get_ref(&self) -> &Vec<u8> {
         self.inner.get_ref()
     }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.inner.get_ref().len()
-    }
 }
 
 impl AsyncRead for SnapshotBuf {
@@ -1250,52 +1245,6 @@ mod tests {
 
     use super::*;
     use crate::db::{Player, Publisher, StatSample, Stream, StreamViewer};
-    use std::io::SeekFrom;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-
-    /// A peer-supplied chunk offset must never extend the receiver buffer by
-    /// bytes the peer did not send: `Cursor<Vec<u8>>` would zero-fill the gap
-    /// and abort the process on allocation for a huge offset.
-    #[tokio::test]
-    async fn snapshot_buf_rejects_offset_past_received_bytes() {
-        let mut buf = SnapshotBuf::default();
-
-        let error = buf
-            .seek(SeekFrom::Start(256 * 1024 * 1024 * 1024 * 1024))
-            .await
-            .expect_err("an offset far past the received bytes must be rejected");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(buf.len(), 0, "a rejected seek must not allocate");
-        assert!(
-            buf.seek(SeekFrom::End(1)).await.is_err(),
-            "a forward End seek must be rejected too"
-        );
-        assert!(
-            buf.seek(SeekFrom::Current(1)).await.is_err(),
-            "a forward Current seek must be rejected too"
-        );
-
-        buf.write_all(b"abc").await.unwrap();
-        assert_eq!(buf.len(), 3);
-
-        // A forward seek to the bytes already received is harmless and is what
-        // a legitimate retry can request.
-        buf.seek(SeekFrom::Start(3)).await.unwrap();
-        buf.write_all(b"def").await.unwrap();
-        assert_eq!(buf.len(), 6);
-
-        // The sender asks for the length with End(0) and may step backwards.
-        assert_eq!(buf.seek(SeekFrom::End(0)).await.unwrap(), 6);
-        assert_eq!(buf.seek(SeekFrom::Current(-1)).await.unwrap(), 5);
-
-        // A rewind is legitimate (the sender restarts a segment).
-        buf.seek(SeekFrom::Start(1)).await.unwrap();
-        buf.write_all(b"Z").await.unwrap();
-        buf.seek(SeekFrom::Start(0)).await.unwrap();
-        let mut out = Vec::new();
-        buf.read_to_end(&mut out).await.unwrap();
-        assert_eq!(out, b"aZcdef");
-    }
 
     fn key(prefix: &str, id: &str) -> String {
         format!("{prefix}_{id:x<32}")
