@@ -51,6 +51,7 @@ jobs:
           cargo llvm-cov --features test-support,cluster --no-report -- --test-threads=1
           cargo llvm-cov --features test-support,cluster --no-report --test rtmp_http_e2e -- --test-threads=1
           cargo llvm-cov --features test-support,cluster --no-report --test cluster_ha -- --test-threads=1
+          cargo llvm-cov --features test-support,cluster --no-report --test cluster_snapshot -- --test-threads=1
           cargo llvm-cov --features test-support,cluster --no-report --test cluster_security -- --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
 
