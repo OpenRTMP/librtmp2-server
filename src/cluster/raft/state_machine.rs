@@ -1185,9 +1185,10 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, io::Error> {
         if let Some(snap) = self.current_snapshot.lock().clone() {
+            let cached = SnapshotBuf::new(snap.data);
             return Ok(Some(Snapshot {
                 meta: snap.meta,
-                snapshot: SnapshotBuf::new(snap.data),
+                snapshot: cached,
             }));
         }
         // Try load from DB. A genuine read failure (I/O, corruption,
