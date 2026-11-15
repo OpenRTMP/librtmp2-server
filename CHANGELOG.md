@@ -13,6 +13,9 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Changed
+- The CI benchmark sweep compares against MediaMTX v1.21.4 (was v1.21.3).
+
 ## [0.7.0] — 2026-11-12
 
 ### Added
