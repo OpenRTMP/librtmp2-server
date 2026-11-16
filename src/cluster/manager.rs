@@ -4562,7 +4562,11 @@ mod tests {
 
     /// The pending ambiguous-acquire list is bounded: the overflow is reported
     /// instead of growing the list without limit.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    ///
+    /// A current-thread runtime keeps the manager's background health loop
+    /// parked while the synchronous insert/assert block runs, so the count is
+    /// not drained by a concurrent reconcile tick.
+    #[tokio::test]
     async fn ambiguous_acquire_list_reports_its_overflow() {
         let n = bootstrap(1, |_| {}).await;
         let m = &n.mgr;
@@ -6067,6 +6071,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pending_stream_cleanup_drains_in_bounded_batches() {
         let n = bootstrap(1, |_| {}).await;
+        // Keep the heartbeat loop from spawning its own drain while the test
+        // drives the batches, otherwise a concurrent tick removes a batch
+        // between the counting asserts.
+        n.mgr
+            .pending_cleanup_drain_running
+            .store(true, Ordering::Release);
         let total = PENDING_STREAM_CLEANUP_BATCH * 2 + 1;
         {
             let mut queued = n.mgr.pending_stream_cleanups.lock();
@@ -6083,6 +6093,9 @@ mod tests {
         n.mgr.retry_pending_stream_cleanups();
         n.mgr.retry_pending_stream_cleanups();
         assert!(n.mgr.pending_stream_cleanups.lock().is_empty());
+        n.mgr
+            .pending_cleanup_drain_running
+            .store(false, Ordering::Release);
         n.mgr.shutdown_blocking();
     }
 
