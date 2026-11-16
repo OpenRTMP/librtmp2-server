@@ -199,7 +199,10 @@ impl RateLimiter {
 pub(crate) fn ct_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let n = a.len().max(b.len());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    // Compare the lengths as a boolean, not as a truncated byte: a length
+    // difference that is a multiple of 256 would otherwise XOR to zero and
+    // let a NUL-filled candidate compare equal to a longer token.
+    let mut diff = u8::from(a.len() != b.len());
     for i in 0..n {
         let ca = a.get(i).copied().unwrap_or(0);
         let cb = b.get(i).copied().unwrap_or(0);
@@ -606,6 +609,11 @@ mod tests {
         assert!(ct_str_eq("abc", "abc"));
         assert!(!ct_str_eq("abc", "abd"));
         assert!(!ct_str_eq("abc", "abcd"));
+        // A length difference of exactly 256 used to truncate to zero in the
+        // length byte, so a NUL-filled candidate compared equal to a longer
+        // NUL-filled token.
+        assert!(!ct_str_eq(&"\0".repeat(256), ""));
+        assert!(!ct_str_eq("", &"\0".repeat(256)));
     }
 
     #[test]
