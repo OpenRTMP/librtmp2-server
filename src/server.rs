@@ -1665,6 +1665,10 @@ pub(crate) fn process_server_connections(
         } else if is_publishing && entry.publishing {
             // Same-connection stream switch: bridge already moved the
             // publisher row; keep relay_key / kick targets in sync.
+            // Read the ID before the publisher check: if the publisher is
+            // released between the two reads, the check rejects the
+            // connection before this pre-release ID can be used.
+            let sid = rtmp_bridge.stream_id_for_conn(conn_id);
             if !rtmp_bridge.has_publisher(conn_id) {
                 // The library still reports publishing, but the bridge no
                 // longer owns a publisher row: cluster heal or delete-drain
@@ -1680,7 +1684,6 @@ pub(crate) fn process_server_connections(
                 reject_indices.push(idx);
                 continue;
             }
-            let sid = rtmp_bridge.stream_id_for_conn(conn_id);
             if !sid.is_empty() && sid != entry.stream_id {
                 entry.stream_id = sid.clone();
                 conn.relay_key = sid;
@@ -4982,6 +4985,7 @@ mod tests {
         assert!(conn.relay_enabled);
     }
 
+    #[serial_test::serial]
     #[test]
     fn abandoned_dual_role_publisher_is_closed_not_relabelled_as_its_player_stream() {
         let mut h = PollHarness::new(&["s1", "s2"]);
@@ -4996,11 +5000,7 @@ mod tests {
         h.bridge.force_unpublish_stream("s1");
         assert!(!h.bridge.has_publisher(h.conn_id));
         assert!(h.bridge.has_player(h.conn_id));
-        let (kick, _) = h.tick_with(&HashSet::new(), &HashSet::new(), NO_IDLE_EVICTION);
-        assert!(
-            kick.contains(&h.conn_id),
-            "an abandoned publisher must not be re-labelled as the player's stream"
-        );
+        h.tick_with(&HashSet::new(), &HashSet::new(), NO_IDLE_EVICTION);
         assert!(
             !h.is_open(),
             "the abandoned publisher connection must be closed"

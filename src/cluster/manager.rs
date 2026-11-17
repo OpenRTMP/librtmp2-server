@@ -5452,8 +5452,14 @@ mod tests {
         m.peer_session_counts.lock().insert(42, (1, 1));
         m.meta().set_addrs(42, dead_addr(), dead_addr());
         m.prune_topology_to_membership();
-        assert!(m.meta().get(42).is_none());
-        assert!(!m.peer_session_counts.lock().contains_key(&42));
+        // A background prune may have removed the address first and be
+        // between the two cache removals; wait for both to be gone.
+        assert!(
+            wait_until(Duration::from_secs(1), || {
+                m.meta().get(42).is_none() && !m.peer_session_counts.lock().contains_key(&42)
+            })
+            .await
+        );
 
         // A local Learner that is already a voter is reconciled to Ready.
         m.health().set_local(NodeHealthState::Learner);
