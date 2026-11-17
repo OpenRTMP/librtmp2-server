@@ -5446,8 +5446,11 @@ mod tests {
         let m = &n.mgr;
 
         // Unknown (non-member) nodes are pruned from every topology cache.
-        m.meta().set_addrs(42, dead_addr(), dead_addr());
+        // Insert the cached count before the address: the background health
+        // loop prunes only nodes that are in `meta`, so this order cannot
+        // leave the count behind if the loop runs between the two inserts.
         m.peer_session_counts.lock().insert(42, (1, 1));
+        m.meta().set_addrs(42, dead_addr(), dead_addr());
         m.prune_topology_to_membership();
         assert!(m.meta().get(42).is_none());
         assert!(!m.peer_session_counts.lock().contains_key(&42));
