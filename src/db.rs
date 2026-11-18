@@ -2258,10 +2258,13 @@ impl Db {
                 }
             }
         }
+        // Publish under the active-counts lock so a concurrent reservation
+        // either lands before the merge or waits for the new map (lock order).
+        let mut counts = self.active_player_counts.lock();
         for (viewer_id, n) in self.unpersisted_player_counts.lock().iter() {
             *next.entry(viewer_id.clone()).or_insert(0) += n;
         }
-        *self.active_player_counts.lock() = next;
+        *counts = next;
     }
 
     /// Atomically insert an active publisher only when the stream has none.
