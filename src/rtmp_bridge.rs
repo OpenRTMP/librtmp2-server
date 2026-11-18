@@ -873,20 +873,13 @@ impl DbRtmpBridge {
         pub_row.active = false;
         if !self.db.publisher_update(&pub_row.id, &pub_row) {
             if self.db.publisher_exists(&pub_row.id) {
-                crate::log_error!(
-                    "RTMP: failed to deactivate publisher on release: stream={} session={} from {peer} (will retry on close)",
-                    pub_row.stream_id,
-                    pub_row.id
-                );
+                crate::log_error!("publisher release failed session={}", pub_row.id);
                 return;
             }
             // The row was dropped out from under the session (cluster snapshot
             // install / stream delete). There is nothing left to update, so
             // clear the in-memory role instead of retrying forever.
-            crate::log_warn!(
-                "RTMP: publisher row {} vanished; clearing the in-memory role",
-                pub_row.id
-            );
+            crate::log_warn!("publisher row {} vanished; clearing role", pub_row.id);
         }
         crate::log_info!(
             "RTMP: publisher released: stream={} session={} from {peer}",
@@ -945,16 +938,10 @@ impl DbRtmpBridge {
         row.active = false;
         if !self.db.publisher_update(&row.id, &row) {
             if self.db.publisher_exists(&row.id) {
-                crate::log_error!(
-                    "RTMP: failed to deactivate superseded publisher session={} conn={conn}",
-                    row.id
-                );
+                crate::log_error!("superseded publisher deactivation failed id={}", row.id);
                 return;
             }
-            crate::log_warn!(
-                "RTMP: superseded publisher row {} vanished; clearing the in-memory role",
-                row.id
-            );
+            crate::log_warn!("superseded publisher row {} vanished", row.id);
         }
         let still_current = self
             .conns
@@ -1010,16 +997,10 @@ impl DbRtmpBridge {
         let updated = self.db.player_update(&row.id, &row);
         if !updated {
             if self.db.player_exists(&row.id) {
-                crate::log_error!(
-                    "RTMP: failed to deactivate superseded player session={} conn={conn}",
-                    row.id
-                );
+                crate::log_error!("superseded player deactivation failed session={}", row.id);
                 return;
             }
-            crate::log_warn!(
-                "RTMP: superseded player row {} vanished; clearing the in-memory role",
-                row.id
-            );
+            crate::log_warn!("superseded player row {} vanished; clearing role", row.id);
             if !self.pending_fast_play_rows.lock().contains(&row.id) {
                 self.db.resync_player_counts();
             }
@@ -1095,17 +1076,10 @@ impl DbRtmpBridge {
         let updated = self.db.player_update(&player_row.id, &player_row);
         if !updated {
             if self.db.player_exists(&player_row.id) {
-                crate::log_error!(
-                    "RTMP: failed to deactivate player on release: stream={} session={} from {peer} (will retry on close)",
-                    player_row.stream_id,
-                    player_row.id
-                );
+                crate::log_error!("player release failed session={}", player_row.id);
                 return;
             }
-            crate::log_warn!(
-                "RTMP: player row {} vanished; clearing the in-memory role",
-                player_row.id
-            );
+            crate::log_warn!("player row {} vanished; clearing role", player_row.id);
             // A fast-path row whose PersistPlay is still queued has no durable
             // row yet; the queued write settles the reserved slot (and
             // deactivates the row once the role is gone). Otherwise rebuild
@@ -1167,10 +1141,7 @@ impl DbRtmpBridge {
         let mut inactive = row.clone();
         inactive.active = false;
         if !self.db.player_update(&row.id, &inactive) {
-            crate::log_error!(
-                "RTMP: failed to retire concurrently persisted player session={}",
-                row.id
-            );
+            crate::log_error!("failed to retire persisted player session={}", row.id);
             if self.db.player_exists(&row.id) {
                 self.pending_deactivations
                     .lock()
@@ -1971,10 +1942,7 @@ impl DbRtmpBridge {
                         .lock()
                         .push(PendingDeactivation::Publisher(inactive));
                 }
-                crate::log_error!(
-                    "RTMP: failed to deactivate dropped publisher session={}; queued for retry",
-                    row.id
-                );
+                crate::log_error!("dropped publisher deactivation queued session={}", row.id);
             }
         }
     }
@@ -2042,10 +2010,7 @@ impl DbRtmpBridge {
                         .lock()
                         .push(PendingDeactivation::Player(inactive));
                 }
-                crate::log_error!(
-                    "RTMP: failed to deactivate dropped player session={}; queued for retry",
-                    row.id
-                );
+                crate::log_error!("dropped player deactivation queued session={}", row.id);
             }
         }
         self.pending_fast_play_rows.lock().remove(&row.id);
@@ -4100,6 +4065,7 @@ mod tests {
         assert!(db.player_list(Some("s1")).iter().all(|row| !row.active));
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
     fn failed_retirement_of_a_concurrently_persisted_player_is_queued() {
         let db = Arc::new(Db::open(":memory:").unwrap());

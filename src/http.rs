@@ -2222,18 +2222,9 @@ async fn handle_stream_player_delete(
             return err_json(StatusCode::NOT_FOUND, "NOT_FOUND", "Player not found");
         }
         DbLookup::Failed => {
-            log_http_access(
-                "DELETE",
-                &path,
-                &peer,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "db error",
-            );
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Failed to load player",
-            );
+            let status = StatusCode::INTERNAL_SERVER_ERROR;
+            log_http_access("DELETE", &path, &peer, status, "db error");
+            return err_json(status, "INTERNAL_ERROR", "Failed to load player");
         }
         DbLookup::Ok(viewer) => viewer,
     };
@@ -2241,18 +2232,9 @@ async fn handle_stream_player_delete(
         Ok(viewers) => viewers,
         Err(e) => {
             crate::log_error!("DELETE player: viewer_list({id}): {e}");
-            log_http_access(
-                "DELETE",
-                &path,
-                &peer,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "db error",
-            );
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Failed to load play keys",
-            );
+            let status = StatusCode::INTERNAL_SERVER_ERROR;
+            log_http_access("DELETE", &path, &peer, status, "db error");
+            return err_json(status, "INTERNAL_ERROR", "Failed to load play keys");
         }
     };
     if viewers.len() <= 1 {
