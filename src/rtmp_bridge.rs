@@ -1961,8 +1961,13 @@ impl DbRtmpBridge {
             let mut inactive = row.clone();
             inactive.active = false;
             if !self.db.publisher_update(&inactive.id, &inactive) {
+                if self.db.publisher_exists(&inactive.id) {
+                    self.pending_deactivations
+                        .lock()
+                        .push(PendingDeactivation::Publisher(inactive));
+                }
                 crate::log_error!(
-                    "RTMP: failed to deactivate dropped publisher session={}",
+                    "RTMP: failed to deactivate dropped publisher session={}; queued for retry",
                     row.id
                 );
             }
@@ -2027,8 +2032,13 @@ impl DbRtmpBridge {
             let mut inactive = row.clone();
             inactive.active = false;
             if !self.db.player_update(&inactive.id, &inactive) {
+                if self.db.player_exists(&inactive.id) {
+                    self.pending_deactivations
+                        .lock()
+                        .push(PendingDeactivation::Player(inactive));
+                }
                 crate::log_error!(
-                    "RTMP: failed to deactivate dropped player session={}",
+                    "RTMP: failed to deactivate dropped player session={}; queued for retry",
                     row.id
                 );
             }
@@ -3738,6 +3748,42 @@ mod tests {
             bridge.stream_id_for_conn(1),
             "s1",
             "surviving publisher must keep stream_id after play cancel"
+        );
+    }
+
+    #[test]
+    fn failed_persist_fast_play_deactivation_is_queued_for_retry() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        let play = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+        // Drop the role before the queued persist runs, so persist inserts
+        // the row and then tries to deactivate it.
+        bridge.release_player(1);
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER block_player_update BEFORE UPDATE ON players \
+                 BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+            )
+            .unwrap()
+        });
+
+        bridge.persist_fast_play(1, &play);
+
+        assert_eq!(
+            bridge.pending_deactivations.lock().len(),
+            1,
+            "a failed post-insert deactivation must be retried, not dropped"
+        );
+        assert!(
+            db.player_list(Some("s1"))
+                .iter()
+                .any(|row| row.id == play.id && row.active),
+            "the failed write leaves the row active until the retry"
         );
     }
 
