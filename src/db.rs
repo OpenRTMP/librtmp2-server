@@ -646,7 +646,7 @@ impl Db {
     /// never observes a state SQLite doesn't also have. Safe to call for a
     /// viewer with no tracked sessions (a no-op) so duplicate
     /// release/disconnect handling can never underflow.
-    fn player_count_decr(&self, viewer_id: &str) {
+    pub(crate) fn player_count_decr(&self, viewer_id: &str) {
         Self::decr_count(&mut self.active_player_counts.lock(), viewer_id);
     }
 
@@ -1269,7 +1269,13 @@ impl Db {
         );
         match result {
             Ok(rows) => match tx.commit() {
-                Ok(()) => Some(rows > 0),
+                Ok(()) => {
+                    // `ON DELETE CASCADE` removed the player rows without
+                    // going through `player_update`, so rebuild the in-memory
+                    // per-viewer counters instead of leaking their slots.
+                    self.resync_active_player_counts(&conn);
+                    Some(rows > 0)
+                }
                 Err(e) => {
                     crate::log_error!("DB pending-delete commit error for {id}: {e}");
                     None
@@ -1303,7 +1309,12 @@ impl Db {
 
         match result {
             Ok(rows) => match tx.commit() {
-                Ok(()) => Some(rows > 0),
+                Ok(()) => {
+                    // The cascade removed players without `player_update`, so
+                    // their in-memory slots would otherwise stay allocated.
+                    self.resync_active_player_counts(&conn);
+                    Some(rows > 0)
+                }
                 Err(e) => {
                     crate::log_error!("DB cascade delete commit error for {id}: {e}");
                     None
@@ -2164,6 +2175,22 @@ impl Db {
         if !conn.is_autocommit() || conn.execute_batch("BEGIN IMMEDIATE").is_err() {
             return (f(), true);
         }
+        // Roll the outer transaction back if `f` panics. Without this guard an
+        // unwind leaves `BEGIN IMMEDIATE` open on the single shared connection:
+        // parking_lot does not poison the mutex, the auth worker thread dies,
+        // and every later write takes the savepoint path (`RELEASE`), so
+        // "committed" rows are silently discarded at exit and the WAL grows.
+        // The guard is a no-op on the normal path because COMMIT/ROLLBACK
+        // returns the connection to autocommit before Drop runs.
+        struct RollbackOnDrop<'a>(&'a Connection);
+        impl Drop for RollbackOnDrop<'_> {
+            fn drop(&mut self) {
+                if !self.0.is_autocommit() {
+                    let _ = self.0.execute_batch("ROLLBACK");
+                }
+            }
+        }
+        let _txn = RollbackOnDrop(&conn);
         let result = f();
         #[cfg(test)]
         let commit = if self
@@ -2813,13 +2840,21 @@ impl Db {
         // the cap re-check below (only for a transition into active) and
         // the in-memory counter sync after the write (for every active
         // transition, in either direction) need it.
-        let current: Option<(bool, String)> = conn
-            .query_row(
-                "SELECT active, viewer_id FROM players WHERE id=?",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
+        let current: Option<(bool, String)> = match conn.query_row(
+            "SELECT active, viewer_id FROM players WHERE id=?",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                // A read fault is not "the row is inactive": treating it as
+                // None would reserve a slot, let the UPDATE succeed, and never
+                // release that reservation. Fail closed before reserving.
+                crate::log_error!("player_update read error for {id}: {e}");
+                return false;
+            }
+        };
         let mut reserved_slot = false;
         if p.active {
             if p.viewer_id.is_empty() {
@@ -3372,6 +3407,29 @@ mod tests {
     }
 
     #[test]
+    fn panic_inside_batch_rolls_back_the_outer_transaction() {
+        let db = Db::open(":memory:").unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.batch(|| panic!("simulated batch failure"));
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            db.with_conn(|conn| conn.is_autocommit()),
+            "a panicking batch must not leave BEGIN IMMEDIATE open"
+        );
+        // The connection is reusable and still commits normally.
+        db.stream_add(&sample_stream(
+            "after_panic",
+            "live_key_panic",
+            "play_key_panic",
+            "sts_key_panic",
+        ))
+        .unwrap();
+        assert!(matches!(db.stream_get("after_panic"), DbLookup::Ok(_)));
+        assert!(db.with_conn(|conn| conn.is_autocommit()));
+    }
+
+    #[test]
     fn nested_batch_runs_inside_the_outer_transaction() {
         let db = Db::open(":memory:").unwrap();
         db.stream_add(&sample_stream(
@@ -3656,6 +3714,32 @@ mod tests {
         assert!(matches!(db.stream_delete("cascade"), Some(true)));
         assert_eq!(db.publisher_list(Some("cascade")).len(), 0);
         assert!(matches!(db.stream_get("cascade"), DbLookup::Missing));
+    }
+
+    #[test]
+    fn stream_delete_releases_cascaded_player_slots() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("cascade_players", "pub_cp", "pl_cp", "st_cp");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert!(db.player_try_acquire(&Player {
+            id: "cascade_player_1".to_string(),
+            stream_id: "cascade_players".to_string(),
+            viewer_id: viewer.id.clone(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
+
+        assert!(matches!(db.stream_delete("cascade_players"), Some(true)));
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            0,
+            "cascade-deleted players must release their in-memory slots"
+        );
     }
 
     #[test]
@@ -4389,6 +4473,53 @@ mod tests {
         assert_eq!(
             db.player_list(Some("stream1")).len(),
             MAX_CONNECTIONS_PER_PLAY_KEY
+        );
+    }
+
+    #[test]
+    fn player_update_read_error_fails_closed_without_reserving_a_slot() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "sts_key_789");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert!(db.player_try_acquire(&Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        }));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
+
+        // Make the row's viewer_id undecodable as a Rust String. The UPDATE
+        // would still succeed, so a swallowed read error would reserve a
+        // second in-memory slot that is never released.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE players SET viewer_id=CAST(x'80' AS TEXT) WHERE id='pl0'",
+                [],
+            )
+            .unwrap()
+        });
+        let update = Player {
+            id: "pl0".to_string(),
+            stream_id: "stream1".to_string(),
+            viewer_id: viewer.id.clone(),
+            connected_at: now_ts(),
+            active: true,
+            ..Default::default()
+        };
+        assert!(
+            !db.player_update("pl0", &update),
+            "a read/decode failure must fail the update closed"
+        );
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            1,
+            "a failed read must not reserve an extra slot"
         );
     }
 

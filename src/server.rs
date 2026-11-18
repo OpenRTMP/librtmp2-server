@@ -1426,6 +1426,13 @@ fn drain_deleted_stream_roles(
         return false;
     }
 
+    // No authorized role survives. Drop any relay state before the caller
+    // closes the socket so a same-tick relay pass cannot emit the deleted
+    // stream's queued frames.
+    conn.relay_key.clear();
+    conn.relay_enabled = false;
+    conn.pending_relay.clear();
+
     let kicked_id = pub_sid
         .filter(|_| pub_hit)
         .or_else(|| play_sid.filter(|_| play_hit))
@@ -5276,7 +5283,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_deleted_roles_never_relays_a_stream_whose_release_failed() {
+    fn drain_deleted_roles_kicks_a_publisher_whose_row_vanished() {
         let (db, bridge) = bridge_with_streams(&["s1"]);
         bridge.on_connect(1, "127.0.0.1:1000");
         assert!(
@@ -5284,8 +5291,8 @@ mod tests {
                 .authorize_publish(1, "live", &sample_stream("s1").publish_key)
                 .is_ok()
         );
-        // The row vanishes under the publisher, so deactivating it fails and
-        // the bridge keeps the role for a retry on close.
+        // The row vanishes under the publisher. The release cannot update it,
+        // but the role must not be kept as a phantom retry target.
         assert_eq!(db.stream_delete("s1"), Some(true));
         let mut conn = rtmp_conn(1, true, false);
         conn.relay_key = "s1".into();
@@ -5298,11 +5305,14 @@ mod tests {
         };
         let deleted: HashSet<String> = ["s1".to_string()].into();
 
-        assert!(!drain_deleted_stream_roles(
+        assert!(drain_deleted_stream_roles(
             &mut conn, &mut entry, &bridge, 1, &deleted
         ));
-        assert!(bridge.has_publisher(1), "role kept for a retry on close");
-        assert!(entry.publishing);
+        assert!(
+            !bridge.has_publisher(1),
+            "the vanished row must not pin a role"
+        );
+        assert!(!entry.publishing);
         assert!(conn.relay_key.is_empty());
         assert!(
             !conn.relay_enabled,
