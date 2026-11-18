@@ -17,6 +17,18 @@ use tempfile::TempDir;
 
 const TEST_API_TOKEN: &str = "cluster-ha-test-api-token";
 
+// Raft acknowledges leader writes before asynchronous learner replication catches up.
+// Assert eventual replica state rather than relying on fixed sleeps under CI load.
+async fn wait_for_replica_state(description: &str, condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+}
+
 fn secret() -> String {
     "test-cluster-secret-32-chars-min--".to_string()
 }
@@ -244,19 +256,23 @@ async fn viewer_and_delete_replicate() {
         created_at: 1,
     };
     n1.create_viewer(&viewer).unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(matches!(
-        n2.db().viewer_get("sv", "v1"),
-        librtmp2_server::db::DbLookup::Ok(_)
-    ));
+    wait_for_replica_state("viewer v1 on node 2", || {
+        matches!(
+            n2.db().viewer_get("sv", "v1"),
+            librtmp2_server::db::DbLookup::Ok(_)
+        )
+    })
+    .await;
 
     n1.begin_delete_stream("sv").unwrap();
     n1.finalize_delete_stream("sv").unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(matches!(
-        n2.db().stream_get("sv"),
-        librtmp2_server::db::DbLookup::Missing
-    ));
+    wait_for_replica_state("stream sv deletion on node 2", || {
+        matches!(
+            n2.db().stream_get("sv"),
+            librtmp2_server::db::DbLookup::Missing
+        )
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
