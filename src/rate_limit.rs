@@ -1,4 +1,8 @@
 //! Per-client HTTP rate limiting (in-process sliding window).
+//!
+//! IPv6 clients are bucketed by their /64 prefix, not by exact address: one
+//! host controls an entire /64, so per-address keys let it mint unlimited
+//! budgets (and evict other clients' buckets).
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -285,6 +289,21 @@ pub fn resolve_client_ip(
     peer
 }
 
+/// Bucket IPv6 clients by their routed `/64` prefix instead of the exact
+/// address. One host can otherwise mint a fresh rate-limit bucket per address
+/// inside its /64 (and evict other clients' buckets once the tracking map is
+/// full), defeating the per-client limit. This mirrors the cluster auth
+/// tracker's `/64` aggregation; IPv4 keys are unchanged.
+fn rate_limit_bucket_ip(peer: IpAddr) -> IpAddr {
+    match peer.to_canonical() {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
 pub async fn middleware(
     State(limiter): State<RateLimiter>,
     request: Request,
@@ -295,7 +314,7 @@ pub async fn middleware(
     let token = limiter.api_token.read().clone();
     let authenticated = bearer_authenticated(request.headers(), &token);
     let (max, bucket) = limiter.bucket_for(path, authenticated);
-    let key = format!("{peer}:{bucket}");
+    let key = format!("{}:{bucket}", rate_limit_bucket_ip(peer));
     if !limiter.check(&key, max) {
         let method = request.method().as_str();
         crate::log_warn!("HTTP: {method} {path} from {peer} → 429 rate limit exceeded");
@@ -325,6 +344,22 @@ mod tests {
             Vec::new(),
             token("test-token"),
         )
+    }
+
+    #[test]
+    fn ipv6_addresses_share_a_slash_64_rate_limit_bucket() {
+        use std::net::IpAddr;
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::ffff".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(rate_limit_bucket_ip(a), rate_limit_bucket_ip(b));
+        assert_ne!(rate_limit_bucket_ip(a), rate_limit_bucket_ip(other));
+
+        // IPv4 (including the v4-mapped form) keeps its exact address.
+        let v4: IpAddr = "198.51.100.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
+        assert_eq!(rate_limit_bucket_ip(v4), v4);
+        assert_eq!(rate_limit_bucket_ip(mapped), v4);
     }
 
     #[test]

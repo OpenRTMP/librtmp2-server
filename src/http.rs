@@ -2237,7 +2237,25 @@ async fn handle_stream_player_delete(
         }
         DbLookup::Ok(viewer) => viewer,
     };
-    if state.db.viewer_list(&id).len() <= 1 {
+    let viewers = match state.db.viewer_list_checked(&id) {
+        Ok(viewers) => viewers,
+        Err(e) => {
+            crate::log_error!("DELETE player: viewer_list({id}): {e}");
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+            );
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Failed to load play keys",
+            );
+        }
+    };
+    if viewers.len() <= 1 {
         log_http_access(
             "DELETE",
             &path,
@@ -5099,6 +5117,19 @@ mod tests {
             .expect("secondary viewer")
             .id;
         let player_uri = format!("/api/v1/streams/pddb/players/{second}");
+
+        // A sibling viewer row with invalid UTF-8 makes the list decode fail
+        // while the requested row still loads. The handler must report a DB
+        // error, not "cannot delete the last play key".
+        exec_sql(
+            &state,
+            "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
+             VALUES ('badutf','pddb',CAST(x'80' AS TEXT),'play_bad_utf8_key_1234567890',1,0);",
+        );
+        let (status, body) = send(&app, "DELETE", &player_uri, true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Failed to load play keys"));
+        exec_sql(&state, "DELETE FROM stream_viewers WHERE id='badutf';");
 
         exec_sql(
             &state,

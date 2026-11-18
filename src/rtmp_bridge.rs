@@ -867,12 +867,21 @@ impl DbRtmpBridge {
         };
         pub_row.active = false;
         if !self.db.publisher_update(&pub_row.id, &pub_row) {
-            crate::log_error!(
-                "RTMP: failed to deactivate publisher on release: stream={} session={} from {peer} (will retry on close)",
-                pub_row.stream_id,
+            if self.db.publisher_exists(&pub_row.id) {
+                crate::log_error!(
+                    "RTMP: failed to deactivate publisher on release: stream={} session={} from {peer} (will retry on close)",
+                    pub_row.stream_id,
+                    pub_row.id
+                );
+                return;
+            }
+            // The row was dropped out from under the session (cluster snapshot
+            // install / stream delete). There is nothing left to update, so
+            // clear the in-memory role instead of retrying forever.
+            crate::log_warn!(
+                "RTMP: publisher row {} vanished; clearing the in-memory role",
                 pub_row.id
             );
-            return;
         }
         crate::log_info!(
             "RTMP: publisher released: stream={} session={} from {peer}",
@@ -930,11 +939,17 @@ impl DbRtmpBridge {
         };
         row.active = false;
         if !self.db.publisher_update(&row.id, &row) {
-            crate::log_error!(
-                "RTMP: failed to deactivate superseded publisher session={} conn={conn}",
+            if self.db.publisher_exists(&row.id) {
+                crate::log_error!(
+                    "RTMP: failed to deactivate superseded publisher session={} conn={conn}",
+                    row.id
+                );
+                return;
+            }
+            crate::log_warn!(
+                "RTMP: superseded publisher row {} vanished; clearing the in-memory role",
                 row.id
             );
-            return;
         }
         let still_current = self
             .conns
@@ -988,11 +1003,18 @@ impl DbRtmpBridge {
         };
         row.active = false;
         if !self.db.player_update(&row.id, &row) {
-            crate::log_error!(
-                "RTMP: failed to deactivate superseded player session={} conn={conn}",
+            if self.db.player_exists(&row.id) {
+                crate::log_error!(
+                    "RTMP: failed to deactivate superseded player session={} conn={conn}",
+                    row.id
+                );
+                return;
+            }
+            crate::log_warn!(
+                "RTMP: superseded player row {} vanished; clearing the in-memory role",
                 row.id
             );
-            return;
+            self.db.player_count_decr(&row.viewer_id);
         }
         #[cfg(all(test, feature = "cluster"))]
         {
@@ -1059,12 +1081,19 @@ impl DbRtmpBridge {
         };
         player_row.active = false;
         if !self.db.player_update(&player_row.id, &player_row) {
-            crate::log_error!(
-                "RTMP: failed to deactivate player on release: stream={} session={} from {peer} (will retry on close)",
-                player_row.stream_id,
+            if self.db.player_exists(&player_row.id) {
+                crate::log_error!(
+                    "RTMP: failed to deactivate player on release: stream={} session={} from {peer} (will retry on close)",
+                    player_row.stream_id,
+                    player_row.id
+                );
+                return;
+            }
+            crate::log_warn!(
+                "RTMP: player row {} vanished; clearing the in-memory role",
                 player_row.id
             );
-            return;
+            self.db.player_count_decr(&player_row.viewer_id);
         }
         crate::log_info!(
             "RTMP: player released: stream={} session={} from {peer}",
@@ -2922,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn release_publisher_keeps_role_when_db_deactivation_fails() {
+    fn release_publisher_clears_role_when_the_row_was_cascade_deleted() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
@@ -2936,14 +2965,16 @@ mod tests {
 
         bridge.release_publisher(1);
 
-        // The role must stay tracked so on_close (or a later replace) can
-        // retry the deactivation instead of leaking an active-looking row.
-        let guard = bridge.conns.lock();
-        assert!(guard.get(&1).unwrap().publisher.is_some());
+        // The row is gone; keeping the role would pin a phantom session and
+        // make a later delete-drain wait for a session no row can release.
+        assert!(
+            bridge.conns.lock().get(&1).unwrap().publisher.is_none(),
+            "a vanished publisher row must clear the in-memory role"
+        );
     }
 
     #[test]
-    fn release_player_keeps_role_when_db_deactivation_fails() {
+    fn release_player_clears_role_when_the_row_was_cascade_deleted() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
@@ -2955,8 +2986,10 @@ mod tests {
 
         bridge.release_player(1);
 
-        let guard = bridge.conns.lock();
-        assert!(guard.get(&1).unwrap().player.is_some());
+        assert!(
+            bridge.conns.lock().get(&1).unwrap().player.is_none(),
+            "a vanished player row must clear the in-memory role"
+        );
     }
 
     #[test]
@@ -3696,7 +3729,7 @@ mod tests {
     }
 
     #[test]
-    fn release_publisher_if_id_keeps_the_role_when_deactivation_fails() {
+    fn release_publisher_if_id_clears_the_role_when_the_row_was_cascade_deleted() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
@@ -3706,9 +3739,9 @@ mod tests {
         assert!(matches!(db.stream_delete("s1"), Some(true)));
 
         bridge.release_publisher_if_id(1, &publisher_id);
-        assert_eq!(
-            bridge.session_rows(1).0.as_ref().map(|p| p.id.as_str()),
-            Some(publisher_id.as_str())
+        assert!(
+            bridge.session_rows(1).0.is_none(),
+            "a vanished superseded publisher row must clear the in-memory role"
         );
     }
 
@@ -3834,7 +3867,7 @@ mod tests {
     }
 
     #[test]
-    fn release_player_if_id_keeps_the_role_when_deactivation_fails() {
+    fn release_player_if_id_clears_the_role_when_the_row_was_cascade_deleted() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
@@ -3844,9 +3877,9 @@ mod tests {
         assert!(matches!(db.stream_delete("s1"), Some(true)));
 
         bridge.release_player_if_id(1, &player_id);
-        assert_eq!(
-            bridge.session_rows(1).1.as_ref().map(|p| p.id.as_str()),
-            Some(player_id.as_str())
+        assert!(
+            bridge.session_rows(1).1.is_none(),
+            "a vanished superseded player row must clear the in-memory role"
         );
     }
 
