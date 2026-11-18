@@ -2238,25 +2238,45 @@ impl Db {
     }
 
     /// Rebuild `active_player_counts` from the `players` table.
+    ///
+    /// Build the replacement map first and publish it only after every row
+    /// decoded. A failed read must not leave the counters empty or partial:
+    /// that would let `player_reserve` admit sessions past the per-key cap.
     fn resync_active_player_counts(&self, conn: &Connection) {
-        let mut counts = self.active_player_counts.lock();
-        counts.clear();
-        let Ok(mut stmt) = conn
+        let mut next = HashMap::new();
+        let mut stmt = match conn
             .prepare("SELECT viewer_id, COUNT(*) FROM players WHERE active=1 GROUP BY viewer_id")
-        else {
-            return;
+        {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                crate::log_error!("player count resync prepare failed: {e}");
+                return;
+            }
         };
-        let rows = stmt.query_map([], |row| {
+        let rows = match stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        });
-        if let Ok(rows) = rows {
-            for (viewer_id, n) in rows.flatten() {
-                counts.insert(viewer_id, n.max(0) as usize);
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                crate::log_error!("player count resync query failed: {e}");
+                return;
+            }
+        };
+        for row in rows {
+            match row {
+                Ok((viewer_id, n)) => {
+                    next.insert(viewer_id, n.max(0) as usize);
+                }
+                Err(e) => {
+                    crate::log_error!("player count resync row failed: {e}");
+                    return;
+                }
             }
         }
         for (viewer_id, n) in self.unpersisted_player_counts.lock().iter() {
-            *counts.entry(viewer_id.clone()).or_insert(0) += n;
+            *next.entry(viewer_id.clone()).or_insert(0) += n;
         }
+        *self.active_player_counts.lock() = next;
     }
 
     /// Atomically insert an active publisher only when the stream has none.
@@ -3793,6 +3813,35 @@ mod tests {
             db.player_active_count_for_viewer(&viewer.id),
             0,
             "cascade-deleted players must release their in-memory slots"
+        );
+    }
+
+    #[test]
+    fn player_count_resync_keeps_the_old_counts_when_the_read_fails() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("resync_fail", "pub_rf", "pl_rf", "st_rf");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert!(db.player_try_acquire(&Player {
+            id: "resync_player".to_string(),
+            stream_id: "resync_fail".to_string(),
+            viewer_id: viewer.id.clone(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
+        db.with_conn(|c| c.execute("DROP TABLE players", []))
+            .unwrap();
+
+        db.resync_player_counts();
+
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            1,
+            "a failed rebuild must keep the previous cap accounting"
         );
     }
 
