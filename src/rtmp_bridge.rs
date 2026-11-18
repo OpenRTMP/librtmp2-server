@@ -1171,6 +1171,11 @@ impl DbRtmpBridge {
                 "RTMP: failed to retire concurrently persisted player session={}",
                 row.id
             );
+            if self.db.player_exists(&row.id) {
+                self.pending_deactivations
+                    .lock()
+                    .push(PendingDeactivation::Player(inactive));
+            }
         }
     }
 
@@ -3002,11 +3007,7 @@ mod tests {
         db.with_conn(|c| c.execute("DROP TABLE publishers", []))
             .unwrap();
         bridge.on_close(1);
-        assert_eq!(
-            bridge.pending_deactivations.lock().len(),
-            1,
-            "a failed deactivation must be queued for the poll loop"
-        );
+        assert_eq!(bridge.pending_deactivations.lock().len(), 1);
     }
 
     #[test]
@@ -3026,10 +3027,7 @@ mod tests {
 
         // The row is gone; keeping the role would pin a phantom session and
         // make a later delete-drain wait for a session no row can release.
-        assert!(
-            bridge.conns.lock().get(&1).unwrap().publisher.is_none(),
-            "a vanished publisher row must clear the in-memory role"
-        );
+        assert!(bridge.conns.lock().get(&1).unwrap().publisher.is_none());
     }
 
     #[test]
@@ -3044,10 +3042,7 @@ mod tests {
 
         bridge.release_publisher(1);
 
-        assert!(
-            bridge.session_rows(1).0.is_some(),
-            "an unreadable table must keep the role for a retry (fail closed)"
-        );
+        assert!(bridge.session_rows(1).0.is_some());
     }
 
     #[test]
@@ -3062,10 +3057,7 @@ mod tests {
 
         bridge.release_player(1);
 
-        assert!(
-            bridge.session_rows(1).1.is_some(),
-            "an unreadable table must keep the role for a retry (fail closed)"
-        );
+        assert!(bridge.session_rows(1).1.is_some());
     }
 
     #[test]
@@ -3083,15 +3075,8 @@ mod tests {
 
         bridge.release_player(1);
 
-        assert!(
-            bridge.conns.lock().get(&1).unwrap().player.is_none(),
-            "a vanished player row must clear the in-memory role"
-        );
-        assert_eq!(
-            db.player_active_count_for_viewer(&viewer_id),
-            0,
-            "releasing a cascade-deleted row must not decrement a slot twice"
-        );
+        assert!(bridge.conns.lock().get(&1).unwrap().player.is_none());
+        assert_eq!(db.player_active_count_for_viewer(&viewer_id), 0);
     }
 
     #[test]
@@ -3765,25 +3750,44 @@ mod tests {
         // the row and then tries to deactivate it.
         bridge.release_player(1);
         db.with_conn(|c| {
-            c.execute_batch(
-                "CREATE TRIGGER block_player_update BEFORE UPDATE ON players \
-                 BEGIN SELECT RAISE(FAIL, 'injected'); END;",
-            )
-            .unwrap()
+            c.execute_batch("CREATE TRIGGER block_player_update BEFORE UPDATE ON players BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap()
         });
 
         bridge.persist_fast_play(1, &play);
 
-        assert_eq!(
-            bridge.pending_deactivations.lock().len(),
-            1,
-            "a failed post-insert deactivation must be retried, not dropped"
-        );
+        assert_eq!(bridge.pending_deactivations.lock().len(), 1);
         assert!(
             db.player_list(Some("s1"))
                 .iter()
-                .any(|row| row.id == play.id && row.active),
-            "the failed write leaves the row active until the retry"
+                .any(|row| row.id == play.id && row.active)
+        );
+    }
+
+    #[test]
+    fn failed_persist_fast_publish_deactivation_is_queued_for_retry() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
+        let publish = bridge.session_rows(1).0.expect("publisher admitted");
+        bridge.release_publisher(1);
+        db.with_conn(|c| {
+            c.execute("DELETE FROM publishers WHERE id=?1", [&publish.id])
+                .unwrap()
+        });
+        db.with_conn(|c| {
+            c.execute_batch("CREATE TRIGGER block_publisher_update BEFORE UPDATE ON publishers BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap()
+        });
+
+        bridge.persist_fast_publish(1, &publish);
+
+        assert_eq!(bridge.pending_deactivations.lock().len(), 1);
+        assert!(
+            db.publisher_list(Some("s1"))
+                .iter()
+                .any(|row| row.id == publish.id && row.active)
         );
     }
 
@@ -3803,23 +3807,14 @@ mod tests {
         // release must not settle the reservation; the queued write does.
         bridge.release_player(1);
         assert!(bridge.session_rows(1).1.is_none());
-        assert_eq!(
-            db.player_active_count_for_viewer(&play.viewer_id),
-            1,
-            "the pending persistence still owns the reserved slot"
-        );
+        assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 1);
 
         bridge.persist_fast_play(1, &play);
-        assert_eq!(
-            db.player_active_count_for_viewer(&play.viewer_id),
-            0,
-            "the queued persistence must settle the slot exactly once"
-        );
+        assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 0);
         assert!(
             db.player_list(Some("s1"))
                 .iter()
-                .all(|player| !player.active),
-            "the persisted row must be deactivated after the role was dropped"
+                .all(|player| !player.active)
         );
     }
 
@@ -3917,8 +3912,7 @@ mod tests {
 
         assert_eq!(
             bridge.session_rows(1).0.as_ref().map(|p| p.id.as_str()),
-            Some(publisher_id.as_str()),
-            "an unreadable table must keep the role for a retry (fail closed)"
+            Some(publisher_id.as_str())
         );
     }
 
@@ -3933,10 +3927,7 @@ mod tests {
         assert!(matches!(db.stream_delete("s1"), Some(true)));
 
         bridge.release_publisher_if_id(1, &publisher_id);
-        assert!(
-            bridge.session_rows(1).0.is_none(),
-            "a vanished superseded publisher row must clear the in-memory role"
-        );
+        assert!(bridge.session_rows(1).0.is_none());
     }
 
     #[test]
@@ -3970,18 +3961,10 @@ mod tests {
 
         assert_eq!(
             bridge.ownership_epochs.lock().get(&1).cloned(),
-            Some(("s2".to_string(), 7)),
-            "releasing the old publisher row must not release the new stream's ownership"
+            Some(("s2".to_string(), 7))
         );
-        assert_eq!(
-            bridge.ownership_epoch_for_conn(1),
-            Some(7),
-            "the in-flight stream must keep its fencing epoch for frame export"
-        );
-        assert!(
-            bridge.session_rows(1).0.is_none(),
-            "the released publisher session itself is still cleared"
-        );
+        assert_eq!(bridge.ownership_epoch_for_conn(1), Some(7));
+        assert!(bridge.session_rows(1).0.is_none());
     }
 
     #[test]
@@ -4075,8 +4058,7 @@ mod tests {
 
         assert_eq!(
             bridge.session_rows(1).1.as_ref().map(|p| p.id.as_str()),
-            Some(player_id.as_str()),
-            "an unreadable table must keep the role for a retry (fail closed)"
+            Some(player_id.as_str())
         );
     }
 
@@ -4091,10 +4073,7 @@ mod tests {
         assert!(matches!(db.stream_delete("s1"), Some(true)));
 
         bridge.release_player_if_id(1, &player_id);
-        assert!(
-            bridge.session_rows(1).1.is_none(),
-            "a vanished superseded player row must clear the in-memory role"
-        );
+        assert!(bridge.session_rows(1).1.is_none());
     }
 
     #[cfg(feature = "cluster")]
@@ -4117,14 +4096,36 @@ mod tests {
         bridge.release_player_if_id(1, &player.id);
 
         assert!(bridge.session_rows(1).1.is_none());
-        assert_eq!(
-            db.player_active_count_for_viewer(&player.viewer_id),
-            0,
-            "the row persisted during release must be retired exactly once"
-        );
+        assert_eq!(db.player_active_count_for_viewer(&player.viewer_id), 0);
+        assert!(db.player_list(Some("s1")).iter().all(|row| !row.active));
+    }
+
+    #[test]
+    fn failed_retirement_of_a_concurrently_persisted_player_is_queued() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        let player = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+        let persisted = player.clone();
+        *bridge.player_release_after_update_hook.lock() =
+            Some(Box::new(move |bridge: &DbRtmpBridge, conn: ConnId| {
+                bridge.persist_fast_play(conn, &persisted);
+            }));
+        db.with_conn(|c| {
+            c.execute_batch("CREATE TRIGGER block_player_update BEFORE UPDATE ON players BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap()
+        });
+
+        bridge.release_player_if_id(1, &player.id);
+
+        assert_eq!(bridge.pending_deactivations.lock().len(), 1);
         assert!(
-            db.player_list(Some("s1")).iter().all(|row| !row.active),
-            "no active row may survive the retired role"
+            db.player_list(Some("s1"))
+                .iter()
+                .any(|row| row.id == player.id && row.active)
         );
     }
 

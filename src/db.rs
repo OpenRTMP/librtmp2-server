@@ -3452,10 +3452,7 @@ mod tests {
             db.batch(|| panic!("simulated batch failure"));
         }));
         assert!(panicked.is_err());
-        assert!(
-            db.with_conn(|conn| conn.is_autocommit()),
-            "a panicking batch must not leave BEGIN IMMEDIATE open"
-        );
+        assert!(db.with_conn(|conn| conn.is_autocommit()));
         // The connection is reusable and still commits normally.
         db.stream_add(&sample_stream(
             "after_panic",
@@ -3473,9 +3470,7 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("panic_players", "pub_pp", "pl_pp", "st_pp");
         db.stream_add(&s).unwrap();
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
-            panic!("viewer not found");
-        };
+        let viewer = db.viewer_list(&s.id).swap_remove(0);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             db.batch(|| {
                 assert!(db.player_try_acquire(&Player {
@@ -3493,14 +3488,9 @@ mod tests {
         assert!(
             db.player_list(Some("panic_players"))
                 .iter()
-                .all(|player| !player.active),
-            "the rolled-back row must not stay active"
+                .all(|player| !player.active)
         );
-        assert_eq!(
-            db.player_active_count_for_viewer(&viewer.id),
-            0,
-            "the in-memory slot must be resynced after the rollback"
-        );
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
     }
 
     #[test]
@@ -3795,9 +3785,7 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("cascade_players", "pub_cp", "pl_cp", "st_cp");
         db.stream_add(&s).unwrap();
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
-            panic!("viewer not found");
-        };
+        let viewer = db.viewer_list(&s.id).swap_remove(0);
         assert!(db.player_try_acquire(&Player {
             id: "cascade_player_1".to_string(),
             stream_id: "cascade_players".to_string(),
@@ -3809,11 +3797,7 @@ mod tests {
         assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
 
         assert!(matches!(db.stream_delete("cascade_players"), Some(true)));
-        assert_eq!(
-            db.player_active_count_for_viewer(&viewer.id),
-            0,
-            "cascade-deleted players must release their in-memory slots"
-        );
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
     }
 
     #[test]
@@ -3821,9 +3805,7 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("resync_fail", "pub_rf", "pl_rf", "st_rf");
         db.stream_add(&s).unwrap();
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
-            panic!("viewer not found");
-        };
+        let viewer = db.viewer_list(&s.id).swap_remove(0);
         assert!(db.player_try_acquire(&Player {
             id: "resync_player".to_string(),
             stream_id: "resync_fail".to_string(),
@@ -3838,11 +3820,52 @@ mod tests {
 
         db.resync_player_counts();
 
-        assert_eq!(
-            db.player_active_count_for_viewer(&viewer.id),
-            1,
-            "a failed rebuild must keep the previous cap accounting"
-        );
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
+    }
+
+    #[test]
+    fn player_count_resync_counts_durable_and_pending_slots() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("resync_ok", "pub_rok", "pl_rok", "st_rok");
+        db.stream_add(&s).unwrap();
+        let viewer = db.viewer_list(&s.id).swap_remove(0);
+        assert!(db.player_try_acquire(&Player {
+            id: "resync_ok_player".to_string(),
+            stream_id: "resync_ok".to_string(),
+            viewer_id: viewer.id.clone(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+        assert!(db.player_reserve(&viewer.id));
+
+        db.resync_player_counts();
+
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 2);
+    }
+
+    #[test]
+    fn player_count_resync_keeps_counts_when_a_row_cannot_be_decoded() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("resync_bad", "pub_rb", "pl_rb", "st_rb");
+        db.stream_add(&s).unwrap();
+        let viewer = db.viewer_list(&s.id).swap_remove(0);
+        assert!(db.player_try_acquire(&Player {
+            id: "resync_bad_player".to_string(),
+            stream_id: "resync_bad".to_string(),
+            viewer_id: viewer.id.clone(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+        db.conn
+            .lock()
+            .execute("INSERT INTO players (id,stream_id,viewer_id,connected_at,active) VALUES ('bad_row','resync_bad',CAST(x'ff' AS TEXT),0,1)", [])
+            .unwrap();
+
+        db.resync_player_counts();
+
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
     }
 
     #[test]
@@ -3850,9 +3873,7 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("pending_players", "pub_ppd", "pl_ppd", "st_ppd");
         db.stream_add(&s).unwrap();
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
-            panic!("viewer not found");
-        };
+        let viewer = db.viewer_list(&s.id).swap_remove(0);
         assert!(db.player_try_acquire(&Player {
             id: "pending_player".to_string(),
             stream_id: "pending_players".to_string(),
@@ -4615,9 +4636,7 @@ mod tests {
         let db = Db::open(":memory:").unwrap();
         let s = sample_stream("stream1", "pub_key_123", "pl_key_456", "sts_key_789");
         db.stream_add(&s).unwrap();
-        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
-            panic!("viewer not found");
-        };
+        let viewer = db.viewer_list(&s.id).swap_remove(0);
         assert!(db.player_try_acquire(&Player {
             id: "pl0".to_string(),
             stream_id: "stream1".to_string(),
@@ -4631,13 +4650,13 @@ mod tests {
         // Make the row's viewer_id undecodable as a Rust String. The UPDATE
         // would still succeed, so a swallowed read error would reserve a
         // second in-memory slot that is never released.
-        db.with_conn(|c| {
-            c.execute(
+        db.conn
+            .lock()
+            .execute(
                 "UPDATE players SET viewer_id=CAST(x'80' AS TEXT) WHERE id='pl0'",
                 [],
             )
-            .unwrap()
-        });
+            .unwrap();
         let update = Player {
             id: "pl0".to_string(),
             stream_id: "stream1".to_string(),
@@ -4646,15 +4665,8 @@ mod tests {
             active: true,
             ..Default::default()
         };
-        assert!(
-            !db.player_update("pl0", &update),
-            "a read/decode failure must fail the update closed"
-        );
-        assert_eq!(
-            db.player_active_count_for_viewer(&viewer.id),
-            1,
-            "a failed read must not reserve an extra slot"
-        );
+        assert!(!db.player_update("pl0", &update));
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
     }
 
     #[test]
