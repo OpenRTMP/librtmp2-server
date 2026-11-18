@@ -5308,16 +5308,10 @@ mod tests {
         assert!(drain_deleted_stream_roles(
             &mut conn, &mut entry, &bridge, 1, &deleted
         ));
-        assert!(
-            !bridge.has_publisher(1),
-            "the vanished row must not pin a role"
-        );
+        assert!(!bridge.has_publisher(1));
         assert!(!entry.publishing);
         assert!(conn.relay_key.is_empty());
-        assert!(
-            !conn.relay_enabled,
-            "a deleted stream must never be relayed"
-        );
+        assert!(!conn.relay_enabled);
     }
 
     #[test]
