@@ -1007,7 +1007,8 @@ impl DbRtmpBridge {
             return;
         };
         row.active = false;
-        if !self.db.player_update(&row.id, &row) {
+        let updated = self.db.player_update(&row.id, &row);
+        if !updated {
             if self.db.player_exists(&row.id) {
                 crate::log_error!(
                     "RTMP: failed to deactivate superseded player session={} conn={conn}",
@@ -1070,6 +1071,10 @@ impl DbRtmpBridge {
         cs.player_stats_reset_pending = true;
         self.player_stats_generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        drop(guard);
+        if !updated {
+            self.deactivate_player_if_present(&row);
+        }
     }
 
     /// Deactivate the player row for this connection without dropping
@@ -1087,7 +1092,8 @@ impl DbRtmpBridge {
             return;
         };
         player_row.active = false;
-        if !self.db.player_update(&player_row.id, &player_row) {
+        let updated = self.db.player_update(&player_row.id, &player_row);
+        if !updated {
             if self.db.player_exists(&player_row.id) {
                 crate::log_error!(
                     "RTMP: failed to deactivate player on release: stream={} session={} from {peer} (will retry on close)",
@@ -1143,6 +1149,29 @@ impl DbRtmpBridge {
         cs.player_stats_reset_pending = true;
         self.player_stats_generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        drop(guard);
+        if !updated {
+            // The row was absent when the release wrote, but a queued fast
+            // PersistPlay can insert it just before the role is cleared and
+            // observe the role still held. Retire that row now; a concurrent
+            // persist that already deactivated it leaves it inactive.
+            self.deactivate_player_if_present(&player_row);
+        }
+    }
+
+    /// Deactivate `row` if a concurrent persist inserted it. Idempotent.
+    fn deactivate_player_if_present(&self, row: &Player) {
+        if !self.db.player_exists(&row.id) {
+            return;
+        }
+        let mut inactive = row.clone();
+        inactive.active = false;
+        if !self.db.player_update(&row.id, &inactive) {
+            crate::log_error!(
+                "RTMP: failed to retire concurrently persisted player session={}",
+                row.id
+            );
+        }
     }
 
     /// Update publisher stats (media bytes_in, bitrate, codec) in the DB.
@@ -4019,6 +4048,37 @@ mod tests {
         assert!(
             bridge.session_rows(1).1.is_none(),
             "a vanished superseded player row must clear the in-memory role"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn release_player_if_id_retires_a_row_persisted_during_the_release() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        let player = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+        let persisted = player.clone();
+        *bridge.player_release_after_update_hook.lock() =
+            Some(Box::new(move |bridge: &DbRtmpBridge, conn: ConnId| {
+                bridge.persist_fast_play(conn, &persisted);
+            }));
+
+        bridge.release_player_if_id(1, &player.id);
+
+        assert!(bridge.session_rows(1).1.is_none());
+        assert_eq!(
+            db.player_active_count_for_viewer(&player.viewer_id),
+            0,
+            "the row persisted during release must be retired exactly once"
+        );
+        assert!(
+            db.player_list(Some("s1")).iter().all(|row| !row.active),
+            "no active row may survive the retired role"
         );
     }
 
