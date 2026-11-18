@@ -2994,9 +2994,7 @@ mod tests {
         assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
         db.with_conn(|c| c.execute("DROP TABLE publishers", []))
             .unwrap();
-
         bridge.release_publisher(1);
-
         assert!(bridge.session_rows(1).0.is_some());
     }
 
@@ -3009,9 +3007,7 @@ mod tests {
         assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
         db.with_conn(|c| c.execute("DROP TABLE players", []))
             .unwrap();
-
         bridge.release_player(1);
-
         assert!(bridge.session_rows(1).1.is_some());
     }
 
@@ -3020,11 +3016,9 @@ mod tests {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
         let bridge = test_bridge(Arc::clone(&db));
-
         bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
         let viewer_id = bridge.session_rows(1).1.unwrap().viewer_id;
-
         assert!(matches!(db.stream_delete("s1"), Some(true)));
         assert_eq!(db.player_active_count_for_viewer(&viewer_id), 0);
 
@@ -3707,9 +3701,7 @@ mod tests {
         db.with_conn(|c| {
             c.execute_batch("CREATE TRIGGER block_player_update BEFORE UPDATE ON players BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap()
         });
-
         bridge.persist_fast_play(1, &play);
-
         assert_eq!(bridge.pending_deactivations.lock().len(), 1);
         assert!(
             db.player_list(Some("s1"))
@@ -3735,14 +3727,12 @@ mod tests {
         db.with_conn(|c| {
             c.execute_batch("CREATE TRIGGER block_publisher_update BEFORE UPDATE ON publishers BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap()
         });
-
         bridge.persist_fast_publish(1, &publish);
-
         assert_eq!(bridge.pending_deactivations.lock().len(), 1);
         assert!(
             db.publisher_list(Some("s1"))
                 .iter()
-                .any(|row| row.id == publish.id && row.active)
+                .any(|r| r.id == publish.id && r.active)
         );
     }
 
@@ -3757,12 +3747,10 @@ mod tests {
             .try_fast_authorize_play(1, "live", &s.play_key)
             .expect("play admitted");
         assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 1);
-
         // The queued write, not this release, settles the reservation.
         bridge.release_player(1);
         assert!(bridge.session_rows(1).1.is_none());
         assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 1);
-
         bridge.persist_fast_play(1, &play);
         assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 0);
         assert!(
@@ -3861,9 +3849,7 @@ mod tests {
         let publisher_id = bridge.session_rows(1).0.unwrap().id;
         db.with_conn(|c| c.execute("DROP TABLE publishers", []))
             .unwrap();
-
         bridge.release_publisher_if_id(1, &publisher_id);
-
         assert_eq!(
             bridge.session_rows(1).0.as_ref().map(|p| p.id.as_str()),
             Some(publisher_id.as_str())
@@ -3879,7 +3865,6 @@ mod tests {
         assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
         let publisher_id = bridge.session_rows(1).0.unwrap().id;
         assert!(matches!(db.stream_delete("s1"), Some(true)));
-
         bridge.release_publisher_if_id(1, &publisher_id);
         assert!(bridge.session_rows(1).0.is_none());
     }
@@ -4073,9 +4058,7 @@ mod tests {
         db.with_conn(|c| {
             c.execute_batch("CREATE TRIGGER block_player_update BEFORE UPDATE ON players BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap()
         });
-
         bridge.release_player_if_id(1, &player.id);
-
         assert_eq!(bridge.pending_deactivations.lock().len(), 1);
         assert!(
             db.player_list(Some("s1"))

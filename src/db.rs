@@ -3800,9 +3800,7 @@ mod tests {
         assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
         db.with_conn(|c| c.execute("DROP TABLE players", []))
             .unwrap();
-
         db.resync_player_counts();
-
         assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
     }
 
@@ -3821,9 +3819,7 @@ mod tests {
             ..Default::default()
         }));
         assert!(db.player_reserve(&viewer.id));
-
         db.resync_player_counts();
-
         assert_eq!(db.player_active_count_for_viewer(&viewer.id), 2);
     }
 
@@ -3845,9 +3841,7 @@ mod tests {
             .lock()
             .execute("INSERT INTO players (id,stream_id,viewer_id,connected_at,active) VALUES ('bad_row','resync_bad',CAST(x'ff' AS TEXT),0,1)", [])
             .unwrap();
-
         db.resync_player_counts();
-
         assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
     }
 
@@ -3873,11 +3867,7 @@ mod tests {
             .unwrap()
         });
         assert_eq!(db.stream_delete_if_pending("pending_players"), Some(true));
-        assert_eq!(
-            db.player_active_count_for_viewer(&viewer.id),
-            0,
-            "the pending-delete finalizer must release cascade-deleted slots"
-        );
+        assert_eq!(db.player_active_count_for_viewer(&viewer.id), 0);
     }
 
     #[test]
