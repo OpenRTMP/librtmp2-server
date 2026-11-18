@@ -3797,6 +3797,37 @@ mod tests {
     }
 
     #[test]
+    fn pending_stream_delete_releases_cascaded_player_slots() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("pending_players", "pub_ppd", "pl_ppd", "st_ppd");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        assert!(db.player_try_acquire(&Player {
+            id: "pending_player".to_string(),
+            stream_id: "pending_players".to_string(),
+            viewer_id: viewer.id.clone(),
+            active: true,
+            connected_at: now_ts(),
+            ..Default::default()
+        }));
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE streams SET enabled=0,pending_delete=1 WHERE id='pending_players'",
+                [],
+            )
+            .unwrap()
+        });
+        assert_eq!(db.stream_delete_if_pending("pending_players"), Some(true));
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            0,
+            "the pending-delete finalizer must release cascade-deleted slots"
+        );
+    }
+
+    #[test]
     fn max_length_stream_id_round_trips() {
         let db = Db::open(":memory:").unwrap();
         let long_id = "a".repeat(63);

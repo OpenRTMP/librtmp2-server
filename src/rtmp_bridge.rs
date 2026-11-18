@@ -2994,6 +2994,42 @@ mod tests {
     }
 
     #[test]
+    fn release_publisher_keeps_role_on_transient_db_failure() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
+        db.with_conn(|c| c.execute("DROP TABLE publishers", []))
+            .unwrap();
+
+        bridge.release_publisher(1);
+
+        assert!(
+            bridge.session_rows(1).0.is_some(),
+            "an unreadable table must keep the role for a retry (fail closed)"
+        );
+    }
+
+    #[test]
+    fn release_player_keeps_role_on_transient_db_failure() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
+        db.with_conn(|c| c.execute("DROP TABLE players", []))
+            .unwrap();
+
+        bridge.release_player(1);
+
+        assert!(
+            bridge.session_rows(1).1.is_some(),
+            "an unreadable table must keep the role for a retry (fail closed)"
+        );
+    }
+
+    #[test]
     fn release_player_clears_role_when_the_row_was_cascade_deleted() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
@@ -3792,6 +3828,26 @@ mod tests {
     }
 
     #[test]
+    fn release_publisher_if_id_keeps_the_role_on_transient_db_failure() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_publish(1, "live", &s.publish_key).is_ok());
+        let publisher_id = bridge.session_rows(1).0.unwrap().id;
+        db.with_conn(|c| c.execute("DROP TABLE publishers", []))
+            .unwrap();
+
+        bridge.release_publisher_if_id(1, &publisher_id);
+
+        assert_eq!(
+            bridge.session_rows(1).0.as_ref().map(|p| p.id.as_str()),
+            Some(publisher_id.as_str()),
+            "an unreadable table must keep the role for a retry (fail closed)"
+        );
+    }
+
+    #[test]
     fn release_publisher_if_id_clears_the_role_when_the_row_was_cascade_deleted() {
         let db = Arc::new(Db::open(":memory:").unwrap());
         let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
@@ -3927,6 +3983,26 @@ mod tests {
         assert!(db.player_try_acquire(&only_play));
         bridge.release_player_if_id(2, &only_play.id);
         assert!(bridge.stream_id_for_conn(2).is_empty());
+    }
+
+    #[test]
+    fn release_player_if_id_keeps_the_role_on_transient_db_failure() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k", "pl_k");
+        let bridge = test_bridge(Arc::clone(&db));
+        bridge.on_connect(1, "127.0.0.1:1000");
+        assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
+        let player_id = bridge.session_rows(1).1.unwrap().id;
+        db.with_conn(|c| c.execute("DROP TABLE players", []))
+            .unwrap();
+
+        bridge.release_player_if_id(1, &player_id);
+
+        assert_eq!(
+            bridge.session_rows(1).1.as_ref().map(|p| p.id.as_str()),
+            Some(player_id.as_str()),
+            "an unreadable table must keep the role for a retry (fail closed)"
+        );
     }
 
     #[test]
