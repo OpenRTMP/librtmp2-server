@@ -650,10 +650,7 @@ impl Db {
         Self::decr_count(&mut self.active_player_counts.lock(), viewer_id);
     }
 
-    /// Rebuild the in-memory player counts from the durable rows. Used when a
-    /// release finds its row already gone: a plain decrement could double-settle
-    /// a slot that a cascade/delete already resynced, while doing nothing could
-    /// leave a snapshot-deleted row's slot behind.
+    /// Rebuild from durable rows when a release finds its row already gone.
     pub(crate) fn resync_player_counts(&self) {
         let conn = self.conn.lock();
         self.resync_active_player_counts(&conn);
@@ -1279,9 +1276,7 @@ impl Db {
         match result {
             Ok(rows) => match tx.commit() {
                 Ok(()) => {
-                    // `ON DELETE CASCADE` removed the player rows without
-                    // going through `player_update`, so rebuild the in-memory
-                    // per-viewer counters instead of leaking their slots.
+                    // Cascade deleted the rows; rebuild the in-memory counters.
                     self.resync_active_player_counts(&conn);
                     Some(rows > 0)
                 }
@@ -1319,8 +1314,7 @@ impl Db {
         match result {
             Ok(rows) => match tx.commit() {
                 Ok(()) => {
-                    // The cascade removed players without `player_update`, so
-                    // their in-memory slots would otherwise stay allocated.
+                    // The cascade removed players; release their slots.
                     self.resync_active_player_counts(&conn);
                     Some(rows > 0)
                 }
@@ -2184,13 +2178,8 @@ impl Db {
         if !conn.is_autocommit() || conn.execute_batch("BEGIN IMMEDIATE").is_err() {
             return (f(), true);
         }
-        // Roll the outer transaction back if `f` panics. Without this guard an
-        // unwind leaves `BEGIN IMMEDIATE` open on the single shared connection:
-        // parking_lot does not poison the mutex, the auth worker thread dies,
-        // and every later write takes the savepoint path (`RELEASE`), so
-        // "committed" rows are silently discarded at exit and the WAL grows.
-        // The guard is a no-op on the normal path because COMMIT/ROLLBACK
-        // returns the connection to autocommit before Drop runs.
+        // Roll back the outer transaction if `f` panics; an open BEGIN on the
+        // shared connection would make later writes vanish into an uncommitted tx.
         struct RollbackOnDrop<'a> {
             db: &'a Db,
             conn: &'a Connection,
@@ -2199,9 +2188,7 @@ impl Db {
             fn drop(&mut self) {
                 if !self.conn.is_autocommit() {
                     let _ = self.conn.execute_batch("ROLLBACK");
-                    // The discarded writes may have taken/released player
-                    // slots through the in-memory counters. Rebuild them from
-                    // the durable rows while the connection is still held.
+                    // Discarded writes may have changed the in-memory slots.
                     self.db.resync_active_player_counts(self.conn);
                 }
             }
@@ -2239,9 +2226,7 @@ impl Db {
 
     /// Rebuild `active_player_counts` from the `players` table.
     ///
-    /// Build the replacement map first and publish it only after every row
-    /// decoded. A failed read must not leave the counters empty or partial:
-    /// that would let `player_reserve` admit sessions past the per-key cap.
+    /// Publish only a complete rebuild; a partial map would break the per-key cap.
     fn resync_active_player_counts(&self, conn: &Connection) {
         let mut next = HashMap::new();
         let mut stmt = match conn
@@ -2887,9 +2872,7 @@ impl Db {
             Ok(row) => Some(row),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(e) => {
-                // A read fault is not "the row is inactive": treating it as
-                // None would reserve a slot, let the UPDATE succeed, and never
-                // release that reservation. Fail closed before reserving.
+                // A read fault must fail closed, not look like an inactive row.
                 crate::log_error!("player_update read error for {id}: {e}");
                 return false;
             }
@@ -4647,9 +4630,7 @@ mod tests {
         }));
         assert_eq!(db.player_active_count_for_viewer(&viewer.id), 1);
 
-        // Make the row's viewer_id undecodable as a Rust String. The UPDATE
-        // would still succeed, so a swallowed read error would reserve a
-        // second in-memory slot that is never released.
+        // A swallowed read error would reserve a slot that is never released.
         db.conn
             .lock()
             .execute(
