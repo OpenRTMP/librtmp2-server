@@ -289,11 +289,8 @@ pub fn resolve_client_ip(
     peer
 }
 
-/// Bucket IPv6 clients by their routed `/64` prefix instead of the exact
-/// address. One host can otherwise mint a fresh rate-limit bucket per address
-/// inside its /64 (and evict other clients' buckets once the tracking map is
-/// full), defeating the per-client limit. This mirrors the cluster auth
-/// tracker's `/64` aggregation; IPv4 keys are unchanged.
+/// Bucket IPv6 clients by routed `/64` so one host cannot mint buckets
+/// per address and evict other clients. IPv4 keys are unchanged.
 fn rate_limit_bucket_ip(peer: IpAddr) -> IpAddr {
     match peer.to_canonical() {
         IpAddr::V6(v6) => {

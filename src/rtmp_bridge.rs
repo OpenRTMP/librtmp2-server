@@ -876,9 +876,7 @@ impl DbRtmpBridge {
                 crate::log_error!("publisher release failed session={}", pub_row.id);
                 return;
             }
-            // The row was dropped out from under the session (cluster snapshot
-            // install / stream delete). There is nothing left to update, so
-            // clear the in-memory role instead of retrying forever.
+            // The row was dropped out from under the session; clear the role.
             crate::log_warn!("publisher row {} vanished; clearing role", pub_row.id);
         }
         crate::log_info!(
@@ -1080,11 +1078,7 @@ impl DbRtmpBridge {
                 return;
             }
             crate::log_warn!("player row {} vanished; clearing role", player_row.id);
-            // A fast-path row whose PersistPlay is still queued has no durable
-            // row yet; the queued write settles the reserved slot (and
-            // deactivates the row once the role is gone). Otherwise rebuild
-            // from the durable rows: a plain decrement could double-settle a
-            // slot a cascade delete already resynced.
+            // Settle a queued fast-path row in its persist; otherwise rebuild.
             if !self.pending_fast_play_rows.lock().contains(&player_row.id) {
                 self.db.resync_player_counts();
             }
@@ -1125,10 +1119,7 @@ impl DbRtmpBridge {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         drop(guard);
         if !updated {
-            // The row was absent when the release wrote, but a queued fast
-            // PersistPlay can insert it just before the role is cleared and
-            // observe the role still held. Retire that row now; a concurrent
-            // persist that already deactivated it leaves it inactive.
+            // A queued persist can insert the row after this release wrote.
             self.deactivate_player_if_present(&player_row);
         }
     }
@@ -2990,8 +2981,7 @@ mod tests {
 
         bridge.release_publisher(1);
 
-        // The row is gone; keeping the role would pin a phantom session and
-        // make a later delete-drain wait for a session no row can release.
+        // A vanished row must not pin a phantom role.
         assert!(bridge.conns.lock().get(&1).unwrap().publisher.is_none());
     }
 
@@ -3768,8 +3758,7 @@ mod tests {
             .expect("play admitted");
         assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 1);
 
-        // The connection closes before the queued PersistPlay runs. The
-        // release must not settle the reservation; the queued write does.
+        // The queued write, not this release, settles the reservation.
         bridge.release_player(1);
         assert!(bridge.session_rows(1).1.is_none());
         assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 1);

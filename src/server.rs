@@ -1426,9 +1426,7 @@ fn drain_deleted_stream_roles(
         return false;
     }
 
-    // No authorized role survives. Drop any relay state before the caller
-    // closes the socket so a same-tick relay pass cannot emit the deleted
-    // stream's queued frames.
+    // No authorized role survives; drop relay state so a same-tick pass cannot emit deleted frames.
     conn.relay_key.clear();
     conn.relay_enabled = false;
     conn.pending_relay.clear();
@@ -5291,8 +5289,7 @@ mod tests {
                 .authorize_publish(1, "live", &sample_stream("s1").publish_key)
                 .is_ok()
         );
-        // The row vanishes under the publisher. The release cannot update it,
-        // but the role must not be kept as a phantom retry target.
+        // The row vanishes; the role must not stay as a phantom retry target.
         assert_eq!(db.stream_delete("s1"), Some(true));
         let mut conn = rtmp_conn(1, true, false);
         conn.relay_key = "s1".into();

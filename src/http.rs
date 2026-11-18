@@ -5100,9 +5100,7 @@ mod tests {
             .id;
         let player_uri = format!("/api/v1/streams/pddb/players/{second}");
 
-        // A sibling viewer row with invalid UTF-8 makes the list decode fail
-        // while the requested row still loads. The handler must report a DB
-        // error, not "cannot delete the last play key".
+        // A sibling row with invalid UTF-8 must report a DB error, not "last key".
         exec_sql(
             &state,
             "INSERT INTO stream_viewers (id,stream_id,name,play_key,enabled,created_at) \
