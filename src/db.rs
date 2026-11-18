@@ -650,6 +650,15 @@ impl Db {
         Self::decr_count(&mut self.active_player_counts.lock(), viewer_id);
     }
 
+    /// Rebuild the in-memory player counts from the durable rows. Used when a
+    /// release finds its row already gone: a plain decrement could double-settle
+    /// a slot that a cascade/delete already resynced, while doing nothing could
+    /// leave a snapshot-deleted row's slot behind.
+    pub(crate) fn resync_player_counts(&self) {
+        let conn = self.conn.lock();
+        self.resync_active_player_counts(&conn);
+    }
+
     /// Decrements `counts[key]`, removing the entry once it reaches zero.
     fn decr_count(counts: &mut HashMap<String, usize>, key: &str) {
         if let Some(count) = counts.get_mut(key) {
@@ -2182,15 +2191,25 @@ impl Db {
         // "committed" rows are silently discarded at exit and the WAL grows.
         // The guard is a no-op on the normal path because COMMIT/ROLLBACK
         // returns the connection to autocommit before Drop runs.
-        struct RollbackOnDrop<'a>(&'a Connection);
+        struct RollbackOnDrop<'a> {
+            db: &'a Db,
+            conn: &'a Connection,
+        }
         impl Drop for RollbackOnDrop<'_> {
             fn drop(&mut self) {
-                if !self.0.is_autocommit() {
-                    let _ = self.0.execute_batch("ROLLBACK");
+                if !self.conn.is_autocommit() {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    // The discarded writes may have taken/released player
+                    // slots through the in-memory counters. Rebuild them from
+                    // the durable rows while the connection is still held.
+                    self.db.resync_active_player_counts(self.conn);
                 }
             }
         }
-        let _txn = RollbackOnDrop(&conn);
+        let _txn = RollbackOnDrop {
+            db: self,
+            conn: &conn,
+        };
         let result = f();
         #[cfg(test)]
         let commit = if self
@@ -3427,6 +3446,41 @@ mod tests {
         .unwrap();
         assert!(matches!(db.stream_get("after_panic"), DbLookup::Ok(_)));
         assert!(db.with_conn(|conn| conn.is_autocommit()));
+    }
+
+    #[test]
+    fn panic_inside_batch_resyncs_player_counts() {
+        let db = Db::open(":memory:").unwrap();
+        let s = sample_stream("panic_players", "pub_pp", "pl_pp", "st_pp");
+        db.stream_add(&s).unwrap();
+        let DbLookup::Ok(viewer) = db.viewer_find_by_play_key(&s.play_key) else {
+            panic!("viewer not found");
+        };
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.batch(|| {
+                assert!(db.player_try_acquire(&Player {
+                    id: "panic_player".to_string(),
+                    stream_id: "panic_players".to_string(),
+                    viewer_id: viewer.id.clone(),
+                    active: true,
+                    connected_at: now_ts(),
+                    ..Default::default()
+                }));
+                panic!("simulated batch failure");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            db.player_list(Some("panic_players"))
+                .iter()
+                .all(|player| !player.active),
+            "the rolled-back row must not stay active"
+        );
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer.id),
+            0,
+            "the in-memory slot must be resynced after the rollback"
+        );
     }
 
     #[test]

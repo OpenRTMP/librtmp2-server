@@ -217,6 +217,10 @@ pub struct DbRtmpBridge {
     /// poll loop can throttle `update_player_stats` to its once-per-second
     /// debounce without ever delaying a rebase (see `player_stats_generation`).
     player_stats_generation: std::sync::atomic::AtomicU64,
+    /// Fast-path play rows whose `PersistPlay` job is still queued. Their
+    /// in-memory slot is settled by the queued write, not by a release that
+    /// sees no durable row yet.
+    pending_fast_play_rows: Mutex<HashSet<String>>,
     deleted_streams: Arc<Mutex<HashSet<String>>>,
     /// Failed publish/play auth attempts keyed by client IP (not `ConnId`) so
     /// reconnecting on a fresh TCP connection does not reset the window —
@@ -320,6 +324,7 @@ impl DbRtmpBridge {
             db,
             conns: Mutex::new(HashMap::new()),
             player_stats_generation: std::sync::atomic::AtomicU64::new(0),
+            pending_fast_play_rows: Mutex::new(HashSet::new()),
             deleted_streams,
             auth_failures: Mutex::new(HashMap::new()),
             coordinator: Mutex::new(None),
@@ -1014,7 +1019,9 @@ impl DbRtmpBridge {
                 "RTMP: superseded player row {} vanished; clearing the in-memory role",
                 row.id
             );
-            self.db.player_count_decr(&row.viewer_id);
+            if !self.pending_fast_play_rows.lock().contains(&row.id) {
+                self.db.resync_player_counts();
+            }
         }
         #[cfg(all(test, feature = "cluster"))]
         {
@@ -1093,7 +1100,14 @@ impl DbRtmpBridge {
                 "RTMP: player row {} vanished; clearing the in-memory role",
                 player_row.id
             );
-            self.db.player_count_decr(&player_row.viewer_id);
+            // A fast-path row whose PersistPlay is still queued has no durable
+            // row yet; the queued write settles the reserved slot (and
+            // deactivates the row once the role is gone). Otherwise rebuild
+            // from the durable rows: a plain decrement could double-settle a
+            // slot a cascade delete already resynced.
+            if !self.pending_fast_play_rows.lock().contains(&player_row.id) {
+                self.db.resync_player_counts();
+            }
         }
         crate::log_info!(
             "RTMP: player released: stream={} session={} from {peer}",
@@ -1768,6 +1782,9 @@ impl DbRtmpBridge {
             }
         }
         self.clear_auth_failures(&rate_key);
+        self.pending_fast_play_rows
+            .lock()
+            .insert(player_row.id.clone());
         crate::log_info!(
             "RTMP: play accepted stream='{}' player session={} from {peer}",
             stream.id,
@@ -1942,6 +1959,7 @@ impl DbRtmpBridge {
             }
         }
         drop(guard);
+        self.pending_fast_play_rows.lock().remove(&row.id);
         self.db.player_cancel_reservation(&row.viewer_id);
     }
 
@@ -1966,6 +1984,7 @@ impl DbRtmpBridge {
                     cs.player = None;
                 }
             }
+            self.pending_fast_play_rows.lock().remove(&row.id);
             self.pending_force_close.lock().insert(conn);
             return;
         }
@@ -1985,6 +2004,7 @@ impl DbRtmpBridge {
                 );
             }
         }
+        self.pending_fast_play_rows.lock().remove(&row.id);
     }
 
     #[cfg(feature = "cluster")]
@@ -2981,14 +3001,21 @@ mod tests {
 
         bridge.on_connect(1, "127.0.0.1:1000");
         assert!(bridge.authorize_play(1, "live", &s.play_key).is_ok());
+        let viewer_id = bridge.session_rows(1).1.unwrap().viewer_id;
 
         assert!(matches!(db.stream_delete("s1"), Some(true)));
+        assert_eq!(db.player_active_count_for_viewer(&viewer_id), 0);
 
         bridge.release_player(1);
 
         assert!(
             bridge.conns.lock().get(&1).unwrap().player.is_none(),
             "a vanished player row must clear the in-memory role"
+        );
+        assert_eq!(
+            db.player_active_count_for_viewer(&viewer_id),
+            0,
+            "releasing a cascade-deleted row must not decrement a slot twice"
         );
     }
 
@@ -3646,6 +3673,42 @@ mod tests {
             bridge.stream_id_for_conn(1),
             "s1",
             "surviving publisher must keep stream_id after play cancel"
+        );
+    }
+
+    #[test]
+    fn release_before_fast_play_persist_settles_the_slot_once() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let s = add_stream_with_player(&db, "s1", "pub_k1", "pl_k1");
+        let bridge = test_bridge(Arc::clone(&db));
+        db.refresh_key_cache();
+        bridge.on_connect(1, "127.0.0.1:1000");
+        let play = bridge
+            .try_fast_authorize_play(1, "live", &s.play_key)
+            .expect("play admitted");
+        assert_eq!(db.player_active_count_for_viewer(&play.viewer_id), 1);
+
+        // The connection closes before the queued PersistPlay runs. The
+        // release must not settle the reservation; the queued write does.
+        bridge.release_player(1);
+        assert!(bridge.session_rows(1).1.is_none());
+        assert_eq!(
+            db.player_active_count_for_viewer(&play.viewer_id),
+            1,
+            "the pending persistence still owns the reserved slot"
+        );
+
+        bridge.persist_fast_play(1, &play);
+        assert_eq!(
+            db.player_active_count_for_viewer(&play.viewer_id),
+            0,
+            "the queued persistence must settle the slot exactly once"
+        );
+        assert!(
+            db.player_list(Some("s1"))
+                .iter()
+                .all(|player| !player.active),
+            "the persisted row must be deactivated after the role was dropped"
         );
     }
 
