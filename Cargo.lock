@@ -1493,9 +1493,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-legacy"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74d539b3ff3904938906727fb181092f1420c8d1b0609fca43267de31e1f6d85"
+checksum = "9473613d832eaa7226f2ef097a710b5863c5f6e45d5ae7e9f70870ea89662139"
 dependencies = [
  "anyerror",
  "derive_more",
