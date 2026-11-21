@@ -13,8 +13,45 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+### Security
+- A cluster snapshot seek is bounded to the bytes already received for every
+  `SeekFrom` variant. A small authenticated frame with a far chunk offset made
+  the snapshot writer reserve that many bytes and abort the process; a
+  legitimate retry may still rewind.
+- Bearer tokens are compared with the full length difference. `ct_str_eq`
+  truncated the length XOR to a byte, so a token 256 bytes longer could
+  compare equal to a shorter NUL-filled candidate.
+
+### Fixed
+- An ambiguous cluster `CreateStream` that was dispatched but not confirmed
+  returns 503 with `CLUSTER_WRITE_UNKNOWN` (or `CLUSTER_TIMEOUT` for an actual
+  timeout) instead of a definite 500. The stream and its generated keys may
+  have committed; the message asks for the same stream ID and any supplied
+  keys before assuming success.
+- `mask_api_token` masks by characters instead of byte slicing, so a stored
+  non-ASCII token no longer panics startup.
+- A release or player retirement that races a queued `PersistPlay` settles the
+  fast-play viewer slot exactly once: a row inserted after the release is
+  retired, a failed post-insert deactivation is queued for retry, and the
+  active player counts are rebuilt after a batch panic rollback and after a
+  cascade stream delete.
+- Resync publishes player counts under the same active-before-pending lock
+  order as the reserve path, so a concurrent reserve/cancel cannot lose an
+  increment and the inverted order can no longer deadlock.
+- IPv6 rate-limit buckets are keyed by /64, so one host cannot mint unlimited
+  buckets or evict other clients. A panicking `Db::batch` transaction is
+  rolled back instead of leaving `BEGIN IMMEDIATE` open, a `player_update`
+  read error fails closed without reserving a slot, and a player-list read
+  fault answers 500 instead of a false last-key 400.
+- A dual-role connection whose publisher row vanished (cluster heal or delete
+  drain) is closed instead of having its media re-attributed to the stream it
+  plays. Phantom publisher and player roles are cleared with their in-memory
+  slots, and relay state is dropped before such a kick.
+
 ### Changed
 - The CI benchmark sweep compares against MediaMTX v1.21.4 (was v1.21.3).
+- Dependency updates: rusqlite 0.43 (bundled SQLite), OpenRaft 0.10.1
+  (`openraft` and `openraft-legacy`) and clap 4.6.9.
 
 ## [0.7.0] — 2026-11-12
 
