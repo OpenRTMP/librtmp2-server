@@ -1852,7 +1852,7 @@ pub async fn send_client_write_outcome(
     .map_err(|e| ClientWriteSendError::Undispatched(format!("control auth: {e}")))?;
     if tokio::time::Instant::now() >= deadline {
         return Err(ClientWriteSendError::Undispatched(
-            "control auth completed after the write deadline".into(),
+            "client write timed out before dispatch (control auth finished too late)".into(),
         ));
     }
     tokio::time::timeout_at(deadline, write_frame(&mut stream, &msg))
