@@ -41,7 +41,7 @@ have no effect until the database is re-seeded (delete `/data/server.db*`).
 ## Supported tags and architectures
 
 - `latest`, `beta`, `alpha` — moving channels
-- `0.7.0`, `v0.7.0` — pinned releases (both spellings are published)
+- `0.8.0`, `v0.8.0` — pinned releases (both spellings are published)
 - `linux/amd64`, `linux/arm64`, `linux/riscv64`
 
 Mirrors: `ghcr.io/openrtmp/librtmp2-server` and `quay.io/openrtmp/librtmp2-server`.
