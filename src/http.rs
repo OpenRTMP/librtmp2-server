@@ -1062,11 +1062,20 @@ struct CreateStreamRequest {
 /// retry collide with the committed row, so that case is a retryable 503.
 fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
     if e.cluster_write_may_have_committed() {
+        // Preserve the pre-existing code for an actual timeout so clients that
+        // match CLUSTER_TIMEOUT keep their retry path; other ambiguous
+        // outcomes (connection reset, lost response, deserialize failure) get
+        // an outcome-neutral code.
+        let code = if e.to_string().contains("timed out") {
+            "CLUSTER_TIMEOUT"
+        } else {
+            "CLUSTER_WRITE_UNKNOWN"
+        };
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "CLUSTER_WRITE_UNKNOWN",
+            code,
             "cluster write outcome is unknown",
-            "Stream creation outcome is unknown and may still complete; retry with the same stream ID (409 means it was created)",
+            "Stream creation outcome is unknown and may still complete; retry with the same stream ID and keys and inspect a 409 before assuming success",
         )
     } else {
         (
@@ -2715,6 +2724,14 @@ mod tests {
         let (status, code, _, _) = create_stream_error(&ambiguous);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "CLUSTER_WRITE_UNKNOWN");
+
+        let timeout = CoordError::Cluster(format!(
+            "{}raft write: timed out",
+            crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
+        ));
+        let (status, code, _, _) = create_stream_error(&timeout);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "CLUSTER_TIMEOUT");
 
         let (status, code, _, _) = create_stream_error(&CoordError::Db);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
