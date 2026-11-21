@@ -1829,13 +1829,13 @@ pub async fn send_client_write_outcome(
     cmd: crate::cluster::command::ClusterCommand,
     proof: String,
     tls_client: Option<Arc<ClientConfig>>,
+    deadline: tokio::time::Instant,
 ) -> Result<crate::cluster::command::ClusterResponse, ClientWriteSendError> {
     let req = serde_json::to_value(&cmd)
         .map_err(|e| ClientWriteSendError::Undispatched(e.to_string()))?;
     let msg = ControlMessage::ClientWrite { req, proof };
-    // Each phase is timed separately so a connect/auth failure is known not to
-    // have sent the command, while a write/read failure stays ambiguous.
-    let mut stream = tokio::time::timeout(ROUNDTRIP_TIMEOUT, connect_raw(leader_addr, tls_client))
+    // One deadline keeps a pre-send expiry undispatched and a sent write ambiguous.
+    let mut stream = tokio::time::timeout_at(deadline, connect_raw(leader_addr, tls_client))
         .await
         .map_err(|_| {
             ClientWriteSendError::Undispatched(format!(
@@ -1843,18 +1843,18 @@ pub async fn send_client_write_outcome(
             ))
         })?
         .map_err(ClientWriteSendError::Undispatched)?;
-    tokio::time::timeout(
-        AUTH_TIMEOUT,
+    tokio::time::timeout_at(
+        deadline,
         client_auth_handshake(&mut stream, secret, local_id),
     )
     .await
     .map_err(|_| ClientWriteSendError::Undispatched("control auth timed out".into()))?
     .map_err(|e| ClientWriteSendError::Undispatched(format!("control auth: {e}")))?;
-    tokio::time::timeout(ROUNDTRIP_TIMEOUT, write_frame(&mut stream, &msg))
+    tokio::time::timeout_at(deadline, write_frame(&mut stream, &msg))
         .await
         .map_err(|_| ClientWriteSendError::Dispatched("client write send timed out".into()))?
         .map_err(|e| ClientWriteSendError::Dispatched(format!("client write send: {e}")))?;
-    let (msg, _read_budget) = tokio::time::timeout(ROUNDTRIP_TIMEOUT, read_frame(&mut stream))
+    let (msg, _read_budget) = tokio::time::timeout_at(deadline, read_frame(&mut stream))
         .await
         .map_err(|_| ClientWriteSendError::Dispatched("client write response timed out".into()))?
         .map_err(|e| ClientWriteSendError::Dispatched(format!("client write response: {e}")))?;
@@ -1893,9 +1893,17 @@ pub async fn send_client_write(
     proof: String,
     tls_client: Option<Arc<ClientConfig>>,
 ) -> Result<crate::cluster::command::ClusterResponse, String> {
-    send_client_write_outcome(leader_addr, secret, local_id, cmd, proof, tls_client)
-        .await
-        .map_err(ClientWriteSendError::into_message)
+    send_client_write_outcome(
+        leader_addr,
+        secret,
+        local_id,
+        cmd,
+        proof,
+        tls_client,
+        tokio::time::Instant::now() + crate::cluster::manager::RAFT_WRITE_TIMEOUT,
+    )
+    .await
+    .map_err(ClientWriteSendError::into_message)
 }
 
 /// Forward an OpenRaft membership change to the current leader.
@@ -3468,6 +3476,7 @@ mod tests {
             set_token("t"),
             GOOD_PROOF.into(),
             None,
+            tokio::time::Instant::now() + crate::cluster::manager::RAFT_WRITE_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -3475,6 +3484,32 @@ mod tests {
             matches!(err, ClientWriteSendError::Undispatched(_)),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_write_expired_deadline_is_undispatched() {
+        // A listening peer lets connect succeed; the expired deadline stops auth.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let err = send_client_write_outcome(
+            &addr,
+            SECRET,
+            1,
+            set_token("t"),
+            GOOD_PROOF.into(),
+            None,
+            tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ClientWriteSendError::Undispatched(message) => {
+                assert!(message.contains("timed out"), "{message}");
+            }
+            ClientWriteSendError::Dispatched(message) => {
+                panic!("expired deadline must not be dispatched: {message}")
+            }
+        }
     }
 
     #[tokio::test]

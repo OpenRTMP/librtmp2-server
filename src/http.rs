@@ -1056,16 +1056,8 @@ struct CreateStreamRequest {
 }
 
 /// Map a `create_stream` failure to the HTTP contract.
-///
-/// A cluster write that was dispatched but not confirmed may still commit the
-/// stream (and its generated keys). Reporting a definite 500 would make a
-/// retry collide with the committed row, so that case is a retryable 503.
 fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
     if e.cluster_write_may_have_committed() {
-        // Preserve the pre-existing code for an actual timeout so clients that
-        // match CLUSTER_TIMEOUT keep their retry path; other ambiguous
-        // outcomes (connection reset, lost response, deserialize failure) get
-        // an outcome-neutral code.
         let code = if e.to_string().contains("timed out") {
             "CLUSTER_TIMEOUT"
         } else {
@@ -2717,25 +2709,22 @@ mod tests {
     #[cfg(feature = "cluster")]
     #[test]
     fn ambiguous_create_stream_reports_a_retryable_503() {
-        let ambiguous = CoordError::Cluster(format!(
-            "{}client write send: connection reset",
-            crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
-        ));
-        let (status, code, _, _) = create_stream_error(&ambiguous);
+        let prefix = crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX;
+        let ambiguous = CoordError::Cluster(format!("{prefix}client write send: connection reset"));
+        let (status, code, reason, message) = create_stream_error(&ambiguous);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "CLUSTER_WRITE_UNKNOWN");
-
-        let timeout = CoordError::Cluster(format!(
-            "{}raft write: timed out",
-            crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
-        ));
+        assert_eq!(reason, "cluster write outcome is unknown");
+        assert!(message.contains("may still complete"));
+        let timeout = CoordError::Cluster(format!("{prefix}raft write: timed out"));
         let (status, code, _, _) = create_stream_error(&timeout);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "CLUSTER_TIMEOUT");
-
-        let (status, code, _, _) = create_stream_error(&CoordError::Db);
+        let (status, code, reason, message) = create_stream_error(&CoordError::Db);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "INTERNAL_ERROR");
+        assert_eq!(reason, "db error");
+        assert_eq!(message, "Failed to create stream");
     }
 
     fn test_state(api_token: &str) -> Arc<AppState> {
