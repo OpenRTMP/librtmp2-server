@@ -834,9 +834,6 @@ impl ClusterManager {
         };
         let delete_token = crate::keygen::keygen_delete_token()
             .unwrap_or_else(|_| crate::db::legacy_delete_token(&stream.id, &stream.publish_key));
-        // Keep the "may still commit" distinction: the HTTP handler must ask
-        // the client to reconcile instead of reporting a definite 500 when the
-        // write was already dispatched to the leader.
         self.block_on_write_outcome(ClusterCommand::CreateStream {
             stream: stream.clone(),
             default_viewer: default_viewer.clone(),
@@ -1204,6 +1201,8 @@ impl ClusterManager {
             .as_ref()
             .map(|h| h.api_token.read().clone())
             .filter(|t| !t.is_empty());
+        // One deadline bounds the local write and every forwarded phase.
+        let deadline = tokio::time::Instant::now() + RAFT_WRITE_TIMEOUT;
         let fut = async move {
             use openraft::error::{ClientWriteError, RaftError};
 
@@ -1240,7 +1239,7 @@ impl ClusterManager {
                     // Connect/auth failures never reached the leader; write or
                     // response failures may still commit, so keep the outcome.
                     match network::send_client_write_outcome(
-                        &addr, &secret, local_id, cmd, proof, tls_client,
+                        &addr, &secret, local_id, cmd, proof, tls_client, deadline,
                     )
                     .await
                     {
@@ -1259,11 +1258,9 @@ impl ClusterManager {
             }
         };
         let timed = async move {
-            tokio::time::timeout(RAFT_WRITE_TIMEOUT, fut)
-                .await
-                .map_err(|_| {
-                    WriteFailure::Dispatched(CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))
-                })?
+            tokio::time::timeout_at(deadline, fut).await.map_err(|_| {
+                WriteFailure::Dispatched(CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))
+            })?
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| self.rt_handle.block_on(timed))
@@ -4553,10 +4550,8 @@ mod tests {
     async fn create_stream_after_shutdown_is_marked_ambiguous() {
         let n = bootstrap(1, |_| {}).await;
         n.mgr.shutdown().await;
-        let err = n
-            .mgr
-            .create_stream(&stream("amb-create"))
-            .expect_err("a shut-down cluster cannot commit");
+        let s = stream("amb-create");
+        let err = n.mgr.create_stream(&s).expect_err("shutdown write failed");
         assert!(
             err.cluster_write_may_have_committed(),
             "a failed client_write may have been dispatched: {err:?}"

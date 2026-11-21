@@ -1846,8 +1846,6 @@ fn is_valid_env_api_token(token: &str) -> bool {
 }
 
 fn mask_api_token(token: &str) -> String {
-    // The stored token is not guaranteed to be ASCII (the env validator only
-    // covers seeding), so index by char, never by byte.
     let chars: Vec<char> = token.chars().collect();
     if chars.len() <= 12 {
         return "***".to_string();
@@ -4492,8 +4490,6 @@ mod tests {
             mask_api_token("0123456789abcdef0123456789abcdef"),
             "01234567...cdef"
         );
-        // Byte 8 falls inside the third 3-byte character; byte indexing used
-        // to panic at startup when a stored token was not ASCII.
         assert_eq!(mask_api_token("€€€€abcdefghijkl"), "€€€€abcd...ijkl");
     }
 
