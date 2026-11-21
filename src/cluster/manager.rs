@@ -834,11 +834,15 @@ impl ClusterManager {
         };
         let delete_token = crate::keygen::keygen_delete_token()
             .unwrap_or_else(|_| crate::db::legacy_delete_token(&stream.id, &stream.publish_key));
-        self.block_on_write(ClusterCommand::CreateStream {
+        // Keep the "may still commit" distinction: the HTTP handler must ask
+        // the client to reconcile instead of reporting a definite 500 when the
+        // write was already dispatched to the leader.
+        self.block_on_write_outcome(ClusterCommand::CreateStream {
             stream: stream.clone(),
             default_viewer: default_viewer.clone(),
             delete_token,
-        })?
+        })
+        .map_err(WriteFailure::into_ambiguous_coord_error)?
         .into_coord_result()?;
         Ok(default_viewer)
     }
