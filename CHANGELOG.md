@@ -13,6 +13,8 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-21
+
 ### Security
 - A cluster snapshot seek is bounded to the bytes already received for every
   `SeekFrom` variant. A small authenticated frame with a far chunk offset made
@@ -57,6 +59,8 @@ begin at `1.0.0`.
   slots, and relay state is dropped before such a kick.
 
 ### Changed
+- Package version `0.7.0` → `0.8.0`. `SnapshotBuf` is public, so this is a
+  minor bump under the crate's pre-1.0 rules.
 - The CI benchmark sweep compares against MediaMTX v1.21.4 (was v1.21.3).
 - Dependency updates: rusqlite 0.43 (bundled SQLite), OpenRaft 0.10.1
   (`openraft` and `openraft-legacy`) and clap 4.6.9.
@@ -1390,7 +1394,8 @@ plaintext RTMP and RTMPS.
 ### Planned
 - REST API enhancements for server management
 
-[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.9...v0.7.0
 [0.6.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.7...v0.6.8
