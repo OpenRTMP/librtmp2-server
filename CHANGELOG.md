@@ -38,8 +38,10 @@ begin at `1.0.0`.
 - Resync publishes player counts under the same active-before-pending lock
   order as the reserve path, so a concurrent reserve/cancel cannot lose an
   increment and the inverted order can no longer deadlock.
-- IPv6 rate-limit buckets are keyed by /64, so one host cannot mint unlimited
-  buckets or evict other clients. A panicking `Db::batch` transaction is
+- IPv6 rate-limit buckets are keyed by /64, so addresses in one /64 share a
+  bucket. A host controlling a /48 can still use many /64 buckets and may
+  evict other clients' buckets once the tracking cap is reached. A panicking
+  `Db::batch` transaction is
   rolled back instead of leaving `BEGIN IMMEDIATE` open, a `player_update`
   read error fails closed without reserving a slot, and a player-list read
   fault answers 500 instead of a false last-key 400.
