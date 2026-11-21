@@ -1055,6 +1055,38 @@ struct CreateStreamRequest {
     stats_key: Option<String>,
 }
 
+/// Map a `create_stream` failure to the HTTP contract.
+///
+/// A cluster write that was dispatched but not confirmed may still commit the
+/// stream (and its generated keys). Reporting a definite 500 would make a
+/// retry collide with the committed row, so that case is a retryable 503.
+fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
+    if e.cluster_write_may_have_committed() {
+        // Preserve the pre-existing code for an actual timeout so clients that
+        // match CLUSTER_TIMEOUT keep their retry path; other ambiguous
+        // outcomes (connection reset, lost response, deserialize failure) get
+        // an outcome-neutral code.
+        let code = if e.to_string().contains("timed out") {
+            "CLUSTER_TIMEOUT"
+        } else {
+            "CLUSTER_WRITE_UNKNOWN"
+        };
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            "cluster write outcome is unknown",
+            "Stream creation outcome is unknown and may still complete; retry with the same stream ID and any keys you supplied, and inspect a 409 before assuming success",
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "db error",
+            "Failed to create stream",
+        )
+    }
+}
+
 async fn handle_stream_create(
     State(state): State<Arc<AppState>>,
     addr: ClientAddr,
@@ -1306,36 +1338,10 @@ async fn handle_stream_create(
                 "Stream ID or access key already exists",
             );
         }
-        Err(e) if e.to_string().contains("timed out") => {
-            // The Raft write was dispatched but not confirmed: the stream can
-            // exist with keys the client never received. Report a retryable
-            // service condition rather than a generic 500.
-            log_http_access(
-                "POST",
-                PATH,
-                &peer,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "cluster write timed out",
-            );
-            return err_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "CLUSTER_TIMEOUT",
-                "Stream creation timed out and may still complete; check the stream list before retrying",
-            );
-        }
-        Err(_) => {
-            log_http_access(
-                "POST",
-                PATH,
-                &peer,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "db error",
-            );
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Failed to create stream",
-            );
+        Err(e) => {
+            let (status, code, reason, message) = create_stream_error(&e);
+            log_http_access("POST", PATH, &peer, status, reason);
+            return err_json(status, code, message);
         }
     };
 
@@ -2707,6 +2713,30 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn ambiguous_create_stream_reports_a_retryable_503() {
+        let ambiguous = CoordError::Cluster(format!(
+            "{}client write send: connection reset",
+            crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
+        ));
+        let (status, code, _, _) = create_stream_error(&ambiguous);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "CLUSTER_WRITE_UNKNOWN");
+
+        let timeout = CoordError::Cluster(format!(
+            "{}raft write: timed out",
+            crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
+        ));
+        let (status, code, _, _) = create_stream_error(&timeout);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "CLUSTER_TIMEOUT");
+
+        let (status, code, _, _) = create_stream_error(&CoordError::Db);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "INTERNAL_ERROR");
+    }
 
     fn test_state(api_token: &str) -> Arc<AppState> {
         test_state_with_config(ServerConfig {
