@@ -1060,17 +1060,19 @@ struct CreateStreamRequest {
 /// A cluster write that was dispatched but not confirmed may still commit the
 /// stream (and its generated keys). Reporting a definite 500 would make a
 /// retry collide with the committed row, so that case is a retryable 503.
-fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str) {
+fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
     if e.cluster_write_may_have_committed() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "CLUSTER_TIMEOUT",
-            "Stream creation timed out and may still complete; check the stream list before retrying",
+            "CLUSTER_WRITE_UNKNOWN",
+            "cluster write outcome is unknown",
+            "Stream creation outcome is unknown and may still complete; retry with the same stream ID (409 means it was created)",
         )
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
+            "db error",
             "Failed to create stream",
         )
     }
@@ -1328,13 +1330,7 @@ async fn handle_stream_create(
             );
         }
         Err(e) => {
-            let ambiguous = e.cluster_write_may_have_committed();
-            let (status, code, message) = create_stream_error(&e);
-            let reason = if ambiguous {
-                "cluster write outcome is unknown"
-            } else {
-                "db error"
-            };
+            let (status, code, reason, message) = create_stream_error(&e);
             log_http_access("POST", PATH, &peer, status, reason);
             return err_json(status, code, message);
         }
@@ -2716,11 +2712,11 @@ mod tests {
             "{}client write send: connection reset",
             crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
         ));
-        let (status, code, _) = create_stream_error(&ambiguous);
+        let (status, code, _, _) = create_stream_error(&ambiguous);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(code, "CLUSTER_TIMEOUT");
+        assert_eq!(code, "CLUSTER_WRITE_UNKNOWN");
 
-        let (status, code, _) = create_stream_error(&CoordError::Db);
+        let (status, code, _, _) = create_stream_error(&CoordError::Db);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "INTERNAL_ERROR");
     }
