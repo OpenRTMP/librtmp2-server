@@ -4549,6 +4549,20 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_stream_after_shutdown_is_marked_ambiguous() {
+        let n = bootstrap(1, |_| {}).await;
+        n.mgr.shutdown().await;
+        let err = n
+            .mgr
+            .create_stream(&stream("amb-create"))
+            .expect_err("a shut-down cluster cannot commit");
+        assert!(
+            err.cluster_write_may_have_committed(),
+            "a failed client_write may have been dispatched: {err:?}"
+        );
+    }
+
     #[test]
     fn dispatched_write_errors_are_marked_ambiguous() {
         let dispatched = WriteFailure::Dispatched(CoordError::Cluster(
