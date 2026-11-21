@@ -61,6 +61,7 @@ begin at `1.0.0`.
 ### Changed
 - Package version `0.7.0` → `0.8.0`. `SnapshotBuf` is public, so this is a
   minor bump under the crate's pre-1.0 rules.
+- Built on librtmp2 0.17.2.
 - The CI benchmark sweep compares against MediaMTX v1.21.4 (was v1.21.3).
 - Dependency updates: rusqlite 0.43 (bundled SQLite), OpenRaft 0.10.1
   (`openraft` and `openraft-legacy`) and clap 4.6.9.
