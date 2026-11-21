@@ -1075,7 +1075,7 @@ fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static st
             StatusCode::SERVICE_UNAVAILABLE,
             code,
             "cluster write outcome is unknown",
-            "Stream creation outcome is unknown and may still complete; retry with the same stream ID and keys and inspect a 409 before assuming success",
+            "Stream creation outcome is unknown and may still complete; retry with the same stream ID and any keys you supplied, and inspect a 409 before assuming success",
         )
     } else {
         (
