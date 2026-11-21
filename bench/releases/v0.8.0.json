@@ -1,0 +1,240 @@
+{
+ "schema": 1,
+ "repo": "OpenRTMP/librtmp2-server",
+ "kind": "release",
+ "version": "0.8.0",
+ "tag": "v0.8.0",
+ "commit": "874791828a360d7caecda4f4185e090f43544de1",
+ "date": "2026-11-21T23:30:44Z",
+ "run_url": "https://github.com/OpenRTMP/librtmp2-server/actions/runs/44960719006",
+ "deps": {
+  "librtmp2": "0.17.2"
+ },
+ "environment": {
+  "cpu": "AMD EPYC 9V74 80-Core Processor",
+  "vcpus": 4,
+  "ram_gib": 15.6,
+  "kernel": "Linux 7.0.0-1020-azure x86_64",
+  "rustc": "1.100.0",
+  "runner": "GitHub-hosted ubuntu26 (image 20261116.202.1)",
+  "shared_vm": true
+ },
+ "suites": {
+  "http_api": {
+   "http_api/create_stream": {
+    "ns": 211589.88686471223,
+    "ci_rel": 0.017963045404412566,
+    "bytes": null,
+    "elements": null
+   },
+   "http_api/health": {
+    "ns": 111551.56900227515,
+    "ci_rel": 0.03094089738780243,
+    "bytes": null,
+    "elements": null
+   },
+   "http_api/list_streams": {
+    "ns": 8351291.568641115,
+    "ci_rel": 0.0023391512890295124,
+    "bytes": null,
+    "elements": null
+   }
+  }
+ },
+ "sweep": {
+  "handshake": {
+   "openrtmp": [
+    9442.2,
+    2.58,
+    2.31,
+    4.4,
+    5.37
+   ],
+   "nginx": [
+    702.2,
+    41.64,
+    41.62,
+    42.8,
+    43.53
+   ],
+   "mediamtx": [
+    6619.0,
+    3.95,
+    3.56,
+    6.56,
+    7.11
+   ]
+  },
+  "play_handshake": {
+   "openrtmp": [
+    7344.3,
+    2.91,
+    2.91,
+    5.55,
+    6.87
+   ],
+   "nginx": [
+    357.3,
+    83.18,
+    83.01,
+    85.38,
+    87.2
+   ],
+   "mediamtx": [
+    5740.6,
+    4.02,
+    3.77,
+    6.49,
+    9.33
+   ]
+  },
+  "join": {
+   "1": {
+    "openrtmp": [
+     0.48,
+     0.48,
+     74.5
+    ],
+    "nginx": [
+     81.68,
+     81.68,
+     74.4
+    ],
+    "mediamtx": [
+     0.71,
+     0.71,
+     74.28
+    ]
+   },
+   "25": {
+    "openrtmp": [
+     1.87,
+     2.56,
+     74.29
+    ],
+    "nginx": [
+     83.04,
+     84.05,
+     74.28
+    ],
+    "mediamtx": [
+     3.84,
+     5.16,
+     74.27
+    ]
+   },
+   "100": {
+    "openrtmp": [
+     3.2,
+     5.72,
+     74.31
+    ],
+    "nginx": [
+     85.7,
+     88.69,
+     74.27
+    ],
+    "mediamtx": [
+     12.34,
+     18.35,
+     74.34
+    ]
+   }
+  },
+  "load": {
+   "500": {
+    "openrtmp": [
+     33.87,
+     59.78,
+     73.67,
+     29.1,
+     24.2
+    ],
+    "nginx": [
+     101.57,
+     116.22,
+     73.57,
+     42.2,
+     21.5
+    ],
+    "mediamtx": [
+     31.34,
+     51.95,
+     73.6,
+     79.0,
+     95.5
+    ]
+   },
+   "1000": {
+    "openrtmp": [
+     22.99,
+     52.44,
+     73.66,
+     57.9,
+     33.6
+    ],
+    "nginx": [
+     183.21,
+     206.98,
+     73.62,
+     85.6,
+     27.6
+    ],
+    "mediamtx": [
+     61.56,
+     103.76,
+     73.59,
+     159.1,
+     142.1
+    ]
+   },
+   "2000": {
+    "openrtmp": [
+     57.01,
+     175.47,
+     73.63,
+     116.4,
+     53.8
+    ],
+    "mediamtx": [
+     184.21,
+     481.81,
+     58.22,
+     195.2,
+     313.6
+    ]
+   }
+  },
+  "versions": {
+   "openrtmp": {
+    "version": "0.8.0",
+    "detail": "librtmp2 0.17.2",
+    "language": "Rust"
+   },
+   "mediamtx": {
+    "version": "v1.21.4",
+    "detail": "",
+    "language": "Go"
+   },
+   "liveforge": {
+    "version": "main @ a93fa22",
+    "detail": "",
+    "language": "Go"
+   },
+   "srs": {
+    "version": "v6.0-r3",
+    "detail": "",
+    "language": "C++"
+   },
+   "nginx": {
+    "version": "nginx 1.31.8",
+    "detail": "nginx-rtmp-module @ 6c7719d",
+    "language": "C"
+   }
+  },
+  "params": {
+   "load viewers": "500 1000 2000",
+   "publisher": "ffmpeg 1280x720@30 H.264 2.5 Mbps + AAC 128 kbps"
+  }
+ }
+}
