@@ -3488,7 +3488,6 @@ mod tests {
 
     #[tokio::test]
     async fn client_write_expired_deadline_is_undispatched() {
-        // A listening peer lets connect succeed; the expired deadline stops auth.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let err = send_client_write_outcome(
@@ -3502,16 +3501,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        match err {
-            ClientWriteSendError::Undispatched(message) => {
-                assert!(message.contains("timed out"), "{message}");
-            }
-            ClientWriteSendError::Dispatched(message) => {
-                panic!("expired deadline must not be dispatched: {message}")
-            }
-        }
+        let undispatched = matches!(&err, ClientWriteSendError::Undispatched(_));
+        assert!(undispatched, "dispatched");
+        assert!(format!("{err:?}").contains("timed out"));
     }
-
     #[tokio::test]
     async fn follower_forwards_client_write_to_leader() {
         // Leader (id 1) and a learner (id 2), each serving the control plane.

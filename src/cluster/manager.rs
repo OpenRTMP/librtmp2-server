@@ -4552,12 +4552,9 @@ mod tests {
         n.mgr.shutdown().await;
         let s = stream("amb-create");
         let err = n.mgr.create_stream(&s).expect_err("shutdown write failed");
-        assert!(
-            err.cluster_write_may_have_committed(),
-            "a failed client_write may have been dispatched: {err:?}"
-        );
+        assert!(err.cluster_write_may_have_committed(), "{err:?}");
+        assert!(err.to_string().contains("raft write"), "{err}");
     }
-
     #[test]
     fn dispatched_write_errors_are_marked_ambiguous() {
         let dispatched = WriteFailure::Dispatched(CoordError::Cluster(

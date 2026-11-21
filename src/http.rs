@@ -1055,7 +1055,6 @@ struct CreateStreamRequest {
     stats_key: Option<String>,
 }
 
-/// Map a `create_stream` failure to the HTTP contract.
 fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
     if e.cluster_write_may_have_committed() {
         let code = if e.to_string().contains("timed out") {
@@ -1078,7 +1077,6 @@ fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static st
         )
     }
 }
-
 async fn handle_stream_create(
     State(state): State<Arc<AppState>>,
     addr: ClientAddr,
@@ -2716,17 +2714,19 @@ mod tests {
         assert_eq!(code, "CLUSTER_WRITE_UNKNOWN");
         assert_eq!(reason, "cluster write outcome is unknown");
         assert!(message.contains("may still complete"));
+        assert!(message.contains("same stream ID"));
         let timeout = CoordError::Cluster(format!("{prefix}raft write: timed out"));
-        let (status, code, _, _) = create_stream_error(&timeout);
+        let (status, code, reason, message) = create_stream_error(&timeout);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "CLUSTER_TIMEOUT");
+        assert_eq!(reason, "cluster write outcome is unknown");
+        assert!(message.contains("may still complete"));
         let (status, code, reason, message) = create_stream_error(&CoordError::Db);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "INTERNAL_ERROR");
         assert_eq!(reason, "db error");
         assert_eq!(message, "Failed to create stream");
     }
-
     fn test_state(api_token: &str) -> Arc<AppState> {
         test_state_with_config(ServerConfig {
             api_token: api_token.to_string(),
