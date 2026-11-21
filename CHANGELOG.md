@@ -29,9 +29,11 @@ begin at `1.0.0`.
   have committed; the message asks for the same stream ID and any supplied
   keys before assuming success.
 - A forwarded cluster write now shares one deadline across its connect, auth,
-  send and response phases. An expired connect/auth phase is undispatched, so a
-  create that never reached the leader is not reported as possibly committed;
-  the local Raft attempt and the post-send phases stay ambiguous.
+  send and response phases. The local Raft attempt is bounded separately, so a
+  connect/auth expiry is undispatched and cannot be mistaken for a dispatched
+  write by an outer timer. A pre-send timeout still returns 503
+  `CLUSTER_TIMEOUT` with a safe-to-retry message; the local Raft attempt and
+  the post-send phases stay ambiguous.
 - `mask_api_token` masks by characters instead of byte slicing, so a stored
   non-ASCII token no longer panics startup.
 - A release or player retirement that races a queued `PersistPlay` settles the
