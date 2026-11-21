@@ -1056,26 +1056,34 @@ struct CreateStreamRequest {
 }
 
 fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
+    let timed_out = e.to_string().contains("timed out");
     if e.cluster_write_may_have_committed() {
-        let code = if e.to_string().contains("timed out") {
+        let code = if timed_out {
             "CLUSTER_TIMEOUT"
         } else {
             "CLUSTER_WRITE_UNKNOWN"
         };
-        (
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             code,
             "cluster write outcome is unknown",
             "Stream creation outcome is unknown and may still complete; retry with the same stream ID and any keys you supplied, and inspect a 409 before assuming success",
-        )
-    } else {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            "db error",
-            "Failed to create stream",
-        )
+        );
     }
+    if timed_out {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CLUSTER_TIMEOUT",
+            "cluster write timed out before dispatch",
+            "Stream creation timed out before it was sent; it is safe to retry",
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL_ERROR",
+        "db error",
+        "Failed to create stream",
+    )
 }
 async fn handle_stream_create(
     State(state): State<Arc<AppState>>,
@@ -2726,6 +2734,12 @@ mod tests {
         assert_eq!(code, "INTERNAL_ERROR");
         assert_eq!(reason, "db error");
         assert_eq!(message, "Failed to create stream");
+        let before = CoordError::Cluster("control connect to leader timed out".into());
+        let (status, code, reason, message) = create_stream_error(&before);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "CLUSTER_TIMEOUT");
+        assert_eq!(reason, "cluster write timed out before dispatch");
+        assert!(message.contains("safe to retry"));
     }
     fn test_state(api_token: &str) -> Arc<AppState> {
         test_state_with_config(ServerConfig {

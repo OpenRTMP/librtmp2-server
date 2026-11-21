@@ -1206,9 +1206,12 @@ impl ClusterManager {
         let fut = async move {
             use openraft::error::{ClientWriteError, RaftError};
 
-            match raft.client_write(cmd.clone()).await {
-                Ok(resp) => Ok(resp.data),
-                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl))) => {
+            match tokio::time::timeout_at(deadline, raft.client_write(cmd.clone())).await {
+                Err(_) => Err(WriteFailure::Dispatched(CoordError::Cluster(
+                    RAFT_WRITE_TIMEOUT_MSG.into(),
+                ))),
+                Ok(Ok(resp)) => Ok(resp.data),
+                Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ftl)))) => {
                     // The leader has not seen this write yet: everything that
                     // fails before the forward below leaves the write
                     // undispatched, so it can never commit.
@@ -1252,20 +1255,15 @@ impl ClusterManager {
                         }
                     }
                 }
-                Err(e) => Err(WriteFailure::Dispatched(CoordError::Cluster(format!(
+                Ok(Err(e)) => Err(WriteFailure::Dispatched(CoordError::Cluster(format!(
                     "raft write: {e}"
                 )))),
             }
         };
-        let timed = async move {
-            tokio::time::timeout_at(deadline, fut).await.map_err(|_| {
-                WriteFailure::Dispatched(CoordError::Cluster(RAFT_WRITE_TIMEOUT_MSG.into()))
-            })?
-        };
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.rt_handle.block_on(timed))
+            tokio::task::block_in_place(|| self.rt_handle.block_on(fut))
         } else {
-            self.rt_handle.block_on(timed)
+            self.rt_handle.block_on(fut)
         }
     }
 

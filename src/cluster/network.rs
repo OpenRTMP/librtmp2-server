@@ -1850,6 +1850,11 @@ pub async fn send_client_write_outcome(
     .await
     .map_err(|_| ClientWriteSendError::Undispatched("control auth timed out".into()))?
     .map_err(|e| ClientWriteSendError::Undispatched(format!("control auth: {e}")))?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ClientWriteSendError::Undispatched(
+            "control auth completed after the write deadline".into(),
+        ));
+    }
     tokio::time::timeout_at(deadline, write_frame(&mut stream, &msg))
         .await
         .map_err(|_| ClientWriteSendError::Dispatched("client write send timed out".into()))?
