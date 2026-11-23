@@ -13,6 +13,29 @@ begin at `1.0.0`.
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-11-23
+
+### Changed
+- Dependency bump: `librtmp2` 0.17.2 -> 0.17.3. That release is documentation
+  and CI only, with no public signature, ABI or runtime behaviour change, so
+  nothing in this server behaves differently; the bump picks up the completed
+  rustdoc (every public item documented, every example runnable) and the
+  corrected documentation of the `librtmp2` contracts this server relies on:
+  - `Conn::handle_command` ignores an AMF0 payload whose command name cannot be
+    read, so a peer sending an extension command cannot break an ingested
+    session.
+  - `Conn::inject_relay_frame` requires an app name and a resolvable relay route
+    key, and `Conn::relay_route_key` prefers a pinned `relay_key` over the
+    app/stream fallback.
+  - `session::stream::publish_begin`/`play_begin` only set the role flag; the
+    stream name comes from the `session::publish`/`session::play` wrappers.
+  - The E-RTMP wire details the relay and init-cache code depends on: multitrack
+    descriptors are two AMF0 values, `fourCcList` is a UI32 count plus
+    UI16-length entries, and `capsEx` is two UI32 masks with an implied version.
+- The minimum supported `librtmp2` is now 0.17.3, so the documented contracts
+  above are guaranteed rather than assumed.
+
+
 ## [0.8.0] — 2026-11-21
 
 ### Security
@@ -1396,6 +1419,7 @@ plaintext RTMP and RTMPS.
 - REST API enhancements for server management
 
 [Unreleased]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.8.0...HEAD
+[0.8.1]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.9...v0.7.0
 [0.6.9]: https://github.com/OpenRTMP/librtmp2-server/compare/v0.6.8...v0.6.9
