@@ -1076,6 +1076,26 @@ fn cluster_leaderless_write(e: &CoordError) -> bool {
     }
 }
 
+/// Response for a delete that reached neither the NotFound/Conflict arms nor
+/// an ambiguous write. Only a leaderless routing failure is transiently
+/// retryable; everything else is reported as the previous generic failure.
+fn delete_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
+    if cluster_leaderless_write(e) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CLUSTER_UNAVAILABLE",
+            "no cluster leader available",
+            "Delete was not applied because no cluster leader was reachable; retry shortly",
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL_ERROR",
+        "failed to disable stream",
+        "Failed to disable stream",
+    )
+}
+
 fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
     let timed_out = e.to_string().contains("timed out");
     if e.cluster_write_may_have_committed() {
@@ -1818,34 +1838,9 @@ async fn handle_stream_delete(
             return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
         }
         clear_http_delete_marker(&state, &id);
-        if cluster_leaderless_write(&e) {
-            // No leader was reachable, so the delete was never applied. This is
-            // transient and retryable, not a database failure.
-            log_http_access(
-                "DELETE",
-                &path,
-                &peer,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no cluster leader available",
-            );
-            return err_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "CLUSTER_UNAVAILABLE",
-                "Delete was not applied because no cluster leader was reachable; retry shortly",
-            );
-        }
-        log_http_access(
-            "DELETE",
-            &path,
-            &peer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to disable stream",
-        );
-        return err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            "Failed to disable stream",
-        );
+        let (status, code, reason, message) = delete_stream_error(&e);
+        log_http_access("DELETE", &path, &peer, status, reason);
+        return err_json(status, code, message);
     }
     #[cfg(feature = "cluster")]
     if let Some(mgr) = state.coordinator.cluster_manager() {
@@ -2817,6 +2812,26 @@ mod tests {
             crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
         ));
         assert!(!cluster_leaderless_write(&ambiguous));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn leaderless_delete_reports_a_retryable_503() {
+        let unavailable = CoordError::Cluster("no leader available to forward write".into());
+        let (status, code, reason, message) = delete_stream_error(&unavailable);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "CLUSTER_UNAVAILABLE");
+        assert_eq!(reason, "no cluster leader available");
+        assert!(message.contains("retry shortly"));
+    }
+
+    #[test]
+    fn delete_stream_db_error_keeps_the_generic_500() {
+        let (status, code, reason, message) = delete_stream_error(&CoordError::Db);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "INTERNAL_ERROR");
+        assert_eq!(reason, "failed to disable stream");
+        assert_eq!(message, "Failed to disable stream");
     }
     fn test_state(api_token: &str) -> Arc<AppState> {
         test_state_with_config(ServerConfig {
