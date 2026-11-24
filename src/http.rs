@@ -1055,16 +1055,18 @@ struct CreateStreamRequest {
     stats_key: Option<String>,
 }
 
-/// True when a cluster write never reached a leader, so the request is
-/// transiently retryable rather than a database failure. Timeouts that happened
-/// before dispatch are reported separately as `CLUSTER_TIMEOUT`.
-fn cluster_write_never_dispatched(e: &CoordError) -> bool {
+/// True only for the exact "no leader" routing failure that
+/// `ClusterManager` produces when a forwarded write has no leader to go to
+/// (see `cluster/manager.rs`, the `no leader available to forward write`
+/// arm). Other undispatched cluster errors — a missing cluster admin token, a
+/// serialization failure, a pre-dispatch timeout — are permanent or are
+/// classified separately and must stay 500/`CLUSTER_TIMEOUT`.
+fn cluster_leaderless_write(e: &CoordError) -> bool {
     #[cfg(feature = "cluster")]
     {
         matches!(
             e,
-            CoordError::Cluster(msg)
-                if !e.cluster_write_may_have_committed() && !msg.contains("timed out")
+            CoordError::Cluster(msg) if msg == "no leader available to forward write"
         )
     }
     #[cfg(not(feature = "cluster"))]
@@ -1097,7 +1099,7 @@ fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static st
             "Stream creation timed out before it was sent; it is safe to retry",
         );
     }
-    if cluster_write_never_dispatched(e) {
+    if cluster_leaderless_write(e) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "CLUSTER_UNAVAILABLE",
@@ -1816,7 +1818,7 @@ async fn handle_stream_delete(
             return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
         }
         clear_http_delete_marker(&state, &id);
-        if cluster_write_never_dispatched(&e) {
+        if cluster_leaderless_write(&e) {
             // No leader was reachable, so the delete was never applied. This is
             // transient and retryable, not a database failure.
             log_http_access(
@@ -2795,18 +2797,26 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
-    fn cluster_unavailable_classifier_is_narrow() {
+    fn cluster_leaderless_classifier_is_narrow() {
         let unavailable = CoordError::Cluster("no leader available to forward write".into());
-        assert!(cluster_write_never_dispatched(&unavailable));
-        assert!(!cluster_write_never_dispatched(&CoordError::Db));
-        assert!(!cluster_write_never_dispatched(&CoordError::Cluster(
+        assert!(cluster_leaderless_write(&unavailable));
+        assert!(!cluster_leaderless_write(&CoordError::Db));
+        assert!(!cluster_leaderless_write(&CoordError::Cluster(
             "control connect to leader timed out".into()
+        )));
+        // Undispatched but permanent: a missing cluster admin token or a
+        // serialization failure must keep the 500 classification.
+        assert!(!cluster_leaderless_write(&CoordError::Cluster(
+            "API token unavailable for cluster admin write".into()
+        )));
+        assert!(!cluster_leaderless_write(&CoordError::Cluster(
+            "key must be a string".into()
         )));
         let ambiguous = CoordError::Cluster(format!(
             "{}raft write: connection reset by peer",
             crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
         ));
-        assert!(!cluster_write_never_dispatched(&ambiguous));
+        assert!(!cluster_leaderless_write(&ambiguous));
     }
     fn test_state(api_token: &str) -> Arc<AppState> {
         test_state_with_config(ServerConfig {
