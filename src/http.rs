@@ -1055,6 +1055,25 @@ struct CreateStreamRequest {
     stats_key: Option<String>,
 }
 
+/// True when a cluster write never reached a leader, so the request is
+/// transiently retryable rather than a database failure. Timeouts that happened
+/// before dispatch are reported separately as `CLUSTER_TIMEOUT`.
+fn cluster_write_never_dispatched(e: &CoordError) -> bool {
+    #[cfg(feature = "cluster")]
+    {
+        matches!(
+            e,
+            CoordError::Cluster(msg)
+                if !e.cluster_write_may_have_committed() && !msg.contains("timed out")
+        )
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
     let timed_out = e.to_string().contains("timed out");
     if e.cluster_write_may_have_committed() {
@@ -1076,6 +1095,14 @@ fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static st
             "CLUSTER_TIMEOUT",
             "cluster write timed out before dispatch",
             "Stream creation timed out before it was sent; it is safe to retry",
+        );
+    }
+    if cluster_write_never_dispatched(e) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CLUSTER_UNAVAILABLE",
+            "no cluster leader available",
+            "Stream creation was not applied because no cluster leader was reachable; retry shortly",
         );
     }
     (
@@ -1789,6 +1816,22 @@ async fn handle_stream_delete(
             return (StatusCode::ACCEPTED, Json(json!({"status": "deleting"}))).into_response();
         }
         clear_http_delete_marker(&state, &id);
+        if cluster_write_never_dispatched(&e) {
+            // No leader was reachable, so the delete was never applied. This is
+            // transient and retryable, not a database failure.
+            log_http_access(
+                "DELETE",
+                &path,
+                &peer,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no cluster leader available",
+            );
+            return err_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CLUSTER_UNAVAILABLE",
+                "Delete was not applied because no cluster leader was reachable; retry shortly",
+            );
+        }
         log_http_access(
             "DELETE",
             &path,
@@ -2740,6 +2783,30 @@ mod tests {
         assert_eq!(code, "CLUSTER_TIMEOUT");
         assert_eq!(reason, "cluster write timed out before dispatch");
         assert!(message.contains("safe to retry"));
+        // A write that never reached a leader is transiently retryable and must
+        // not be reported as a database failure.
+        let unavailable = CoordError::Cluster("no leader available to forward write".into());
+        let (status, code, reason, message) = create_stream_error(&unavailable);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "CLUSTER_UNAVAILABLE");
+        assert_eq!(reason, "no cluster leader available");
+        assert!(message.contains("retry shortly"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_unavailable_classifier_is_narrow() {
+        let unavailable = CoordError::Cluster("no leader available to forward write".into());
+        assert!(cluster_write_never_dispatched(&unavailable));
+        assert!(!cluster_write_never_dispatched(&CoordError::Db));
+        assert!(!cluster_write_never_dispatched(&CoordError::Cluster(
+            "control connect to leader timed out".into()
+        )));
+        let ambiguous = CoordError::Cluster(format!(
+            "{}raft write: connection reset by peer",
+            crate::state::AMBIGUOUS_CLUSTER_WRITE_PREFIX
+        ));
+        assert!(!cluster_write_never_dispatched(&ambiguous));
     }
     fn test_state(api_token: &str) -> Arc<AppState> {
         test_state_with_config(ServerConfig {
