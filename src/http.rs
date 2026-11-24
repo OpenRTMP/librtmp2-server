@@ -1055,32 +1055,16 @@ struct CreateStreamRequest {
     stats_key: Option<String>,
 }
 
-/// True only for the exact "no leader" routing failure that
-/// `ClusterManager` produces when a forwarded write has no leader to go to
-/// (see `cluster/manager.rs`, the `no leader available to forward write`
-/// arm). Other undispatched cluster errors — a missing cluster admin token, a
-/// serialization failure, a pre-dispatch timeout — are permanent or are
-/// classified separately and must stay 500/`CLUSTER_TIMEOUT`.
+/// Exact no-leader routing failure from `ClusterManager`.
+#[cfg(feature = "cluster")]
 fn cluster_leaderless_write(e: &CoordError) -> bool {
-    #[cfg(feature = "cluster")]
-    {
-        matches!(
-            e,
-            CoordError::Cluster(msg) if msg == "no leader available to forward write"
-        )
-    }
-    #[cfg(not(feature = "cluster"))]
-    {
-        let _ = e;
-        false
-    }
+    matches!(e, CoordError::Cluster(msg) if msg == "no leader available to forward write")
 }
 
-/// Response for a delete that reached neither the NotFound/Conflict arms nor
-/// an ambiguous write. Only a leaderless routing failure is transiently
-/// retryable; everything else is reported as the previous generic failure.
-fn delete_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
-    if cluster_leaderless_write(e) {
+/// Delete fallthrough: only a leaderless routing failure is retryable.
+fn delete_stream_error(_e: &CoordError) -> (StatusCode, &'static str, &'static str, &'static str) {
+    #[cfg(feature = "cluster")]
+    if cluster_leaderless_write(_e) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "CLUSTER_UNAVAILABLE",
@@ -1119,6 +1103,7 @@ fn create_stream_error(e: &CoordError) -> (StatusCode, &'static str, &'static st
             "Stream creation timed out before it was sent; it is safe to retry",
         );
     }
+    #[cfg(feature = "cluster")]
     if cluster_leaderless_write(e) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2780,8 +2765,6 @@ mod tests {
         assert_eq!(code, "CLUSTER_TIMEOUT");
         assert_eq!(reason, "cluster write timed out before dispatch");
         assert!(message.contains("safe to retry"));
-        // A write that never reached a leader is transiently retryable and must
-        // not be reported as a database failure.
         let unavailable = CoordError::Cluster("no leader available to forward write".into());
         let (status, code, reason, message) = create_stream_error(&unavailable);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2789,7 +2772,6 @@ mod tests {
         assert_eq!(reason, "no cluster leader available");
         assert!(message.contains("retry shortly"));
     }
-
     #[cfg(feature = "cluster")]
     #[test]
     fn cluster_leaderless_classifier_is_narrow() {
@@ -2799,8 +2781,6 @@ mod tests {
         assert!(!cluster_leaderless_write(&CoordError::Cluster(
             "control connect to leader timed out".into()
         )));
-        // Undispatched but permanent: a missing cluster admin token or a
-        // serialization failure must keep the 500 classification.
         assert!(!cluster_leaderless_write(&CoordError::Cluster(
             "API token unavailable for cluster admin write".into()
         )));
@@ -2813,7 +2793,6 @@ mod tests {
         ));
         assert!(!cluster_leaderless_write(&ambiguous));
     }
-
     #[cfg(feature = "cluster")]
     #[test]
     fn leaderless_delete_reports_a_retryable_503() {
@@ -2824,7 +2803,6 @@ mod tests {
         assert_eq!(reason, "no cluster leader available");
         assert!(message.contains("retry shortly"));
     }
-
     #[test]
     fn delete_stream_db_error_keeps_the_generic_500() {
         let (status, code, reason, message) = delete_stream_error(&CoordError::Db);
